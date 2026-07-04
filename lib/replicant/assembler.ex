@@ -57,6 +57,7 @@ defmodule Replicant.Assembler do
   @type t :: %__MODULE__{
           sink: module(),
           relations: %{non_neg_integer() => Relation.t()},
+          projected: %{non_neg_integer() => [Change.Column.t()]},
           txn: buffer() | nil,
           ordinal: non_neg_integer()
         }
@@ -67,7 +68,7 @@ defmodule Replicant.Assembler do
           changes: [Change.t()]
         }
 
-  defstruct [:sink, :txn, relations: %{}, ordinal: 0]
+  defstruct [:sink, :txn, relations: %{}, projected: %{}, ordinal: 0]
 
   @doc "Create a new assembler bound to `sink` (a module implementing `Replicant.Sink`)."
   @spec new(module()) :: t()
@@ -232,12 +233,12 @@ defmodule Replicant.Assembler do
   defp handle_relation(%__MODULE__{relations: relations} = asm, %Relation{} = rel) do
     case Map.get(relations, rel.id) do
       nil ->
-        {:ok, %{asm | relations: Map.put(relations, rel.id, rel)}}
+        {:ok, cache_relation(asm, rel)}
 
       cached ->
         case SchemaChange.classify(cached, rel) do
           nil ->
-            {:ok, %{asm | relations: Map.put(relations, rel.id, rel)}}
+            {:ok, cache_relation(asm, rel)}
 
           %SchemaChange{kind: :additive} = sc ->
             Telemetry.event([:replicant, :schema_change, :additive], %{}, %{
@@ -245,7 +246,7 @@ defmodule Replicant.Assembler do
               kind: :additive
             })
 
-            {:schema_change, sc, %{asm | relations: Map.put(relations, rel.id, rel)}}
+            {:schema_change, sc, cache_relation(asm, rel)}
 
           %SchemaChange{kind: :destructive} = sc ->
             delegate_or_halt(asm, sc, rel)
@@ -262,7 +263,7 @@ defmodule Replicant.Assembler do
             kind: :additive
           })
 
-          {:schema_change, sc, %{asm | relations: Map.put(asm.relations, rel.id, rel)}}
+          {:schema_change, sc, cache_relation(asm, rel)}
 
         {:error, _reason} ->
           Telemetry.event([:replicant, :schema_change, :halted], %{}, %{
@@ -299,7 +300,8 @@ defmodule Replicant.Assembler do
         {:halt, %Error{reason: :config_invalid, shape: "row for uncached relation"}, asm}
 
       %Relation{} = rel ->
-        change = build_change(op, rel, new_tuple, old_spec, buffer.begin_lsn, ordinal)
+        projected = Map.fetch!(asm.projected, rid)
+        change = build_change(op, rel, projected, new_tuple, old_spec, buffer.begin_lsn, ordinal)
         {:ok, %{asm | txn: %{buffer | changes: [change | buffer.changes]}, ordinal: ordinal + 1}}
     end
   end
@@ -312,7 +314,15 @@ defmodule Replicant.Assembler do
   defp old_spec(nil, key_tuple), do: {key_tuple, true}
   defp old_spec(old_tuple, _key_tuple), do: {old_tuple, false}
 
-  defp build_change(op, %Relation{} = rel, new_tuple, old_spec, commit_lsn, ordinal) do
+  defp build_change(
+         op,
+         %Relation{} = rel,
+         projected_columns,
+         new_tuple,
+         old_spec,
+         commit_lsn,
+         ordinal
+       ) do
     columns = rel.columns || []
     {record, unchanged} = materialize(new_tuple, columns)
     old_record = materialize_old(old_spec, columns)
@@ -324,11 +334,24 @@ defmodule Replicant.Assembler do
       record: record,
       old_record: old_record,
       unchanged: unchanged,
-      columns: Enum.map(columns, &to_change_column/1),
+      columns: projected_columns,
       commit_lsn: commit_lsn,
       ordinal: ordinal
     }
   end
+
+  # Cache a relation AND its pre-projected `Change.Column` list together. The column
+  # metadata is relation-invariant, so a bulk transaction (N rows of one relation)
+  # reuses one shared projection instead of rebuilding it per row.
+  defp cache_relation(%__MODULE__{relations: rels, projected: proj} = asm, %Relation{} = rel) do
+    %{
+      asm
+      | relations: Map.put(rels, rel.id, rel),
+        projected: Map.put(proj, rel.id, project(rel))
+    }
+  end
+
+  defp project(%Relation{columns: columns}), do: Enum.map(columns || [], &to_change_column/1)
 
   defp to_change_column(%Relation.Column{name: n, type: t, flags: f, type_modifier: m}) do
     %Change.Column{name: n, type: t, flags: f, type_modifier: m}

@@ -139,11 +139,19 @@ defmodule Replicant.AssemblerTest do
                Assembler.handle_message(asm, commit_msg())
 
       assert returned_lsn == @lsn
-      assert [%Change{op: :insert, table: "orders", record: record}] = txn.changes
+
+      assert [%Change{op: :insert, table: "orders", record: record, columns: columns}] =
+               txn.changes
+
       assert record["status"] == "paid"
       # spec §10: keys stay binaries through the real decode→assemble producer path
       # (no String.to_atom) — the non-vacuous string-key guard the seam table assigns here.
       assert Enum.all?(Map.keys(record), &is_binary/1)
+      # change.columns carries the relation's per-column metadata (memoized at
+      # relation-cache time), projected to Change.Column structs.
+      assert Enum.map(columns, & &1.name) == ["id", "status"]
+      assert Enum.map(columns, & &1.type) == ["int4", "text"]
+      assert hd(columns).flags == [:key]
       # watermark-int: the sink was dispatched exactly once with the txn
       assert [{@lsn, [_change]}] = RecordingSink.seen()
     end
