@@ -1,0 +1,38 @@
+# Build artifacts
+_build/
+erl_crash.dump
+*.beam
+*.ez
+
+# Dependencies
+deps/
+
+# Documentation
+/doc/
+
+# Dialyzer PLTs
+priv/plts/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+*.DS_Store
+
+# AI Tools
+/.serena/
+/.expert/
+/.gemini/
+/.cursor/
+/.opencode/
+/.antigravity/
+/.codex/
+/.claude/
+/.agent/
+/.aider/
+
+# Superpowers lifecycle artifacts (specs, plans, handoffs, reviews) — local only, never tracked
+/docs/superpowers/
+
