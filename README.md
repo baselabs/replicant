@@ -139,6 +139,23 @@ Contributor and agent working rules — including the redaction,
 identifier-validation, and tenant-blind invariants — live in
 [`AGENTS.md`](AGENTS.md).
 
+## Roadmap
+
+This release is **Plan 1 — the offline core** (decode / assemble / validate /
+redact), proven by unit tests plus a real-`pgoutput`-byte conformance suite with **no
+live database**. Every public module named above ships today.
+
+The next slice, **Plan 2 — live streaming + exactly-once**, adds:
+
+- `Replicant.Connection` (`Postgrex.ReplicationConnection`): replication-slot
+  lifecycle, **ack-after-checkpoint** + keepalive, **slot-invalidation fail-closed
+  halt**, reconnect/backoff, and a go-forward-only start guard.
+- A **crash-injection integration suite** (real PG16): kill the process at
+  adversarial points and assert exactly-once delivery.
+
+Until Plan 2 lands, `replicant` decodes and assembles committed transactions from
+`pgoutput` bytes you supply — it does not yet own a live replication connection.
+
 ## Credits
 
 - [**walex**](https://github.com/cpursley/walex) — the `pgoutput` byte parser,
