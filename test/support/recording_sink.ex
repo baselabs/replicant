@@ -9,11 +9,16 @@ defmodule Replicant.Test.RecordingSink do
   use Agent
 
   def start_link(_opts \\ []) do
-    Agent.start_link(fn -> [] end, name: __MODULE__)
+    case Agent.start_link(fn -> [] end, name: __MODULE__) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+    end
   end
 
   @impl Replicant.Sink
-  def checkpoint, do: {:ok, nil}
+  def checkpoint do
+    {:ok, Process.get({__MODULE__, :checkpoint})}
+  end
 
   @impl Replicant.Sink
   def handle_transaction(%Replicant.Transaction{} = txn) do
