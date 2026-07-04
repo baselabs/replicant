@@ -22,7 +22,7 @@ defmodule Replicant.Change do
   @type op :: :insert | :update | :delete | :truncate
 
   @type t :: %__MODULE__{
-          op: op(),
+          op: op() | nil,
           schema: String.t() | nil,
           table: String.t() | nil,
           record: %{String.t() => term()} | nil,
