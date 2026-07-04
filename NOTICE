@@ -1,0 +1,16 @@
+replicant
+Copyright 2026 rjpalermo / baselabs. Licensed under the MIT License (see LICENSE).
+
+This product includes vendored source from the following projects:
+
+  * walex (https://github.com/cpursley/walex) — MIT License.
+    The pgoutput byte parser (lib/replicant/decoder/decoder.ex), the OID-to-type
+    database (lib/replicant/decoder/oid_database.ex), the type caster
+    (lib/replicant/casting/types.ex), and the array parser
+    (lib/replicant/casting/array_parser.ex) derive from walex.
+  * walex in turn draws on cainophile / pgoutput_decoder
+    (https://github.com/cainophile) — Apache 2.0.
+  * and on Supabase Realtime (https://github.com/supabase/realtime) — Apache 2.0.
+  * The OID database originates in epgsql (https://github.com/epgsql) — BSD.
+
+All retained under their original license terms, compatible with MIT.
