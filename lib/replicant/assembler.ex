@@ -361,9 +361,14 @@ defmodule Replicant.Assembler do
 
   defp materialize_old({tuple, key_only}, columns) do
     {record, _unchanged} = materialize(tuple, columns)
+    key_names = key_column_names(columns)
 
-    if key_only and record != nil do
-      Map.take(record, key_column_names(columns))
+    # Filter to the key columns ONLY when the relation actually declares them (a
+    # key-only tuple always corresponds to >= 1 key column in valid pgoutput). If a
+    # malformed relation flags no keys, keep the full record rather than emptying
+    # old_record — an empty old_record is strictly less useful than the raw tuple.
+    if key_only and record != nil and key_names != [] do
+      Map.take(record, key_names)
     else
       record
     end

@@ -105,7 +105,17 @@ defmodule Replicant.AssemblerTest do
 
   setup do
     {:ok, pid} = RecordingSink.start_link()
-    on_exit(fn -> if Process.alive?(pid), do: Agent.stop(pid) end)
+
+    on_exit(fn ->
+      # Deterministic teardown: stopping the linked named Agent can race its own
+      # link-driven death (TOCTOU on Process.alive?/1), so tolerate a dead pid.
+      try do
+        Agent.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
     RecordingSink.reset()
     :ok
   end
@@ -268,7 +278,17 @@ defmodule Replicant.AssemblerTest do
 
     test "a destructive change is APPLIED (not halted) when the sink accepts it via handle_schema_change/2" do
       {:ok, pid} = AcceptingSink.start_link()
-      on_exit(fn -> if Process.alive?(pid), do: Agent.stop(pid) end)
+
+      on_exit(fn ->
+        # Deterministic teardown: stopping the linked named Agent can race its own
+        # link-driven death (TOCTOU on Process.alive?/1), so tolerate a dead pid.
+        try do
+          Agent.stop(pid)
+        catch
+          :exit, _ -> :ok
+        end
+      end)
+
       asm = Assembler.new(AcceptingSink)
 
       {:ok, asm} =
