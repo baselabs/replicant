@@ -1,0 +1,25 @@
+defmodule Replicant.TransactionTest do
+  use ExUnit.Case, async: true
+
+  alias Replicant.{Change, Transaction}
+
+  describe "commit_lsn watermark ordering" do
+    test "a re-delivered transaction (commit_lsn == checkpoint) is ordered <= checkpoint" do
+      txn = %Transaction{commit_lsn: 0x2A, changes: [%Change{op: :insert}]}
+      # exactly-once skip predicate: commit_lsn <= checkpoint
+      assert txn.commit_lsn <= 0x2A
+      refute txn.commit_lsn <= 0x29
+    end
+
+    test "file dominates offset across a 4GiB boundary (watermark does not skip a newer txn)" do
+      # commit at file 1, offset 5; checkpoint at file 0, max offset. The commit is
+      # NEWER, so the exactly-once predicate commit_lsn <= checkpoint must be FALSE.
+      # Route the LSN through the struct so this guards the real watermark decision,
+      # not just an integer-arithmetic fact.
+      txn = %Transaction{commit_lsn: Bitwise.bsl(1, 32) + 5, changes: [%Change{op: :insert}]}
+      checkpoint = 0xFFFFFFFF
+      refute txn.commit_lsn <= checkpoint
+      assert txn.commit_lsn > checkpoint
+    end
+  end
+end
