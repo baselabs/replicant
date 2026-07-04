@@ -33,6 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message type including the unchanged-TOAST sentinel and all replica-identity modes —
   runs with no live database.
 
+### Fixed — Plan 1 closeout review (2026-07-04)
+
+- The assembler's value-free boundary now catches sink `throw`/`exit` (not only
+  raises), scrubbing them value-free — a sink exit reason (e.g. a `GenServer.call`
+  timeout) can embed the transaction's row values (Critical Rule 1).
+- A row or truncate for a relation never seen in the stream halts fail-closed
+  instead of emitting a table-less empty change checkpointed as success.
+- A replica-identity change expressed via the `:key`-flagged column set (a
+  `REPLICA IDENTITY USING INDEX` / primary-key swap with the enum unchanged) now
+  classifies `:destructive` (spec §7/§9), not silently unhandled.
+- `old_record` is key-only under non-FULL replica identity — the NULL placeholders
+  a key tuple carries for non-key columns are dropped (spec §7).
+- A multi-relation `Truncate` assigns each relation a unique, monotonic `ordinal`
+  (previously all shared one, colliding with a following change's ordinal).
+- Sink raise/throw/exit failures are labeled `:sink_failed` (distinguishable from a
+  casting `:decode_failure`).
+
 ### Pending — Plan 2 (next slice): live streaming + exactly-once
 
 - `Replicant.Connection` (`Postgrex.ReplicationConnection`): slot lifecycle,
