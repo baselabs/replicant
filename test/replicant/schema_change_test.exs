@@ -78,6 +78,35 @@ defmodule Replicant.SchemaChangeTest do
     end
   end
 
+  describe "classify/2 — replica-identity key-set change (closeout review, spec §7/§9)" do
+    test "moving the :key flag to a different column (enum unchanged) is destructive" do
+      # REPLICA IDENTITY USING INDEX swap / PK change: same enum (:index), same column
+      # names/types, but the :key-flagged column set moved id -> email. This changes the
+      # meaning of old_record for every subsequent change and MUST classify destructive.
+      old = rel("orders", [col("id", "int4", [:key]), col("email", "text", [])], :index)
+      new = rel("orders", [col("id", "int4", []), col("email", "text", [:key])], :index)
+
+      assert %SchemaChange{kind: :destructive, change: :replica_identity_changed, table: "orders"} =
+               SchemaChange.classify(old, new)
+    end
+
+    test "adding a new :key column (enum unchanged) is destructive, not additive" do
+      old = rel("orders", [col("id", "int4", [:key])], :index)
+      new = rel("orders", [col("id", "int4", [:key]), col("tenant_id", "int8", [:key])], :index)
+
+      assert %SchemaChange{kind: :destructive, change: :replica_identity_changed} =
+               SchemaChange.classify(old, new)
+    end
+
+    test "a non-key column add with an unchanged key set stays additive (no over-firing)" do
+      old = rel("orders", [col("id", "int4", [:key])], :index)
+      new = rel("orders", [col("id", "int4", [:key]), col("note", "text", [])], :index)
+
+      assert %SchemaChange{kind: :additive, change: :column_added} =
+               SchemaChange.classify(old, new)
+    end
+  end
+
   describe "classify/2 — no change" do
     test "identical relations yield nil" do
       r = rel("orders", [col("id", "int4", [:key])])

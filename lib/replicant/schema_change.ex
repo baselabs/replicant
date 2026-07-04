@@ -9,15 +9,14 @@ defmodule Replicant.SchemaChange do
   `classify/2`. `nil` means "no schema-relevant change" (e.g. only column order
   shifted without drops/type/identity changes — treated as additive-safe).
 
-  ## Known limitation
-  A change to *which* columns form the replica identity — expressed via per-column
-  `:key` flags rather than the `replica_identity` enum (e.g. a `REPLICA IDENTITY
-  USING INDEX` swap to a different unique index, or a primary-key change that keeps
-  the same column names) — is **not** detected when the enum value itself is
-  unchanged. Such changes are rare and usually accompany a column drop/add (which
-  IS caught). If your workload alters key-column sets without dropping/adding
-  columns, gate it upstream. (Plan 2 may extend `classify/2` to diff the
-  `:key`-flagged column set.)
+  ## Replica-identity changes (spec §7/§9)
+  A change of replica identity is destructive because it alters the meaning of
+  `old_record` for every subsequent change. `classify/2` catches it two ways:
+  the `replica_identity` **enum** value changing (`:default -> :all_columns`), AND
+  the set of `:key`-flagged columns changing while the enum is unchanged (a
+  `REPLICA IDENTITY USING INDEX` swap to a different unique index, or a
+  primary-key change that keeps the same column names). Both classify
+  `:replica_identity_changed :destructive`.
   """
 
   alias Replicant.Decoder.Messages.Relation
@@ -44,13 +43,7 @@ defmodule Replicant.SchemaChange do
   @spec classify(Relation.t() | nil, Relation.t()) :: t() | nil
   def classify(%Relation{} = old, %Relation{columns: new_cols} = new) do
     if old.replica_identity != new.replica_identity do
-      %__MODULE__{
-        kind: :destructive,
-        change: :replica_identity_changed,
-        schema: new.namespace,
-        table: new.name,
-        detail: "replica_identity #{old.replica_identity} -> #{new.replica_identity}"
-      }
+      replica_identity_changed(old, new)
     else
       diff_columns(old.columns, new_cols, new)
     end
@@ -58,6 +51,16 @@ defmodule Replicant.SchemaChange do
 
   def classify(nil, %Relation{} = new),
     do: classify(%Relation{columns: [], replica_identity: nil}, new)
+
+  defp replica_identity_changed(old, new) do
+    %__MODULE__{
+      kind: :destructive,
+      change: :replica_identity_changed,
+      schema: new.namespace,
+      table: new.name,
+      detail: "replica_identity #{old.replica_identity} -> #{new.replica_identity}"
+    }
+  end
 
   defp diff_columns(old_cols, new_cols, new) do
     old_by_name = column_index(old_cols)
@@ -86,6 +89,12 @@ defmodule Replicant.SchemaChange do
         end
       end)
 
+    # A change to the :key-flagged column set with the enum unchanged (a USING
+    # INDEX / primary-key swap) is a replica-identity change — destructive. Checked
+    # AFTER drop/type (a dropped key column is reported as :column_dropped) and
+    # BEFORE :additive (destructive dominates a co-occurring non-key add).
+    key_changed = key_columns(old_cols) != key_columns(new_cols)
+
     cond do
       MapSet.size(dropped) > 0 ->
         %__MODULE__{
@@ -107,6 +116,16 @@ defmodule Replicant.SchemaChange do
           detail: "#{name}: #{from_t} -> #{to_t}"
         }
 
+      key_changed ->
+        %__MODULE__{
+          kind: :destructive,
+          change: :replica_identity_changed,
+          schema: new.namespace,
+          table: new.name,
+          detail:
+            "key columns #{inspect(key_columns(old_cols))} -> #{inspect(key_columns(new_cols))}"
+        }
+
       MapSet.size(added) > 0 ->
         %__MODULE__{
           kind: :additive,
@@ -123,5 +142,12 @@ defmodule Replicant.SchemaChange do
 
   defp column_index(columns) do
     Map.new(columns, fn %Relation.Column{name: name} = col -> {name, col} end)
+  end
+
+  defp key_columns(columns) do
+    columns
+    |> Enum.filter(fn %Relation.Column{flags: flags} -> is_list(flags) and :key in flags end)
+    |> Enum.map(& &1.name)
+    |> Enum.sort()
   end
 end
