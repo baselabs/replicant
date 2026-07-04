@@ -28,7 +28,7 @@ defmodule Replicant.Change do
           record: %{String.t() => term()} | nil,
           old_record: %{String.t() => term()} | nil,
           unchanged: [String.t()],
-          columns: [Column.t()],
+          columns: [Replicant.Change.Column.t()],
           commit_lsn: Replicant.lsn() | nil,
           ordinal: non_neg_integer()
         }
