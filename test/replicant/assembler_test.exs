@@ -20,6 +20,45 @@ defmodule Replicant.AssemblerTest.AcceptingSink do
   def handle_schema_change(_sc, _ctx), do: :ok
 end
 
+defmodule Replicant.AssemblerTest.ThrowingSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+  @impl true
+  def checkpoint, do: {:ok, nil}
+  @impl true
+  def handle_transaction(_txn), do: throw(:sink_threw)
+end
+
+defmodule Replicant.AssemblerTest.ExitingSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+  @impl true
+  def checkpoint, do: {:ok, nil}
+  # exit reason embeds the whole transaction — mimics a GenServer.call/Agent timeout
+  # whose call args carry the row values (the Critical-Rule-1 leak vector).
+  @impl true
+  def handle_transaction(txn), do: exit({:sink_down, txn})
+end
+
+defmodule Replicant.AssemblerTest.RaisingSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+  @impl true
+  def checkpoint, do: {:ok, nil}
+  @impl true
+  def handle_transaction(_txn), do: raise("sink boom")
+end
+
+defmodule Replicant.AssemblerTest.ExitCheckpointSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+  # checkpoint/0 exits (e.g. a GenServer.call to a dead checkpoint-store process)
+  @impl true
+  def checkpoint, do: exit(:checkpoint_store_down)
+  @impl true
+  def handle_transaction(txn), do: {:ok, txn.commit_lsn}
+end
+
 defmodule Replicant.AssemblerTest do
   use ExUnit.Case, async: false
 
@@ -285,6 +324,169 @@ defmodule Replicant.AssemblerTest do
     after
       :telemetry.detach({__MODULE__, :telemetry})
     end
+  end
+
+  describe "fail-closed boundary hardening (closeout review, 2026-07-04)" do
+    alias Replicant.AssemblerTest.{ExitCheckpointSink, ExitingSink, RaisingSink, ThrowingSink}
+    alias Replicant.Error
+
+    test "a sink that THROWS is scrubbed to {:halt, :sink_failed} — never escapes the boundary" do
+      assert {:halt, %Error{reason: :sink_failed}, _asm} = drive_single_row(ThrowingSink)
+    end
+
+    test "a sink that EXITS with a row-value-bearing reason is scrubbed value-free — no escape, no leak" do
+      asm = Assembler.new(ExitingSink)
+      {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          relation_msg([col("id", "int4", [:key]), col("v", "text")])
+        )
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Messages.Insert{
+          relation_id: 16_384,
+          tuple_data: {"1", "secret-row-97"}
+        })
+
+      assert {:halt, %Error{reason: :sink_failed} = err, _asm} =
+               Assembler.handle_message(asm, commit_msg())
+
+      refute inspect(err) <> Exception.message(err) =~ "secret-row-97"
+    end
+
+    test "a sink that RAISES is labeled :sink_failed (distinguishable from a casting :decode_failure)" do
+      assert {:halt, %Error{reason: :sink_failed}, _asm} = drive_single_row(RaisingSink)
+    end
+
+    test "a checkpoint/0 that EXITS is caught, does not escape the boundary (fail-open, dup-safe)" do
+      assert {:transaction, %Transaction{}, @lsn, _asm} = drive_single_row(ExitCheckpointSink)
+    end
+
+    test "a row for an uncached relation halts fail-closed and does NOT dispatch the sink" do
+      asm = Assembler.new(RecordingSink)
+      {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+
+      assert {:halt, %Error{reason: :config_invalid}, _asm} =
+               Assembler.handle_message(asm, %Messages.Insert{
+                 relation_id: 999,
+                 tuple_data: {"x"}
+               })
+
+      assert RecordingSink.seen() == []
+    end
+
+    test "a truncate for an uncached relation halts fail-closed" do
+      asm = Assembler.new(RecordingSink)
+      {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+
+      assert {:halt, %Error{reason: :config_invalid}, _asm} =
+               Assembler.handle_message(asm, %Messages.Truncate{
+                 number_of_relations: 1,
+                 options: [],
+                 truncated_relations: [999]
+               })
+    end
+  end
+
+  describe "old_record is key-only under non-FULL identity (spec §7)" do
+    test "a key-identity delete drops non-key nil placeholders from old_record" do
+      asm = Assembler.new(RecordingSink)
+      {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          relation_msg([col("id", "int4", [:key]), col("name", "text")], 16_384, :index)
+        )
+
+      # Delete USING INDEX: full-width key tuple {"5", nil} — id is key, name non-key sent NULL.
+      delete = %Messages.Delete{
+        relation_id: 16_384,
+        old_tuple_data: nil,
+        changed_key_tuple_data: {"5", nil}
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, delete)
+
+      {:transaction, %Transaction{changes: [change]}, @lsn, _} =
+        Assembler.handle_message(asm, commit_msg())
+
+      assert change.old_record == %{"id" => 5}
+      refute Map.has_key?(change.old_record, "name")
+    end
+
+    test "a FULL-identity old tuple keeps all columns (real values, none dropped)" do
+      asm = Assembler.new(RecordingSink)
+      {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          relation_msg([col("id", "int4", [:key]), col("name", "text")], 16_384, :all_columns)
+        )
+
+      # FULL identity → old_tuple_data carries the whole old row; nothing is dropped.
+      update = %Messages.Update{
+        relation_id: 16_384,
+        tuple_data: {"5", "new"},
+        old_tuple_data: {"5", "old"},
+        changed_key_tuple_data: nil
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, update)
+
+      {:transaction, %Transaction{changes: [change]}, @lsn, _} =
+        Assembler.handle_message(asm, commit_msg())
+
+      assert change.old_record == %{"id" => 5, "name" => "old"}
+    end
+  end
+
+  describe "truncate ordinals (closeout review)" do
+    test "truncate assigns unique monotonic ordinals that do not collide with following changes" do
+      asm = Assembler.new(RecordingSink)
+      {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, relation_msg([col("id", "int4", [:key])], 16_384))
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, relation_msg([col("id", "int4", [:key])], 16_385))
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Messages.Insert{relation_id: 16_384, tuple_data: {"1"}})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Messages.Truncate{
+          number_of_relations: 2,
+          options: [],
+          truncated_relations: [16_384, 16_385]
+        })
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Messages.Insert{relation_id: 16_384, tuple_data: {"2"}})
+
+      {:transaction, %Transaction{changes: changes}, @lsn, _} =
+        Assembler.handle_message(asm, commit_msg())
+
+      ordinals = Enum.map(changes, & &1.ordinal)
+      assert ordinals == [0, 1, 2, 3]
+      assert length(Enum.uniq(ordinals)) == length(ordinals)
+    end
+  end
+
+  # Drive Begin → Relation → Insert → Commit through `sink`, returning the Commit result.
+  defp drive_single_row(sink) do
+    asm = Assembler.new(sink)
+    {:ok, asm} = Assembler.handle_message(asm, begin_msg())
+    {:ok, asm} = Assembler.handle_message(asm, relation_msg([col("id", "int4", [:key])]))
+
+    {:ok, asm} =
+      Assembler.handle_message(asm, %Messages.Insert{relation_id: 16_384, tuple_data: {"1"}})
+
+    Assembler.handle_message(asm, commit_msg())
   end
 
   # Helper: configure the recording sink's checkpoint/0 return for the skip test.

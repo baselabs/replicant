@@ -13,6 +13,9 @@ defmodule Replicant.Assembler do
     * `Insert/Update/Delete/Truncate` — accumulate a `Change`, casting values via
                      `Replicant.Casting.Types.cast_record/2` and extracting
                      unchanged-TOAST sentinels into `change.unchanged` (spec §7).
+                     A row/truncate for a relation that was never cached halts
+                     fail-closed (we cannot identify the table — never emit a
+                     table-less change that would be checkpointed as success).
     * `Commit`     — attach the transaction-granularity commit LSN; pre-skip if
                      `commit_lsn <= checkpoint()` (spec §2); else call
                      `sink.handle_transaction/1` synchronously and return the LSN.
@@ -28,11 +31,13 @@ defmodule Replicant.Assembler do
   Connection's (Plan 2).
 
   ## Value-free boundary
-  `handle_message/2` wraps its body in a rescue: a raise from the casting path
-  (a malformed numeric/bytea in `Types.cast_record/2`) or from the sink apply is
-  scrubbed into `{:halt, %Error{reason: :decode_failure}}` — symmetric to
-  `Replicant.Decoder.decode/1`. A row/commit message arriving before any `Begin`
-  halts as `:config_invalid` rather than crashing.
+  `handle_message/2` wraps its body in `rescue` AND `catch`: a raise from the
+  casting path (a malformed numeric/bytea in `Types.cast_record/2`) is scrubbed
+  into `{:halt, %Error{reason: :decode_failure}}`; a sink raise/throw/exit is
+  scrubbed by `apply_sink/3` into `{:halt, %Error{reason: :sink_failed}}` — never
+  inspecting a throw/exit reason, which (e.g. a `GenServer.call` timeout carrying
+  the transaction) can embed row values (Critical Rule 1). A row/commit message
+  arriving before any `Begin` halts as `:config_invalid` rather than crashing.
   """
 
   alias Replicant.{
@@ -75,14 +80,15 @@ defmodule Replicant.Assembler do
     * `{:skipped, lsn(), t()}` — Commit but `commit_lsn <= checkpoint` (watermark skip).
     * `{:schema_change, SchemaChange.t(), t()}` — additive schema change applied.
     * `{:halt, SchemaChange.t() | term(), t()}` — destructive schema change, sink
-      failure, or a value-bearing raise (e.g. casting a malformed numeric) —
-      fail-closed, value-free.
+      failure, an unidentifiable-relation row, or a value-bearing raise (e.g.
+      casting a malformed numeric) — fail-closed, value-free.
 
   `handle_message/2` is itself the value-free boundary for the casting path: the
   vendored `Types.cast_record/2` raises `ArgumentError` on malformed numerics /
   bytea (a corrupted stream), and those exceptions embed row bytes. The public
   wrapper scrubs any such raise into `{:halt, %Error{reason: :decode_failure}}`
-  (Critical Rule 1) — symmetric to `Replicant.Decoder.decode/1`.
+  and any stray throw/exit (defense-in-depth) likewise, never inspecting the
+  reason (Critical Rule 1) — symmetric to `Replicant.Decoder.decode/1`.
   """
   @spec handle_message(t(), struct()) ::
           {:ok, t()}
@@ -94,6 +100,10 @@ defmodule Replicant.Assembler do
     do_handle_message(asm, message)
   rescue
     exception -> {:halt, Error.decode_failure(exception), asm}
+  catch
+    # A throw/exit escaping the casting/dispatch path must not breach the value-free
+    # boundary. Never inspect the reason — it can embed row values (Critical Rule 1).
+    _kind, _reason -> {:halt, %Error{reason: :decode_failure}, asm}
   end
 
   defp do_handle_message(%__MODULE__{} = asm, %Begin{final_lsn: lsn, xid: xid}) do
@@ -124,61 +134,60 @@ defmodule Replicant.Assembler do
     {:ok, asm}
   end
 
-  defp do_handle_message(
-         %__MODULE__{txn: buffer, relations: relations, ordinal: ordinal} = asm,
-         %Insert{
-           relation_id: rid,
-           tuple_data: tuple
-         }
-       ) do
-    change = build_change(:insert, relations, rid, tuple, nil, buffer.begin_lsn, ordinal)
-    {:ok, %{asm | txn: %{buffer | changes: [change | buffer.changes]}, ordinal: ordinal + 1}}
+  defp do_handle_message(%__MODULE__{} = asm, %Insert{relation_id: rid, tuple_data: tuple}) do
+    accumulate(asm, :insert, rid, tuple, nil)
   end
 
-  defp do_handle_message(
-         %__MODULE__{txn: buffer, relations: relations, ordinal: ordinal} = asm,
-         %Update{
-           relation_id: rid,
-           tuple_data: tuple,
-           old_tuple_data: old_tuple,
-           changed_key_tuple_data: key_tuple
-         }
-       ) do
-    old = old_tuple || key_tuple
-    change = build_change(:update, relations, rid, tuple, old, buffer.begin_lsn, ordinal)
-    {:ok, %{asm | txn: %{buffer | changes: [change | buffer.changes]}, ordinal: ordinal + 1}}
-  end
-
-  defp do_handle_message(
-         %__MODULE__{txn: buffer, relations: relations, ordinal: ordinal} = asm,
-         %Delete{
-           relation_id: rid,
-           old_tuple_data: old_tuple,
-           changed_key_tuple_data: key_tuple
-         }
-       ) do
-    old = old_tuple || key_tuple
-    change = build_change(:delete, relations, rid, nil, old, buffer.begin_lsn, ordinal)
-    {:ok, %{asm | txn: %{buffer | changes: [change | buffer.changes]}, ordinal: ordinal + 1}}
-  end
-
-  defp do_handle_message(%__MODULE__{txn: buffer, ordinal: ordinal} = asm, %Truncate{
-         truncated_relations: rids
+  defp do_handle_message(%__MODULE__{} = asm, %Update{
+         relation_id: rid,
+         tuple_data: tuple,
+         old_tuple_data: old_tuple,
+         changed_key_tuple_data: key_tuple
        }) do
-    changes =
-      Enum.map(rids, fn rid ->
-        rel = Map.get(asm.relations, rid)
+    accumulate(asm, :update, rid, tuple, old_spec(old_tuple, key_tuple))
+  end
 
-        %Change{
-          op: :truncate,
-          schema: rel && rel.namespace,
-          table: rel && rel.name,
-          commit_lsn: buffer.begin_lsn,
-          ordinal: ordinal
-        }
-      end)
+  defp do_handle_message(%__MODULE__{} = asm, %Delete{
+         relation_id: rid,
+         old_tuple_data: old_tuple,
+         changed_key_tuple_data: key_tuple
+       }) do
+    accumulate(asm, :delete, rid, nil, old_spec(old_tuple, key_tuple))
+  end
 
-    {:ok, %{asm | txn: %{buffer | changes: Enum.reverse(changes, buffer.changes)}}}
+  defp do_handle_message(
+         %__MODULE__{txn: buffer, relations: relations, ordinal: ordinal} = asm,
+         %Truncate{
+           truncated_relations: rids
+         }
+       ) do
+    if Enum.all?(rids, &Map.has_key?(relations, &1)) do
+      # Each truncated relation gets its own monotonic ordinal so a truncate never
+      # collides with a following change's ordinal in the same transaction.
+      {changes, next_ordinal} =
+        Enum.map_reduce(rids, ordinal, fn rid, ord ->
+          rel = Map.fetch!(relations, rid)
+
+          change = %Change{
+            op: :truncate,
+            schema: rel.namespace,
+            table: rel.name,
+            commit_lsn: buffer.begin_lsn,
+            ordinal: ord
+          }
+
+          {change, ord + 1}
+        end)
+
+      {:ok,
+       %{
+         asm
+         | txn: %{buffer | changes: Enum.reverse(changes, buffer.changes)},
+           ordinal: next_ordinal
+       }}
+    else
+      {:halt, %Error{reason: :config_invalid, shape: "truncate for uncached relation"}, asm}
+    end
   end
 
   defp do_handle_message(%__MODULE__{txn: buffer} = asm, %Commit{
@@ -202,6 +211,12 @@ defmodule Replicant.Assembler do
         {:skipped, txn.commit_lsn, reset(asm)}
 
       _ ->
+        # {:ok, nil} (never persisted → go forward), {:ok, older_lsn} (newer txn), OR
+        # {:error, _} / a raised/exited checkpoint read → apply. Fail-OPEN on a
+        # checkpoint fault is dup-safe by the §6 sink idempotency contract: a
+        # re-dispatched already-persisted txn is deduped by the sink (skip
+        # commit_lsn <= its own checkpoint; upsert by PK), and a real store outage
+        # makes handle_transaction fail → halt.
         apply_sink(asm.sink, txn, asm)
     end
   end
@@ -269,16 +284,43 @@ defmodule Replicant.Assembler do
 
   # --- change building ---
 
-  defp build_change(op, relations, rid, new_tuple, old_tuple, commit_lsn, ordinal) do
-    rel = Map.get(relations, rid)
-    columns = (rel && rel.columns) || []
+  # A row for a relation that was never cached cannot be identified (nil table,
+  # empty record). Halting fail-closed prevents silently checkpointing dropped
+  # data as success (a well-formed pgoutput stream always sends Relation first).
+  defp accumulate(
+         %__MODULE__{txn: buffer, relations: relations, ordinal: ordinal} = asm,
+         op,
+         rid,
+         new_tuple,
+         old_spec
+       ) do
+    case Map.get(relations, rid) do
+      nil ->
+        {:halt, %Error{reason: :config_invalid, shape: "row for uncached relation"}, asm}
+
+      %Relation{} = rel ->
+        change = build_change(op, rel, new_tuple, old_spec, buffer.begin_lsn, ordinal)
+        {:ok, %{asm | txn: %{buffer | changes: [change | buffer.changes]}, ordinal: ordinal + 1}}
+    end
+  end
+
+  # `old_spec` captures BOTH the old tuple and whether it is key-only:
+  #   * a full old tuple (REPLICA IDENTITY FULL, byte 'O') → `{tuple, false}`
+  #   * a changed-key tuple (DEFAULT/USING INDEX, byte 'K') → `{tuple, true}`
+  # so `old_record` stays key-only under non-FULL identity (spec §7).
+  defp old_spec(nil, nil), do: nil
+  defp old_spec(nil, key_tuple), do: {key_tuple, true}
+  defp old_spec(old_tuple, _key_tuple), do: {old_tuple, false}
+
+  defp build_change(op, %Relation{} = rel, new_tuple, old_spec, commit_lsn, ordinal) do
+    columns = rel.columns || []
     {record, unchanged} = materialize(new_tuple, columns)
-    {old_record, _} = materialize(old_tuple, columns)
+    old_record = materialize_old(old_spec, columns)
 
     %Change{
       op: op,
-      schema: rel && rel.namespace,
-      table: rel && rel.name,
+      schema: rel.namespace,
+      table: rel.name,
       record: record,
       old_record: old_record,
       unchanged: unchanged,
@@ -311,15 +353,43 @@ defmodule Replicant.Assembler do
     |> then(fn {record, unchanged} -> {record, Enum.reverse(unchanged)} end)
   end
 
+  # Build `old_record`. A key-only tuple (DEFAULT/USING INDEX identity) sends the
+  # key columns' values and NULL placeholders for non-key columns; those
+  # placeholders are dropped so `old_record` is key-only (spec §7) and a real NULL
+  # in a key column is not confused with a non-key placeholder.
+  defp materialize_old(nil, _columns), do: nil
+
+  defp materialize_old({tuple, key_only}, columns) do
+    {record, _unchanged} = materialize(tuple, columns)
+
+    if key_only and record != nil do
+      Map.take(record, key_column_names(columns))
+    else
+      record
+    end
+  end
+
+  defp key_column_names(columns) do
+    for %Relation.Column{name: name, flags: flags} <- columns,
+        is_list(flags) and :key in flags,
+        do: name
+  end
+
   defp cast_value(nil, _type), do: nil
   defp cast_value(value, type) when is_binary(value), do: Types.cast_record(value, type)
 
   # --- sink apply ---
 
+  # Reads the sink's checkpoint. A raise or exit from `checkpoint/0` (e.g. a
+  # GenServer.call to a dead checkpoint-store process) is caught and reported as a
+  # "no checkpoint" read — the Commit path then applies (fail-open, dup-safe by the
+  # §6 idempotency contract) rather than letting the throw/exit breach the boundary.
   defp checkpoint(sink) do
     sink.checkpoint()
   rescue
     _ -> {:ok, nil}
+  catch
+    _kind, _reason -> {:ok, nil}
   end
 
   defp apply_sink(sink, %Transaction{} = txn, asm) do
@@ -329,9 +399,9 @@ defmodule Replicant.Assembler do
       try do
         sink.handle_transaction(txn)
       rescue
-        e ->
-          Telemetry.event([:replicant, :sink, :failed], %{}, %{reason: :sink_failed})
-          {:rescued, e}
+        e -> {:sink_raised, e}
+      catch
+        kind, reason -> {:sink_caught, kind, reason}
       end
 
     duration = System.monotonic_time(:millisecond) - start_mono
@@ -342,20 +412,29 @@ defmodule Replicant.Assembler do
 
         {:transaction, txn, lsn, reset(asm)}
 
-      {:rescued, e} ->
-        # Scrub the sink exception value-free (Critical Rule 1) — symmetric to the
-        # decode boundary. `apply_sink` catches its own raise so the outer
-        # `handle_message` wrapper's :decode_failure is reserved for casting raises.
-        {:halt, Error.decode_failure(e), asm}
-
       {:error, _reason} ->
-        Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{
-          reason: :sink_failed
-        })
+        sink_failed(asm, duration)
 
-        {:halt, %Error{reason: :sink_failed}, asm}
+      {:sink_raised, e} ->
+        # Scrub the sink exception value-free (Critical Rule 1). Reason is
+        # :sink_failed (NOT :decode_failure) so a sink fault is distinguishable
+        # from a casting fault; only the exception module name is kept for triage.
+        sink_failed(asm, duration, safe_shape(e))
+
+      {:sink_caught, _kind, _reason} ->
+        # A throw/exit reason may embed row values (a GenServer.call timeout
+        # carrying the transaction). Do NOT inspect it — scrub value-free.
+        sink_failed(asm, duration)
     end
   end
+
+  defp sink_failed(asm, duration, shape \\ nil) do
+    Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{reason: :sink_failed})
+    {:halt, %Error{reason: :sink_failed, shape: shape}, asm}
+  end
+
+  defp safe_shape(%{__struct__: mod}), do: inspect(mod)
+  defp safe_shape(_), do: nil
 
   defp reset(asm), do: %{asm | txn: nil, ordinal: 0}
 end
