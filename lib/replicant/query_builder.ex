@@ -126,6 +126,53 @@ defmodule Replicant.QueryBuilder do
     end
   end
 
+  @doc """
+  DDL creating the lib-owned checkpoint table if absent. `slot_name` is the PK, one
+  row per slot; `commit_lsn` is a `bigint` (the `Replicant.lsn/0` integer — no
+  `pg_lsn` text parse at the boundary). The table name is a validated identifier;
+  `IF NOT EXISTS` is a name check only, so the caller MUST also shape-probe (see
+  `checkpoint_column_probe/0`).
+  """
+  @spec checkpoint_ensure_table(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def checkpoint_ensure_table(table) do
+    with :ok <- Identifier.validate(table) do
+      {:ok,
+       "CREATE TABLE IF NOT EXISTS #{table} " <>
+         "(slot_name text PRIMARY KEY, commit_lsn bigint NOT NULL, " <>
+         "updated_at timestamptz NOT NULL DEFAULT now())"}
+    end
+  end
+
+  @doc "Query reading `commit_lsn` for a slot. `slot_name` is bound `$1`; only the validated table is interpolated."
+  @spec checkpoint_read(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def checkpoint_read(table) do
+    with :ok <- Identifier.validate(table) do
+      {:ok, "SELECT commit_lsn FROM #{table} WHERE slot_name = $1"}
+    end
+  end
+
+  @doc "Upsert of `commit_lsn` for a slot. `slot_name`/`commit_lsn` are bound `$1`/`$2`; only the validated table is interpolated."
+  @spec checkpoint_upsert(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def checkpoint_upsert(table) do
+    with :ok <- Identifier.validate(table) do
+      {:ok,
+       "INSERT INTO #{table} (slot_name, commit_lsn, updated_at) VALUES ($1, $2, now()) " <>
+         "ON CONFLICT (slot_name) DO UPDATE SET commit_lsn = EXCLUDED.commit_lsn, updated_at = now()"}
+    end
+  end
+
+  @doc """
+  Query probing the `commit_lsn` column's `data_type`. The table name is bound `$1`
+  (a string value in `information_schema`, not an identifier position), so no
+  interpolation and no validation are needed here — the caller has already validated
+  the table for the interpolating builders above.
+  """
+  @spec checkpoint_column_probe() :: String.t()
+  def checkpoint_column_probe do
+    "SELECT data_type FROM information_schema.columns " <>
+      "WHERE table_name = $1 AND column_name = 'commit_lsn' LIMIT 1"
+  end
+
   @doc "Query returning `pg_is_in_recovery()` — `true` on a standby (spec §8 R-ISO advisory)."
   @spec is_in_recovery() :: String.t()
   # Name mirrors PostgreSQL's own `pg_is_in_recovery()` function (not an Elixir

@@ -106,4 +106,39 @@ defmodule Replicant.QueryBuilderTest do
       assert {:error, :invalid_identifier} = QueryBuilder.publication_tables("p'; DROP")
     end
   end
+
+  describe "checkpoint store builders" do
+    test "checkpoint_ensure_table/1 validates the identifier and builds CREATE TABLE IF NOT EXISTS" do
+      assert {:ok, sql} = QueryBuilder.checkpoint_ensure_table("replicant_checkpoints")
+      assert sql =~ "CREATE TABLE IF NOT EXISTS replicant_checkpoints"
+      assert sql =~ "slot_name text PRIMARY KEY"
+      assert sql =~ "commit_lsn bigint NOT NULL"
+
+      assert {:error, :invalid_identifier} =
+               QueryBuilder.checkpoint_ensure_table("bad; DROP TABLE x")
+
+      assert {:error, :invalid_identifier} = QueryBuilder.checkpoint_ensure_table("Uppercase")
+    end
+
+    test "checkpoint_read/1 and checkpoint_upsert/1 interpolate only the validated table; values are $n" do
+      assert {:ok, read} = QueryBuilder.checkpoint_read("cp")
+      assert read == "SELECT commit_lsn FROM cp WHERE slot_name = $1"
+      assert {:ok, up} = QueryBuilder.checkpoint_upsert("cp")
+
+      assert up ==
+               "INSERT INTO cp (slot_name, commit_lsn, updated_at) VALUES ($1, $2, now()) " <>
+                 "ON CONFLICT (slot_name) DO UPDATE SET commit_lsn = EXCLUDED.commit_lsn, updated_at = now()"
+
+      assert {:error, :invalid_identifier} = QueryBuilder.checkpoint_read("a b")
+      assert {:error, :invalid_identifier} = QueryBuilder.checkpoint_upsert("a b")
+    end
+
+    test "checkpoint_column_probe/0 binds the table name (no interpolation)" do
+      sql = QueryBuilder.checkpoint_column_probe()
+      assert sql =~ "SELECT data_type"
+      assert sql =~ "FROM information_schema.columns"
+      assert sql =~ "table_name = $1"
+      assert sql =~ "column_name = 'commit_lsn'"
+    end
+  end
 end
