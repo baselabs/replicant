@@ -96,11 +96,22 @@ defmodule Replicant.Connection do
   @doc "Start the replication connection for a pipeline (called by `Replicant.Pipeline`)."
   @spec start_link(Replicant.Config.t()) :: {:ok, pid()} | {:error, term()}
   def start_link(config) do
-    opts =
-      config.connection ++
-        [name: via(config.slot_name), sync_connect: false, auto_reconnect: true]
+    Postgrex.ReplicationConnection.start_link(__MODULE__, config, connection_opts(config))
+  end
 
-    Postgrex.ReplicationConnection.start_link(__MODULE__, config, opts)
+  @doc false
+  @spec connection_opts(Replicant.Config.t()) :: keyword()
+  def connection_opts(config) do
+    # The library's control opts MUST win over any same-key opts in the caller's
+    # :connection list: a caller `sync_connect: true` would break the non-blocking
+    # facade, a `name` would break Registry wiring, `auto_reconnect: false` would
+    # disable resilience. Keyword.merge/2 gives the SECOND list precedence and
+    # dedupes — unlike `++`, where the caller's first-occurrence key would win.
+    Keyword.merge(config.connection,
+      name: via(config.slot_name),
+      sync_connect: false,
+      auto_reconnect: true
+    )
   end
 
   @doc "The Registry via-name a pipeline's Connection registers under."

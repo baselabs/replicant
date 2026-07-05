@@ -315,6 +315,34 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
+  # ---- connection opts precedence ----
+
+  describe "connection_opts/1 — library control opts win over caller :connection" do
+    test "name/sync_connect/auto_reconnect override caller-supplied same keys" do
+      config = %{
+        slot_name: "conn_test",
+        connection: [
+          hostname: "h",
+          port: 5432,
+          # A caller passing these must NOT be able to break the facade contract:
+          sync_connect: true,
+          auto_reconnect: false,
+          name: :caller_chosen_name
+        ]
+      }
+
+      opts = Connection.connection_opts(config)
+
+      assert Keyword.get(opts, :sync_connect) == false
+      assert Keyword.get(opts, :auto_reconnect) == true
+      assert Keyword.get(opts, :name) == Connection.via("conn_test")
+      assert Keyword.get(opts, :hostname) == "h"
+      # No stale duplicate of an overridden key survives.
+      assert Enum.count(opts, fn {k, _} -> k == :sync_connect end) == 1
+      assert Enum.count(opts, fn {k, _} -> k == :name end) == 1
+    end
+  end
+
   # ---- connect chain ----
 
   describe "handle_connect/1 + recovery telemetry" do
