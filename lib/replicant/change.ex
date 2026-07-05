@@ -19,7 +19,7 @@ defmodule Replicant.Change do
   or attacker-influenced schema must not exhaust the atom table.
   """
 
-  @type op :: :insert | :update | :delete | :truncate
+  @type op :: :insert | :update | :delete | :truncate | :snapshot
 
   @type t :: %__MODULE__{
           op: op() | nil,

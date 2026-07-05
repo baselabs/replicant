@@ -31,4 +31,13 @@ defmodule Replicant.ChangeTest do
       assert %Change.Column{}.flags == []
     end
   end
+
+  describe "snapshot op (spec §6.2)" do
+    test "op accepts :snapshot; a backfill row carries nil commit_lsn and empty columns" do
+      change = %Change{op: :snapshot, schema: "public", table: "orders", record: %{"id" => 1}}
+      assert change.op == :snapshot
+      assert change.commit_lsn == nil
+      assert change.columns == []
+    end
+  end
 end

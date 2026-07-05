@@ -17,6 +17,7 @@ defmodule Replicant.Error do
           | :schema_change_destructive
           | :slot_invalidated
           | :config_invalid
+          | :snapshot_failed
 
   @type t :: %__MODULE__{
           reason: reason(),

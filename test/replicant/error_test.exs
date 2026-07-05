@@ -44,4 +44,14 @@ defmodule Replicant.ErrorTest do
       assert_raise FunctionClauseError, fn -> Error.decode_failure(~D[2024-01-01]) end
     end
   end
+
+  describe "snapshot fault (spec §9, Critical Rule 1)" do
+    test "a :snapshot_failed error renders reason + structural fields only, no value" do
+      err = %Replicant.Error{reason: :snapshot_failed, table: "orders", shape: "Postgrex.Error"}
+      msg = Exception.message(err)
+      assert msg =~ "reason=snapshot_failed"
+      assert msg =~ "table=orders"
+      assert msg =~ "shape=Postgrex.Error"
+    end
+  end
 end
