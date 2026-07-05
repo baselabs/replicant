@@ -17,13 +17,22 @@ defmodule Replicant do
   update. Use `lsn_to_string/1` for display (`"0/16E3778"`); LSNs are WAL
   positions, not row data, so they are permitted in telemetry metadata.
 
-  ## This is the offline core
+  ## Starting a pipeline
 
-  This library version ships the decode / assemble / validate / redact core:
-  the vendored `pgoutput` parser, the type-aware assembler, the
-  identifier-validated SQL builder, and the pluggable `Replicant.Sink` behaviour.
-  Live streaming (the `Postgrex.ReplicationConnection` that owns the slot and
-  acks only after the sink commits) lands in the next slice.
+  Configure each pipeline explicitly at `start_link/1` (no global mutable state):
+
+      Replicant.start_link(
+        connection: [hostname: "standby.internal", port: 5432, username: "u",
+                     password: "p", database: "orders", ssl: true],  # point at a STANDBY (R-ISO)
+        slot_name: "replicant_orders",
+        publication: "orders_pub",
+        sink: MyApp.OrdersSink,        # implements Replicant.Sink
+        go_forward_only: false         # must be true to start a :state_mirror sink from empty
+      )
+
+  The `Replicant.Connection` owns the slot and advances it only after the sink has
+  durably persisted a transaction (ack-after-checkpoint); the `Replicant.AssemblerServer`
+  applies the sink synchronously off the keepalive path.
   """
 
   @typedoc """
@@ -43,5 +52,33 @@ defmodule Replicant do
     file = Bitwise.bsr(lsn, 32)
     offset = Bitwise.band(lsn, 0xFFFFFFFF)
     "#{Integer.to_string(file, 16)}/#{Integer.to_string(offset, 16)}"
+  end
+
+  @doc """
+  Start a CDC pipeline. Validates `opts`, enforces the go-forward-only start guard,
+  and supervises a `Replicant.Connection` + `Replicant.AssemblerServer` under the
+  pipeline `DynamicSupervisor`.
+
+  Options: `:connection` (a Postgrex connection keyword list — point at a STANDBY
+  per R-ISO), `:slot_name`, `:publication` (both allowlist-validated identifiers),
+  `:sink` (a module implementing `Replicant.Sink`), and `:go_forward_only`
+  (default `false`; must be `true` to start a `:state_mirror` sink from an empty
+  checkpoint — see `Replicant.Config`).
+
+  Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` is
+  `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`.
+  """
+  @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
+  def start_link(opts) when is_list(opts) do
+    with {:ok, config} <- Replicant.Config.validate(opts),
+         :ok <- Replicant.Config.guard(config) do
+      Replicant.Supervisor.start_pipeline(config)
+    end
+  end
+
+  @doc "Stop a running pipeline by slot name (idempotent)."
+  @spec stop(String.t()) :: :ok
+  def stop(slot_name) when is_binary(slot_name) do
+    Replicant.Supervisor.stop_pipeline(slot_name)
   end
 end
