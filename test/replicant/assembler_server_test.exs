@@ -1,0 +1,131 @@
+defmodule Replicant.AssemblerServerTest do
+  use ExUnit.Case, async: false
+
+  alias Replicant.AssemblerServer
+  alias Replicant.Decoder.Messages.{Begin, Commit, Insert, Relation}
+  alias Replicant.Decoder.Messages.Relation.Column
+  alias Replicant.Test.RecordingSink
+
+  defp col(name, type, flags),
+    do: %Column{name: name, type: type, flags: flags, type_modifier: -1}
+
+  defp relation(cols),
+    do: %Relation{
+      id: 1,
+      namespace: "public",
+      name: "t",
+      replica_identity: :default,
+      columns: cols
+    }
+
+  defp start(slot, sink) do
+    {:ok, pid} = AssemblerServer.start_link(slot_name: slot, sink: sink)
+    pid
+  end
+
+  defp cast(pid, msg, bytes), do: GenServer.cast(pid, {:message, msg, bytes, self()})
+
+  defmodule SkipSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, 0x100}
+    @impl true
+    def handle_transaction(_txn), do: raise("must not be called for a skipped txn")
+  end
+
+  defmodule FailWriteSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, nil}
+    @impl true
+    def handle_transaction(_txn), do: {:error, :store_unreachable}
+  end
+
+  setup do
+    {:ok, _} = RecordingSink.start_link()
+    RecordingSink.reset()
+    :ok
+  end
+
+  test "a full transaction applies the sink and notifies the connection with the commit LSN" do
+    pid = start("srv_happy", RecordingSink)
+    cast(pid, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
+    cast(pid, relation([col("id", "int4", [:key])]), 30)
+    cast(pid, %Insert{relation_id: 1, tuple_data: {"1"}}, 15)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x2A, end_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    assert_receive {:sink_committed, 0x2A}, 1000
+    assert [{0x2A, [change]}] = RecordingSink.seen()
+    assert change.op == :insert
+    assert change.record["id"] == 1
+    refute :sys.get_state(pid).halted
+  end
+
+  test "a watermark-skipped transaction still advances the ack (commit_lsn <= checkpoint)" do
+    pid = start("srv_skip", SkipSink)
+    cast(pid, %Begin{final_lsn: 0x50, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
+    cast(pid, relation([col("id", "int4", [:key])]), 30)
+    cast(pid, %Insert{relation_id: 1, tuple_data: {"1"}}, 15)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x50, end_lsn: 0x50, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    # 0x50 <= checkpoint 0x100 → skipped, but the ack must still advance to 0x50.
+    assert_receive {:sink_committed, 0x50}, 1000
+    refute :sys.get_state(pid).halted
+  end
+
+  test "a sink WRITE fault halts fail-closed and sends no ack (spec §6 fail-closed)" do
+    pid = start("srv_failwrite", FailWriteSink)
+    cast(pid, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
+    cast(pid, relation([col("id", "int4", [:key])]), 30)
+    cast(pid, %Insert{relation_id: 1, tuple_data: {"1"}}, 15)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x2A, end_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    # get_state flushes the mailbox → all four casts processed before we read.
+    assert :sys.get_state(pid).halted
+    refute_received {:sink_committed, _}
+  end
+
+  test "a destructive schema change (dropped column) halts fail-closed" do
+    pid = start("srv_destructive", RecordingSink)
+    cast(pid, relation([col("id", "int4", [:key]), col("name", "text", [])]), 30)
+    cast(pid, relation([col("id", "int4", [:key])]), 30)
+
+    assert :sys.get_state(pid).halted
+    refute_received {:sink_committed, _}
+  end
+
+  test "post-halt WAL is dropped (no reprocessing during teardown)" do
+    pid = start("srv_drop_after_halt", FailWriteSink)
+    cast(pid, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
+    cast(pid, relation([col("id", "int4", [:key])]), 30)
+    cast(pid, %Insert{relation_id: 1, tuple_data: {"1"}}, 15)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x2A, end_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    assert :sys.get_state(pid).halted
+
+    # Further WAL after the halt is ignored (no crash, no ack).
+    cast(pid, %Begin{final_lsn: 0x99, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 8}, 20)
+    assert :sys.get_state(pid).halted
+    refute_received {:sink_committed, _}
+  end
+end

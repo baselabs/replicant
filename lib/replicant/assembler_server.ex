@@ -1,0 +1,80 @@
+defmodule Replicant.AssemblerServer do
+  @moduledoc """
+  The serial process shell over the pure `Replicant.Assembler` (spec §4). Receives
+  **decoded** pgoutput messages from `Replicant.Connection` (which decodes behind
+  the value-free boundary and never applies the sink), assembles transactions, and
+  applies the sink **synchronously** — blocking THIS process, off the Connection's
+  keepalive path. On a durable sink commit (or a watermark skip) it messages the
+  Connection so the ack advances asynchronously; on a fail-closed condition
+  (destructive schema change, sink WRITE fault, an unidentifiable-relation row) it
+  halts the whole pipeline permanently (spec §6/§9).
+
+  It is a single serial `GenServer` (not a Task per transaction) so transactions
+  apply strictly in commit order — the correctness baseline of synchronous
+  per-transaction delivery.
+  """
+  use GenServer
+
+  alias Replicant.Assembler
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    slot_name = Keyword.fetch!(opts, :slot_name)
+    GenServer.start_link(__MODULE__, opts, name: via(slot_name))
+  end
+
+  @doc "The Registry via-name a pipeline's AssemblerServer registers under."
+  @spec via(String.t()) :: {:via, module(), term()}
+  def via(slot_name), do: {:via, Registry, {Replicant.Registry, {slot_name, :assembler}}}
+
+  @impl true
+  def init(opts) do
+    slot_name = Keyword.fetch!(opts, :slot_name)
+    sink = Keyword.fetch!(opts, :sink)
+    {:ok, %{slot_name: slot_name, asm: Assembler.new(sink), halted: false}}
+  end
+
+  # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
+  # will terminate this process; reprocessing here would be wasted and unsafe.
+  @impl true
+  def handle_cast({:message, _message, _bytes, _from}, %{halted: true} = state) do
+    {:noreply, state}
+  end
+
+  def handle_cast({:message, message, bytes, from}, state) do
+    asm = Assembler.observe_bytes(state.asm, bytes)
+    dispatch(Assembler.handle_message(asm, message), from, state)
+  end
+
+  defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}
+
+  defp dispatch({:transaction, _txn, lsn, asm}, from, state) do
+    # The sink durably persisted the txn + checkpoint; tell the Connection to
+    # advance the ack to `lsn` asynchronously (never on the Connection's own path).
+    send(from, {:sink_committed, lsn})
+    {:noreply, %{state | asm: asm}}
+  end
+
+  defp dispatch({:skipped, lsn, asm}, from, state) do
+    # Watermark skip (commit_lsn <= sink checkpoint): the txn already landed, but
+    # the ack must still advance to `lsn` so the slot moves past re-delivered data.
+    send(from, {:sink_committed, lsn})
+    {:noreply, %{state | asm: asm}}
+  end
+
+  defp dispatch({:schema_change, _sc, asm}, _from, state) do
+    # Additive schema change auto-applied mid-stream; no commit boundary, no ack.
+    {:noreply, %{state | asm: asm}}
+  end
+
+  defp dispatch({:halt, reason, _asm}, _from, state) do
+    # Fail-closed: destructive schema change / sink write fault / unidentifiable
+    # relation. `reason` is already value-free (a %SchemaChange{} or a value-free
+    # %Error{} from the assembler's boundary). Terminate the whole pipeline
+    # permanently; mark halted so no further WAL is processed in the teardown
+    # window. Do NOT self-crash (a crash exit would race :one_for_all restart
+    # before the DynamicSupervisor terminates the pipeline).
+    Replicant.Supervisor.halt(state.slot_name, reason)
+    {:noreply, %{state | halted: true}}
+  end
+end
