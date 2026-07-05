@@ -104,6 +104,33 @@ defmodule Replicant.Test.SlowLedgerSink do
   end
 end
 
+defmodule Replicant.Test.StuckLedgerSink do
+  @moduledoc """
+  A sink whose `handle_transaction/1` blocks forever, so the AssemblerServer never
+  drains and the durable checkpoint never advances. Used to prove the fail-closed
+  sink-lag halt: with the checkpoint pinned, the Connection's in-flight lag
+  (`received_lsn - max(checkpoint_lsn, stream_floor_lsn)`) grows monotonically past
+  the ceiling and trips `:sink_too_slow` instead of OOMing. `checkpoint/0` delegates
+  to `LedgerSink` (a real durable read).
+  """
+  @behaviour Replicant.Sink
+
+  alias Replicant.Test.LedgerSink
+
+  @impl true
+  def checkpoint, do: LedgerSink.checkpoint()
+
+  @impl true
+  # Block forever via a receive with no matching clause — dialyzer infers `no_return`
+  # (unlike `Process.sleep(:infinity)`, whose success type `:ok` mismatches the
+  # `{:ok, lsn} | {:error, _}` callback contract).
+  def handle_transaction(_txn) do
+    receive do
+      :never -> {:ok, 0}
+    end
+  end
+end
+
 defmodule Replicant.Test.FailOpenLedgerSink do
   @moduledoc """
   A `LedgerSink` whose `checkpoint/0` reports `{:ok, nil}` — the spec §14.15
@@ -113,19 +140,25 @@ defmodule Replicant.Test.FailOpenLedgerSink do
 
   `checkpoint/0` is read in two places (Task 2/1): the `Connection` seeds its
   resume LSN from it, and the `Assembler` pre-skips a re-delivered transaction with
-  it. Reporting `nil` makes the Connection resume from `0/0` (so PG re-delivers an
-  already-applied transaction) AND disables the Assembler pre-skip (so the
-  re-delivered transaction reaches the sink) — the ONLY path on which the sink's
-  own watermark dedup is exercised. `handle_transaction/1` delegates to
-  `LedgerSink`, which reads its DURABLE `_replicant_checkpoint` watermark inside the
-  apply transaction and records the re-delivery as `skipped` (applied zero more
-  times, effect-once). Rows still upsert by PK, so a bare re-delivery without the
-  watermark would also be effect-safe; the watermark makes the dedup observable.
+  it. Reporting `nil` makes the Connection resume from `0/0` AND disables the
+  Assembler pre-skip (so a re-delivered transaction reaches the sink) — the ONLY path
+  on which the sink's own watermark dedup is exercised. `handle_transaction/1`
+  delegates to `LedgerSink`, which reads its DURABLE `_replicant_checkpoint`
+  watermark inside the apply transaction and records the re-delivery as `skipped`
+  (applied zero more times, effect-once). Rows still upsert by PK, so a bare
+  re-delivery without the watermark would also be effect-safe; the watermark makes
+  the dedup observable.
 
-  This is the faithful realization of risk #1: a clean Connection crash cannot
-  re-deliver an already-checkpointed transaction (the durable checkpoint IS the
-  resume LSN, and `START_REPLICATION` skips transactions at/below it), so the sink
-  dedup is only reachable when the checkpoint read itself fails open.
+  Why the fail-open path is needed to exercise the SINK's dedup: whether PG
+  re-delivers a transaction is governed by the slot's **server-side
+  `confirmed_flush_lsn`**, not the client's `START_REPLICATION ... <start_lsn>`
+  argument (the client value is a clamped hint — PG never streams below
+  `confirmed_flush_lsn`). More to the point, with a plain `LedgerSink` any
+  re-delivery is caught by the **Assembler's Commit-path pre-skip**
+  (`commit_lsn <= sink.checkpoint()` → `{:skipped}`) BEFORE it ever reaches the
+  sink, so the sink's own watermark dedup is unreachable that way. Reporting `nil`
+  from `checkpoint/0` disables that pre-skip, letting the re-delivery fall through to
+  the sink so its watermark dedup is the thing under test.
   """
   @behaviour Replicant.Sink
 

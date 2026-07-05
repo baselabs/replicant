@@ -108,6 +108,125 @@ defmodule Replicant.ConnectionTest do
 
       refute_received {:"$gen_cast", _}
     end
+
+    test "the FIRST frame of a stream never false-halts — lag is measured from the stream floor, not 0" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_first", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      # A fresh stream begins at a large absolute LSN while checkpoint is still 0; the
+      # first frame must read lag 0 (floor := wal_end), never wal_end - 0.
+      xlog = <<?w, 0::64, 50_000_000::64, 0::64, begin_payload::binary>>
+
+      st =
+        state(
+          slot_name: "conn_first",
+          checkpoint_lsn: 0,
+          stream_floor_lsn: nil,
+          max_inflight_lag: 100
+        )
+
+      assert {:noreply, new_state} = Connection.handle_data(xlog, st)
+      assert new_state.received_lsn == 50_000_000
+      assert new_state.stream_floor_lsn == 50_000_000
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from}}
+    end
+
+    test "an XLogData whose lag over the stream floor is at/under the bound still forwards" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_underbound", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      # floor pre-seeded at 1000; wal_end 1100 → lag 100 == bound (not OVER) → forwards.
+      xlog = <<?w, 0::64, 1100::64, 0::64, begin_payload::binary>>
+
+      st =
+        state(
+          slot_name: "conn_underbound",
+          checkpoint_lsn: 0,
+          stream_floor_lsn: 1000,
+          max_inflight_lag: 100
+        )
+
+      assert {:noreply, new_state} = Connection.handle_data(xlog, st)
+      assert new_state.received_lsn == 1100
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from}}
+    end
+  end
+
+  # ---- §4 bounded in-flight window / fail-closed sink-lag halt ----
+
+  describe "handle_data(XLogData) — bounded in-flight window (spec §4)" do
+    test "over-bound in-flight lag halts fail-closed with :sink_too_slow and forwards nothing" do
+      :telemetry.attach(
+        {__MODULE__, :too_slow},
+        [:replicant, :connection, :disconnected],
+        fn _e, meas, meta, pid -> send(pid, {:disc, meas, meta}) end,
+        self()
+      )
+
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_slow", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      # floor 1000, wal_end 1201, checkpoint 0, bound 100 → lag 201 > 100 → halt.
+      xlog = <<?w, 0::64, 1201::64, 0::64, begin_payload::binary>>
+
+      st =
+        state(
+          slot_name: "conn_slow",
+          checkpoint_lsn: 0,
+          stream_floor_lsn: 1000,
+          max_inflight_lag: 100
+        )
+
+      assert {:disconnect, :sink_too_slow} = Connection.handle_data(xlog, st)
+
+      assert_received {:disc, %{lag: 201}, %{reason: :sink_too_slow}}
+      refute_received {:"$gen_cast", _}
+      :telemetry.detach({__MODULE__, :too_slow})
+    end
+
+    test "lag is measured against the durable checkpoint once it advances past the floor" do
+      :telemetry.attach(
+        {__MODULE__, :cp_floor},
+        [:replicant, :connection, :disconnected],
+        fn _e, meas, meta, pid -> send(pid, {:disc, meas, meta}) end,
+        self()
+      )
+
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_cpfloor", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      # checkpoint has advanced to 5000 (a real commit LSN) above the 1000 floor;
+      # wal_end 5150 → lag = 5150 - max(5000, 1000) = 150 > 100 → halt.
+      xlog = <<?w, 0::64, 5150::64, 0::64, begin_payload::binary>>
+
+      st =
+        state(
+          slot_name: "conn_cpfloor",
+          checkpoint_lsn: 5000,
+          stream_floor_lsn: 1000,
+          max_inflight_lag: 100
+        )
+
+      assert {:disconnect, :sink_too_slow} = Connection.handle_data(xlog, st)
+      assert_received {:disc, %{lag: 150}, %{reason: :sink_too_slow}}
+      :telemetry.detach({__MODULE__, :cp_floor})
+    end
+
+    test "the high-water received_lsn advances monotonically and never regresses on a lower wal_end" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_hw", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+
+      st =
+        state(
+          slot_name: "conn_hw",
+          checkpoint_lsn: 0,
+          received_lsn: 500,
+          stream_floor_lsn: 400,
+          max_inflight_lag: 10_000
+        )
+
+      # A stale/reordered lower wal_end (50) must not drop the high-water below 500.
+      xlog = <<?w, 0::64, 50::64, 0::64, begin_payload::binary>>
+
+      assert {:noreply, new_state} = Connection.handle_data(xlog, st)
+      assert new_state.received_lsn == 500
+    end
   end
 
   # ---- slot invalidation (fail-closed halt) ----

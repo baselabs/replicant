@@ -9,14 +9,15 @@ defmodule Replicant.Config do
   `validate/1` then `guard/1` before spawning a pipeline.
   """
 
-  alias Replicant.{Identifier, Sink}
+  alias Replicant.{Connection, Identifier, Sink}
 
   @type t :: %{
           connection: keyword(),
           slot_name: String.t(),
           publication: String.t(),
           sink: module(),
-          go_forward_only: boolean()
+          go_forward_only: boolean(),
+          max_inflight_lag: pos_integer()
         }
 
   @doc """
@@ -27,19 +28,22 @@ defmodule Replicant.Config do
   callbacks).
   """
   @spec validate(keyword()) ::
-          {:ok, t()} | {:error, :config_invalid | :invalid_identifier | :invalid_sink}
+          {:ok, t()}
+          | {:error, :config_invalid | :invalid_identifier | :invalid_sink}
   def validate(opts) when is_list(opts) do
     with {:ok, connection} <- fetch_connection(opts),
          {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
          {:ok, publication} <- fetch_identifier(opts, :publication),
-         {:ok, sink} <- fetch_sink(opts) do
+         {:ok, sink} <- fetch_sink(opts),
+         {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts) do
       {:ok,
        %{
          connection: connection,
          slot_name: slot_name,
          publication: publication,
          sink: sink,
-         go_forward_only: Keyword.get(opts, :go_forward_only, false) == true
+         go_forward_only: Keyword.get(opts, :go_forward_only, false) == true,
+         max_inflight_lag: max_inflight_lag
        }}
     end
   end
@@ -81,6 +85,17 @@ defmodule Replicant.Config do
     _ -> :read_fault
   catch
     _kind, _reason -> :read_fault
+  end
+
+  # The bounded in-flight window ceiling (WAL bytes, spec §4). Omitted → the
+  # Connection default. A present value must be a positive integer; anything else is
+  # a config error (never a silent fallback that would mask a mis-set bound).
+  defp fetch_max_inflight_lag(opts) do
+    case Keyword.fetch(opts, :max_inflight_lag) do
+      :error -> {:ok, Connection.default_max_inflight_lag()}
+      {:ok, n} when is_integer(n) and n > 0 -> {:ok, n}
+      {:ok, _bad} -> {:error, :config_invalid}
+    end
   end
 
   defp fetch_connection(opts) do

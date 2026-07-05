@@ -4,6 +4,15 @@ defmodule Replicant.CrashInjectionTest do
 
   alias Replicant.Test.{LedgerSink, PG16}
 
+  # The §4 spike tests drive an EXPLICIT small in-flight ceiling (64 KiB) via the
+  # `:max_inflight_lag` override, sized against the live 25ms/txn slow sink so a
+  # normal 200-txn burst (~37 KB peak lag) drains under it while a pathological
+  # 600-txn burst / a stuck sink trip the fail-closed halt. The PRODUCTION default is
+  # the far-larger backlog ceiling (`Replicant.Connection.default_max_inflight_lag/0`,
+  # 64 MiB) — this small override only makes the mechanism observable at test scale;
+  # it is NOT the shipped default.
+  @spike_bound 65_536
+
   setup do
     unless PG16.enabled?() do
       :ok
@@ -76,15 +85,18 @@ defmodule Replicant.CrashInjectionTest do
   end
 
   # RISK #1 (finalized against the live stream): the plan's premise — "a crash after
-  # sink-commit before ack re-delivers" — does NOT hold for a plain `LedgerSink`. The
-  # durable checkpoint IS the Connection's resume LSN, and `START_REPLICATION SLOT ...
-  # LOGICAL <checkpoint>` skips every transaction at/below it, so PG never re-delivers
-  # an already-checkpointed transaction on a clean crash+restart (proven live). The
-  # sink's idempotency dedup (spec §6) is therefore only reachable via the spec §14.15
-  # checkpoint-read-fail-open path: `FailOpenLedgerSink.checkpoint/0` reports `nil`, so
-  # after the kill-before-ack the restart resumes from `0/0` (PG re-delivers txn 1) AND
-  # the Assembler pre-skip is disabled (the re-delivery reaches the sink), whose DURABLE
-  # `_replicant_checkpoint` watermark records it `skipped` and applies it zero more times.
+  # sink-commit before ack re-delivers" — does NOT reach the SINK for a plain
+  # `LedgerSink`. Two mechanisms suppress it, and neither is the client `start_lsn`:
+  # (a) whether PG re-streams a transaction is governed by the slot's server-side
+  # `confirmed_flush_lsn` (the client `START_REPLICATION ... <start_lsn>` value is a
+  # clamped hint, never a lower bound PG honors literally); and (b) even when PG does
+  # re-deliver, the Assembler's Commit-path pre-skip (`commit_lsn <= sink.checkpoint()`
+  # → `{:skipped}`) drops it BEFORE the sink. So the sink's own idempotency dedup
+  # (spec §6) is only reachable via the spec §14.15 checkpoint-read-fail-open path:
+  # `FailOpenLedgerSink.checkpoint/0` reports `nil`, so after the kill-before-ack the
+  # restart resumes from `0/0` (PG re-delivers txn 1) AND the Assembler pre-skip is
+  # disabled (the re-delivery reaches the sink), whose DURABLE `_replicant_checkpoint`
+  # watermark records it `skipped` and applies it zero more times.
   # The kill hook is `[:replicant, :sink, :committed]` — the real post-durable-commit,
   # pre-ack event: it fires from WITHIN the AssemblerServer AFTER the sink durably
   # commits and BEFORE that process sends `{:sink_committed, lsn}` to the Connection, so
@@ -115,37 +127,144 @@ defmodule Replicant.CrashInjectionTest do
     assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
-  # RISK #2 (finalized against the live stream): a 200-txn burst at a 25ms/txn sink
-  # peaks the AssemblerServer mailbox at ~549–579 messages (200 txns × ~2.9 pgoutput
-  # messages each), then drains MONOTONICALLY to completion — bounded by the FINITE
-  # burst, never growing unbounded; all 200 apply exactly once. The bound is the
-  # burst-implied ceiling (~580) + margin. `max_messages` was left at its `{:stream,
-  # sql, [], state}` default: it bounds Postgrex's per-batch SOCKET read (messages
-  # accumulated before `handle_data/2`), NOT the downstream AssemblerServer mailbox,
-  # so tuning it would not lower this peak — no `lib/` change was warranted.
+  # RISK #2 (spec §4 bounded in-flight window, proven against the live stream). The
+  # prior `max_len < 800` spike was VACUOUS: with no in-flight bound the mailbox
+  # scaled linearly with burst (measured RED: 200-txn → ~537 msgs, 600-txn → ~1629
+  # msgs), so a threshold chosen for the 200-burst is meaningless at 600. These three
+  # tests encode the REAL §4 property: the in-flight WAL lag ceiling
+  # (`received_lsn - max(checkpoint_lsn, stream_floor_lsn)`) holds INDEPENDENT of
+  # burst — a normal burst drains under it, a pathological one (or a stuck sink) halts
+  # fail-closed before the mailbox grows unbounded. No silent OOM/livelock either way.
+  #
+  # They drive an EXPLICIT `max_inflight_lag: @spike_bound` (64 KiB) so the mechanism
+  # is observable at test scale — NOT the production default (64 MiB backlog ceiling).
+  # Bound sizing (live PG16, 25ms/txn slow sink, @spike_bound = 65_536 B):
+  #   * 200-txn burst → peak in-flight lag ~37 KB   → UNDER 64 KiB → drains, all 200 apply.
+  #   * 600-txn burst → peak in-flight lag ~110+ KB → OVER 64 KiB → fail-closed halt.
+  # (measured over 3 live runs: the 200-peak stayed ~37 KB while the natural 600-peak
+  # was ~110–118 KB — the halt fires the instant lag crosses 65_536, so the observed
+  # halt lag is ~65.6 KB, NOT the unbounded 110 KB the RED reached.)
   @tag :spike
-  test "backpressure: a slow sink under a burst keeps the assembler mailbox bounded", %{
+  @tag timeout: 120_000
+  test "bounded in-flight window: the lag ceiling holds independent of burst size", %{
     ctrl: ctrl,
     slot: slot
   } do
-    start_pipeline(slot, sink: Replicant.Test.SlowLedgerSink)
+    # (A) A NORMAL 200-txn burst drains UNDER the configured ceiling (no halt). The
+    # peak in-flight lag occurs right after the burst lands (frames arrive at wire
+    # speed, the 25ms/txn sink has barely drained), so a dense ~5s sample catches it.
+    start_pipeline(slot, sink: Replicant.Test.SlowLedgerSink, max_inflight_lag: @spike_bound)
+    conn = connection_pid(slot)
     for i <- 1..200, do: insert(ctrl, i, "n#{i}")
 
-    asm = assembler_pid(slot)
-
-    max_len =
-      Enum.reduce(1..40, 0, fn _, acc ->
-        {:message_queue_len, len} = Process.info(asm, :message_queue_len)
-        Process.sleep(50)
-        max(acc, len)
+    max_lag_200 =
+      sample(125, 0, fn acc ->
+        max(acc, inflight_lag(conn))
       end)
 
-    assert max_len < 800,
-           "assembler mailbox grew unbounded (#{max_len}); a healthy 200-txn burst " <>
-             "peaks at ~580 and drains — this exceeds the burst-implied ceiling, " <>
-             "so the per-transaction synchronous drain (§4 backpressure) regressed"
+    IO.puts(
+      "\n[spike A] 200-txn burst peak in-flight lag = #{max_lag_200} B (ceiling #{@spike_bound} B)"
+    )
 
-    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 200 end, 1200)
+    assert max_lag_200 <= @spike_bound,
+           "a normal 200-txn burst peaked at #{max_lag_200} B in-flight lag, over the " <>
+             "#{@spike_bound} B ceiling — it should DRAIN under the bound, not halt"
+
+    # And it drains to completion (never halted): all 200 apply exactly once.
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 200 end, 400)
+    assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
+  end
+
+  @tag :spike
+  @tag timeout: 120_000
+  test "bounded in-flight window: a 600-txn burst trips the fail-closed :sink_too_slow halt", %{
+    ctrl: ctrl,
+    slot: slot
+  } do
+    # (B) A PATHOLOGICAL 600-txn burst at the same slow sink exceeds the ceiling and
+    # halts fail-closed BEFORE the mailbox grows unbounded (the RED was ~1629 msgs).
+    attach_sink_too_slow(slot)
+    start_pipeline(slot, sink: Replicant.Test.SlowLedgerSink, max_inflight_lag: @spike_bound)
+    for i <- 1..600, do: insert(ctrl, i, "n#{i}")
+
+    assert_receive {:sink_too_slow, %{lag: lag}}, 15_000
+    IO.puts("\n[spike B] 600-txn burst tripped :sink_too_slow at in-flight lag = #{lag} B")
+    assert lag > @spike_bound
+
+    # The pipeline is torn down permanently (fail-closed) — not livelocking/OOMing.
+    PG16.wait_until(
+      fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
+      400
+    )
+
+    :telemetry.detach({__MODULE__, {:too_slow, slot}})
+  end
+
+  @tag :spike
+  @tag timeout: 120_000
+  test "fail-closed halt: a genuinely-stuck sink halts (no silent OOM/livelock)", %{
+    ctrl: ctrl,
+    slot: slot
+  } do
+    # The sink blocks forever on its first txn → the checkpoint never advances → the
+    # in-flight lag grows monotonically past the ceiling and MUST fail-closed halt.
+    attach_sink_too_slow(slot)
+    start_pipeline(slot, sink: Replicant.Test.StuckLedgerSink, max_inflight_lag: @spike_bound)
+    for i <- 1..600, do: insert(ctrl, i, "n#{i}")
+
+    assert_receive {:sink_too_slow, %{lag: lag}}, 15_000
+    IO.puts("\n[spike C] stuck sink tripped :sink_too_slow at in-flight lag = #{lag} B")
+    assert lag > @spike_bound
+
+    PG16.wait_until(
+      fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
+      400
+    )
+
+    # Nothing was durably applied (the stuck sink never committed) — no partial state.
+    assert count(ctrl, "sink_orders") == 0
+    :telemetry.detach({__MODULE__, {:too_slow, slot}})
+  end
+
+  # Poll `reader.(acc)` `n` times at 40ms, folding into `acc`.
+  defp sample(0, acc, _reader), do: acc
+
+  defp sample(n, acc, reader) do
+    acc = reader.(acc)
+    Process.sleep(40)
+    sample(n - 1, acc, reader)
+  end
+
+  # The live in-flight WAL lag from the running Connection's state (0 if unreadable,
+  # e.g. mid-teardown after a halt).
+  defp inflight_lag(conn) do
+    case safe_conn_state(conn) do
+      %Replicant.Connection{received_lsn: r, checkpoint_lsn: c} -> r - c
+      _ -> 0
+    end
+  end
+
+  defp safe_conn_state(conn) do
+    case :sys.get_state(conn, 100) do
+      %{state: {Replicant.Connection, %Replicant.Connection{} = st}} -> st
+      {_, %{state: {Replicant.Connection, %Replicant.Connection{} = st}}} -> st
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  catch
+    _, _ -> nil
+  end
+
+  defp attach_sink_too_slow(slot) do
+    :telemetry.attach(
+      {__MODULE__, {:too_slow, slot}},
+      [:replicant, :connection, :disconnected],
+      fn _e, meas, meta, pid ->
+        if meta[:reason] == :sink_too_slow, do: send(pid, {:sink_too_slow, meas})
+      end,
+      self()
+    )
   end
 
   defp start_pipeline(slot, opts \\ []) do
@@ -158,14 +277,18 @@ defmodule Replicant.CrashInjectionTest do
       self()
     )
 
-    {:ok, _pid} =
-      Replicant.start_link(
-        connection: PG16.pg_opts(),
-        slot_name: slot,
-        publication: "orders_pub",
-        sink: sink,
-        go_forward_only: true
-      )
+    base = [
+      connection: PG16.pg_opts(),
+      slot_name: slot,
+      publication: "orders_pub",
+      sink: sink,
+      go_forward_only: true
+    ]
+
+    # Thread an explicit in-flight ceiling through only when a test sets it (the §4
+    # spike tests do; the correctness tests omit it and take the production default).
+    extra = Keyword.take(opts, [:max_inflight_lag])
+    {:ok, _pid} = Replicant.start_link(base ++ extra)
 
     assert_receive {:slot_active, ^slot}, 15_000
     :telemetry.detach({__MODULE__, {:active, slot}})
@@ -216,7 +339,6 @@ defmodule Replicant.CrashInjectionTest do
     do: rows(c, "SELECT count(*) FROM _replicant_calls WHERE outcome = 'skipped'") |> hd() |> hd()
 
   defp connection_pid(slot), do: lookup_pid({slot, :connection})
-  defp assembler_pid(slot), do: lookup_pid({slot, :assembler})
 
   defp lookup_pid(key) do
     PG16.wait_until(fn -> match?([{_, _}], Registry.lookup(Replicant.Registry, key)) end, 200)

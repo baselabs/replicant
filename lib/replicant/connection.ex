@@ -10,6 +10,17 @@ defmodule Replicant.Connection do
     * decodes each XLogData payload behind Plan 1's value-free boundary and forwards
       the decoded message to `Replicant.AssemblerServer` — it never applies the sink,
       so it is always free to answer keepalives;
+    * tracks a **bounded in-flight window** (spec §4): the high-water received LSN
+      (`received_lsn`, the latest XLogData `wal_end`) minus the confirmed-durable
+      floor is the in-flight WAL lag — un-drained WAL, a proxy for the transaction
+      BACKLOG accumulating ahead of the sink. A single non-blocking integer
+      comparison in `handle_data/2` compares it to `max_inflight_lag` (a
+      backlog-sized ceiling, default 64 MiB);
+    * when the in-flight lag exceeds the bound the sink is genuinely lagging: it
+      **halts fail-closed** with `{:sink_too_slow, lag}` (surfaced telemetry +
+      `Replicant.Supervisor.halt/2` + `{:disconnect, :sink_too_slow}`) — never a
+      silent reconnect livelock or an unbounded-mailbox OOM. On restart it resumes
+      from the checkpoint (loss=0 by the §6 idempotent dedup);
     * advances the ack asynchronously on `{:sink_committed, L}` from the AssemblerServer;
     * on connect/reconnect detects an invalidated slot (`wal_status = 'lost'` or
       `conflicting` on PG16) and halts the pipeline fail-closed — never silently
@@ -17,12 +28,40 @@ defmodule Replicant.Connection do
 
   The connect chain is a `handle_result/2` state machine:
   `:recovery_check` → `:invalidation_check` → (`:create_slot` if absent) → `:streaming`.
+
+  ## Why a fail-closed halt and not soft pacing (Postgrex flow-control)
+
+  `Postgrex.ReplicationConnection` re-arms the replication socket (`active: :once`)
+  **automatically** after each `handle_data/2` batch — the handler's return value has
+  no way to defer socket re-activation, so there is no lever to pause TCP reading
+  from the handler. `:max_messages` bounds only Postgrex's per-batch socket buffer,
+  not the downstream `AssemblerServer` mailbox. So true socket-level pacing is not
+  available; the bounded in-flight window is enforced by the fail-closed halt at the
+  ceiling — which bounds memory (the pipeline tears down before the mailbox grows
+  unbounded) and surfaces the overload rather than silently livelocking.
   """
   use Postgrex.ReplicationConnection
 
   alias Replicant.{AssemblerServer, Decoder, QueryBuilder, Telemetry}
 
   @pg_epoch DateTime.to_unix(~U[2000-01-01 00:00:00Z], :microsecond)
+
+  # Default in-flight-lag ceiling in WAL bytes (spec §4 bounded in-flight window) —
+  # the multi-transaction BACKLOG bound. `received_lsn` advances per XLogData frame
+  # while `checkpoint_lsn` only advances at a Commit boundary, so the in-flight lag
+  # transiently includes the WAL of the single transaction currently mid-stream. This
+  # ceiling (64 MiB) is therefore sized to sit comfortably above any single
+  # normal-but-large transaction (bulk insert/update, large/TOASTed rows) so it fires
+  # ONLY when the sink is genuinely lagging and a real backlog of un-drained
+  # transactions accumulates — never on one in-flight txn. Override per pipeline via
+  # `Replicant.Config`'s `:max_inflight_lag`.
+  #
+  # PROTO-V1 LIMITATION: a single transaction whose own buffered WAL exceeds the bound
+  # would still trip the halt mid-transaction (there is no Commit boundary to advance
+  # the checkpoint until the whole txn arrives). Unbounded single-transaction size is
+  # a future slice (proto-v2 streaming of in-progress transactions); for v1, size the
+  # bound above the largest expected single transaction.
+  @default_max_inflight_lag 67_108_864
 
   @type step :: :disconnected | :recovery_check | :invalidation_check | :create_slot | :streaming
 
@@ -32,6 +71,9 @@ defmodule Replicant.Connection do
           sink: module(),
           go_forward_only: boolean(),
           checkpoint_lsn: Replicant.lsn(),
+          received_lsn: Replicant.lsn(),
+          stream_floor_lsn: Replicant.lsn() | nil,
+          max_inflight_lag: pos_integer(),
           step: step()
         }
 
@@ -40,9 +82,16 @@ defmodule Replicant.Connection do
     :publication,
     :sink,
     :go_forward_only,
+    :stream_floor_lsn,
     checkpoint_lsn: 0,
+    received_lsn: 0,
+    max_inflight_lag: @default_max_inflight_lag,
     step: :disconnected
   ]
+
+  @doc "The default in-flight-lag ceiling (WAL bytes) when the config omits it."
+  @spec default_max_inflight_lag() :: pos_integer()
+  def default_max_inflight_lag, do: @default_max_inflight_lag
 
   @doc "Start the replication connection for a pipeline (called by `Replicant.Pipeline`)."
   @spec start_link(Replicant.Config.t()) :: {:ok, pid()} | {:error, term()}
@@ -69,6 +118,9 @@ defmodule Replicant.Connection do
        sink: config.sink,
        go_forward_only: config.go_forward_only,
        checkpoint_lsn: 0,
+       received_lsn: 0,
+       stream_floor_lsn: nil,
+       max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
        step: :disconnected
      }}
   end
@@ -81,8 +133,20 @@ defmodule Replicant.Connection do
     # first async advance.
     checkpoint_lsn = read_checkpoint(state.sink)
 
+    # Reset the in-flight window on (re)connect. `stream_floor_lsn` is re-derived from
+    # the FIRST XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
+    # `START_REPLICATION` to the slot's server-side `confirmed_flush_lsn`, which for a
+    # fresh/empty checkpoint is the slot-creation LSN (a large absolute value), NOT 0.
+    # Measuring lag against that per-stream floor (never against absolute 0) is what
+    # keeps the very first frame from reading as a ~50 MB false "lag".
     {:query, QueryBuilder.is_in_recovery(),
-     %{state | checkpoint_lsn: checkpoint_lsn, step: :recovery_check}}
+     %{
+       state
+       | checkpoint_lsn: checkpoint_lsn,
+         received_lsn: checkpoint_lsn,
+         stream_floor_lsn: nil,
+         step: :recovery_check
+     }}
   end
 
   @impl true
@@ -132,21 +196,26 @@ defmodule Replicant.Connection do
   def handle_result(_result, _state), do: {:disconnect, :unexpected_result}
 
   @impl true
-  # XLogData: decode behind the value-free boundary, forward the decoded message
-  # + raw byte-size to the AssemblerServer. A decode error halts fail-closed.
-  def handle_data(<<?w, _wal_start::64, _wal_end::64, _clock::64, payload::binary>>, state) do
-    case Decoder.decode(payload) do
-      {:ok, message} ->
-        GenServer.cast(
-          AssemblerServer.via(state.slot_name),
-          {:message, message, byte_size(payload), self()}
-        )
+  # XLogData: advance the in-flight high-water to this frame's `wal_end`, then decode
+  # behind the value-free boundary and forward the decoded message + raw byte-size to
+  # the AssemblerServer. A decode error halts fail-closed. When the in-flight WAL lag
+  # (`inflight_lag/1`, received frontier minus the confirmed-durable floor) exceeds
+  # the bound, the sink cannot keep up: halt fail-closed (§4) before the mailbox grows
+  # unbounded — a single non-blocking integer comparison, so keepalives are never
+  # starved.
+  def handle_data(<<?w, _wal_start::64, wal_end::64, _clock::64, payload::binary>>, state) do
+    # Capture the per-stream floor from the FIRST frame — the position PG actually
+    # began streaming at (its clamped `confirmed_flush_lsn`), so lag is measured
+    # relative to the stream, never absolute 0.
+    stream_floor_lsn = state.stream_floor_lsn || wal_end
+    received_lsn = max(state.received_lsn, wal_end)
+    state = %{state | received_lsn: received_lsn, stream_floor_lsn: stream_floor_lsn}
+    lag = inflight_lag(state)
 
-        {:noreply, state}
-
-      {:error, error} ->
-        Replicant.Supervisor.halt(state.slot_name, error)
-        {:disconnect, :decode_failure}
+    if lag > state.max_inflight_lag do
+      halt_sink_too_slow(state, lag)
+    else
+      forward_message(payload, state)
     end
   end
 
@@ -203,6 +272,46 @@ defmodule Replicant.Connection do
   end
 
   # ---- private ----
+
+  # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor.
+  # The floor is the higher of the durable `checkpoint_lsn` (once a commit advances
+  # it to a real absolute LSN) and the per-stream `stream_floor_lsn` (the position PG
+  # began streaming at, used before the first commit while checkpoint is still 0).
+  # A cheap two-integer subtraction — safe to call on the keepalive-free hot path.
+  defp inflight_lag(%{received_lsn: received, checkpoint_lsn: cp, stream_floor_lsn: floor}) do
+    received - max(cp, floor || received)
+  end
+
+  defp forward_message(payload, state) do
+    case Decoder.decode(payload) do
+      {:ok, message} ->
+        GenServer.cast(
+          AssemblerServer.via(state.slot_name),
+          {:message, message, byte_size(payload), self()}
+        )
+
+        {:noreply, state}
+
+      {:error, error} ->
+        Replicant.Supervisor.halt(state.slot_name, error)
+        {:disconnect, :decode_failure}
+    end
+  end
+
+  # Fail-closed lag-halt (spec §4): the sink is not draining fast enough — the
+  # in-flight window is exceeded. Surface it with value-free telemetry (the `reason`
+  # meta key is allowlisted; the `lag` measurement is a WAL-byte count, never a row
+  # value), tear the pipeline down permanently, and disconnect. This BOUNDS memory
+  # (no unbounded mailbox) and SURFACES the overload (no silent livelock). Restart
+  # resumes from the durable checkpoint (loss=0 by §6 dedup).
+  defp halt_sink_too_slow(state, lag) do
+    Telemetry.event([:replicant, :connection, :disconnected], %{lag: lag}, %{
+      reason: :sink_too_slow
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:sink_too_slow, lag})
+    {:disconnect, :sink_too_slow}
+  end
 
   defp start_streaming(state) do
     {:ok, sql} =

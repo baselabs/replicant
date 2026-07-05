@@ -31,9 +31,15 @@ defmodule Replicant.Test.PG16 do
   @doc "Poll `fun` until it returns true, or flunk after ~ `tries * 25`ms."
   def wait_until(fun, tries \\ 400) do
     cond do
-      fun.() -> :ok
-      tries == 0 -> ExUnit.Assertions.flunk("timed out waiting for a live-PG condition")
-      true -> Process.sleep(25) && wait_until(fun, tries - 1)
+      fun.() ->
+        :ok
+
+      tries == 0 ->
+        ExUnit.Assertions.flunk("timed out waiting for a live-PG condition")
+
+      true ->
+        _ = Process.sleep(25)
+        wait_until(fun, tries - 1)
     end
   end
 end

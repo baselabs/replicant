@@ -79,6 +79,25 @@ defmodule Replicant.ConfigTest do
       opts = Keyword.delete(@base ++ [sink: StateMirrorPersisted], :connection)
       assert {:error, :config_invalid} = Config.validate(opts)
     end
+
+    test "defaults max_inflight_lag to the Connection ceiling when omitted" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.max_inflight_lag == Replicant.Connection.default_max_inflight_lag()
+    end
+
+    test "accepts an explicit positive-integer max_inflight_lag (§4 bounded window)" do
+      {:ok, cfg} =
+        Config.validate(@base ++ [sink: StateMirrorPersisted, max_inflight_lag: 4_096])
+
+      assert cfg.max_inflight_lag == 4_096
+    end
+
+    test "rejects a non-positive-integer max_inflight_lag" do
+      for bad <- [0, -1, "1024", 1.5] do
+        opts = @base ++ [sink: StateMirrorPersisted, max_inflight_lag: bad]
+        assert {:error, :config_invalid} = Config.validate(opts)
+      end
+    end
   end
 
   describe "guard/1 — go-forward-only start guard (spec §3/§6)" do
