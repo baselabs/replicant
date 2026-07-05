@@ -12,6 +12,39 @@ defmodule Replicant.SinkTest.AppendLogSink do
   def sink_kind, do: :append_log
 end
 
+defmodule Replicant.SinkTest.SnapshotCapable do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  @impl Replicant.Sink
+  def handle_snapshot(_changes, _ctx), do: :ok
+
+  @impl Replicant.Sink
+  def handle_snapshot_complete(lsn), do: {:ok, lsn}
+end
+
+defmodule Replicant.SinkTest.HalfSnapshot do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  @impl Replicant.Sink
+  def handle_snapshot(_changes, _ctx), do: :ok
+
+  # deliberately missing handle_snapshot_complete/1
+end
+
 defmodule Replicant.SinkTest do
   use ExUnit.Case, async: false
 
@@ -58,6 +91,20 @@ defmodule Replicant.SinkTest do
     test "sink_kind/1 returns the sink's own kind when sink_kind/0 IS implemented" do
       assert function_exported?(Replicant.SinkTest.AppendLogSink, :sink_kind, 0)
       assert Sink.sink_kind(Replicant.SinkTest.AppendLogSink) == :append_log
+    end
+
+    test "supports_snapshot?/1 is false for a sink with neither snapshot callback" do
+      refute Sink.supports_snapshot?(RecordingSink)
+    end
+
+    test "supports_snapshot?/1 requires BOTH snapshot callbacks" do
+      assert Sink.supports_snapshot?(Replicant.SinkTest.SnapshotCapable)
+      refute Sink.supports_snapshot?(Replicant.SinkTest.HalfSnapshot)
+    end
+
+    test "a snapshot-capable sink still compiles as a valid minimal sink" do
+      assert function_exported?(Replicant.SinkTest.SnapshotCapable, :handle_snapshot, 2)
+      assert function_exported?(Replicant.SinkTest.SnapshotCapable, :handle_snapshot_complete, 1)
     end
   end
 end
