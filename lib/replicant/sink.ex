@@ -51,7 +51,14 @@ defmodule Replicant.Sink do
   @spec sink_kind(module()) :: :state_mirror | :append_log
   def sink_kind(module) do
     if function_exported?(module, :sink_kind, 0) do
-      module.sink_kind()
+      # Coerce ANY unrecognized return to the strict :state_mirror default. sink_kind
+      # gates the go-forward start guard; treating a typo'd/invalid kind as the laxer
+      # :append_log would fail OPEN on a safety check and let an empty state-mirror
+      # sink partial-deliver. Only an explicit :append_log bypasses the guard.
+      case module.sink_kind() do
+        :append_log -> :append_log
+        _other -> :state_mirror
+      end
     else
       :state_mirror
     end

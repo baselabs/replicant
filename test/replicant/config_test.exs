@@ -40,6 +40,18 @@ defmodule Replicant.ConfigTest do
     def handle_transaction(_txn), do: {:ok, 0}
   end
 
+  defmodule InvalidKindEmpty do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, nil}
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+    # A typo'd / invalid kind (neither :state_mirror nor :append_log). It must be
+    # treated as the strict :state_mirror default so the go-forward guard still fires.
+    @impl true
+    def sink_kind, do: :stat_mirror
+  end
+
   @base [
     connection: [
       hostname: "standby.internal",
@@ -129,6 +141,13 @@ defmodule Replicant.ConfigTest do
       # the guard refuses ONLY on a definitive {:ok, nil}, never on a fault.
       {:ok, cfg} = Config.validate(@base ++ [sink: RaisingCheckpoint])
       assert :ok = Config.guard(cfg)
+    end
+
+    test "REFUSES a sink with an INVALID sink_kind from an empty checkpoint (fail-closed, not fail-open)" do
+      # An unrecognized sink_kind must be treated as the strict :state_mirror default,
+      # so a typo cannot silently bypass the guard and partial-deliver.
+      {:ok, cfg} = Config.validate(@base ++ [sink: InvalidKindEmpty])
+      assert {:error, :go_forward_required} = Config.guard(cfg)
     end
   end
 end
