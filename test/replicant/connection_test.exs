@@ -1,3 +1,11 @@
+defmodule Replicant.Test.FailIfCompleteSink do
+  def handle_snapshot_complete(_lsn), do: raise("must not be called in lib mode")
+end
+
+defmodule Replicant.Test.OkCompleteSink do
+  def handle_snapshot_complete(lsn), do: {:ok, lsn}
+end
+
 defmodule Replicant.ConnectionTest do
   use ExUnit.Case, async: false
 
@@ -462,6 +470,24 @@ defmodule Replicant.ConnectionTest do
       st = state(step: :snapshotting, snapshot: true)
       err = %Replicant.Error{reason: :snapshot_failed}
       assert {:disconnect, :snapshot_failed} = Connection.handle_info({:snapshot_failed, err}, st)
+    end
+
+    test "the lib-mode snapshot handoff does NOT call the sink's handle_snapshot_complete/1" do
+      # Lib mode returns {:ok, cp} WITHOUT invoking handle_snapshot_complete/1 (the Connection
+      # writes the store handoff instead); sink-owned mode still calls it.
+      assert {:ok, 77} =
+               Replicant.Snapshotter.complete_for_test(
+                 Replicant.Test.FailIfCompleteSink,
+                 77,
+                 :lib
+               )
+
+      assert {:ok, 77} =
+               Replicant.Snapshotter.complete_for_test(
+                 Replicant.Test.OkCompleteSink,
+                 77,
+                 :sink_owned
+               )
     end
   end
 

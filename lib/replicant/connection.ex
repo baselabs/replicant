@@ -235,6 +235,7 @@ defmodule Replicant.Connection do
       connection: state.connection,
       publication: state.publication,
       sink: state.sink,
+      mode: if(lib_mode?(state), do: :lib, else: :sink_owned),
       reply_to: self()
     })
 
@@ -296,15 +297,37 @@ defmodule Replicant.Connection do
 
   # Snapshot finished durably (checkpoint := consistent_point): seed the checkpoint and
   # stream from the handoff LSN. The snapshotter's own :normal exit does not propagate
-  # over the link, so this graceful message still drives the handoff.
+  # over the link, so this graceful message still drives the handoff. In lib mode the
+  # sink does NOT own the checkpoint, so the handoff LSN is written to the store HERE,
+  # ordered before streaming — a write fault halts fail-closed (the whole snapshot
+  # re-runs, since the store checkpoint stays nil until the handoff lands).
   def handle_info({:snapshot_done, lsn}, %{step: :snapshotting} = state) when is_integer(lsn) do
-    Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+    case write_snapshot_handoff(state, lsn) do
+      :ok ->
+        Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+        if lib_mode?(state), do: seed_assembler(state, lsn)
 
-    {:ok, sql} =
-      QueryBuilder.start_replication(state.slot_name, state.publication, start_lsn: lsn)
+        {:ok, sql} =
+          QueryBuilder.start_replication(state.slot_name, state.publication, start_lsn: lsn)
 
-    {:stream, sql, [],
-     %{state | step: :streaming, checkpoint_lsn: lsn, received_lsn: lsn, stream_floor_lsn: nil}}
+        {:stream, sql, [],
+         %{
+           state
+           | step: :streaming,
+             checkpoint_lsn: lsn,
+             received_lsn: lsn,
+             stream_floor_lsn: nil
+         }}
+
+      {:error, _} ->
+        Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
+          slot_name: state.slot_name,
+          reason: :checkpoint_store_failed
+        })
+
+        Replicant.Supervisor.halt(state.slot_name, {:checkpoint_store, :snapshot_handoff_failed})
+        {:disconnect, :checkpoint_store_failed}
+    end
   end
 
   def handle_info({:snapshot_failed, _error}, %{step: :snapshotting} = state) do
@@ -445,6 +468,16 @@ defmodule Replicant.Connection do
   defp seed_assembler(state, lsn) when is_integer(lsn) do
     GenServer.cast(AssemblerServer.via(state.slot_name), {:seed_lib_checkpoint, lsn})
   end
+
+  # The snapshot handoff write. Sink-owned: the snapshotter already durably set the sink
+  # checkpoint via handle_snapshot_complete/1, so this is a no-op (:ok) and the stream
+  # branch runs unchanged. Lib mode: write the handoff LSN to the store here (after all
+  # batches, before streaming) — the store is the durable checkpoint the resume reads.
+  defp write_snapshot_handoff(%{checkpoint_store: store, slot_name: slot}, lsn)
+       when is_list(store),
+       do: Replicant.CheckpointStore.write(Replicant.CheckpointStore.via(slot), lsn)
+
+  defp write_snapshot_handoff(_state, _lsn), do: :ok
 
   # ---- connect matrix (spec §8): slot presence × checkpoint state × snapshot mode ----
 
