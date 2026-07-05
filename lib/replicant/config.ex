@@ -18,7 +18,8 @@ defmodule Replicant.Config do
           sink: module(),
           go_forward_only: boolean(),
           snapshot: boolean(),
-          max_inflight_lag: pos_integer()
+          max_inflight_lag: pos_integer(),
+          checkpoint_store: keyword() | nil
         }
 
   @doc """
@@ -42,7 +43,8 @@ defmodule Replicant.Config do
     with {:ok, connection} <- fetch_connection(opts),
          {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
          {:ok, publication} <- fetch_identifier(opts, :publication),
-         {:ok, sink} <- fetch_sink(opts),
+         {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
+         {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          snapshot = Keyword.get(opts, :snapshot, false) == true,
@@ -56,7 +58,8 @@ defmodule Replicant.Config do
          sink: sink,
          go_forward_only: go_forward_only,
          snapshot: snapshot,
-         max_inflight_lag: max_inflight_lag
+         max_inflight_lag: max_inflight_lag,
+         checkpoint_store: checkpoint_store
        }}
     end
   end
@@ -76,6 +79,10 @@ defmodule Replicant.Config do
   is the expected first-run state, not a partial-delivery risk.
   """
   @spec guard(t()) :: :ok | {:error, :go_forward_required}
+  # Lib mode (a present :checkpoint_store): the library owns the checkpoint, so the
+  # empty-checkpoint go-forward enforcement moves to connect time — the guard defers here.
+  def guard(%{checkpoint_store: store}) when is_list(store), do: :ok
+
   def guard(%{sink: sink, go_forward_only: go_forward_only, snapshot: snapshot}) do
     cond do
       go_forward_only == true -> :ok
@@ -127,6 +134,31 @@ defmodule Replicant.Config do
     end
   end
 
+  # A present :checkpoint_store must be a keyword with a non-empty :connection list and,
+  # if given, a :table that passes the identifier allowlist (Critical Rule 2). Absent →
+  # nil (sink-owned mode). A mis-shaped value is a config error, never a silent fallback.
+  defp fetch_checkpoint_store(opts) do
+    case Keyword.fetch(opts, :checkpoint_store) do
+      :error ->
+        {:ok, nil}
+
+      {:ok, store} when is_list(store) ->
+        with conn when is_list(conn) and conn != [] <- Keyword.get(store, :connection),
+             :ok <- validate_store_table(Keyword.get(store, :table)) do
+          {:ok, store}
+        else
+          {:error, :invalid_identifier} = err -> err
+          _ -> {:error, :config_invalid}
+        end
+
+      {:ok, _bad} ->
+        {:error, :config_invalid}
+    end
+  end
+
+  defp validate_store_table(nil), do: :ok
+  defp validate_store_table(table), do: Identifier.validate(table)
+
   defp fetch_connection(opts) do
     case Keyword.get(opts, :connection) do
       conn when is_list(conn) and conn != [] -> {:ok, conn}
@@ -143,15 +175,27 @@ defmodule Replicant.Config do
     end
   end
 
-  defp fetch_sink(opts) do
+  # In lib mode (a present :checkpoint_store) the library owns the checkpoint, so the sink
+  # need not implement checkpoint/0 — only handle_transaction/1 is mandatory. Sink-owned
+  # mode still requires both callbacks.
+  defp fetch_sink(opts, lib_mode?) do
     sink = Keyword.get(opts, :sink)
 
-    if is_atom(sink) and sink != nil and Code.ensure_loaded?(sink) and
-         function_exported?(sink, :checkpoint, 0) and
-         function_exported?(sink, :handle_transaction, 1) do
-      {:ok, sink}
-    else
-      {:error, :invalid_sink}
+    cond do
+      not (is_atom(sink) and sink != nil and Code.ensure_loaded?(sink)) ->
+        {:error, :invalid_sink}
+
+      not function_exported?(sink, :handle_transaction, 1) ->
+        {:error, :invalid_sink}
+
+      lib_mode? ->
+        {:ok, sink}
+
+      function_exported?(sink, :checkpoint, 0) ->
+        {:ok, sink}
+
+      true ->
+        {:error, :invalid_sink}
     end
   end
 end

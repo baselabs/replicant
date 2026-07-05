@@ -1,3 +1,14 @@
+# A plain module (no @behaviour): checkpoint/0 is still a MANDATORY @callback at this
+# task's commit point (Task 10 moves it to @optional_callbacks), so declaring @behaviour
+# would fail `mix compile --warnings-as-errors`. Config.fetch_sink checks callbacks at
+# RUNTIME via function_exported?/3, so a plain module is a faithful lib-mode-sink fixture.
+# Defined at file top-level (NOT nested under Replicant.ConfigTest) so its fully-qualified
+# name is exactly Replicant.Test.CpStubSink — a nested defmodule would be renamed
+# Replicant.ConfigTest.Replicant.Test.CpStubSink and relativize the %Transaction{} match.
+defmodule Replicant.Test.CpStubSink do
+  def handle_transaction(%Replicant.Transaction{} = txn), do: {:ok, txn.commit_lsn}
+end
+
 defmodule Replicant.ConfigTest do
   use ExUnit.Case, async: true
 
@@ -75,6 +86,14 @@ defmodule Replicant.ConfigTest do
     slot_name: "replicant_orders",
     publication: "orders_pub"
   ]
+
+  defp base_opts,
+    do: [
+      connection: [hostname: "h"],
+      slot_name: "s",
+      publication: "p",
+      sink: Replicant.Test.RecordingSink
+    ]
 
   describe "validate/1" do
     test "accepts a well-formed config and normalises go_forward_only" do
@@ -187,6 +206,52 @@ defmodule Replicant.ConfigTest do
     test "snapshot defaults to false and does not affect a normal config" do
       {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
       assert cfg.snapshot == false
+    end
+  end
+
+  describe "checkpoint_store (lib mode)" do
+    test "a valid :checkpoint_store is normalised onto the config" do
+      opts = base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], table: "cp"]]
+      assert {:ok, cfg} = Config.validate(opts)
+      assert cfg.checkpoint_store == [connection: [hostname: "db"], table: "cp"]
+    end
+
+    test "lib mode does NOT require the sink to implement checkpoint/0" do
+      # CpStubSink implements ONLY handle_transaction/1 (a plain module, no @behaviour).
+      opts =
+        [
+          connection: [hostname: "h"],
+          slot_name: "s",
+          publication: "p",
+          sink: Replicant.Test.CpStubSink
+        ] ++
+          [checkpoint_store: [connection: [hostname: "db"]]]
+
+      assert {:ok, cfg} = Config.validate(opts)
+      assert cfg.sink == Replicant.Test.CpStubSink
+    end
+
+    test "sink-owned mode still requires checkpoint/0" do
+      opts = [
+        connection: [hostname: "h"],
+        slot_name: "s",
+        publication: "p",
+        sink: Replicant.Test.CpStubSink
+      ]
+
+      assert {:error, :invalid_sink} = Config.validate(opts)
+    end
+
+    test "an invalid checkpoint_store table identifier is rejected" do
+      opts = base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], table: "Bad Name"]]
+      assert {:error, :invalid_identifier} = Config.validate(opts)
+    end
+
+    test "guard defers in lib mode (empty-checkpoint enforcement moves to connect)" do
+      {:ok, cfg} =
+        Config.validate(base_opts() ++ [checkpoint_store: [connection: [hostname: "db"]]])
+
+      assert Config.guard(cfg) == :ok
     end
   end
 end
