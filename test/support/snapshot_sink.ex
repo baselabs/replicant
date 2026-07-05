@@ -51,3 +51,27 @@ defmodule Replicant.Test.SnapshotSink do
     {:ok, lsn}
   end
 end
+
+defmodule Replicant.Test.SlowSnapshotSink do
+  @moduledoc "SnapshotSink whose handle_snapshot sleeps, keeping the snapshot in-progress for orphan-lifetime tests."
+  @behaviour Replicant.Sink
+
+  alias Replicant.Test.SnapshotSink
+
+  @impl true
+  def checkpoint, do: SnapshotSink.checkpoint()
+  @impl true
+  def handle_transaction(txn), do: SnapshotSink.handle_transaction(txn)
+  @impl true
+  def handle_snapshot(changes, ctx) do
+    # Signal (from INSIDE the snapshotter process) that the snapshot is genuinely
+    # mid-flight, THEN block. Orphan-lifetime tests wait for this before tearing the
+    # pipeline down so the kill lands while the snapshotter is truly in-progress.
+    :telemetry.execute([:replicant, :test, :slow_snapshot_sleeping], %{}, %{})
+    Process.sleep(5_000)
+    SnapshotSink.handle_snapshot(changes, ctx)
+  end
+
+  @impl true
+  def handle_snapshot_complete(lsn), do: SnapshotSink.handle_snapshot_complete(lsn)
+end

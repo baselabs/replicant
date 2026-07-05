@@ -84,8 +84,6 @@ defmodule Replicant.Connection do
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
-          snapshot_lsn: Replicant.lsn() | nil,
-          snapshot_ref: reference() | nil,
           step: step()
         }
 
@@ -97,8 +95,6 @@ defmodule Replicant.Connection do
     :snapshot,
     :connection,
     :stream_floor_lsn,
-    :snapshot_lsn,
-    :snapshot_ref,
     checkpoint_lsn: 0,
     checkpoint_state: :empty,
     received_lsn: 0,
@@ -230,26 +226,27 @@ defmodule Replicant.Connection do
   end
 
   # The EXPORT_SNAPSHOT slot was created (spec §4): capture its consistent point and
-  # exported snapshot name, spawn+monitor the Snapshotter to read the base snapshot on a
+  # exported snapshot name, spawn+LINK the Snapshotter to read the base snapshot on a
   # separate connection, and idle in :snapshotting to hold the exported snapshot valid.
-  # The handoff LSN (`snapshot_lsn`) is where streaming resumes once the snapshot lands.
+  # The link binds the snapshotter to this Connection: a pipeline teardown mid-snapshot
+  # tears the snapshotter down with it (no orphan). The handoff LSN arrives on
+  # `{:snapshot_done, lsn}` and is where streaming resumes once the snapshot lands.
   def handle_result(
         [%Postgrex.Result{rows: [[_slot, consistent_point, snapshot_name, _plugin]]}],
         %{step: :create_export_slot} = state
       ) do
     cp = Replicant.lsn_from_string(consistent_point)
 
-    {_pid, ref} =
-      Replicant.Snapshotter.start(%{
-        snapshot_name: snapshot_name,
-        consistent_point: cp,
-        connection: state.connection,
-        publication: state.publication,
-        sink: state.sink,
-        reply_to: self()
-      })
+    Replicant.Snapshotter.start(%{
+      snapshot_name: snapshot_name,
+      consistent_point: cp,
+      connection: state.connection,
+      publication: state.publication,
+      sink: state.sink,
+      reply_to: self()
+    })
 
-    {:noreply, %{state | step: :snapshotting, snapshot_ref: ref, snapshot_lsn: cp}}
+    {:noreply, %{state | step: :snapshotting}}
   end
 
   def handle_result(%Postgrex.Error{}, _state) do
@@ -305,40 +302,21 @@ defmodule Replicant.Connection do
     {:noreply, [encode_status_update(checkpoint)], %{state | checkpoint_lsn: checkpoint}}
   end
 
-  # Snapshot finished durably (checkpoint := consistent_point): flush the monitor's
-  # pending :normal DOWN, seed the checkpoint, and stream from the handoff LSN.
+  # Snapshot finished durably (checkpoint := consistent_point): seed the checkpoint and
+  # stream from the handoff LSN. The snapshotter's own :normal exit does not propagate
+  # over the link, so this graceful message still drives the handoff.
   def handle_info({:snapshot_done, lsn}, %{step: :snapshotting} = state) when is_integer(lsn) do
-    if is_reference(state.snapshot_ref), do: Process.demonitor(state.snapshot_ref, [:flush])
     Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
 
     {:ok, sql} =
       QueryBuilder.start_replication(state.slot_name, state.publication, start_lsn: lsn)
 
     {:stream, sql, [],
-     %{
-       state
-       | step: :streaming,
-         checkpoint_lsn: lsn,
-         received_lsn: lsn,
-         stream_floor_lsn: nil,
-         snapshot_ref: nil
-     }}
+     %{state | step: :streaming, checkpoint_lsn: lsn, received_lsn: lsn, stream_floor_lsn: nil}}
   end
 
   def handle_info({:snapshot_failed, _error}, %{step: :snapshotting} = state) do
     Replicant.Supervisor.halt(state.slot_name, {:snapshot, :snapshot_failed})
-    {:disconnect, :snapshot_failed}
-  end
-
-  # The monitored snapshotter died abnormally without reporting — fail-closed. A :normal
-  # exit (it finished and sent {:snapshot_done}) is a no-op.
-  def handle_info({:DOWN, ref, :process, _pid, :normal}, %{snapshot_ref: ref} = state) do
-    {:noreply, state}
-  end
-
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{snapshot_ref: ref} = state) do
-    Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: :snapshot_failed})
-    Replicant.Supervisor.halt(state.slot_name, {:snapshot, :snapshot_down})
     {:disconnect, :snapshot_failed}
   end
 

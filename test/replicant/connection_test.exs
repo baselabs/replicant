@@ -399,7 +399,12 @@ defmodule Replicant.ConnectionTest do
   end
 
   describe "handle_result(:create_export_slot) + handle_info handoff" do
-    test "captures consistent_point + snapshot_name, spawns the snapshotter, idles in :snapshotting" do
+    test "captures consistent_point + snapshot_name, spawns the linked snapshotter, idles in :snapshotting" do
+      # spawn_link links the snapshotter to THIS test process. It connects to the dummy
+      # test host, fails inside its value-free boundary, and exits :normal (a :normal exit
+      # never propagates over a link), so it cannot disturb the test.
+      Process.flag(:trap_exit, true)
+
       # CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT result row order (probed):
       # [slot_name, consistent_point, snapshot_name, output_plugin].
       result = [
@@ -410,12 +415,17 @@ defmodule Replicant.ConnectionTest do
 
       assert {:noreply, new_state} = Connection.handle_result(result, st)
       assert new_state.step == :snapshotting
-      assert new_state.snapshot_lsn == 0x16E3778
-      assert is_reference(new_state.snapshot_ref)
+
+      # Flush any stray {:EXIT, _, _} the linked snapshotter may have delivered.
+      receive do
+        {:EXIT, _, _} -> :ok
+      after
+        0 -> :ok
+      end
     end
 
     test "{:snapshot_done, lsn} starts streaming from the handoff LSN" do
-      st = state(step: :snapshotting, snapshot: true, snapshot_lsn: 0x16E3778, checkpoint_lsn: 0)
+      st = state(step: :snapshotting, snapshot: true, checkpoint_lsn: 0)
 
       assert {:stream, sql, [], new_state} =
                Connection.handle_info({:snapshot_done, 0x16E3778}, st)
@@ -430,22 +440,6 @@ defmodule Replicant.ConnectionTest do
       st = state(step: :snapshotting, snapshot: true)
       err = %Replicant.Error{reason: :snapshot_failed}
       assert {:disconnect, :snapshot_failed} = Connection.handle_info({:snapshot_failed, err}, st)
-    end
-
-    test "an abnormal :DOWN from the monitored snapshotter halts fail-closed" do
-      ref = make_ref()
-      st = state(step: :snapshotting, snapshot: true, snapshot_ref: ref)
-
-      assert {:disconnect, :snapshot_failed} =
-               Connection.handle_info({:DOWN, ref, :process, self(), :boom}, st)
-    end
-
-    test "a :normal :DOWN from the snapshotter (it finished) is ignored" do
-      ref = make_ref()
-      st = state(step: :snapshotting, snapshot: true, snapshot_ref: ref)
-
-      assert {:noreply, ^st} =
-               Connection.handle_info({:DOWN, ref, :process, self(), :normal}, st)
     end
   end
 

@@ -153,15 +153,91 @@ defmodule Replicant.SnapshotTest do
     assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
-  defp start_snapshot_pipeline(slot) do
+  test "orphan safety: the snapshotter dies with the pipeline (no post-teardown sink mutation)",
+       %{ctrl: ctrl, slot: slot} do
+    Postgrex.query!(
+      ctrl,
+      "INSERT INTO orders (id, note) SELECT g, 'seed' || g FROM generate_series(1, 100) g",
+      []
+    )
+
+    parent = self()
+    # Both handlers run IN the Snapshotter process, so self() there is the snapshotter pid.
+    # [:snapshot, :started] fires during transaction setup; [:test, :slow_snapshot_sleeping]
+    # fires from INSIDE the sleeping sink — i.e. genuinely mid-snapshot.
+    :telemetry.attach(
+      {__MODULE__, :snap_pid, slot},
+      [:replicant, :snapshot, :started],
+      fn _e, _m, _meta, _cfg -> send(parent, {:snapshotter_pid, self()}) end,
+      nil
+    )
+
+    :telemetry.attach(
+      {__MODULE__, :sleeping, slot},
+      [:replicant, :test, :slow_snapshot_sleeping],
+      fn _e, _m, _meta, _cfg -> send(parent, {:snapshot_sleeping, self()}) end,
+      nil
+    )
+
+    start_snapshot_pipeline(slot, sink: Replicant.Test.SlowSnapshotSink)
+    assert_receive {:snapshotter_pid, snap_pid}, 15_000
+    :telemetry.detach({__MODULE__, :snap_pid, slot})
+
+    # Wait until the snapshotter is ACTUALLY mid-snapshot (inside the sleeping sink) —
+    # not merely started. Killing during transaction setup would break the export and
+    # the snapshotter would self-exit regardless of link/monitor, masking the bug.
+    assert_receive {:snapshot_sleeping, ^snap_pid}, 15_000
+    :telemetry.detach({__MODULE__, :sleeping, slot})
+    assert Process.alive?(snap_pid)
+
+    # Tear down the pipeline mid-snapshot (the sink is sleeping 5s). With spawn_link the
+    # Connection↔Snapshotter link kills the orphan; with the old spawn_monitor it survives
+    # (the sleeping snapshotter is unlinked from the Connection, so the kill can't reach it).
+    conn = connection_pid(slot)
+    Process.exit(conn, :kill)
+
+    # This poll window (~1s) is well under the 5s sink sleep. With spawn_link the kill
+    # propagates near-instantly and the orphan dies inside the window; with the old
+    # spawn_monitor the orphan keeps sleeping and is still alive when the window ends.
+    # Poll (never flunk) so the descriptive refute below is what fires on the bug.
+    poll_dead(snap_pid, 40)
+
+    refute Process.alive?(snap_pid),
+           "the orphan snapshotter must be torn down with the pipeline (spawn_link), not survive it"
+  end
+
+  defp poll_dead(_pid, 0), do: :ok
+
+  defp poll_dead(pid, tries) do
+    if Process.alive?(pid) do
+      Process.sleep(25)
+      poll_dead(pid, tries - 1)
+    else
+      :ok
+    end
+  end
+
+  defp start_snapshot_pipeline(slot, opts \\ []) do
+    sink = Keyword.get(opts, :sink, SnapshotSink)
+
     {:ok, _pid} =
       Replicant.start_link(
         connection: PG16.pg_opts(),
         slot_name: slot,
         publication: "orders_pub",
-        sink: SnapshotSink,
+        sink: sink,
         snapshot: true
       )
+  end
+
+  defp connection_pid(slot) do
+    PG16.wait_until(
+      fn -> match?([{_, _}], Registry.lookup(Replicant.Registry, {slot, :connection})) end,
+      200
+    )
+
+    [{pid, _}] = Registry.lookup(Replicant.Registry, {slot, :connection})
+    pid
   end
 
   defp reset_schema(c) do

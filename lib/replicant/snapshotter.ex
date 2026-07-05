@@ -4,8 +4,12 @@ defmodule Replicant.Snapshotter do
   Postgrex connection, at the LSN a durable slot exported via `EXPORT_SNAPSHOT`, and
   pushes the rows to the sink as `%Change{op: :snapshot}` batches — then durably sets the
   sink checkpoint to the snapshot's consistent point (the handoff commit). Spawned and
-  monitored by `Replicant.Connection`, which holds the exported snapshot valid by staying
-  idle (proven safe past `wal_sender_timeout`, spec §11).
+  LINKED to `Replicant.Connection`, which holds the exported snapshot valid by staying
+  idle (proven safe past `wal_sender_timeout`, spec §11). The link binds the snapshotter's
+  lifetime to the pipeline: a Connection/pipeline teardown mid-snapshot tears the
+  snapshotter down with it, so an orphan can never mutate the sink after the pipeline is
+  gone. Graceful completion exits `:normal` (which never propagates over the link), so the
+  `{:snapshot_done, lsn}` / `{:snapshot_failed, err}` messages still drive the handoff.
 
   ## Value-free boundary (Critical Rule 1)
   A Postgrex query/cursor fault — raised OR returned — can embed row/column values in its
@@ -30,9 +34,9 @@ defmodule Replicant.Snapshotter do
           reply_to: pid()
         }
 
-  @doc "Spawn + monitor the snapshotter. Returns `{pid, monitor_ref}`."
-  @spec start(args()) :: {pid(), reference()}
-  def start(args), do: spawn_monitor(__MODULE__, :run, [args])
+  @doc "Spawn + LINK the snapshotter to the caller (the Connection) so it is torn down with the pipeline. Returns the pid."
+  @spec start(args()) :: pid()
+  def start(args), do: spawn_link(__MODULE__, :run, [args])
 
   @doc false
   @spec run(args()) :: :ok
