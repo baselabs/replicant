@@ -9,7 +9,7 @@ defmodule Replicant.Sink do
 
   | callback | required | purpose |
   |---|---|---|
-  | `c:checkpoint/0` | **yes** | last durably-persisted commit LSN (`nil` = never) |
+  | `c:checkpoint/0` | in sink-owned mode | last durably-persisted commit LSN (`nil` = never). In **lib mode** (`:checkpoint_store` configured) the library owns the checkpoint and this callback is not required. |
   | `c:handle_transaction/1` | **yes** | persist the txn + checkpoint atomically, return `{:ok, lsn}` |
   | `c:handle_schema_change/2` | no | accept/decline a `SchemaChange`; default halts destructive |
   | `c:sink_kind/0` | no | `:state_mirror` (default) or `:append_log` |
@@ -21,6 +21,17 @@ defmodule Replicant.Sink do
   Assembler dispatches the optional ones via `function_exported?/3`, providing the
   documented default. The two snapshot callbacks come as a pair — `supports_snapshot?/1`
   gates `snapshot: true` on BOTH being present.
+
+  ## Lib mode (non-transactional sinks)
+
+  When the pipeline is configured with `:checkpoint_store`, the library owns the
+  checkpoint: it reads it on connect and writes it (to a Postgres table) AFTER
+  `handle_transaction/1` returns `{:ok, _}`, then advances the ack. A lib-mode sink
+  therefore implements ONLY `handle_transaction/1` (persisting DATA; it still returns
+  `{:ok, lsn}` — the value is ignored, per the §14.20 discipline) and need not
+  implement `checkpoint/0`. `Config` enforces `checkpoint/0` presence at start for
+  sink-owned mode. The guarantee is at-least-once, dup bounded to one transaction,
+  never loss — NOT effect-once (a non-transactional sink cannot dedup).
   """
 
   @doc "Last durably-persisted commit LSN, for resume AND as the dedup watermark."
@@ -76,6 +87,7 @@ defmodule Replicant.Sink do
               {:ok, Replicant.lsn()} | {:error, term()}
 
   @optional_callbacks [
+    checkpoint: 0,
     handle_schema_change: 2,
     sink_kind: 0,
     handle_snapshot: 2,

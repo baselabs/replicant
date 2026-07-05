@@ -106,5 +106,17 @@ defmodule Replicant.SinkTest do
       assert function_exported?(Replicant.SinkTest.SnapshotCapable, :handle_snapshot, 2)
       assert function_exported?(Replicant.SinkTest.SnapshotCapable, :handle_snapshot_complete, 1)
     end
+
+    test "checkpoint/0 is an optional callback (a lib-mode sink omits it and still satisfies @behaviour)" do
+      assert {:checkpoint, 0} in Replicant.Sink.behaviour_info(:optional_callbacks)
+      # WriteOnlySink declares @behaviour Replicant.Sink WITHOUT checkpoint/0 and must compile.
+      # ensure_loaded first: a test/support module referenced only by fully-qualified
+      # name (no alias/call) is not yet loaded into the VM, and function_exported?/3
+      # does not force-load it (same reason lib/replicant/config.ex checks
+      # Code.ensure_loaded?/1 before function_exported?/3 on a configured sink).
+      assert Code.ensure_loaded?(Replicant.Test.WriteOnlySink)
+      assert function_exported?(Replicant.Test.WriteOnlySink, :handle_transaction, 1)
+      refute function_exported?(Replicant.Test.WriteOnlySink, :checkpoint, 0)
+    end
   end
 end
