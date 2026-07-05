@@ -2,7 +2,7 @@ defmodule Replicant.CrashInjectionTest do
   use ExUnit.Case, async: false
   @moduletag :integration
 
-  alias Replicant.Test.{LedgerSink, PG16}
+  alias Replicant.Test.{LedgerSink, PauseGate, PausingLedgerSink, PG16}
 
   # The §4 spike tests drive an EXPLICIT small in-flight ceiling (64 KiB) via the
   # `:max_inflight_lag` override, sized against the live 25ms/txn slow sink so a
@@ -124,6 +124,175 @@ defmodule Replicant.CrashInjectionTest do
     PG16.wait_until(fn -> skipped_count(ctrl) >= 1 end, 400)
 
     assert rows(ctrl, "SELECT id, note FROM sink_orders ORDER BY id") == [[1, "a"]]
+    assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
+  end
+
+  # ADVERSARIAL CRASH-INJECTION (spec §12.2 line 144: "kill the Connection ... MID-
+  # TRANSACTION"). In pgoutput proto v1 PG streams a committed txn's frames
+  # (Begin → row changes → Commit) as a burst; the AssemblerServer assembles them into
+  # its open `txn` buffer and applies the sink SYNCHRONOUSLY at Commit — the transaction
+  # is only DURABLY committed (checkpoint advanced) once `handle_transaction/1` returns.
+  # A mid-transaction kill is a crash while a committed-in-PG transaction is IN-FLIGHT in
+  # the consumer — assembled/being-applied but NOT yet durably committed. `:one_for_all`
+  # discards that in-memory in-flight transaction, and on resume PG re-streams the WHOLE
+  # transaction from the durable checkpoint — which sits BEFORE it (the prior control
+  # txn's LSN) — so it is assembled and applied exactly once (loss=0, effect-dup=0).
+  #
+  # WHY A SANCTIONED TEST-ONLY HOOK, NOT `:sys.get_state`-POLLING: the task's primary
+  # approach (poll the assembler's transient in-buffer `changes` and kill at
+  # `0 < changes < N`) proved UNRELIABLE against the live stream — measured over 8 live
+  # trials at N=2000 it caught the mid-buffer state only 2/8 times (6/8 MISS): the
+  # AssemblerServer churns a large frame burst faster than a `:sys.get_state` poll can
+  # observe it, and while it is applying a prior txn `:sys.get_state` times out entirely.
+  # A racy catch is not a valid gate. So this uses the task's explicitly-sanctioned
+  # fallback: a DETERMINISTIC test-only instrumentation hook (`PausingLedgerSink` +
+  # `PauseGate`, test-support only, NO `lib/` change / telemetry) that blocks the
+  # AssemblerServer at the sink boundary with the transaction fully ASSEMBLED but NOT
+  # durably committed — the exact in-flight precondition a mid-transaction crash must
+  # survive. The kill lands in that deterministic window; the injection-is-real evidence
+  # is proven three ways at kill time: the sink signalled `{:sink_paused, lsn, N}` (the
+  # whole txn assembled, N changes, about to apply), the durable checkpoint is still at
+  # the CONTROL txn's LSN (the big txn NOT committed), and ZERO of the big txn's rows are
+  # in `sink_orders`.
+  @midtxn_rows 5_000
+  test "mid-transaction kill: in-flight txn discarded, whole txn re-streamed exactly once", %{
+    ctrl: ctrl,
+    slot: slot
+  } do
+    # Arm the pause gate to block the first transaction of >= @midtxn_rows changes,
+    # notifying this test process. Torn down on exit.
+    {:ok, gate} = PauseGate.start_link(self(), @midtxn_rows)
+    on_exit(fn -> if Process.alive?(gate), do: Agent.stop(gate) end)
+
+    start_pipeline(slot, sink: PausingLedgerSink)
+
+    # A control txn FIRST so the durable checkpoint advances to a point strictly BEFORE
+    # the large txn — proving resume re-streams the whole large txn, not from 0/0.
+    insert(ctrl, 1, "ctrl")
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 1 end)
+    control_cp = checkpoint_lsn(ctrl)
+    assert is_integer(control_cp) and control_cp > 0
+
+    # Fire the large single-commit txn from its OWN connection (one Begin→N rows→Commit).
+    big_task =
+      Task.async(fn ->
+        {:ok, c} = Postgrex.start_link(PG16.pg_opts())
+
+        Postgrex.query!(
+          c,
+          "INSERT INTO orders (id, note) SELECT g, 'big' FROM generate_series(2, #{@midtxn_rows + 1}) g",
+          [],
+          timeout: 30_000
+        )
+
+        GenServer.stop(c)
+      end)
+
+    # DETERMINISTIC catch: the sink blocks with the whole txn assembled, signalling us.
+    assert_receive {:sink_paused, big_lsn, assembled_changes}, 20_000
+
+    # Injection-is-real evidence #1: the WHOLE txn is assembled (all N changes) and about
+    # to be applied — this is a mid-transaction (in-flight, uncommitted) kill.
+    assert assembled_changes == @midtxn_rows
+    assert big_lsn > control_cp
+
+    # Injection-is-real evidence #2/#3: the big txn is NOT durably committed at kill time —
+    # the checkpoint is still the control txn's LSN and ZERO of its rows are applied.
+    assert checkpoint_lsn(ctrl) == control_cp,
+           "the big txn must NOT be durably committed at kill time (checkpoint still control's)"
+
+    assert count(ctrl, "sink_orders") == 1,
+           "the big txn's rows must NOT be applied at kill time (only the control row present)"
+
+    IO.puts(
+      "\n[mid-txn] killed Connection with the whole txn IN-FLIGHT: #{assembled_changes} changes " <>
+        "assembled, sink entered, checkpoint still at control LSN #{control_cp} " <>
+        "(big txn LSN #{big_lsn} NOT committed, 0 of #{@midtxn_rows} rows applied)"
+    )
+
+    # Disarm the gate so the re-streamed txn applies (does not pause) after the restart.
+    PauseGate.disarm()
+
+    # Kill the Connection mid-transaction: :one_for_all also terminates the blocked
+    # AssemblerServer, discarding the in-flight transaction.
+    conn = connection_pid(slot)
+    ref = Process.monitor(conn)
+    Process.exit(conn, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^conn, _}, 5000
+
+    Task.await(big_task, 40_000)
+
+    total = @midtxn_rows + 1
+
+    # loss=0: every row of the control txn AND the whole re-streamed large txn is present.
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == total end, 800)
+
+    assert rows(ctrl, "SELECT id FROM sink_orders ORDER BY id") ==
+             Enum.map(1..total, &[&1])
+
+    # effect-dup=0: the ledger (not the PK-upsert, which would MASK a dup) proves every
+    # committed LSN applied exactly once — the discarded in-flight txn produced no
+    # duplicate on the re-stream.
+    assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
+  end
+
+  # ADVERSARIAL CRASH-INJECTION (spec §12.2 line 144: "kill the Connection ... DURING A
+  # KEEPALIVE"). When the stream is idle (all committed WAL drained, no txn buffering)
+  # the only Connection↔PG traffic is the primary-keepalive/standby-status exchange, on
+  # which the Connection replies with its DURABLE checkpoint. This test kills the
+  # Connection in that idle/keepalive window and proves the kill on the ack/keepalive
+  # path loses nothing and duplicates nothing (the ack only advances the idempotent
+  # checkpoint — re-running it is a no-op).
+  #
+  # DETERMINISTIC idle window (not a bare sleep-and-hope): after the pre-kill txns land,
+  # `wait_until_idle/2` confirms the pipeline reached the idle state by THREE signals — the
+  # durable `checkpoint_lsn` advanced past 0 (a commit landed), the `received_lsn` frontier
+  # is STABLE across a settle interval (no new WAL arriving → the stream drained → the only
+  # traffic is the keepalive/standby-status exchange), AND the AssemblerServer's open buffer
+  # is nil (no txn mid-assembly). Only then is the Connection killed. Post-kill txns are
+  # streamed and everything (pre- and post-kill) is asserted present exactly once.
+  test "during-keepalive kill: an idle-window crash loses nothing, duplicates nothing", %{
+    ctrl: ctrl,
+    slot: slot
+  } do
+    start_pipeline(slot)
+
+    for id <- 1..3, do: insert(ctrl, id, "pre#{id}")
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 3 end)
+
+    conn = connection_pid(slot)
+    asm = assembler_pid(slot)
+
+    # Drive the pipeline to a verified idle/keepalive state before the kill: durable
+    # checkpoint advanced, received frontier stable (drained), assembler buffer nil.
+    caught_up_lsn = wait_until_idle(conn, asm)
+
+    IO.puts(
+      "\n[keepalive] Connection idle at durable checkpoint_lsn #{caught_up_lsn}, received " <>
+        "frontier stable (WAL drained), assembler buffer nil — killing on the keepalive/ack path"
+    )
+
+    ref = Process.monitor(conn)
+    Process.exit(conn, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^conn, _}, 5000
+
+    # More txns after the idle-window kill; the pipeline restarts (:one_for_all) and
+    # resumes from the durable checkpoint.
+    for id <- 4..6, do: insert(ctrl, id, "post#{id}")
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 6 end, 400)
+
+    # loss=0: the full pre- AND post-kill row set is present after resume.
+    assert rows(ctrl, "SELECT id, note FROM sink_orders ORDER BY id") == [
+             [1, "pre1"],
+             [2, "pre2"],
+             [3, "pre3"],
+             [4, "post4"],
+             [5, "post5"],
+             [6, "post6"]
+           ]
+
+    # effect-dup=0: the ledger proves every committed LSN applied exactly once — the kill
+    # on the keepalive/ack path duplicated nothing.
     assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
@@ -256,6 +425,67 @@ defmodule Replicant.CrashInjectionTest do
     _, _ -> nil
   end
 
+  # The durable checkpoint LSN from `_replicant_checkpoint` (nil before the first commit).
+  defp checkpoint_lsn(c) do
+    case rows(c, "SELECT lsn FROM _replicant_checkpoint WHERE id = 1") do
+      [[lsn]] -> lsn
+      [] -> nil
+    end
+  end
+
+  # Drive-and-verify the pipeline into the idle/keepalive window and return the idle LSN.
+  #
+  # Idle is a VERIFIED precondition of the kill (not a bare sleep): (1) the Connection's
+  # durable `checkpoint_lsn` has advanced past 0 (a commit landed) and (2) its
+  # `received_lsn` frontier is STABLE across a sampling interval — no new WAL is arriving,
+  # so the stream has drained and the only Connection↔PG traffic is the primary-
+  # keepalive/standby-status exchange (on which the Connection replies with `checkpoint_lsn`)
+  # — and (3) the AssemblerServer's open buffer is nil (no txn mid-assembly). Note the
+  # idle `received_lsn` sits a small CONSTANT gap above `checkpoint_lsn` (the WAL of the
+  # commit record's own tail after the last applied commit), so idleness is stability of
+  # the frontier, NOT `received == checkpoint`.
+  defp wait_until_idle(conn, asm) do
+    PG16.wait_until(fn -> idle_lsn(conn, asm) != nil end, 400)
+    idle_lsn(conn, asm) || flunk_idle()
+  end
+
+  defp flunk_idle, do: ExUnit.Assertions.flunk("pipeline never reached a verified idle state")
+
+  defp idle_lsn(conn, asm) do
+    with %Replicant.Connection{checkpoint_lsn: cp, received_lsn: r1} when cp > 0 <-
+           safe_conn_state(conn),
+         nil <- buffered_txn(asm),
+         :stable <- frontier_stable(conn, r1) do
+      cp
+    else
+      _ -> nil
+    end
+  end
+
+  # `:stable` when the Connection's `received_lsn` frontier is unchanged after a short
+  # settle — i.e. no new WAL frame arrived in the window, the drained/idle signal.
+  defp frontier_stable(conn, r1) do
+    Process.sleep(60)
+
+    case safe_conn_state(conn) do
+      %Replicant.Connection{received_lsn: ^r1} -> :stable
+      _ -> :moving
+    end
+  end
+
+  # nil when the AssemblerServer has no open transaction buffer (idle), the buffer map
+  # otherwise, `:unreadable` if the state can't be read. Confirms no txn is mid-assembly.
+  defp buffered_txn(asm) do
+    case :sys.get_state(asm, 200) do
+      %{asm: %Replicant.Assembler{txn: txn}} -> txn
+      _ -> :unreadable
+    end
+  rescue
+    _ -> :unreadable
+  catch
+    _, _ -> :unreadable
+  end
+
   defp attach_sink_too_slow(slot) do
     :telemetry.attach(
       {__MODULE__, {:too_slow, slot}},
@@ -316,12 +546,32 @@ defmodule Replicant.CrashInjectionTest do
     Postgrex.query!(c, "CREATE PUBLICATION orders_pub FOR TABLE orders", [])
   end
 
-  defp drop_slot(c, slot) do
+  # Drop the slot, tolerating the transient "replication slot is active" window: after a
+  # `Process.exit(conn, :kill)` the PG-side walsender releases the slot slightly AFTER the
+  # BEAM pipeline tears down, so an immediate `pg_drop_replication_slot` can raise
+  # `... is active for PID ...`. Retry on any error for ~1s, then a final raising attempt
+  # so a genuine teardown fault (not the active-slot race) still surfaces. On a
+  # non-existent slot the `WHERE` matches no rows → a no-op success (the `setup` pre-drop).
+  defp drop_slot(c, slot), do: drop_slot(c, slot, 20)
+
+  defp drop_slot(c, slot, 0) do
     Postgrex.query!(
       c,
       "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
       [slot]
     )
+  end
+
+  defp drop_slot(c, slot, tries) do
+    Postgrex.query!(
+      c,
+      "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
+      [slot]
+    )
+  rescue
+    _ ->
+      Process.sleep(50)
+      drop_slot(c, slot, tries - 1)
   end
 
   defp insert(c, id, note),
@@ -339,6 +589,7 @@ defmodule Replicant.CrashInjectionTest do
     do: rows(c, "SELECT count(*) FROM _replicant_calls WHERE outcome = 'skipped'") |> hd() |> hd()
 
   defp connection_pid(slot), do: lookup_pid({slot, :connection})
+  defp assembler_pid(slot), do: lookup_pid({slot, :assembler})
 
   defp lookup_pid(key) do
     PG16.wait_until(fn -> match?([{_, _}], Registry.lookup(Replicant.Registry, key)) end, 200)

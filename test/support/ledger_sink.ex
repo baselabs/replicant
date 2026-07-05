@@ -170,3 +170,91 @@ defmodule Replicant.Test.FailOpenLedgerSink do
   @impl true
   def handle_transaction(txn), do: LedgerSink.handle_transaction(txn)
 end
+
+defmodule Replicant.Test.PauseGate do
+  @moduledoc """
+  Test-only coordination gate for `Replicant.Test.PausingLedgerSink`. Holds the pid
+  to notify and whether the sink is currently "armed" to pause the next multi-row
+  transaction. An `Agent` registered under this module name, started (and torn down)
+  by the mid-transaction crash-injection test. Not part of `lib/` — a pure test
+  harness so the mid-transaction kill lands deterministically at the sink boundary
+  (the assembler having fully assembled the txn but NOT yet durably committed it),
+  which `:sys.get_state`-polling the assembler's in-buffer state could not catch
+  reliably (the assembler churns a large frame burst faster than a poll can observe).
+  """
+
+  @doc "Start the gate armed to pause the next txn of `>= min_changes` rows, notifying `notify`."
+  @spec start_link(pid(), pos_integer()) :: Agent.on_start()
+  def start_link(notify, min_changes) do
+    Agent.start_link(fn -> %{notify: notify, armed: true, min_changes: min_changes} end,
+      name: __MODULE__
+    )
+  end
+
+  @doc "Disarm the gate so the re-streamed txn (after the kill) applies without pausing."
+  @spec disarm() :: :ok
+  def disarm, do: Agent.update(__MODULE__, &%{&1 | armed: false})
+
+  @doc """
+  Decide whether to pause for a txn of `change_count` rows. When armed AND
+  `change_count >= min_changes`, atomically disarm (so only ONE txn is paused),
+  return `{:pause, notify_pid}`; else `:apply`.
+  """
+  @spec decide(non_neg_integer()) :: {:pause, pid()} | :apply
+  def decide(change_count) do
+    Agent.get_and_update(__MODULE__, fn state ->
+      if state.armed and change_count >= state.min_changes do
+        {{:pause, state.notify}, %{state | armed: false}}
+      else
+        {:apply, state}
+      end
+    end)
+  end
+end
+
+defmodule Replicant.Test.PausingLedgerSink do
+  @moduledoc """
+  A `LedgerSink` that pauses (blocks the AssemblerServer) inside `handle_transaction/1`
+  for the FIRST large multi-row transaction, to make a MID-TRANSACTION kill (spec §12.2)
+  deterministic. When the `Replicant.Test.PauseGate` is armed and the transaction has
+  `>= min_changes` changes, it notifies the test with `{:sink_paused, commit_lsn,
+  change_count}` — the transaction is now fully ASSEMBLED but NOT durably committed (no
+  rows written, the checkpoint still at the prior txn) — then blocks on `receive` until
+  the test either releases it or (the real path) kills the Connection, whose `:one_for_all`
+  restart terminates this blocked AssemblerServer, discarding the in-flight transaction.
+
+  On the re-streamed retry after the restart the gate is disarmed, so the transaction
+  applies exactly once through the durable `LedgerSink`. `checkpoint/0` delegates to the
+  real durable read so resume works normally.
+
+  This is the sanctioned test-only instrumentation hook (the task's fallback): it fires
+  DETERMINISTICALLY at the sink boundary with the transaction in-flight-not-committed —
+  the exact precondition a mid-transaction crash must survive — rather than relying on a
+  racy `:sys.get_state` catch of the transient in-buffer state. No `lib/` change, no
+  `lib/` telemetry.
+  """
+  @behaviour Replicant.Sink
+
+  alias Replicant.Test.{LedgerSink, PauseGate}
+  alias Replicant.Transaction
+
+  @impl true
+  def checkpoint, do: LedgerSink.checkpoint()
+
+  @impl true
+  def handle_transaction(%Transaction{commit_lsn: lsn, changes: changes} = txn) do
+    case PauseGate.decide(length(changes)) do
+      {:pause, notify} ->
+        send(notify, {:sink_paused, lsn, length(changes)})
+        # Block here with the txn assembled but NOT durably committed. The test kills
+        # the Connection during this window; :one_for_all terminates this process, so
+        # this receive typically never returns. `:release` is a graceful escape hatch.
+        receive do
+          :release -> LedgerSink.handle_transaction(txn)
+        end
+
+      :apply ->
+        LedgerSink.handle_transaction(txn)
+    end
+  end
+end
