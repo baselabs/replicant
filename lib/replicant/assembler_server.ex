@@ -45,7 +45,7 @@ defmodule Replicant.AssemblerServer do
       Replicant.CheckpointStore.write(Replicant.CheckpointStore.via(slot_name), lsn)
     end
 
-    Assembler.new(sink, mode: :lib, checkpoint_writer: writer)
+    Assembler.new(sink, mode: :lib, checkpoint_writer: writer, slot_name: slot_name)
   end
 
   defp build_assembler(_slot_name, sink, nil), do: Assembler.new(sink)

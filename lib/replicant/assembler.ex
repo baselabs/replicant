@@ -62,7 +62,8 @@ defmodule Replicant.Assembler do
           ordinal: non_neg_integer(),
           mode: :sink_owned | :lib,
           checkpoint_writer: (lsn() -> :ok | {:error, term()}) | nil,
-          lib_checkpoint: lsn() | nil
+          lib_checkpoint: lsn() | nil,
+          slot_name: String.t() | nil
         }
 
   @type buffer :: %{
@@ -80,7 +81,8 @@ defmodule Replicant.Assembler do
     ordinal: 0,
     mode: :sink_owned,
     checkpoint_writer: nil,
-    lib_checkpoint: nil
+    lib_checkpoint: nil,
+    slot_name: nil
   ]
 
   @doc """
@@ -90,8 +92,9 @@ defmodule Replicant.Assembler do
     * (default) sink-owned — the sink returns its own checkpoint; `checkpoint/0`
       is the watermark read live per Commit;
     * `mode: :lib` — the library owns the checkpoint: `:checkpoint_writer` (a
-      `(lsn -> :ok | {:error, _})`) persists it after the sink, and
-      `:lib_checkpoint` seeds the in-memory watermark used by the pre-skip.
+      `(lsn -> :ok | {:error, _})`) persists it after the sink, `:lib_checkpoint`
+      seeds the in-memory watermark used by the pre-skip, and `:slot_name` labels
+      the value-free `[:replicant, :checkpoint_store, :failed]` telemetry (spec §10).
   """
   @spec new(module(), keyword()) :: t()
   def new(sink, opts \\ []) do
@@ -99,7 +102,8 @@ defmodule Replicant.Assembler do
       sink: sink,
       mode: Keyword.get(opts, :mode, :sink_owned),
       checkpoint_writer: Keyword.get(opts, :checkpoint_writer),
-      lib_checkpoint: Keyword.get(opts, :lib_checkpoint)
+      lib_checkpoint: Keyword.get(opts, :lib_checkpoint),
+      slot_name: Keyword.get(opts, :slot_name)
     }
   end
 
@@ -517,6 +521,7 @@ defmodule Replicant.Assembler do
             # Triage fidelity: label a checkpoint-store WRITE fault as a checkpoint_store
             # failure (not :sink_failed) — the sink persisted fine; the store write did not.
             Telemetry.event([:replicant, :checkpoint_store, :failed], %{duration: duration}, %{
+              slot_name: asm.slot_name,
               reason: :checkpoint_store_failed
             })
 

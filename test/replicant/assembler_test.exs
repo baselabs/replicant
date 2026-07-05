@@ -269,6 +269,32 @@ defmodule Replicant.AssemblerTest do
       :telemetry.detach({__MODULE__, :telemetry})
     end
 
+    test "a WRITE fault emits [:checkpoint_store, :failed] carrying slot_name (spec §10 shape)" do
+      # §10 specifies the :failed metadata as (slot_name, reason). The Assembler is the
+      # third emission site (with CheckpointStore + Connection); it must carry slot_name too.
+      attach_telemetry(self())
+
+      writer = fn _lsn -> {:error, :store_down} end
+
+      asm =
+        Assembler.new(OkSink,
+          mode: :lib,
+          checkpoint_writer: writer,
+          lib_checkpoint: nil,
+          slot_name: "rep_slot_x"
+        )
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      assert {:halt, %Replicant.Error{reason: :checkpoint_store_failed}, _asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 100, commit_timestamp: nil})
+
+      assert_received {:tel, [:replicant, :checkpoint_store, :failed],
+                       %{slot_name: "rep_slot_x", reason: :checkpoint_store_failed}}
+    after
+      :telemetry.detach({__MODULE__, :telemetry})
+    end
+
     test "a dead-store writer EXIT is caught value-free and halts :checkpoint_store_failed (not :decode_failure)" do
       writer = fn _lsn -> exit(:noproc) end
       asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
@@ -604,6 +630,7 @@ defmodule Replicant.AssemblerTest do
         [:replicant, :transaction, :assembled],
         [:replicant, :sink, :committed],
         [:replicant, :sink, :failed],
+        [:replicant, :checkpoint_store, :failed],
         [:replicant, :schema_change, :additive],
         [:replicant, :schema_change, :halted]
       ],
