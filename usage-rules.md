@@ -10,16 +10,18 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   transaction-granularity exactly-once semantics.
 - **Is not:** Ash-aware, tenant-aware, or classification-aware. Never put
   multitenancy or sensitive-data logic here — that is `ash_replicant`'s job.
-- **Is not (yet):** a live streaming client. This version ships the offline
-  core (decode / assemble / validate / redact). The
-  `Postgrex.ReplicationConnection` that owns the slot and streams live WAL is a
-  later slice.
+- **Is:** a live streaming client. Owns the replication slot via
+  `Postgrex.ReplicationConnection`, acks only after the sink durably commits
+  (ack-after-checkpoint), and halts fail-closed on slot invalidation — proven
+  by a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
 
 ## Public surface
 
-- **`Replicant`** — the facade module. `t:lsn/0` (a `non_neg_integer` 64-bit
-  LSN, `(file <<< 32) ||| offset`) and `lsn_to_string/1` (uppercase
-  `"file/offset"` hex display, matching Postgres `pg_lsn`).
+- **`Replicant`** — the facade module. `start_link/1` starts a supervised
+  streaming pipeline (validates opts, enforces the go-forward guard) and
+  `stop/1` tears one down; `t:lsn/0` (a `non_neg_integer` 64-bit LSN,
+  `(file <<< 32) ||| offset`) and `lsn_to_string/1` (uppercase `"file/offset"`
+  hex display, matching Postgres `pg_lsn`).
 - **`Replicant.Transaction`** — an assembled, committed transaction: ordered
   changes plus the transaction's single `commit_lsn`.
 - **`Replicant.Change`** — a single row change (`insert`/`update`/`delete`),
@@ -34,6 +36,15 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   parser; catches and redacts any raise into a value-free `Replicant.Error`.
 - **`Replicant.Assembler`** — groups decoded messages into
   `Replicant.Transaction`s by `commit_lsn`.
+- **`Replicant.Connection`** — the `Postgrex.ReplicationConnection` that owns
+  the replication slot: ack-after-checkpoint keepalive replies, async ack,
+  slot-invalidation fail-closed halt, and the bounded in-flight window.
+- **`Replicant.AssemblerServer`** — the serial process that applies the sink
+  synchronously off the keepalive path.
+- **`Replicant.Pipeline`** — the per-slot `:one_for_all` supervisor pairing a
+  Connection with an AssemblerServer; started by `Replicant.start_link/1`.
+- **`Replicant.Config`** — validates pipeline options + the go-forward-only
+  start guard.
 - **`Replicant.QueryBuilder`** — builds the identifier-validated SQL used to
   create/manage slots and publications.
 - **`Replicant.Identifier`** — allowlist validation for slot, publication, and

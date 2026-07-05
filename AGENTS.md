@@ -64,12 +64,14 @@ All gates must pass before a commit/PR. Update `CHANGELOG.md` under
   no `postgrex` dependency. The decoder conformance suite decodes REAL captured
   `pgoutput` bytes (walex's MIT-licensed capture, inlined and credited) for every
   message type — including the unchanged-TOAST sentinel and all replica-identity
-  modes. It never self-signs fixtures. Plan 2 adds an independent fresh docker-PG16
-  capture to corroborate.
-- **Integration + crash-injection tests** (Plan 2, `test/integration/**`): gate
+  modes. It never self-signs fixtures. An independent docker-PG16 capture
+  (`test/integration/pg16_conformance_test.exs`) corroborates it against a live
+  server.
+- **Integration + crash-injection tests** (`test/integration/**`): gate
   on `REPLICANT_TEST_URL` pointing at a live PG16 with `wal_level=logical`;
   skip when unset. Spin PG16 with
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:16`.
+  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
+  then `export REPLICANT_TEST_URL="postgres://postgres@localhost:5599/postgres"`.
 - **TDD:** write the test first.
 
 ## Docs & lifecycle-artifact policy

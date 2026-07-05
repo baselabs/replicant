@@ -10,10 +10,11 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic) and
 `ash_age`. Multitenancy, classification, and Ash resources live one layer up,
 in a future `ash_replicant` sink adapter.
 
-> **Status:** this release ships the **offline core** — decode, assemble,
-> validate, redact. Live streaming (the `Postgrex.ReplicationConnection` that
-> owns the replication slot and acks only after the sink commits) is the next
-> slice; it is not in this version. See "This is the offline core" below.
+> **Status:** live streaming has landed. Replicant owns the replication slot
+> via `Postgrex.ReplicationConnection`, acks only after the sink durably
+> commits (ack-after-checkpoint), halts fail-closed on slot invalidation, and
+> is proven by a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
+> See "How it streams" below.
 
 ## Highlights
 
@@ -58,21 +59,27 @@ Use `Replicant.lsn_to_string/1` for display; LSNs are WAL positions, not row
 data, so they are permitted in telemetry metadata. The exactly-once watermark
 check is plain integer comparison: `txn.commit_lsn <= checkpoint`.
 
-## This is the offline core
+## How it streams
 
-This release ships the decode / assemble / validate / redact core:
+A running pipeline is two processes under a `:one_for_all` supervisor:
 
-- the vendored `pgoutput` byte parser (credited in `NOTICE`),
-- the type-aware assembler that groups decoded messages into
-  `Replicant.Transaction`s by `commit_lsn`,
-- the identifier-validated SQL builder for slot/publication management, and
-- the pluggable `Replicant.Sink` behaviour that a consumer implements to
-  receive assembled transactions.
+- **`Replicant.Connection`** (`Postgrex.ReplicationConnection`) owns the
+  replication slot and the socket. It answers every keepalive with the **last
+  durably-checkpointed LSN** as the flush position (never the received
+  `wal_end`), decodes each WAL message behind the value-free boundary, and
+  forwards the decoded message to the assembler — it never runs the sink, so it
+  is always free to answer keepalives. It advances the ack asynchronously only
+  when the sink signals a durable commit, and halts fail-closed on slot
+  invalidation (`wal_status = 'lost'` / `conflicting`), a decode failure, or a
+  sustained sink-lag backlog (the bounded in-flight window).
+- **`Replicant.AssemblerServer`** applies the sink synchronously, off the
+  keepalive path, and halts fail-closed on a destructive schema change or a
+  sink write fault.
 
-Live streaming — the `Postgrex.ReplicationConnection` that owns the
-replication slot, feeds it decoded WAL, and acknowledges progress only after
-the sink has durably committed — is not part of this release. Nothing here
-opens a replication connection or talks to a live server.
+Because the ack reports only the durable checkpoint, a crash between dispatch
+and persist re-delivers from the older `confirmed_flush` and the idempotent
+sink dedups — the exactly-once seam that `walex`'s fire-and-forget
+`wal_end + 1` ack does not have.
 
 ## The 5 critical rules (see `AGENTS.md` for the full text)
 
@@ -94,35 +101,32 @@ def deps do
 end
 ```
 
-## Usage sketch (offline core)
+## Usage
 
-The public surface today covers the offline pipeline pieces — decode an
-already-captured `pgoutput` message, assemble transactions, and validate
-identifiers before building slot/publication SQL:
-
-```elixir
-# Decode a single pgoutput protocol message (never raises; redacts on failure).
-{:ok, message} = Replicant.Decoder.decode(bytes)
-
-# Validate an identifier before it reaches SQL.
-:ok = Replicant.Identifier.validate("my_publication")
-
-# Compare LSNs as plain integers — this is the exactly-once watermark check.
-Replicant.lsn_to_string(transaction.commit_lsn)
-#=> "0/16E3778"
-```
-
-A sink implements `Replicant.Sink` to receive assembled
-`Replicant.Transaction`s once live streaming ships:
+Start a pipeline against a standby with `Replicant.start_link/1`, pointing it at
+a sink that implements `checkpoint/0` + `handle_transaction/1`:
 
 ```elixir
-defmodule MyApp.Sink do
+Replicant.start_link(
+  connection: [hostname: "standby.internal", port: 5432, username: "u",
+               password: "p", database: "orders", ssl: true],
+  slot_name: "replicant_orders",
+  publication: "orders_pub",
+  sink: MyApp.OrdersSink,
+  go_forward_only: false
+)
+
+defmodule MyApp.OrdersSink do
   @behaviour Replicant.Sink
 
   @impl true
-  def handle_transaction(%Replicant.Transaction{} = txn) do
-    # Persist txn.changes durably, keyed by txn.commit_lsn, before returning.
-    :ok
+  def checkpoint, do: {:ok, MyApp.Repo.last_committed_lsn()}
+
+  @impl true
+  def handle_transaction(%Replicant.Transaction{commit_lsn: lsn} = txn) do
+    # In ONE DB transaction: skip if lsn <= checkpoint, else upsert txn.changes
+    # by table PK and persist lsn as the new checkpoint. Then:
+    {:ok, lsn}
   end
 end
 ```
@@ -141,20 +145,21 @@ identifier-validation, and tenant-blind invariants — live in
 
 ## Roadmap
 
-This release is **Plan 1 — the offline core** (decode / assemble / validate /
-redact), proven by unit tests plus a real-`pgoutput`-byte conformance suite with **no
-live database**. Every public module named above ships today.
+**Plan 1 (offline core)** and **Plan 2 (live streaming + exactly-once)** have
+both shipped: decode / assemble / validate / redact, plus the
+`Postgrex.ReplicationConnection` that owns the slot with ack-after-checkpoint,
+slot-invalidation fail-closed halt, the bounded in-flight window, and a
+real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0.
 
-The next slice, **Plan 2 — live streaming + exactly-once**, adds:
+The remaining slices are the spec §3 non-goals, each a named future subsystem
+that composes on this streaming core (the v1 primitive is fail-closed without
+it):
 
-- `Replicant.Connection` (`Postgrex.ReplicationConnection`): replication-slot
-  lifecycle, **ack-after-checkpoint** + keepalive, **slot-invalidation fail-closed
-  halt**, reconnect/backoff, and a go-forward-only start guard.
-- A **crash-injection integration suite** (real PG16): kill the process at
-  adversarial points and assert exactly-once delivery.
-
-Until Plan 2 lands, `replicant` decodes and assembles committed transactions from
-`pgoutput` bytes you supply — it does not yet own a live replication connection.
+- initial snapshot / backfill (`replicant-snapshot`),
+- multi-transaction batching (`replicant-batching`),
+- `pgoutput` proto ≥ 2 in-progress-transaction streaming (`replicant-streaming`),
+- a non-transactional-sink checkpoint store (`replicant-checkpoint-store`), and
+- the Ash / tenancy / classification sink (`ash_replicant`, a sibling library).
 
 ## Credits
 

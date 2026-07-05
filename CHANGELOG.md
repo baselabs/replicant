@@ -50,10 +50,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sink raise/throw/exit failures are labeled `:sink_failed` (distinguishable from a
   casting `:decode_failure`).
 
-### Pending — Plan 2 (next slice): live streaming + exactly-once
+### Added — Plan 2: live streaming + exactly-once
 
-- `Replicant.Connection` (`Postgrex.ReplicationConnection`): slot lifecycle,
-  ack-after-checkpoint + keepalive, slot-invalidation fail-closed halt,
-  reconnect/backoff, and a go-forward-only start guard.
-- The crash-injection integration suite (real PG16; kill at adversarial points; assert
-  exactly-once). Not in this release.
+- `Replicant.Connection` (`Postgrex.ReplicationConnection`) — owns the replication
+  slot and advances it only after the sink durably commits: keepalive replies and
+  the async ack report the **last durably-checkpointed LSN** as the flush position
+  (never the received `wal_end` — fixes walex's fire-and-forget `wal_end+1`
+  at-most-once ack). Decodes each WAL message behind the value-free boundary and
+  forwards decoded messages to the assembler; never blocks on the sink.
+- **Slot-invalidation fail-closed halt** (spec §8 R-ISO) — detects `wal_status = 'lost'`
+  or `conflicting` on PG16 (not `invalidation_reason`, which is PG17+) and halts the
+  pipeline permanently rather than silently recreating the slot.
+- `Replicant.AssemblerServer` — a serial process that applies the sink synchronously
+  off the keepalive path; halts fail-closed on a destructive schema change or a sink
+  write fault. `Replicant.Pipeline` (`:one_for_all`) + `Replicant.Supervisor`
+  (`DynamicSupervisor`) + `Replicant.Application` + `Replicant.Registry`.
+- **Go-forward-only start guard** (`Replicant.Config`) — refuses a `:state_mirror`
+  sink resuming from an empty checkpoint without `go_forward_only: true`.
+- **Bounded in-flight window + fail-closed "sink cannot keep up" lag-halt** (spec §4) —
+  the Connection tracks un-checkpointed WAL lag and halts fail-closed past a
+  configurable `:max_inflight_lag` (default 64 MiB backlog ceiling) rather than
+  growing the assembler mailbox unboundedly; keepalive-safe (never blocks the
+  Connection).
+- `byte_size` + `lag_ms` on `[:replicant, :transaction, :assembled]`; the
+  `[:replicant, :connection, *]` and `[:replicant, :checkpoint, :advanced]` events.
+- Gated crash-injection integration suite (real PG16, `wal_level=logical`): baseline
+  exactly-once, crash-and-resume (loss = 0), re-delivery dedup (effect-dup = 0),
+  mid-transaction + during-keepalive kills, the §4 backpressure spike, and an
+  independent PG16 `pgoutput`-conformance capture.
+- `postgrex ~> 0.22` dependency (co-resolves with `decimal ~> 3.1`).
