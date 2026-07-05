@@ -17,6 +17,7 @@ defmodule Replicant.Config do
           publication: String.t(),
           sink: module(),
           go_forward_only: boolean(),
+          snapshot: boolean(),
           max_inflight_lag: pos_integer()
         }
 
@@ -29,20 +30,30 @@ defmodule Replicant.Config do
   """
   @spec validate(keyword()) ::
           {:ok, t()}
-          | {:error, :config_invalid | :invalid_identifier | :invalid_sink}
+          | {:error,
+             :config_invalid
+             | :invalid_identifier
+             | :invalid_sink
+             | :conflicting_start_mode
+             | :snapshot_unsupported}
   def validate(opts) when is_list(opts) do
     with {:ok, connection} <- fetch_connection(opts),
          {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
          {:ok, publication} <- fetch_identifier(opts, :publication),
          {:ok, sink} <- fetch_sink(opts),
-         {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts) do
+         {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
+         go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
+         snapshot = Keyword.get(opts, :snapshot, false) == true,
+         :ok <- validate_start_mode(go_forward_only, snapshot),
+         :ok <- validate_snapshot_support(snapshot, sink) do
       {:ok,
        %{
          connection: connection,
          slot_name: slot_name,
          publication: publication,
          sink: sink,
-         go_forward_only: Keyword.get(opts, :go_forward_only, false) == true,
+         go_forward_only: go_forward_only,
+         snapshot: snapshot,
          max_inflight_lag: max_inflight_lag
        }}
     end
@@ -60,9 +71,10 @@ defmodule Replicant.Config do
   sink; only a definitive empty checkpoint proves partial-delivery risk).
   """
   @spec guard(t()) :: :ok | {:error, :go_forward_required}
-  def guard(%{sink: sink, go_forward_only: go_forward_only}) do
+  def guard(%{sink: sink, go_forward_only: go_forward_only, snapshot: snapshot}) do
     cond do
       go_forward_only == true -> :ok
+      snapshot == true -> :ok
       Sink.sink_kind(sink) != :state_mirror -> :ok
       checkpoint_definitively_empty?(sink) -> {:error, :go_forward_required}
       true -> :ok
@@ -85,6 +97,18 @@ defmodule Replicant.Config do
     _ -> :read_fault
   catch
     _kind, _reason -> :read_fault
+  end
+
+  # go_forward_only and snapshot are mutually exclusive explicit start intents.
+  defp validate_start_mode(true, true), do: {:error, :conflicting_start_mode}
+  defp validate_start_mode(_gfo, _snapshot), do: :ok
+
+  # snapshot: true requires BOTH snapshot callbacks — a partial sink is refused rather
+  # than half-running a backfill (spec §7).
+  defp validate_snapshot_support(false, _sink), do: :ok
+
+  defp validate_snapshot_support(true, sink) do
+    if Sink.supports_snapshot?(sink), do: :ok, else: {:error, :snapshot_unsupported}
   end
 
   # The bounded in-flight window ceiling (WAL bytes, spec §4). Omitted → the

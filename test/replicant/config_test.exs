@@ -52,6 +52,18 @@ defmodule Replicant.ConfigTest do
     def sink_kind, do: :stat_mirror
   end
 
+  defmodule SnapshotCapableEmpty do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, nil}
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+    @impl true
+    def handle_snapshot(_changes, _ctx), do: :ok
+    @impl true
+    def handle_snapshot_complete(lsn), do: {:ok, lsn}
+  end
+
   @base [
     connection: [
       hostname: "standby.internal",
@@ -148,6 +160,33 @@ defmodule Replicant.ConfigTest do
       # so a typo cannot silently bypass the guard and partial-deliver.
       {:ok, cfg} = Config.validate(@base ++ [sink: InvalidKindEmpty])
       assert {:error, :go_forward_required} = Config.guard(cfg)
+    end
+  end
+
+  describe "snapshot start mode (spec §7)" do
+    test "accepts snapshot: true for a snapshot-capable sink and normalises the flag" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: SnapshotCapableEmpty, snapshot: true])
+      assert cfg.snapshot == true
+    end
+
+    test "snapshot: true satisfies the go-forward guard for an empty state-mirror sink" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: SnapshotCapableEmpty, snapshot: true])
+      assert :ok = Config.guard(cfg)
+    end
+
+    test "rejects go_forward_only + snapshot both true (conflicting intents)" do
+      opts = @base ++ [sink: SnapshotCapableEmpty, snapshot: true, go_forward_only: true]
+      assert {:error, :conflicting_start_mode} = Config.validate(opts)
+    end
+
+    test "rejects snapshot: true when the sink lacks the snapshot callbacks" do
+      opts = @base ++ [sink: StateMirrorEmpty, snapshot: true]
+      assert {:error, :snapshot_unsupported} = Config.validate(opts)
+    end
+
+    test "snapshot defaults to false and does not affect a normal config" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.snapshot == false
     end
   end
 end
