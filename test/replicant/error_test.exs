@@ -54,4 +54,11 @@ defmodule Replicant.ErrorTest do
       assert msg =~ "shape=Postgrex.Error"
     end
   end
+
+  test "checkpoint-store reasons build and render structurally" do
+    e = %Replicant.Error{reason: :checkpoint_store_failed}
+    assert Replicant.Error.message(e) =~ "reason=checkpoint_store_failed"
+    m = %Replicant.Error{reason: :checkpoint_store_schema_mismatch, shape: "commit_lsn=text"}
+    assert Replicant.Error.message(m) =~ "shape=commit_lsn=text"
+  end
 end

@@ -18,6 +18,8 @@ defmodule Replicant.Error do
           | :slot_invalidated
           | :config_invalid
           | :snapshot_failed
+          | :checkpoint_store_failed
+          | :checkpoint_store_schema_mismatch
 
   @type t :: %__MODULE__{
           reason: reason(),

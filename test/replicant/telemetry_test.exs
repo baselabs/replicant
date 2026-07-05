@@ -54,6 +54,17 @@ defmodule Replicant.TelemetryTest do
     end
   end
 
+  test "slot_name is a permitted (value-free) metadata key" do
+    assert %{slot_name: "rep_x", commit_lsn: 5} =
+             Telemetry.validate!(%{slot_name: "rep_x", commit_lsn: 5})
+  end
+
+  test "TRIPWIRE: a non-allowlisted (row-value-shaped) key still raises" do
+    assert_raise ArgumentError, ~r/value-free allowlist/, fn ->
+      Telemetry.validate!(%{customer_email: "a@b.c"})
+    end
+  end
+
   describe "span/3" do
     test "a stop-side off-allowlist metadata key raises (Critical Rule 1 on the merged meta)" do
       # span/3 merges start + stop meta and re-validates before the stop event —
