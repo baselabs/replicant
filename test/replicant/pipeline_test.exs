@@ -57,4 +57,41 @@ defmodule Replicant.PipelineTest do
     # Not restarted: no pipeline child re-registers under the slot.
     assert Registry.lookup(Replicant.Registry, {"pl_halt", :pipeline}) == []
   end
+
+  test "lib-mode config starts a CheckpointStore child registered by slot" do
+    config = %{
+      connection: [hostname: "127.0.0.1", port: 1],
+      slot_name: "pl_lib_#{System.unique_integer([:positive])}",
+      publication: "p",
+      sink: Replicant.Test.RecordingSink,
+      go_forward_only: false,
+      snapshot: false,
+      max_inflight_lag: 64 * 1024 * 1024,
+      checkpoint_store: [connection: [hostname: "127.0.0.1", port: 1], table: "cp"]
+    }
+
+    {:ok, _sup} = Replicant.Pipeline.start_link(config)
+    on_exit(fn -> Replicant.Supervisor.stop_pipeline(config.slot_name) end)
+
+    assert [{_pid, _}] =
+             Registry.lookup(Replicant.Registry, {config.slot_name, :checkpoint_store})
+  end
+
+  test "sink-owned config starts NO CheckpointStore child" do
+    config = %{
+      connection: [hostname: "127.0.0.1", port: 1],
+      slot_name: "pl_owned_#{System.unique_integer([:positive])}",
+      publication: "p",
+      sink: Replicant.Test.RecordingSink,
+      go_forward_only: false,
+      snapshot: false,
+      max_inflight_lag: 64 * 1024 * 1024,
+      checkpoint_store: nil
+    }
+
+    {:ok, _sup} = Replicant.Pipeline.start_link(config)
+    on_exit(fn -> Replicant.Supervisor.stop_pipeline(config.slot_name) end)
+
+    assert [] == Registry.lookup(Replicant.Registry, {config.slot_name, :checkpoint_store})
+  end
 end

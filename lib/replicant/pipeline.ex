@@ -7,8 +7,10 @@ defmodule Replicant.Pipeline do
   `Replicant.Registry` so `Replicant.Supervisor.halt/2` can terminate the whole
   pipeline permanently on a fail-closed condition.
 
-  The AssemblerServer starts first (the Connection casts decoded messages to it;
-  with `sync_connect: false` the Connection does not stream until after boot).
+  The AssemblerServer starts before the Connection (the Connection casts decoded
+  messages to it; with `sync_connect: false` the Connection does not stream until
+  after boot). In lib mode the CheckpointStore starts first of all, so the
+  Connection can read it on connect and the AssemblerServer can write through it.
   """
   use Supervisor
 
@@ -23,11 +25,28 @@ defmodule Replicant.Pipeline do
 
   @impl true
   def init(config) do
-    children = [
-      {Replicant.AssemblerServer, slot_name: config.slot_name, sink: config.sink},
-      {Replicant.Connection, config}
-    ]
+    children =
+      checkpoint_store_child(config) ++
+        [
+          {Replicant.AssemblerServer, assembler_opts(config)},
+          {Replicant.Connection, config}
+        ]
 
     Supervisor.init(children, strategy: :one_for_all)
   end
+
+  # Lib mode: the CheckpointStore is the FIRST child (the Connection reads it on connect,
+  # the AssemblerServer writes through it). It uses a non-sync Postgrex connect, so a boot
+  # blip does not fail the `:temporary` pipeline.
+  defp checkpoint_store_child(%{checkpoint_store: store, slot_name: slot}) when is_list(store),
+    do: [{Replicant.CheckpointStore, slot_name: slot, checkpoint_store: store}]
+
+  defp checkpoint_store_child(_config), do: []
+
+  defp assembler_opts(%{checkpoint_store: store, slot_name: slot, sink: sink})
+       when is_list(store),
+       do: [slot_name: slot, sink: sink, checkpoint_store: store]
+
+  defp assembler_opts(%{slot_name: slot, sink: sink}),
+    do: [slot_name: slot, sink: sink]
 end
