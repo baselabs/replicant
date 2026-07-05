@@ -84,6 +84,7 @@ defmodule Replicant.Connection do
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
+          checkpoint_store: keyword() | nil,
           step: step()
         }
 
@@ -99,6 +100,7 @@ defmodule Replicant.Connection do
     checkpoint_state: :empty,
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
+    checkpoint_store: nil,
     step: :disconnected
   ]
 
@@ -148,17 +150,20 @@ defmodule Replicant.Connection do
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
+       checkpoint_store: Map.get(config, :checkpoint_store),
        step: :disconnected
      }}
   end
 
   @impl true
   def handle_connect(state) do
-    # Read the durable checkpoint (off the keepalive path — a blocking sink call is
-    # fine here). A read fault is fail-open (§14.15): resume from 0, the idempotent
-    # sink dedups the re-stream. This value seeds every keepalive ack until the
-    # first async advance.
-    {checkpoint_state, checkpoint_lsn} = read_checkpoint(state.sink)
+    # Read the durable checkpoint (off the keepalive path — a blocking read is fine
+    # here). In lib mode the store is the connect authority (a read FAULT halts
+    # fail-closed in :invalidation_check — never fail-open, since a non-idempotent
+    # lib-mode sink cannot dedup a resume-from-0). In sink-owned mode a read fault is
+    # fail-open (§14.15): resume from 0, the idempotent sink dedups the re-stream.
+    # This value seeds every keepalive ack until the first async advance.
+    {checkpoint_state, checkpoint_lsn} = read_checkpoint(state)
 
     # Reset the in-flight window on (re)connect. `stream_floor_lsn` is re-derived from
     # the FIRST XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
@@ -194,29 +199,16 @@ defmodule Replicant.Connection do
   end
 
   def handle_result([%Postgrex.Result{rows: rows}], %{step: :invalidation_check} = state) do
-    case classify_slot_status(rows) do
-      :absent when state.checkpoint_lsn > 0 ->
-        # DATA GAP (spec §8): the sink has durable state (checkpoint > 0) but the slot
-        # is gone (dropped/rebuilt/restored-from-backup). A fresh slot would begin
-        # streaming at its creation LSN, silently skipping every transaction between
-        # the sink's checkpoint and now — unrecoverable loss. Halt fail-closed with a
-        # distinct data-gap signal; NEVER silently recreate. (An EMPTY checkpoint —
-        # nil or a §14.15 read-fault, both read as 0 — is a genuine first run / go
-        # forward and DOES create the slot below.)
-        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: :data_gap})
-        Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_with_checkpoint})
-        {:disconnect, :data_gap}
+    cond do
+      lib_mode?(state) and state.checkpoint_state == :fault ->
+        lib_store_fault(state)
 
-      :absent ->
-        begin_absent_slot(state)
+      lib_mode?(state) and lib_go_forward_violation?(state) ->
+        Replicant.Supervisor.halt(state.slot_name, {:config, :go_forward_required})
+        {:disconnect, :go_forward_required}
 
-      :ok ->
-        begin_present_slot(state)
-
-      {:invalidated, reason} ->
-        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: reason})
-        Replicant.Supervisor.halt(state.slot_name, {:slot_invalidated, reason})
-        {:disconnect, :slot_invalidated}
+      true ->
+        classify_and_begin(rows, state)
     end
   end
 
@@ -351,7 +343,48 @@ defmodule Replicant.Connection do
     end
   end
 
+  @doc false
+  @spec lib_mode?(map()) :: boolean()
+  def lib_mode?(%{checkpoint_store: store}), do: is_list(store)
+  def lib_mode?(_), do: false
+
+  @doc false
+  @spec lib_go_forward_violation?(map()) :: boolean()
+  def lib_go_forward_violation?(%{
+        checkpoint_state: :empty,
+        sink: sink,
+        go_forward_only: false,
+        snapshot: false
+      }),
+      do: Replicant.Sink.sink_kind(sink) == :state_mirror
+
+  def lib_go_forward_violation?(_), do: false
+
   # ---- private ----
+
+  # A lib-mode store read FAULT at connect is potentially TRANSIENT — the store's
+  # non-sync Postgrex may still be connecting, or a brief blip. Do NOT permanently
+  # halt: disconnect so `auto_reconnect` re-runs the connect (re-reading the store). A
+  # transient blip self-heals on the next connect; we never stream past an unknown
+  # checkpoint (fail-closed BY DESIGN). Distinct from a WRITE fault mid-stream, which
+  # halts permanently (Task 5). Matches spec §8: a transient blip is absorbed, not halted.
+  #
+  # UNPACED under a PERSISTENT store outage: the store is a SEPARATE Postgrex connection.
+  # This replication connection's own `Protocol.connect` still SUCCEEDS every attempt (PG
+  # is up; only the store is down), so Postgrex's `reconnect_backoff` timer never arms —
+  # there is NO backoff between attempts. The connect → read-store → :fault → disconnect
+  # loop therefore spins with no pacing (bounded only by the per-attempt TCP connect +
+  # recovery/invalidation queries), surfacing this telemetry each turn. This is fail-closed
+  # by design (loss=0), NOT a paced retry. Bounded-retry-then-halt is the named §14.18
+  # future (deliberately out of this plan's scope).
+  defp lib_store_fault(state) do
+    Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
+      slot_name: state.slot_name,
+      reason: :checkpoint_store_failed
+    })
+
+    {:disconnect, :checkpoint_store_unavailable}
+  end
 
   # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor.
   # The floor is the higher of the durable `checkpoint_lsn` (once a commit advances
@@ -394,6 +427,8 @@ defmodule Replicant.Connection do
   end
 
   defp start_streaming(state) do
+    if lib_mode?(state), do: seed_assembler(state, state.checkpoint_lsn)
+
     {:ok, sql} =
       QueryBuilder.start_replication(state.slot_name, state.publication,
         start_lsn: state.checkpoint_lsn
@@ -402,7 +437,48 @@ defmodule Replicant.Connection do
     {:stream, sql, [], %{state | step: :streaming}}
   end
 
+  # Seed the lib-mode watermark from the SAME store read the connect used, before any
+  # Commit cast — this bounds the resume dup to a single transaction (the store
+  # checkpoint, ahead of the slot's confirmed_flush, otherwise re-streams N txns
+  # un-deduped). A no-op in sink-owned mode (never called; the assembler ignores
+  # lib_checkpoint there).
+  defp seed_assembler(state, lsn) when is_integer(lsn) do
+    GenServer.cast(AssemblerServer.via(state.slot_name), {:seed_lib_checkpoint, lsn})
+  end
+
   # ---- connect matrix (spec §8): slot presence × checkpoint state × snapshot mode ----
+
+  # The unchanged sink-owned slot-classification decision (also the lib-mode path once
+  # the two fail-closed gates in :invalidation_check pass): map the invalidation-status
+  # rows to a connect action. Extracted from the `cond` only to keep that branch
+  # cyclomatically small (credo) — every branch here is the pre-lib-mode behavior,
+  # verbatim.
+  defp classify_and_begin(rows, state) do
+    case classify_slot_status(rows) do
+      :absent when state.checkpoint_lsn > 0 ->
+        # DATA GAP (spec §8): the sink has durable state (checkpoint > 0) but the slot
+        # is gone (dropped/rebuilt/restored-from-backup). A fresh slot would begin
+        # streaming at its creation LSN, silently skipping every transaction between
+        # the sink's checkpoint and now — unrecoverable loss. Halt fail-closed with a
+        # distinct data-gap signal; NEVER silently recreate. (An EMPTY checkpoint —
+        # nil or a §14.15 read-fault, both read as 0 — is a genuine first run / go
+        # forward and DOES create the slot below.)
+        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: :data_gap})
+        Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_with_checkpoint})
+        {:disconnect, :data_gap}
+
+      :absent ->
+        begin_absent_slot(state)
+
+      :ok ->
+        begin_present_slot(state)
+
+      {:invalidated, reason} ->
+        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: reason})
+        Replicant.Supervisor.halt(state.slot_name, {:slot_invalidated, reason})
+        {:disconnect, :slot_invalidated}
+    end
+  end
 
   # Slot ABSENT, checkpoint not durable (empty or fault-as-0).
   defp begin_absent_slot(%{snapshot: true, checkpoint_state: :fault} = state),
@@ -441,10 +517,23 @@ defmodule Replicant.Connection do
   end
 
   # Definitive checkpoint read for the connect decision. Distinguishes a durable value
-  # (:present) from a genuine first-run/empty (:empty) from a read fault (:fault). Only
-  # snapshot mode acts on :fault (halt); the streaming/go-forward path treats :fault as 0
+  # (:present) from a genuine first-run/empty (:empty) from a read fault (:fault).
+  #
+  # Lib mode (a `:checkpoint_store` keyword is present): read the lib-owned store — the
+  # connect authority. A store read FAULT halts fail-closed (handled in
+  # :invalidation_check) — NOT fail-open: a non-idempotent lib-mode sink cannot dedup a
+  # resume-from-0. Sink-owned mode: unchanged (reads `sink.checkpoint()`); only snapshot
+  # mode acts on :fault (halt), the streaming/go-forward path treats :fault as 0
   # (fail-open, §14.15) via checkpoint_lsn.
-  defp read_checkpoint(sink) do
+  defp read_checkpoint(%{checkpoint_store: store, slot_name: slot}) when is_list(store) do
+    case Replicant.CheckpointStore.read(Replicant.CheckpointStore.via(slot)) do
+      {:ok, lsn} when is_integer(lsn) and lsn > 0 -> {:present, lsn}
+      {:ok, _nil_or_zero} -> {:empty, 0}
+      {:error, _} -> {:fault, 0}
+    end
+  end
+
+  defp read_checkpoint(%{sink: sink}) do
     case safe_checkpoint(sink) do
       {:ok, lsn} when is_integer(lsn) and lsn > 0 -> {:present, lsn}
       {:ok, _nil_or_zero} -> {:empty, 0}

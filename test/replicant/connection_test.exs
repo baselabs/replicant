@@ -234,6 +234,28 @@ defmodule Replicant.ConnectionTest do
 
   # ---- slot invalidation (fail-closed halt) ----
 
+  describe "lib_mode?/1 + lib_go_forward_violation?/1 (lib-mode connect helpers)" do
+    test "lib_go_forward_violation?/1 fires only for an empty state-mirror without go_forward/snapshot" do
+      base = %{
+        checkpoint_state: :empty,
+        sink: Replicant.Test.RecordingSink,
+        go_forward_only: false,
+        snapshot: false,
+        checkpoint_store: [connection: []]
+      }
+
+      assert Replicant.Connection.lib_go_forward_violation?(base)
+      refute Replicant.Connection.lib_go_forward_violation?(%{base | go_forward_only: true})
+      refute Replicant.Connection.lib_go_forward_violation?(%{base | snapshot: true})
+      refute Replicant.Connection.lib_go_forward_violation?(%{base | checkpoint_state: :present})
+    end
+
+    test "lib_mode?/1 reflects the presence of a :checkpoint_store" do
+      assert Replicant.Connection.lib_mode?(%{checkpoint_store: [connection: []]})
+      refute Replicant.Connection.lib_mode?(%{checkpoint_store: nil})
+    end
+  end
+
   describe "classify_slot_status/1 (PG16 wal_status + conflicting)" do
     test "an absent slot classifies :absent (first run → create)" do
       assert Connection.classify_slot_status([]) == :absent
