@@ -50,10 +50,12 @@ defmodule Replicant.MixProject do
       {:decimal, "~> 3.1"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.0"},
-      # Live streaming (Plan 2): the ReplicationConnection substrate. ~> 0.22 (NOT
-      # ~> 0.20 — 0.20 requires decimal ~> 1.5/2.0 and conflicts with decimal ~> 3.1;
-      # 0.22.2 requires decimal ~> 1.5 or ~> 2.0 or ~> 3.0 and accepts 3.1).
-      {:postgrex, "~> 0.22"},
+      # Live streaming (Plan 2): the ReplicationConnection substrate. Floor 0.22.2
+      # (NOT ~> 0.20 — 0.20 requires decimal ~> 1.5/2.0 and conflicts with decimal
+      # ~> 3.1; 0.22.2 requires decimal ~> 1.5 or ~> 2.0 or ~> 3.0 and accepts 3.1).
+      # 0.22.2 (not 0.22) so a lock regeneration can never resolve 0.22.0/0.22.1,
+      # which carry CVE-2026-32687 (SQLi in Postgrex.Notifications.listen/3, fixed 0.22.2).
+      {:postgrex, "~> 0.22.2"},
       # Dev/Test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
