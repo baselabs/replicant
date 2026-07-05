@@ -28,12 +28,23 @@ defmodule Replicant.CheckpointStore do
 
   @doc "Read the durable checkpoint for this slot (`nil` = never written) or a value-free error."
   @spec read(GenServer.server()) :: {:ok, Replicant.lsn() | nil} | {:error, Error.t()}
-  def read(server), do: GenServer.call(server, :read)
+  def read(server) do
+    GenServer.call(server, :read)
+  catch
+    # A store-call EXIT (call timeout, or :noproc if the store died / never started) must
+    # NOT crash the calling Connection — convert it to a value-free error so the connect
+    # :fault (read) and snapshot-handoff halt (write) fail-closed paths engage. The store's
+    # own guarded/1 already scrubs a RETURNED fault; this covers the EXIT class it cannot.
+    :exit, _ -> {:error, %Error{reason: :checkpoint_store_failed}}
+  end
 
   @doc "Write the checkpoint (`INSERT ... ON CONFLICT`) or return a value-free error. Never advance the ack on `{:error, _}`."
   @spec write(GenServer.server(), Replicant.lsn()) :: :ok | {:error, Error.t()}
-  def write(server, lsn) when is_integer(lsn) and lsn >= 0,
-    do: GenServer.call(server, {:write, lsn})
+  def write(server, lsn) when is_integer(lsn) and lsn >= 0 do
+    GenServer.call(server, {:write, lsn})
+  catch
+    :exit, _ -> {:error, %Error{reason: :checkpoint_store_failed}}
+  end
 
   @impl true
   def init(opts) do
@@ -137,14 +148,18 @@ defmodule Replicant.CheckpointStore do
   defp table_ok({:error, :invalid_identifier}),
     do: {:error, %Error{reason: :config_invalid, shape: "checkpoint_store table"}}
 
-  # The value-free boundary: a Postgrex fault (raised OR returned) can embed a
-  # parameter in its `.postgres` map — scrub to a structural Error, never inspecting
-  # the message (Critical Rule 1; mirrors Snapshotter.snapshot_error/1). A returned
-  # `%Error{}` (schema mismatch, config) passes through unchanged.
+  # The value-free boundary: a store fault (RAISED or RETURNED) can embed a parameter in
+  # its message or `.postgres` map — scrub to a structural Error, never inspecting the
+  # message (Critical Rule 1; mirrors Snapshotter.snapshot_error/1). This must scrub EVERY
+  # exception a query can surface, not only `%Postgrex.Error{}`: a genuine connection outage
+  # RETURNS `{:error, %DBConnection.ConnectionError{}}` (the boot-blip / persistent-outage
+  # path the design relies on), which is neither a `%Postgrex.Error{}` nor a raise — leaving
+  # it unscrubbed would fall through to `ensure/1`'s `case` and crash the store
+  # (CaseClauseError). A returned `%Error{}` (schema mismatch, config) passes through unchanged.
   defp guarded(fun) do
     case fun.() do
-      {:error, %Postgrex.Error{} = e} -> {:error, store_error(e)}
       {:error, %Error{}} = err -> err
+      {:error, e} when is_exception(e) -> {:error, store_error(e)}
       other -> other
     end
   rescue
@@ -153,12 +168,13 @@ defmodule Replicant.CheckpointStore do
     _kind, _reason -> {:error, %Error{reason: :checkpoint_store_failed}}
   end
 
-  # Every caller passes an exception struct: the `%Postgrex.Error{}` branch above,
-  # or the `rescue` clause (a rescued value is always normalized to an exception
-  # struct). So the module name is always available — no non-struct fallback (it
-  # would be dead code dialyzer flags). This diverges from `Snapshotter.snapshot_error/1`,
-  # whose bare-atom clause is live only because `do_snapshot` calls it with a raw
-  # validation reason; no such call path exists here.
+  # Every caller passes an exception struct: the `{:error, e} when is_exception(e)` branch
+  # above (a returned `%Postgrex.Error{}` / `%DBConnection.ConnectionError{}` / any query
+  # exception), or the `rescue` clause (a rescued value is always normalized to an exception
+  # struct). So the module name is always available — no non-struct fallback (it would be
+  # dead code dialyzer flags). This diverges from `Snapshotter.snapshot_error/1`, whose
+  # bare-atom clause is live only because `do_snapshot` calls it with a raw validation
+  # reason; no such call path exists here.
   defp store_error(%{__struct__: mod}),
     do: %Error{reason: :checkpoint_store_failed, shape: inspect(mod)}
 
