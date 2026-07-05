@@ -41,14 +41,60 @@ defmodule Replicant.AssemblerServer do
   # Commit). No store I/O in init (fast boot; the CheckpointStore's own non-sync
   # connect owns resilience). A lib-mode assembler is NEVER built without a writer.
   defp build_assembler(slot_name, sink, store) when is_list(store) do
+    max_retries = Keyword.get(store, :max_retries, 5)
+    backoff = Keyword.get(store, :retry_backoff_ms, 1000)
+
     writer = fn lsn ->
-      Replicant.CheckpointStore.write(Replicant.CheckpointStore.via(slot_name), lsn)
+      write_with_retry(store_write(slot_name, lsn), slot_name, max_retries, backoff, 0)
     end
 
     Assembler.new(sink, mode: :lib, checkpoint_writer: writer, slot_name: slot_name)
   end
 
   defp build_assembler(_slot_name, sink, nil), do: Assembler.new(sink)
+
+  # The store write as a 0-arity thunk (so the retry loop can re-invoke it).
+  defp store_write(slot_name, lsn) do
+    fn -> Replicant.CheckpointStore.write(Replicant.CheckpointStore.via(slot_name), lsn) end
+  end
+
+  @doc false
+  # Bounded sleep-retry for the mid-stream checkpoint write (spec §4). BLOCKS the serial
+  # applier: it must NOT advance to the next transaction before this one's checkpoint is
+  # durable (dup-bound-of-one). A PERMANENT fault returns immediately (halt-now); a transient
+  # fault retries up to `max_retries` with a `retry_backoff_ms` sleep, then returns {:error, _}
+  # (→ `Assembler.apply_sink` halts). The self-driven halt is intentionally delayed until
+  # retries exhaust (up to `backoff × max_retries`); an external supervisor `:shutdown` still
+  # preempts the sleep (this non-trapping GenServer cannot delay its own teardown), so pipeline
+  # shutdown is never blocked.
+  @spec write_with_retry(
+          (-> :ok | {:error, term()}),
+          String.t(),
+          non_neg_integer(),
+          pos_integer(),
+          non_neg_integer()
+        ) ::
+          :ok | {:error, atom()}
+  def write_with_retry(write_fun, slot_name, max_retries, backoff, attempt) do
+    case write_fun.() do
+      :ok ->
+        :ok
+
+      {:error, %Replicant.Error{reason: reason}} ->
+        cond do
+          Replicant.CheckpointStore.permanent_reason?(reason) ->
+            {:error, reason}
+
+          Replicant.CheckpointStore.retry_decision(attempt, max_retries) == :retry ->
+            Replicant.CheckpointStore.emit_retrying(slot_name, attempt + 1, max_retries)
+            Process.sleep(backoff)
+            write_with_retry(write_fun, slot_name, max_retries, backoff, attempt + 1)
+
+          true ->
+            {:error, reason}
+        end
+    end
+  end
 
   # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
   # will terminate this process; reprocessing here would be wasted and unsafe.

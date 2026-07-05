@@ -192,4 +192,47 @@ defmodule Replicant.AssemblerServerTest do
     # get_state flushes the mailbox → the cast is processed before we read.
     assert :sys.get_state(pid).asm.lib_checkpoint == 4242
   end
+
+  describe "lib-mode write retry (write_with_retry/5)" do
+    test "retries a TRANSIENT fault then succeeds (proves it does not give up on the first fault)" do
+      calls = :counters.new(1, [])
+
+      stub = fn ->
+        n = :counters.get(calls, 1)
+        :counters.add(calls, 1, 1)
+        if n == 0, do: {:error, %Replicant.Error{reason: :checkpoint_store_failed}}, else: :ok
+      end
+
+      assert :ok = Replicant.AssemblerServer.write_with_retry(stub, "rep_wr", 3, 5, 0)
+      assert :counters.get(calls, 1) == 2
+    end
+
+    test "a TRANSIENT fault that never clears halts after max_retries (returns {:error, reason})" do
+      calls = :counters.new(1, [])
+
+      stub = fn ->
+        :counters.add(calls, 1, 1)
+        {:error, %Replicant.Error{reason: :checkpoint_store_failed}}
+      end
+
+      assert {:error, :checkpoint_store_failed} =
+               Replicant.AssemblerServer.write_with_retry(stub, "rep_wr2", 2, 5, 0)
+
+      assert :counters.get(calls, 1) == 3
+    end
+
+    test "a PERMANENT fault (schema mismatch) returns immediately, 0 retries" do
+      calls = :counters.new(1, [])
+
+      stub = fn ->
+        :counters.add(calls, 1, 1)
+        {:error, %Replicant.Error{reason: :checkpoint_store_schema_mismatch}}
+      end
+
+      assert {:error, :checkpoint_store_schema_mismatch} =
+               Replicant.AssemblerServer.write_with_retry(stub, "rep_wr3", 5, 5, 0)
+
+      assert :counters.get(calls, 1) == 1
+    end
+  end
 end
