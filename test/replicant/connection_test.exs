@@ -491,6 +491,48 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
+  # ---- store-fault paced retry (spec §4/§7/§9) ----
+
+  describe "read_checkpoint_result/1 + store_retry_step/1 + reset_retry_count/2" do
+    test "read_checkpoint_result maps store returns to connect states (permanent vs transient)" do
+      # The lib clause of read_checkpoint delegates the store return → connect-state mapping to
+      # this @doc false pure function, so it is unit-testable without a live store.
+      perm = {:error, %Replicant.Error{reason: :checkpoint_store_schema_mismatch}}
+      trans = {:error, %Replicant.Error{reason: :checkpoint_store_failed}}
+      assert Replicant.Connection.read_checkpoint_result(perm) == {:fault_permanent, 0}
+      assert Replicant.Connection.read_checkpoint_result(trans) == {:fault, 0}
+      assert Replicant.Connection.read_checkpoint_result({:ok, 42}) == {:present, 42}
+      assert Replicant.Connection.read_checkpoint_result({:ok, nil}) == {:empty, 0}
+    end
+
+    test "store_retry_step/1 retries while count < max, halts at the bound, and is a no-op on 0-max" do
+      base = %{
+        slot_name: "rep_step",
+        store_retry_count: 0,
+        checkpoint_store: [connection: [], max_retries: 2, retry_backoff_ms: 5]
+      }
+
+      assert {:retry, %{store_retry_count: 1}} = Replicant.Connection.store_retry_step(base)
+
+      assert {:retry, %{store_retry_count: 2}} =
+               Replicant.Connection.store_retry_step(%{base | store_retry_count: 1})
+
+      assert :halt = Replicant.Connection.store_retry_step(%{base | store_retry_count: 2})
+
+      zero = %{base | checkpoint_store: [connection: [], max_retries: 0, retry_backoff_ms: 5]}
+      assert :halt = Replicant.Connection.store_retry_step(zero)
+    end
+
+    test "reset_retry_count keeps the count across a fault, resets to 0 on a successful read (self-heal)" do
+      # The connect-read self-heal: a transient fault accumulates the counter, then a recovered
+      # read resets it so a later separate outage starts fresh.
+      assert Replicant.Connection.reset_retry_count(3, :fault) == 3
+      assert Replicant.Connection.reset_retry_count(3, :fault_permanent) == 3
+      assert Replicant.Connection.reset_retry_count(3, :present) == 0
+      assert Replicant.Connection.reset_retry_count(3, :empty) == 0
+    end
+  end
+
   # ---- connection opts precedence ----
 
   describe "connection_opts/1 — library control opts win over caller :connection" do

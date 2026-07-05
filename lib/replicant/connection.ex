@@ -80,11 +80,12 @@ defmodule Replicant.Connection do
           snapshot: boolean(),
           connection: keyword(),
           checkpoint_lsn: Replicant.lsn(),
-          checkpoint_state: :present | :empty | :fault,
+          checkpoint_state: :present | :empty | :fault | :fault_permanent,
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
           checkpoint_store: keyword() | nil,
+          store_retry_count: non_neg_integer(),
           step: step()
         }
 
@@ -101,6 +102,7 @@ defmodule Replicant.Connection do
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
     checkpoint_store: nil,
+    store_retry_count: 0,
     step: :disconnected
   ]
 
@@ -151,6 +153,7 @@ defmodule Replicant.Connection do
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
        checkpoint_store: Map.get(config, :checkpoint_store),
+       store_retry_count: 0,
        step: :disconnected
      }}
   end
@@ -164,6 +167,10 @@ defmodule Replicant.Connection do
     # fail-open (§14.15): resume from 0, the idempotent sink dedups the re-stream.
     # This value seeds every keepalive ack until the first async advance.
     {checkpoint_state, checkpoint_lsn} = read_checkpoint(state)
+    # Reset the store-retry counter on any SUCCESSFUL read (a separate later outage — the
+    # transient-self-heal case — starts fresh at 0); keep it across a fault so the paced
+    # retry accumulates toward the bound. Delegated to a @doc false helper (unit-tested).
+    store_retry_count = reset_retry_count(state.store_retry_count, checkpoint_state)
 
     # Reset the in-flight window on (re)connect. `stream_floor_lsn` is re-derived from
     # the FIRST XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
@@ -176,6 +183,7 @@ defmodule Replicant.Connection do
        state
        | checkpoint_lsn: checkpoint_lsn,
          checkpoint_state: checkpoint_state,
+         store_retry_count: store_retry_count,
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
          step: :recovery_check
@@ -200,8 +208,11 @@ defmodule Replicant.Connection do
 
   def handle_result([%Postgrex.Result{rows: rows}], %{step: :invalidation_check} = state) do
     cond do
+      lib_mode?(state) and state.checkpoint_state == :fault_permanent ->
+        halt_store_permanent(state)
+
       lib_mode?(state) and state.checkpoint_state == :fault ->
-        lib_store_fault(state)
+        pace_store_retry(state)
 
       lib_mode?(state) and lib_go_forward_violation?(state) ->
         Replicant.Supervisor.halt(state.slot_name, {:config, :go_forward_required})
@@ -335,6 +346,14 @@ defmodule Replicant.Connection do
     {:disconnect, :snapshot_failed}
   end
 
+  # The paced-retry timer fired: disconnect so `auto_reconnect` re-runs the FULL connect
+  # chain (fresh recovery + slot-invalidation + store read). The retry counter persists on
+  # the Connection struct across the disconnect (Postgrex.ReplicationConnection keeps
+  # mod_state), so attempts accumulate toward the bound.
+  def handle_info(:store_retry_reconnect, _state) do
+    {:disconnect, :checkpoint_store_retry}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
   # ---- public helpers (unit-tested directly) ----
@@ -385,29 +404,77 @@ defmodule Replicant.Connection do
 
   # ---- private ----
 
-  # A lib-mode store read FAULT at connect is potentially TRANSIENT — the store's
-  # non-sync Postgrex may still be connecting, or a brief blip. Do NOT permanently
-  # halt: disconnect so `auto_reconnect` re-runs the connect (re-reading the store). A
-  # transient blip self-heals on the next connect; we never stream past an unknown
-  # checkpoint (fail-closed BY DESIGN). Distinct from a WRITE fault mid-stream, which
-  # halts permanently (Task 5). Matches spec §8: a transient blip is absorbed, not halted.
-  #
-  # UNPACED under a PERSISTENT store outage: the store is a SEPARATE Postgrex connection.
-  # This replication connection's own `Protocol.connect` still SUCCEEDS every attempt (PG
-  # is up; only the store is down), so Postgrex's `reconnect_backoff` timer never arms —
-  # there is NO backoff between attempts. The connect → read-store → :fault → disconnect
-  # loop therefore spins with no pacing (bounded only by the per-attempt TCP connect +
-  # recovery/invalidation queries), surfacing this telemetry each turn. This is fail-closed
-  # by design (loss=0), NOT a paced retry. Bounded-retry-then-halt is the named §14.18
-  # future (deliberately out of this plan's scope).
-  defp lib_store_fault(state) do
+  # A PERMANENT store fault at connect (wrong column type / invalid table id) cannot be
+  # fixed by retrying — halt fail-closed immediately (spec §7/§9). This ALSO fixes the
+  # interim bug where a schema-mismatch retried forever.
+  defp halt_store_permanent(state) do
     Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
       slot_name: state.slot_name,
       reason: :checkpoint_store_failed
     })
 
-    {:disconnect, :checkpoint_store_unavailable}
+    Replicant.Supervisor.halt(state.slot_name, {:checkpoint_store, :schema})
+    # Stay idle (do NOT disconnect) so `auto_reconnect` cannot re-run the connect chain and
+    # re-detect the permanent fault in a spin until the async teardown lands — same terminal
+    # discipline as the exhaustion path (spec §9). The async `Supervisor.halt` kills us.
+    {:noreply, state}
   end
+
+  # A TRANSIENT store read fault: paced bounded retry (spec §4). On a retry, arm a timer and
+  # stay idle for the backoff, then `handle_info(:store_retry_reconnect)` disconnects so the
+  # framework's OWN connect chain re-runs FRESH (re-checking slot invalidation every attempt —
+  # never replaying a stale invalidation snapshot). On exhaustion, HALT by staying idle: emit
+  # `:failed`, `Supervisor.halt`, and return `{:noreply}` — we do NOT disconnect, so no
+  # post-halt reconnect can race the async teardown into an N+1 read (spec §9 terminal guard).
+  defp pace_store_retry(state) do
+    case store_retry_step(state) do
+      {:retry, state} ->
+        Process.send_after(self(), :store_retry_reconnect, retry_backoff_ms(state))
+        {:noreply, state}
+
+      :halt ->
+        Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
+          slot_name: state.slot_name,
+          reason: :checkpoint_store_failed
+        })
+
+        Replicant.Supervisor.halt(state.slot_name, {:checkpoint_store, :unavailable})
+        {:noreply, state}
+    end
+  end
+
+  @doc false
+  @spec store_retry_step(map()) :: {:retry, map()} | :halt
+  def store_retry_step(state) do
+    max = max_retries(state)
+
+    case Replicant.CheckpointStore.retry_decision(state.store_retry_count, max) do
+      :retry ->
+        attempt = state.store_retry_count + 1
+        Replicant.CheckpointStore.emit_retrying(state.slot_name, attempt, max)
+        {:retry, %{state | store_retry_count: attempt}}
+
+      :halt ->
+        :halt
+    end
+  end
+
+  # Read the retry policy. Config normalizes these onto :checkpoint_store; the defaults here
+  # mirror Config's (spec §6) and defend a directly-constructed config map in tests.
+  defp max_retries(%{checkpoint_store: store}), do: Keyword.get(store, :max_retries, 5)
+
+  defp retry_backoff_ms(%{checkpoint_store: store}),
+    do: Keyword.get(store, :retry_backoff_ms, 1000)
+
+  @doc false
+  # Keep the retry counter across a fault (accumulate toward the bound); reset to 0 on a
+  # SUCCESSFUL read so a later, separate outage (the transient self-heal case) starts fresh.
+  @spec reset_retry_count(non_neg_integer(), atom()) :: non_neg_integer()
+  def reset_retry_count(count, checkpoint_state)
+      when checkpoint_state in [:fault, :fault_permanent],
+      do: count
+
+  def reset_retry_count(_count, _success), do: 0
 
   # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor.
   # The floor is the higher of the durable `checkpoint_lsn` (once a commit advances
@@ -559,11 +626,7 @@ defmodule Replicant.Connection do
   # mode acts on :fault (halt), the streaming/go-forward path treats :fault as 0
   # (fail-open, §14.15) via checkpoint_lsn.
   defp read_checkpoint(%{checkpoint_store: store, slot_name: slot}) when is_list(store) do
-    case Replicant.CheckpointStore.read(Replicant.CheckpointStore.via(slot)) do
-      {:ok, lsn} when is_integer(lsn) and lsn > 0 -> {:present, lsn}
-      {:ok, _nil_or_zero} -> {:empty, 0}
-      {:error, _} -> {:fault, 0}
-    end
+    read_checkpoint_result(Replicant.CheckpointStore.read(Replicant.CheckpointStore.via(slot)))
   end
 
   defp read_checkpoint(%{sink: sink}) do
@@ -573,6 +636,20 @@ defmodule Replicant.Connection do
       _fault -> {:fault, 0}
     end
   end
+
+  @doc false
+  @spec read_checkpoint_result(term()) ::
+          {:present | :empty | :fault | :fault_permanent, Replicant.lsn()}
+  def read_checkpoint_result({:ok, lsn}) when is_integer(lsn) and lsn > 0, do: {:present, lsn}
+  def read_checkpoint_result({:ok, _nil_or_zero}), do: {:empty, 0}
+
+  def read_checkpoint_result({:error, %Replicant.Error{reason: reason}}) do
+    if Replicant.CheckpointStore.permanent_reason?(reason),
+      do: {:fault_permanent, 0},
+      else: {:fault, 0}
+  end
+
+  def read_checkpoint_result({:error, _other}), do: {:fault, 0}
 
   defp safe_checkpoint(sink) do
     sink.checkpoint()
