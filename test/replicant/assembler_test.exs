@@ -536,4 +536,70 @@ defmodule Replicant.AssemblerTest do
       nil
     )
   end
+
+  describe "byte_size + lag_ms enrichment on [:transaction, :assembled]" do
+    defmodule EnrichSink do
+      @behaviour Replicant.Sink
+      @impl true
+      def checkpoint, do: {:ok, nil}
+      @impl true
+      def handle_transaction(txn), do: {:ok, txn.commit_lsn}
+    end
+
+    test "a commit carries the accumulated byte_size and a non-negative lag_ms (value-free)" do
+      alias Replicant.Decoder.Messages.{Begin, Commit, Insert, Relation}
+      alias Replicant.Decoder.Messages.Relation.Column
+
+      :telemetry.attach(
+        {__MODULE__, :enrich},
+        [:replicant, :transaction, :assembled],
+        fn _event, _measurements, meta, pid -> send(pid, {:assembled_meta, meta}) end,
+        self()
+      )
+
+      relation = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "id", type: "int4", flags: [:key], type_modifier: -1}]
+      }
+
+      # The AssemblerServer ordering: observe_bytes(payload_size) THEN handle_message.
+      # byte_size accrues for the messages processed while a txn buffer is open
+      # (Begin's own bytes fall before the buffer exists — a wire-size gauge, not exact).
+      asm =
+        Replicant.Assembler.new(EnrichSink)
+        |> step(20, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7})
+        |> step(30, relation)
+        |> step(15, %Insert{relation_id: 1, tuple_data: {"1"}})
+
+      # Commit is observed (buffer still open) then handled → emit reads byte_size.
+      asm = Replicant.Assembler.observe_bytes(asm, 8)
+
+      {:transaction, _txn, _lsn, _asm} =
+        Replicant.Assembler.handle_message(asm, %Commit{
+          lsn: 0x2A,
+          end_lsn: 0x2A,
+          commit_timestamp: ~U[2026-07-04 00:00:00Z],
+          flags: []
+        })
+
+      assert_received {:assembled_meta, meta}
+      assert meta.change_count == 1
+      assert meta.commit_lsn == 0x2A
+      # 30 (relation) + 15 (insert) + 8 (commit) = 53; Begin's 20 fell before the buffer opened.
+      assert meta.byte_size == 53
+      assert is_integer(meta.lag_ms) and meta.lag_ms >= 0
+
+      :telemetry.detach({__MODULE__, :enrich})
+    end
+
+    # observe_bytes THEN handle_message, returning the updated assembler.
+    defp step(asm, bytes, message) do
+      asm = Replicant.Assembler.observe_bytes(asm, bytes)
+      {:ok, asm} = Replicant.Assembler.handle_message(asm, message)
+      asm
+    end
+  end
 end

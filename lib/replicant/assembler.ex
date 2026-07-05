@@ -65,7 +65,8 @@ defmodule Replicant.Assembler do
   @type buffer :: %{
           begin_lsn: lsn() | nil,
           xid: non_neg_integer() | nil,
-          changes: [Change.t()]
+          changes: [Change.t()],
+          byte_size: non_neg_integer()
         }
 
   defstruct [:sink, :txn, relations: %{}, projected: %{}, ordinal: 0]
@@ -73,6 +74,23 @@ defmodule Replicant.Assembler do
   @doc "Create a new assembler bound to `sink` (a module implementing `Replicant.Sink`)."
   @spec new(module()) :: t()
   def new(sink), do: %__MODULE__{sink: sink}
+
+  @doc """
+  Accumulate the raw WAL payload byte-size of the message about to be handled into
+  the open transaction buffer, for the `byte_size` metadata on
+  `[:replicant, :transaction, :assembled]` (spec §10). `Replicant.AssemblerServer`
+  calls this with `byte_size(payload)` before each `handle_message/2`. It is a
+  no-op before any `Begin` (bytes arriving outside a transaction — a lone
+  Relation/Type/Origin — have no buffer to attribute to), so a stray pre-Begin
+  payload never crashes here.
+  """
+  @spec observe_bytes(t(), non_neg_integer()) :: t()
+  def observe_bytes(%__MODULE__{txn: nil} = asm, _bytes), do: asm
+
+  def observe_bytes(%__MODULE__{txn: buffer} = asm, bytes)
+      when is_integer(bytes) and bytes >= 0 do
+    %{asm | txn: %{buffer | byte_size: buffer.byte_size + bytes}}
+  end
 
   @doc """
   Handle one decoded message. Returns:
@@ -108,7 +126,7 @@ defmodule Replicant.Assembler do
   end
 
   defp do_handle_message(%__MODULE__{} = asm, %Begin{final_lsn: lsn, xid: xid}) do
-    {:ok, %{asm | txn: %{begin_lsn: lsn, xid: xid, changes: []}, ordinal: 0}}
+    {:ok, %{asm | txn: %{begin_lsn: lsn, xid: xid, changes: [], byte_size: 0}, ordinal: 0}}
   end
 
   # A row/commit message that arrives before any Begin is malformed → fail-closed
@@ -204,7 +222,12 @@ defmodule Replicant.Assembler do
     Telemetry.event(
       [:replicant, :transaction, :assembled],
       %{},
-      %{change_count: length(txn.changes), commit_lsn: txn.commit_lsn}
+      %{
+        change_count: length(txn.changes),
+        commit_lsn: txn.commit_lsn,
+        byte_size: buffer.byte_size,
+        lag_ms: lag_ms(txn.commit_timestamp)
+      }
     )
 
     case checkpoint(asm.sink) do
@@ -463,6 +486,15 @@ defmodule Replicant.Assembler do
 
   defp safe_shape(%{__struct__: mod}), do: inspect(mod)
   defp safe_shape(_), do: nil
+
+  # Live lag from the transaction's commit timestamp to now, clamped ≥ 0 (clock
+  # skew must not surface a negative). A nil timestamp → 0. Uses runtime `now`, so
+  # no fixed-date time-bomb; it is a WAL position/time gauge, never a row value.
+  defp lag_ms(nil), do: 0
+
+  defp lag_ms(%DateTime{} = commit_timestamp) do
+    max(0, System.os_time(:millisecond) - DateTime.to_unix(commit_timestamp, :millisecond))
+  end
 
   defp reset(asm), do: %{asm | txn: nil, ordinal: 0}
 end
