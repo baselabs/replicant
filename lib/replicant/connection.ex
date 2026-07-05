@@ -63,17 +63,29 @@ defmodule Replicant.Connection do
   # bound above the largest expected single transaction.
   @default_max_inflight_lag 67_108_864
 
-  @type step :: :disconnected | :recovery_check | :invalidation_check | :create_slot | :streaming
+  @type step ::
+          :disconnected
+          | :recovery_check
+          | :invalidation_check
+          | :create_slot
+          | :create_export_slot
+          | :snapshotting
+          | :streaming
 
   @type t :: %__MODULE__{
           slot_name: String.t(),
           publication: String.t(),
           sink: module(),
           go_forward_only: boolean(),
+          snapshot: boolean(),
+          connection: keyword(),
           checkpoint_lsn: Replicant.lsn(),
+          checkpoint_state: :present | :empty | :fault,
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
+          snapshot_lsn: Replicant.lsn() | nil,
+          snapshot_ref: reference() | nil,
           step: step()
         }
 
@@ -82,8 +94,13 @@ defmodule Replicant.Connection do
     :publication,
     :sink,
     :go_forward_only,
+    :snapshot,
+    :connection,
     :stream_floor_lsn,
+    :snapshot_lsn,
+    :snapshot_ref,
     checkpoint_lsn: 0,
+    checkpoint_state: :empty,
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
     step: :disconnected
@@ -128,7 +145,10 @@ defmodule Replicant.Connection do
        publication: config.publication,
        sink: config.sink,
        go_forward_only: config.go_forward_only,
+       snapshot: Map.get(config, :snapshot, false),
+       connection: config.connection,
        checkpoint_lsn: 0,
+       checkpoint_state: :empty,
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
@@ -142,7 +162,7 @@ defmodule Replicant.Connection do
     # fine here). A read fault is fail-open (§14.15): resume from 0, the idempotent
     # sink dedups the re-stream. This value seeds every keepalive ack until the
     # first async advance.
-    checkpoint_lsn = read_checkpoint(state.sink)
+    {checkpoint_state, checkpoint_lsn} = read_checkpoint(state.sink)
 
     # Reset the in-flight window on (re)connect. `stream_floor_lsn` is re-derived from
     # the FIRST XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
@@ -154,6 +174,7 @@ defmodule Replicant.Connection do
      %{
        state
        | checkpoint_lsn: checkpoint_lsn,
+         checkpoint_state: checkpoint_state,
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
          step: :recovery_check
@@ -191,12 +212,10 @@ defmodule Replicant.Connection do
         {:disconnect, :data_gap}
 
       :absent ->
-        {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
-        {:query, sql, %{state | step: :create_slot}}
+        begin_absent_slot(state)
 
       :ok ->
-        Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
-        start_streaming(state)
+        begin_present_slot(state)
 
       {:invalidated, reason} ->
         Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: reason})
@@ -208,6 +227,29 @@ defmodule Replicant.Connection do
   def handle_result([%Postgrex.Result{}], %{step: :create_slot} = state) do
     Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
     start_streaming(state)
+  end
+
+  # The EXPORT_SNAPSHOT slot was created (spec §4): capture its consistent point and
+  # exported snapshot name, spawn+monitor the Snapshotter to read the base snapshot on a
+  # separate connection, and idle in :snapshotting to hold the exported snapshot valid.
+  # The handoff LSN (`snapshot_lsn`) is where streaming resumes once the snapshot lands.
+  def handle_result(
+        [%Postgrex.Result{rows: [[_slot, consistent_point, snapshot_name, _plugin]]}],
+        %{step: :create_export_slot} = state
+      ) do
+    cp = Replicant.lsn_from_string(consistent_point)
+
+    {_pid, ref} =
+      Replicant.Snapshotter.start(%{
+        snapshot_name: snapshot_name,
+        consistent_point: cp,
+        connection: state.connection,
+        publication: state.publication,
+        sink: state.sink,
+        reply_to: self()
+      })
+
+    {:noreply, %{state | step: :snapshotting, snapshot_ref: ref, snapshot_lsn: cp}}
   end
 
   def handle_result(%Postgrex.Error{}, _state) do
@@ -261,6 +303,43 @@ defmodule Replicant.Connection do
     checkpoint = max(state.checkpoint_lsn, lsn)
     Telemetry.event([:replicant, :checkpoint, :advanced], %{}, %{commit_lsn: checkpoint})
     {:noreply, [encode_status_update(checkpoint)], %{state | checkpoint_lsn: checkpoint}}
+  end
+
+  # Snapshot finished durably (checkpoint := consistent_point): flush the monitor's
+  # pending :normal DOWN, seed the checkpoint, and stream from the handoff LSN.
+  def handle_info({:snapshot_done, lsn}, %{step: :snapshotting} = state) when is_integer(lsn) do
+    if is_reference(state.snapshot_ref), do: Process.demonitor(state.snapshot_ref, [:flush])
+    Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+
+    {:ok, sql} =
+      QueryBuilder.start_replication(state.slot_name, state.publication, start_lsn: lsn)
+
+    {:stream, sql, [],
+     %{
+       state
+       | step: :streaming,
+         checkpoint_lsn: lsn,
+         received_lsn: lsn,
+         stream_floor_lsn: nil,
+         snapshot_ref: nil
+     }}
+  end
+
+  def handle_info({:snapshot_failed, _error}, %{step: :snapshotting} = state) do
+    Replicant.Supervisor.halt(state.slot_name, {:snapshot, :snapshot_failed})
+    {:disconnect, :snapshot_failed}
+  end
+
+  # The monitored snapshotter died abnormally without reporting — fail-closed. A :normal
+  # exit (it finished and sent {:snapshot_done}) is a no-op.
+  def handle_info({:DOWN, ref, :process, _pid, :normal}, %{snapshot_ref: ref} = state) do
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{snapshot_ref: ref} = state) do
+    Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: :snapshot_failed})
+    Replicant.Supervisor.halt(state.slot_name, {:snapshot, :snapshot_down})
+    {:disconnect, :snapshot_failed}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
@@ -345,10 +424,53 @@ defmodule Replicant.Connection do
     {:stream, sql, [], %{state | step: :streaming}}
   end
 
+  # ---- connect matrix (spec §8): slot presence × checkpoint state × snapshot mode ----
+
+  # Slot ABSENT, checkpoint not durable (empty or fault-as-0).
+  defp begin_absent_slot(%{snapshot: true, checkpoint_state: :fault} = state),
+    do: halt_snapshot(state, :checkpoint_unreadable)
+
+  defp begin_absent_slot(%{snapshot: true} = state), do: create_export_slot(state)
+
+  defp begin_absent_slot(state) do
+    {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
+    {:query, sql, %{state | step: :create_slot}}
+  end
+
+  # Slot PRESENT.
+  defp begin_present_slot(%{snapshot: true, checkpoint_state: :fault} = state),
+    do: halt_snapshot(state, :checkpoint_unreadable)
+
+  defp begin_present_slot(%{snapshot: true, checkpoint_state: :empty} = state),
+    do: halt_snapshot(state, :snapshot_incomplete)
+
+  defp begin_present_slot(state) do
+    # :present (resume) or non-snapshot go-forward with an existing slot — unchanged.
+    Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+    start_streaming(state)
+  end
+
+  defp create_export_slot(state) do
+    {:ok, sql} = QueryBuilder.create_export_slot(state.slot_name)
+    {:query, sql, %{state | step: :create_export_slot}}
+  end
+
+  # Fail-closed snapshot halt (spec §8) — never auto-drops a slot.
+  defp halt_snapshot(state, reason) do
+    Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: reason})
+    Replicant.Supervisor.halt(state.slot_name, {:snapshot, reason})
+    {:disconnect, reason}
+  end
+
+  # Definitive checkpoint read for the connect decision. Distinguishes a durable value
+  # (:present) from a genuine first-run/empty (:empty) from a read fault (:fault). Only
+  # snapshot mode acts on :fault (halt); the streaming/go-forward path treats :fault as 0
+  # (fail-open, §14.15) via checkpoint_lsn.
   defp read_checkpoint(sink) do
     case safe_checkpoint(sink) do
-      {:ok, lsn} when is_integer(lsn) -> lsn
-      _other -> 0
+      {:ok, lsn} when is_integer(lsn) and lsn > 0 -> {:present, lsn}
+      {:ok, _nil_or_zero} -> {:empty, 0}
+      _fault -> {:fault, 0}
     end
   end
 

@@ -18,7 +18,10 @@ defmodule Replicant.ConnectionTest do
       publication: "orders_pub",
       sink: StubSink,
       go_forward_only: false,
+      snapshot: false,
+      connection: [hostname: "h", port: 5599, username: "postgres", database: "postgres"],
       checkpoint_lsn: 0,
+      checkpoint_state: :empty,
       step: :streaming
     }
 
@@ -312,6 +315,137 @@ defmodule Replicant.ConnectionTest do
       assert sql =~ "START_REPLICATION SLOT conn_test"
       assert sql =~ "0/16E3778"
       assert new_state.step == :streaming
+    end
+  end
+
+  describe "handle_result(:invalidation_check) — snapshot-mode connect matrix (spec §8)" do
+    test "absent slot + empty checkpoint + snapshot: true → creates the EXPORT_SNAPSHOT slot" do
+      result = [%Postgrex.Result{rows: []}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          snapshot: true,
+          checkpoint_lsn: 0,
+          checkpoint_state: :empty
+        )
+
+      assert {:query, sql, new_state} = Connection.handle_result(result, st)
+      assert sql =~ "CREATE_REPLICATION_SLOT conn_test LOGICAL pgoutput EXPORT_SNAPSHOT"
+      assert new_state.step == :create_export_slot
+    end
+
+    test "present slot + empty checkpoint + snapshot: true → halts :snapshot_incomplete (never auto-drops)" do
+      result = [%Postgrex.Result{rows: [["reserved", false]]}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          snapshot: true,
+          checkpoint_lsn: 0,
+          checkpoint_state: :empty
+        )
+
+      assert {:disconnect, :snapshot_incomplete} = Connection.handle_result(result, st)
+    end
+
+    test "checkpoint read fault + snapshot: true → halts :checkpoint_unreadable (fail-closed)" do
+      for rows <- [[], [["reserved", false]]] do
+        result = [%Postgrex.Result{rows: rows}]
+
+        st =
+          state(
+            step: :invalidation_check,
+            snapshot: true,
+            checkpoint_lsn: 0,
+            checkpoint_state: :fault
+          )
+
+        assert {:disconnect, :checkpoint_unreadable} = Connection.handle_result(result, st)
+      end
+    end
+
+    test "present slot + present checkpoint + snapshot: true → resumes streaming (already bootstrapped)" do
+      result = [%Postgrex.Result{rows: [["reserved", false]]}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          snapshot: true,
+          checkpoint_lsn: 0x16E3778,
+          checkpoint_state: :present
+        )
+
+      assert {:stream, sql, [], new_state} = Connection.handle_result(result, st)
+      assert sql =~ "START_REPLICATION SLOT conn_test"
+      assert new_state.step == :streaming
+    end
+
+    test "NON-snapshot mode is unchanged: absent + empty → NOEXPORT create_slot" do
+      result = [%Postgrex.Result{rows: []}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          snapshot: false,
+          checkpoint_lsn: 0,
+          checkpoint_state: :empty
+        )
+
+      assert {:query, sql, new_state} = Connection.handle_result(result, st)
+      assert sql =~ "NOEXPORT_SNAPSHOT"
+      assert new_state.step == :create_slot
+    end
+  end
+
+  describe "handle_result(:create_export_slot) + handle_info handoff" do
+    test "captures consistent_point + snapshot_name, spawns the snapshotter, idles in :snapshotting" do
+      # CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT result row order (probed):
+      # [slot_name, consistent_point, snapshot_name, output_plugin].
+      result = [
+        %Postgrex.Result{rows: [["conn_test", "0/16E3778", "00000003-0000DD8A-1", "pgoutput"]]}
+      ]
+
+      st = state(step: :create_export_slot, snapshot: true)
+
+      assert {:noreply, new_state} = Connection.handle_result(result, st)
+      assert new_state.step == :snapshotting
+      assert new_state.snapshot_lsn == 0x16E3778
+      assert is_reference(new_state.snapshot_ref)
+    end
+
+    test "{:snapshot_done, lsn} starts streaming from the handoff LSN" do
+      st = state(step: :snapshotting, snapshot: true, snapshot_lsn: 0x16E3778, checkpoint_lsn: 0)
+
+      assert {:stream, sql, [], new_state} =
+               Connection.handle_info({:snapshot_done, 0x16E3778}, st)
+
+      assert sql =~ "START_REPLICATION SLOT conn_test"
+      assert sql =~ "0/16E3778"
+      assert new_state.step == :streaming
+      assert new_state.checkpoint_lsn == 0x16E3778
+    end
+
+    test "{:snapshot_failed, error} halts the pipeline fail-closed" do
+      st = state(step: :snapshotting, snapshot: true)
+      err = %Replicant.Error{reason: :snapshot_failed}
+      assert {:disconnect, :snapshot_failed} = Connection.handle_info({:snapshot_failed, err}, st)
+    end
+
+    test "an abnormal :DOWN from the monitored snapshotter halts fail-closed" do
+      ref = make_ref()
+      st = state(step: :snapshotting, snapshot: true, snapshot_ref: ref)
+
+      assert {:disconnect, :snapshot_failed} =
+               Connection.handle_info({:DOWN, ref, :process, self(), :boom}, st)
+    end
+
+    test "a :normal :DOWN from the snapshotter (it finished) is ignored" do
+      ref = make_ref()
+      st = state(step: :snapshotting, snapshot: true, snapshot_ref: ref)
+
+      assert {:noreply, ^st} =
+               Connection.handle_info({:DOWN, ref, :process, self(), :normal}, st)
     end
   end
 
