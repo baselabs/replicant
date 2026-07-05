@@ -140,6 +140,14 @@ requires the sink to also implement `handle_snapshot/2` (batch upsert; clear the
 checkpoint); a mid-snapshot crash halts fail-closed (`:snapshot_incomplete`) for an
 operator to drop the slot and retry.
 
+**Lib-owned checkpoint (non-transactional sinks).** Pass a `:checkpoint_store`
+(`[connection: <postgrex opts>, table: "replicant_checkpoints"]`) to flip the pipeline
+into **lib mode**: the library writes the checkpoint to a durable Postgres table **after**
+the sink persists (checkpoint-after-persist), so a non-transactional sink (files, S3,
+Kafka, external APIs) needs to implement only `handle_transaction/1`. The guarantee is
+**at-least-once, duplicate bounded to one transaction, never loss** — not effect-once (a
+non-transactional sink cannot dedup).
+
 ## Development
 
 ```bash
@@ -154,21 +162,23 @@ identifier-validation, and tenant-blind invariants — live in
 
 ## Roadmap
 
-**Plan 1 (offline core)**, **Plan 2 (live streaming + exactly-once)**, and
-**initial snapshot / backfill (`replicant-snapshot`)** have all shipped: decode /
+**Plan 1 (offline core)**, **Plan 2 (live streaming + exactly-once)**,
+**initial snapshot / backfill (`replicant-snapshot`)**, and the
+**lib-owned checkpoint store (`replicant-checkpoint-store`)** have all shipped: decode /
 assemble / validate / redact, plus the `Postgrex.ReplicationConnection` that owns the
 slot with ack-after-checkpoint, slot-invalidation fail-closed halt, the bounded
 in-flight window, a real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0,
-and the `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN backfill that seeds a mirror
-from a populated source gap-free and dup-free.
+the `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN backfill that seeds a mirror
+from a populated source gap-free and dup-free, and a lib-owned checkpoint mode for
+**non-transactional** sinks (a durable Postgres checkpoint written after persist —
+at-least-once, dup bounded to one transaction, never loss).
 
 The remaining slices are the spec §3 non-goals, each a named future subsystem
 that composes on this streaming core (the v1 primitive is fail-closed without
 it):
 
 - multi-transaction batching (`replicant-batching`),
-- `pgoutput` proto ≥ 2 in-progress-transaction streaming (`replicant-streaming`),
-- a non-transactional-sink checkpoint store (`replicant-checkpoint-store`), and
+- `pgoutput` proto ≥ 2 in-progress-transaction streaming (`replicant-streaming`), and
 - the Ash / tenancy / classification sink (`ash_replicant`, a sibling library).
 
 ## Credits

@@ -35,7 +35,9 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   (`handle_snapshot/2` + `handle_snapshot_complete/1`) let a sink be bootstrapped
   from a populated source: batches of `%Change{op: :snapshot}` rows (upsert by PK;
   clear the table when `first_for_table?` is true — a hard redo-safety obligation),
-  then a durable handoff checkpoint at the snapshot's consistent point.
+  then a durable handoff checkpoint at the snapshot's consistent point. In **lib mode**
+  (`:checkpoint_store` configured) the library owns the checkpoint, so a sink implements
+  only `handle_transaction/1` — `checkpoint/0` is optional there; its returned LSN is ignored.
 - **`Replicant.Decoder`** — `decode/1` wraps the vendored `pgoutput` byte
   parser; catches and redacts any raise into a value-free `Replicant.Error`.
 - **`Replicant.Assembler`** — groups decoded messages into
@@ -54,6 +56,12 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   tables at the `EXPORT_SNAPSHOT` LSN (a `REPEATABLE READ` cursor on a separate
   connection) and pushes `%Change{op: :snapshot}` batches to the sink, behind a
   value-free error boundary; the `Connection` hands off to streaming at that LSN.
+- **`Replicant.CheckpointStore`** — in **lib mode** (a `:checkpoint_store` option
+  is present), a supervised GenServer owning one `replicant_checkpoints` row per slot:
+  the library writes the checkpoint (`commit_lsn bigint`) to this durable Postgres table
+  **after** the sink persists, so a non-transactional sink (files, S3, Kafka, external
+  APIs) needs no atomic data+checkpoint unit. Value-free boundary; lazy table create +
+  shape-probe; a store read fault at connect fail-closes.
 - **`Replicant.QueryBuilder`** — builds the identifier-validated SQL used to
   create/manage slots and publications.
 - **`Replicant.Identifier`** — allowlist validation for slot, publication, and
@@ -76,6 +84,11 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   transaction whose `commit_lsn <= checkpoint`; upsert rows by table PK.
   There is no naked exactly-once without two-phase commit or an idempotent
   sink; never claim one.
+- **Lib mode is at-least-once, never effect-once.** With a `:checkpoint_store`, the
+  library writes the checkpoint after the sink persists (checkpoint-after-persist), so a
+  crash between persist and checkpoint re-delivers exactly one transaction on resume:
+  **duplicate bounded to one transaction, never loss.** A non-transactional sink cannot
+  dedup — do not claim effect-once for it.
 - **Unchanged TOAST is a sentinel, not a value.** It surfaces only as
   `Replicant.Change`'s `unchanged` list of column names, never in `record`.
   Sinks must leave those columns untouched on upsert.

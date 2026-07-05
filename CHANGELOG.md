@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Lib-owned checkpoint store (non-transactional sinks) (`replicant-checkpoint-store`)
+
+- A second checkpoint **mode**, selected once in `Replicant.Config` by the presence of a
+  `:checkpoint_store` option. **Absent** → today's sink-owned path, unchanged. **Present**
+  → the library owns the checkpoint for a **non-transactional** sink (files, S3, Kafka,
+  external APIs) by writing it to a durable Postgres table **after** the sink confirms
+  persist. Guarantee: **at-least-once, duplicate bounded to one transaction, never loss —
+  NOT effect-once** (a non-transactional sink cannot dedup).
+- `Replicant.CheckpointStore` — a supervised GenServer over a normal Postgrex connection
+  owning one `replicant_checkpoints` row per slot (`commit_lsn bigint`; validated table
+  identifier, values bound `$n`). Lazy `CREATE TABLE IF NOT EXISTS` + `information_schema`
+  shape-probe (a wrong pre-existing `commit_lsn` type halts `:checkpoint_store_schema_mismatch`),
+  non-sync connect for boot resilience, all behind the value-free error boundary (Critical Rule 1).
+- The checkpoint **write** lives in the `Assembler`'s `apply_sink`, after the sink returns
+  `{:ok, _}` and **before** the `[:replicant, :sink, :committed]` telemetry / ack
+  (checkpoint-after-persist); a write fault halts `:checkpoint_store_failed`, never announcing
+  commit. The three checkpoint **reads** redirect to the store: the connect-time authority
+  (a store read fault fail-closes to a retryable disconnect, never streaming past an unknown
+  checkpoint), the go-forward guard (deferred from config to connect), and the watermark
+  pre-skip (an in-memory watermark seeded once from the connect read).
+- `snapshot: true` composes with lib mode: the snapshot handoff LSN is written to the store
+  (the sink's `handle_snapshot_complete/1` is not called in lib mode), ordered before streaming;
+  a handoff write fault halts `:snapshot_handoff_failed` (whole-snapshot redo on operator restart).
+- `Replicant.Sink`: `checkpoint/0` is now an `@optional_callbacks` entry — a lib-mode sink
+  implements only `handle_transaction/1` (persisting data; its returned LSN is ignored).
+  `Config` enforces `checkpoint/0` presence at start for sink-owned mode only.
+- New telemetry `[:replicant, :checkpoint_store, :written | :read | :failed]`; new `Replicant.Error`
+  reasons `:checkpoint_store_failed` and `:checkpoint_store_schema_mismatch`; `slot_name` added to
+  the value-free telemetry allowlist.
+
 ### Added — Initial snapshot / backfill (`replicant-snapshot`)
 
 - `snapshot: true` start mode: `Replicant.start_link/1` bootstraps a `:state_mirror`
