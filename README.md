@@ -131,6 +131,15 @@ defmodule MyApp.OrdersSink do
 end
 ```
 
+**Start modes.** A `:state_mirror` sink starting from an empty checkpoint must declare
+its intent — `go_forward_only: true` (stream only new changes), or `snapshot: true`
+(**backfill** the current state, then hand off to streaming at the snapshot LSN with zero
+gap and zero duplication). A non-empty checkpoint simply resumes. `snapshot: true`
+requires the sink to also implement `handle_snapshot/2` (batch upsert; clear the table on
+`first_for_table?`) and `handle_snapshot_complete/1` (durably persist the handoff
+checkpoint); a mid-snapshot crash halts fail-closed (`:snapshot_incomplete`) for an
+operator to drop the slot and retry.
+
 ## Development
 
 ```bash
@@ -145,17 +154,18 @@ identifier-validation, and tenant-blind invariants — live in
 
 ## Roadmap
 
-**Plan 1 (offline core)** and **Plan 2 (live streaming + exactly-once)** have
-both shipped: decode / assemble / validate / redact, plus the
-`Postgrex.ReplicationConnection` that owns the slot with ack-after-checkpoint,
-slot-invalidation fail-closed halt, the bounded in-flight window, and a
-real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0.
+**Plan 1 (offline core)**, **Plan 2 (live streaming + exactly-once)**, and
+**initial snapshot / backfill (`replicant-snapshot`)** have all shipped: decode /
+assemble / validate / redact, plus the `Postgrex.ReplicationConnection` that owns the
+slot with ack-after-checkpoint, slot-invalidation fail-closed halt, the bounded
+in-flight window, a real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0,
+and the `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN backfill that seeds a mirror
+from a populated source gap-free and dup-free.
 
 The remaining slices are the spec §3 non-goals, each a named future subsystem
 that composes on this streaming core (the v1 primitive is fail-closed without
 it):
 
-- initial snapshot / backfill (`replicant-snapshot`),
 - multi-transaction batching (`replicant-batching`),
 - `pgoutput` proto ≥ 2 in-progress-transaction streaming (`replicant-streaming`),
 - a non-transactional-sink checkpoint store (`replicant-checkpoint-store`), and

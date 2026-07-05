@@ -31,7 +31,11 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   type change, replica-identity change). Destructive changes halt fail-closed.
 - **`Replicant.Sink`** — the behaviour a consumer implements: receives one
   `Replicant.Transaction` at a time and must durably persist it (or raise)
-  before the slot advances past its `commit_lsn`.
+  before the slot advances past its `commit_lsn`. Optional snapshot callbacks
+  (`handle_snapshot/2` + `handle_snapshot_complete/1`) let a sink be bootstrapped
+  from a populated source: batches of `%Change{op: :snapshot}` rows (upsert by PK;
+  clear the table when `first_for_table?` is true — a hard redo-safety obligation),
+  then a durable handoff checkpoint at the snapshot's consistent point.
 - **`Replicant.Decoder`** — `decode/1` wraps the vendored `pgoutput` byte
   parser; catches and redacts any raise into a value-free `Replicant.Error`.
 - **`Replicant.Assembler`** — groups decoded messages into
@@ -43,8 +47,13 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   synchronously off the keepalive path.
 - **`Replicant.Pipeline`** — the per-slot `:one_for_all` supervisor pairing a
   Connection with an AssemblerServer; started by `Replicant.start_link/1`.
-- **`Replicant.Config`** — validates pipeline options + the go-forward-only
-  start guard.
+- **`Replicant.Config`** — validates pipeline options + the start-mode guard
+  (`go_forward_only` / `snapshot` / resume; `go_forward_only` + `snapshot` both
+  set is refused as `:conflicting_start_mode`).
+- **`Replicant.Snapshotter`** — reads a consistent snapshot of the publication's
+  tables at the `EXPORT_SNAPSHOT` LSN (a `REPEATABLE READ` cursor on a separate
+  connection) and pushes `%Change{op: :snapshot}` batches to the sink, behind a
+  value-free error boundary; the `Connection` hands off to streaming at that LSN.
 - **`Replicant.QueryBuilder`** — builds the identifier-validated SQL used to
   create/manage slots and publications.
 - **`Replicant.Identifier`** — allowlist validation for slot, publication, and

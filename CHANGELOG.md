@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Initial snapshot / backfill (`replicant-snapshot`)
+
+- `snapshot: true` start mode: `Replicant.start_link/1` bootstraps a `:state_mirror`
+  (or any snapshot-capable) sink from an already-populated source and hands off to
+  streaming at the snapshot LSN — **gap-free and dup-free** by the existing transaction
+  watermark. Composes with `go_forward_only` and resume (both `true` → `:conflicting_start_mode`).
+- `Replicant.Sink` gains two `@optional_callbacks`: `handle_snapshot/2` (batch upsert;
+  `first_for_table?` triggers the per-table reset — a hard redo-safety obligation) and
+  `handle_snapshot_complete/1` (the durable checkpoint handoff). `%Change{op: :snapshot}`
+  carries backfill rows.
+- `Replicant.Snapshotter` reads the publication's tables at the exported
+  `consistent_point` via a `REPEATABLE READ` cursor on a separate connection, behind a
+  value-free error boundary (Critical Rule 1). `EXPORT_SNAPSHOT` slot creation +
+  `SET TRANSACTION SNAPSHOT` (snapshot-name-literal validated, not the identifier
+  allowlist) + server-side `format('%I.%I')` table quoting.
+- Fail-closed crash recovery: a mid-COPY crash halts `:snapshot_incomplete` (never
+  auto-drops a slot); a checkpoint read fault in snapshot mode halts
+  `:checkpoint_unreadable`. The operator drops the slot to retry.
+- `Replicant.lsn_from_string/1`; `Replicant.Error` reason `:snapshot_failed`.
+
 ### Added — Plan 1: offline CDC core (decode / assemble / validate / redact)
 
 - Vendored `pgoutput` byte parser behind a **value-free-error decode boundary**
