@@ -169,4 +169,27 @@ defmodule Replicant.AssemblerServerTest do
     assert :sys.get_state(pid).halted
     refute_received {:sink_committed, _}
   end
+
+  test "sink-owned init builds a :sink_owned assembler" do
+    {:ok, pid} =
+      start_supervised({Replicant.AssemblerServer, slot_name: "s_owned", sink: RecordingSink})
+
+    assert :sys.get_state(pid).asm.mode == :sink_owned
+  end
+
+  test "a {:seed_lib_checkpoint, lsn} cast sets the in-memory watermark" do
+    writer = fn _ -> :ok end
+    # Start with a sink-owned assembler, then inject a lib-mode one directly to
+    # exercise the seed cast handler (bypass the store wiring for this unit test).
+    {:ok, pid} =
+      start_supervised({Replicant.AssemblerServer, slot_name: "s_seed", sink: RecordingSink})
+
+    :sys.replace_state(pid, fn st ->
+      %{st | asm: Replicant.Assembler.new(RecordingSink, mode: :lib, checkpoint_writer: writer)}
+    end)
+
+    GenServer.cast(AssemblerServer.via("s_seed"), {:seed_lib_checkpoint, 4242})
+    # get_state flushes the mailbox → the cast is processed before we read.
+    assert :sys.get_state(pid).asm.lib_checkpoint == 4242
+  end
 end

@@ -31,8 +31,24 @@ defmodule Replicant.AssemblerServer do
   def init(opts) do
     slot_name = Keyword.fetch!(opts, :slot_name)
     sink = Keyword.fetch!(opts, :sink)
-    {:ok, %{slot_name: slot_name, asm: Assembler.new(sink), halted: false}}
+    asm = build_assembler(slot_name, sink, Keyword.get(opts, :checkpoint_store))
+    {:ok, %{slot_name: slot_name, asm: asm, halted: false}}
   end
+
+  # Lib mode: bind the writer to the pipeline's CheckpointStore (the watermark is
+  # seeded later by the Connection's {:seed_lib_checkpoint, _} cast, from the SAME
+  # store read it does on connect — one read, deterministic ordering before any
+  # Commit). No store I/O in init (fast boot; the CheckpointStore's own non-sync
+  # connect owns resilience). A lib-mode assembler is NEVER built without a writer.
+  defp build_assembler(slot_name, sink, store) when is_list(store) do
+    writer = fn lsn ->
+      Replicant.CheckpointStore.write(Replicant.CheckpointStore.via(slot_name), lsn)
+    end
+
+    Assembler.new(sink, mode: :lib, checkpoint_writer: writer)
+  end
+
+  defp build_assembler(_slot_name, sink, nil), do: Assembler.new(sink)
 
   # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
   # will terminate this process; reprocessing here would be wasted and unsafe.
@@ -44,6 +60,13 @@ defmodule Replicant.AssemblerServer do
   def handle_cast({:message, message, bytes, from}, state) do
     asm = Assembler.observe_bytes(state.asm, bytes)
     dispatch(Assembler.handle_message(asm, message), from, state)
+  end
+
+  # The Connection seeds the lib-mode watermark from its connect-time store read,
+  # before streaming. A no-op in sink-owned mode (the assembler ignores
+  # lib_checkpoint there).
+  def handle_cast({:seed_lib_checkpoint, lsn}, %{asm: asm} = state) when is_integer(lsn) do
+    {:noreply, %{state | asm: %{asm | lib_checkpoint: lsn}}}
   end
 
   defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}
