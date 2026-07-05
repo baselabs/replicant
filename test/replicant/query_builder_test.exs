@@ -64,4 +64,48 @@ defmodule Replicant.QueryBuilderTest do
       assert QueryBuilder.is_in_recovery() == "SELECT pg_is_in_recovery();"
     end
   end
+
+  describe "create_export_slot/1" do
+    test "builds the EXPORT_SNAPSHOT variant from a validated slot name" do
+      {:ok, sql} = QueryBuilder.create_export_slot("orders_slot")
+      assert sql =~ "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput EXPORT_SNAPSHOT"
+      refute sql =~ "NOEXPORT"
+    end
+
+    test "rejects a hostile slot name, builds nothing" do
+      assert {:error, :invalid_identifier} = QueryBuilder.create_export_slot("x; DROP")
+    end
+  end
+
+  describe "set_transaction_snapshot/1" do
+    test "adopts a real PG exported-snapshot name (uppercase hex + hyphens)" do
+      {:ok, sql} = QueryBuilder.set_transaction_snapshot("00000003-0000DD8A-1")
+      assert sql == "SET TRANSACTION SNAPSHOT '00000003-0000DD8A-1'"
+    end
+
+    test "rejects a name with a quote/whitespace/injection (string-literal guard)" do
+      for bad <- ["00000003'; DROP--", "00 00", "abc", "'", "1-2-3; DROP", ""] do
+        assert {:error, :invalid_snapshot_name} = QueryBuilder.set_transaction_snapshot(bad)
+      end
+    end
+
+    test "rejects a non-binary" do
+      assert {:error, :invalid_snapshot_name} = QueryBuilder.set_transaction_snapshot(nil)
+    end
+  end
+
+  describe "publication_tables/1" do
+    test "selects schema, table, and PG-quoted qualified name for the validated publication" do
+      {:ok, sql} = QueryBuilder.publication_tables("orders_pub")
+      assert sql =~ "pg_publication_tables"
+      assert sql =~ "pubname = 'orders_pub'"
+      assert sql =~ "format('%I.%I', schemaname, tablename)"
+      assert sql =~ "schemaname"
+      assert sql =~ "tablename"
+    end
+
+    test "rejects a hostile publication name" do
+      assert {:error, :invalid_identifier} = QueryBuilder.publication_tables("p'; DROP")
+    end
+  end
 end

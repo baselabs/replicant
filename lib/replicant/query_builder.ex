@@ -12,6 +12,12 @@ defmodule Replicant.QueryBuilder do
 
   @pgoutput "pgoutput"
 
+  # PG exports a snapshot name as "%08X-%08X-%d". This allowlist forbids quotes and
+  # whitespace so the name is safe inside the SET TRANSACTION SNAPSHOT '<name>' STRING
+  # LITERAL — it is NOT an identifier position, so `Identifier.validate/1` (which rejects
+  # uppercase hex and hyphens) is the WRONG guard here (spec §9).
+  @snapshot_name ~r/\A[0-9A-Fa-f]{1,16}-[0-9A-Fa-f]{1,16}-\d{1,10}\z/
+
   @doc """
   Replication command that starts streaming WAL from `start_lsn` for the publication.
 
@@ -38,6 +44,52 @@ defmodule Replicant.QueryBuilder do
   def create_durable_slot(slot_name) do
     with :ok <- Identifier.validate(slot_name) do
       {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} NOEXPORT_SNAPSHOT;"}
+    end
+  end
+
+  @doc """
+  Replication command to create a durable logical slot that EXPORTS a consistent
+  snapshot (spec §4). The result row is `[slot_name, consistent_point, snapshot_name,
+  output_plugin]` — the caller reads `consistent_point` (a `pg_lsn` string) and
+  `snapshot_name` from it.
+  """
+  @spec create_export_slot(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_export_slot(slot_name) do
+    with :ok <- Identifier.validate(slot_name) do
+      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} EXPORT_SNAPSHOT;"}
+    end
+  end
+
+  @doc """
+  Command adopting an exported snapshot by name (spec §9). The name is validated as a
+  snapshot-name LITERAL — not an identifier — before interpolation into the quoted
+  string; a name with a quote/whitespace/other injection returns
+  `{:error, :invalid_snapshot_name}` and builds nothing.
+  """
+  @spec set_transaction_snapshot(term()) :: {:ok, String.t()} | {:error, :invalid_snapshot_name}
+  def set_transaction_snapshot(name) when is_binary(name) do
+    if Regex.match?(@snapshot_name, name) do
+      {:ok, "SET TRANSACTION SNAPSHOT '#{name}'"}
+    else
+      {:error, :invalid_snapshot_name}
+    end
+  end
+
+  def set_transaction_snapshot(_name), do: {:error, :invalid_snapshot_name}
+
+  @doc """
+  Query returning each publication table's `schemaname`, `tablename`, and PG-quoted
+  fully-qualified name (`format('%I.%I', …)`, spec §9). The quoted `qualified` column is
+  interpolation-safe for any valid identifier (mixed-case/quoted tables the streaming
+  path also supports); the raw `schemaname`/`tablename` fill the `%Change{}` fields. The
+  publication name is validated (already an allowlisted identifier) then interpolated.
+  """
+  @spec publication_tables(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def publication_tables(publication) do
+    with :ok <- Identifier.validate(publication) do
+      {:ok,
+       "SELECT schemaname, tablename, format('%I.%I', schemaname, tablename) AS qualified " <>
+         "FROM pg_publication_tables WHERE pubname = '#{publication}'"}
     end
   end
 
