@@ -65,6 +65,17 @@ defmodule Replicant.TelemetryTest do
     end
   end
 
+  test "attempt and max_retries are permitted (value-free) metadata keys" do
+    assert %{slot_name: "s", attempt: 2, max_retries: 5} =
+             Telemetry.validate!(%{slot_name: "s", attempt: 2, max_retries: 5})
+  end
+
+  test "TRIPWIRE: a row-value-shaped key alongside the retry keys still raises" do
+    assert_raise ArgumentError, ~r/value-free allowlist/, fn ->
+      Telemetry.validate!(%{attempt: 1, max_retries: 5, customer_email: "a@b.c"})
+    end
+  end
+
   describe "span/3" do
     test "a stop-side off-allowlist metadata key raises (Critical Rule 1 on the merged meta)" do
       # span/3 merges start + stop meta and re-validates before the stop event —
