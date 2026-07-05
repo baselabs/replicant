@@ -34,7 +34,7 @@ defmodule Replicant.Assembler do
   `handle_message/2` wraps its body in `rescue` AND `catch`: a raise from the
   casting path (a malformed numeric/bytea in `Types.cast_record/2`) is scrubbed
   into `{:halt, %Error{reason: :decode_failure}}`; a sink raise/throw/exit is
-  scrubbed by `apply_sink/3` into `{:halt, %Error{reason: :sink_failed}}` — never
+  scrubbed by `apply_sink/2` into `{:halt, %Error{reason: :sink_failed}}` — never
   inspecting a throw/exit reason, which (e.g. a `GenServer.call` timeout carrying
   the transaction) can embed row values (Critical Rule 1). A row/commit message
   arriving before any `Begin` halts as `:config_invalid` rather than crashing.
@@ -59,7 +59,10 @@ defmodule Replicant.Assembler do
           relations: %{non_neg_integer() => Relation.t()},
           projected: %{non_neg_integer() => [Change.Column.t()]},
           txn: buffer() | nil,
-          ordinal: non_neg_integer()
+          ordinal: non_neg_integer(),
+          mode: :sink_owned | :lib,
+          checkpoint_writer: (lsn() -> :ok | {:error, term()}) | nil,
+          lib_checkpoint: lsn() | nil
         }
 
   @type buffer :: %{
@@ -69,11 +72,36 @@ defmodule Replicant.Assembler do
           byte_size: non_neg_integer()
         }
 
-  defstruct [:sink, :txn, relations: %{}, projected: %{}, ordinal: 0]
+  defstruct [
+    :sink,
+    :txn,
+    relations: %{},
+    projected: %{},
+    ordinal: 0,
+    mode: :sink_owned,
+    checkpoint_writer: nil,
+    lib_checkpoint: nil
+  ]
 
-  @doc "Create a new assembler bound to `sink` (a module implementing `Replicant.Sink`)."
-  @spec new(module()) :: t()
-  def new(sink), do: %__MODULE__{sink: sink}
+  @doc """
+  Create an assembler bound to `sink` (a module implementing `Replicant.Sink`).
+  `opts` selects the checkpoint mode:
+
+    * (default) sink-owned — the sink returns its own checkpoint; `checkpoint/0`
+      is the watermark read live per Commit;
+    * `mode: :lib` — the library owns the checkpoint: `:checkpoint_writer` (a
+      `(lsn -> :ok | {:error, _})`) persists it after the sink, and
+      `:lib_checkpoint` seeds the in-memory watermark used by the pre-skip.
+  """
+  @spec new(module(), keyword()) :: t()
+  def new(sink, opts \\ []) do
+    %__MODULE__{
+      sink: sink,
+      mode: Keyword.get(opts, :mode, :sink_owned),
+      checkpoint_writer: Keyword.get(opts, :checkpoint_writer),
+      lib_checkpoint: Keyword.get(opts, :lib_checkpoint)
+    }
+  end
 
   @doc """
   Accumulate the raw WAL payload byte-size of the message about to be handled into
@@ -230,18 +258,10 @@ defmodule Replicant.Assembler do
       }
     )
 
-    case checkpoint(asm.sink) do
-      {:ok, checkpoint} when not is_nil(checkpoint) and txn.commit_lsn <= checkpoint ->
-        {:skipped, txn.commit_lsn, reset(asm)}
-
-      _ ->
-        # {:ok, nil} (never persisted → go forward), {:ok, older_lsn} (newer txn), OR
-        # {:error, _} / a raised/exited checkpoint read → apply. Fail-OPEN on a
-        # checkpoint fault is dup-safe by the §6 sink idempotency contract: a
-        # re-dispatched already-persisted txn is deduped by the sink (skip
-        # commit_lsn <= its own checkpoint; upsert by PK), and a real store outage
-        # makes handle_transaction fail → halt.
-        apply_sink(asm.sink, txn, asm)
+    if skip?(asm, txn) do
+      {:skipped, txn.commit_lsn, reset(asm)}
+    else
+      apply_sink(asm, txn)
     end
   end
 
@@ -443,7 +463,25 @@ defmodule Replicant.Assembler do
     _kind, _reason -> {:ok, nil}
   end
 
-  defp apply_sink(sink, %Transaction{} = txn, asm) do
+  # Lib mode: compare against the IN-MEMORY watermark (seeded from the store,
+  # advanced on each write) — no per-transaction store round-trip.
+  defp skip?(%__MODULE__{mode: :lib, lib_checkpoint: cp}, %Transaction{commit_lsn: lsn}),
+    do: is_integer(cp) and lsn <= cp
+
+  # Sink-owned: read the sink's checkpoint live. Reproduces the prior Commit-path
+  # semantics exactly — skip only on {:ok, non-nil, >= commit_lsn}; {:ok, nil}
+  # (never persisted), {:ok, older_lsn} (newer txn), a {:error, _}, or a
+  # raised/exited read all fail-OPEN (dup-safe by the §6 sink idempotency
+  # contract: a re-dispatched already-persisted txn is deduped by the sink, and a
+  # real store outage makes handle_transaction fail → halt).
+  defp skip?(%__MODULE__{sink: sink}, %Transaction{commit_lsn: lsn}) do
+    case checkpoint(sink) do
+      {:ok, cp} -> not is_nil(cp) and lsn <= cp
+      _ -> false
+    end
+  end
+
+  defp apply_sink(%__MODULE__{sink: sink} = asm, %Transaction{} = txn) do
     start_mono = System.monotonic_time(:millisecond)
 
     result =
@@ -459,16 +497,31 @@ defmodule Replicant.Assembler do
 
     case result do
       {:ok, _lsn} ->
-        # Ack the KNOWN durable position — `txn.commit_lsn`, the LSN just committed —
-        # NOT the sink's returned value. A misbehaving sink returning a higher LSN
-        # would otherwise advance the slot past un-persisted WAL (loss). Per §6 a
-        # correct sink returns exactly `txn.commit_lsn`, so this is contract-equivalent
-        # for a correct sink and fail-safe against a buggy one.
-        Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{
-          commit_lsn: txn.commit_lsn
-        })
+        # Lib mode: persist the checkpoint to the store BEFORE announcing "committed"
+        # (checkpoint-after-persist). A write fault halts fail-closed — never ack
+        # without a durable checkpoint. Sink-owned: write_checkpoint/2 is a no-op.
+        case write_checkpoint(asm, txn.commit_lsn) do
+          :ok ->
+            # Ack the KNOWN durable position — `txn.commit_lsn`, the LSN just committed —
+            # NOT the sink's returned value. A misbehaving sink returning a higher LSN
+            # would otherwise advance the slot past un-persisted WAL (loss). Per §6 a
+            # correct sink returns exactly `txn.commit_lsn`, so this is contract-equivalent
+            # for a correct sink and fail-safe against a buggy one.
+            Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{
+              commit_lsn: txn.commit_lsn
+            })
 
-        {:transaction, txn, txn.commit_lsn, reset(asm)}
+            {:transaction, txn, txn.commit_lsn, advance(asm, txn.commit_lsn)}
+
+          {:error, _} ->
+            # Triage fidelity: label a checkpoint-store WRITE fault as a checkpoint_store
+            # failure (not :sink_failed) — the sink persisted fine; the store write did not.
+            Telemetry.event([:replicant, :checkpoint_store, :failed], %{duration: duration}, %{
+              reason: :checkpoint_store_failed
+            })
+
+            {:halt, %Error{reason: :checkpoint_store_failed}, asm}
+        end
 
       {:error, _reason} ->
         sink_failed(asm, duration)
@@ -485,6 +538,28 @@ defmodule Replicant.Assembler do
         sink_failed(asm, duration)
     end
   end
+
+  # Sink-owned: the sink already wrote its own checkpoint atomically. Lib mode:
+  # write via the injected writer. A writer raise/exit (e.g. a dead
+  # CheckpointStore) is caught value-free and categorised :checkpoint_store_failed
+  # (NOT :decode_failure) — never inspecting the reason (Critical Rule 1).
+  defp write_checkpoint(%__MODULE__{mode: :sink_owned}, _lsn), do: :ok
+
+  defp write_checkpoint(%__MODULE__{mode: :lib, checkpoint_writer: writer}, lsn)
+       when is_function(writer, 1) do
+    writer.(lsn)
+  rescue
+    _ -> {:error, :checkpoint_store_failed}
+  catch
+    _kind, _reason -> {:error, :checkpoint_store_failed}
+  end
+
+  # Advance the in-memory lib watermark on a durable commit (lib mode) and reset
+  # the buffer. Sink-owned: a bare buffer reset (the watermark lives in the sink).
+  defp advance(%__MODULE__{mode: :lib} = asm, lsn),
+    do: %{reset(asm) | lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)}
+
+  defp advance(asm, _lsn), do: reset(asm)
 
   defp sink_failed(asm, duration, shape \\ nil) do
     Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{reason: :sink_failed})

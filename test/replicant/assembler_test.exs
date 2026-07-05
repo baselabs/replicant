@@ -204,6 +204,81 @@ defmodule Replicant.AssemblerTest do
     end
   end
 
+  describe "lib mode (checkpoint-store)" do
+    defmodule OkSink do
+      # No @behaviour — checkpoint/0 is still mandatory at this commit point (Task 10).
+      def handle_transaction(%Replicant.Transaction{} = txn), do: {:ok, txn.commit_lsn}
+    end
+
+    alias Replicant.Decoder.Messages.{Begin, Commit}
+
+    test "a committed txn writes the checkpoint via the writer BEFORE returning, and advances the in-memory watermark" do
+      parent = self()
+
+      writer = fn lsn ->
+        send(parent, {:wrote, lsn})
+        :ok
+      end
+
+      asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      assert {:transaction, _txn, 100, asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 100, commit_timestamp: nil})
+
+      assert_received {:wrote, 100}
+      assert asm.lib_checkpoint == 100
+    end
+
+    test "a re-delivered txn <= the in-memory watermark is pre-skipped (no writer call)" do
+      parent = self()
+
+      writer = fn lsn ->
+        send(parent, {:wrote, lsn})
+        :ok
+      end
+
+      asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: 100)
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 50, xid: 2})
+
+      assert {:skipped, 50, _asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 50, commit_timestamp: nil})
+
+      refute_received {:wrote, _}
+    end
+
+    test "a checkpoint-store WRITE fault halts fail-closed (:checkpoint_store_failed), never announcing commit" do
+      # Gate the checkpoint-after-persist ORDERING, not just the halt: a regression
+      # that emitted [:sink, :committed] and THEN halted would still satisfy the
+      # {:halt, ...} assertion — so we must also prove committed was NEVER emitted.
+      attach_telemetry(self())
+
+      writer = fn _lsn -> {:error, :store_down} end
+      asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      assert {:halt, %Replicant.Error{reason: :checkpoint_store_failed}, _asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 100, commit_timestamp: nil})
+
+      # The write faulted → the sink's commit must never have been announced.
+      refute_received {:tel, [:replicant, :sink, :committed], _}
+    after
+      :telemetry.detach({__MODULE__, :telemetry})
+    end
+
+    test "a dead-store writer EXIT is caught value-free and halts :checkpoint_store_failed (not :decode_failure)" do
+      writer = fn _lsn -> exit(:noproc) end
+      asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 7, xid: 1})
+
+      assert {:halt, %Replicant.Error{reason: :checkpoint_store_failed}, _asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 7, commit_timestamp: nil})
+    end
+  end
+
   describe "schema-change diff (spec §9) — destructive halts fail-closed" do
     test "an added column is additive and does not halt" do
       asm = Assembler.new(RecordingSink)
