@@ -191,4 +191,37 @@ defmodule Replicant.CheckpointStore do
 
     {:reply, {:error, e}, state}
   end
+
+  @doc """
+  True when a store fault reason is PERMANENT (retrying cannot fix it): a wrong
+  pre-existing column type (`:checkpoint_store_schema_mismatch`) or an invalid table
+  identifier (`:config_invalid`). Every other reason — `:checkpoint_store_failed`, into
+  which a `%Postgrex.Error{}` / `%DBConnection.ConnectionError{}` is scrubbed — is
+  transient AT THE VALUE-FREE BOUNDARY (a momentary blip and a wrong-host misconfig are
+  indistinguishable here), so it is retried, then halted (spec §7).
+  """
+  @spec permanent_reason?(atom()) :: boolean()
+  def permanent_reason?(:checkpoint_store_schema_mismatch), do: true
+  def permanent_reason?(:config_invalid), do: true
+  def permanent_reason?(_transient), do: false
+
+  @doc """
+  The shared retry decision: `:retry` while `attempt < max_retries`, else `:halt`.
+  `attempt` is the count of retries ALREADY made (0 on the first fault). `max_retries: 0`
+  ⇒ always `:halt` (halt-now opt-out). Used identically by the connect-read (timer) and
+  mid-stream write (sleep) sites so their counter semantics cannot drift (spec §4).
+  """
+  @spec retry_decision(non_neg_integer(), non_neg_integer()) :: :retry | :halt
+  def retry_decision(attempt, max_retries) when attempt < max_retries, do: :retry
+  def retry_decision(_attempt, _max_retries), do: :halt
+
+  @doc "Emit the value-free `[:replicant, :checkpoint_store, :retrying]` event (slot_name + ints only)."
+  @spec emit_retrying(String.t(), pos_integer(), non_neg_integer()) :: :ok
+  def emit_retrying(slot_name, attempt, max_retries) do
+    Telemetry.event([:replicant, :checkpoint_store, :retrying], %{}, %{
+      slot_name: slot_name,
+      attempt: attempt,
+      max_retries: max_retries
+    })
+  end
 end

@@ -54,4 +54,35 @@ defmodule Replicant.CheckpointStoreFaultTest do
     assert {:error, %Error{reason: :checkpoint_store_failed}} = CheckpointStore.read(via)
     assert {:error, %Error{reason: :checkpoint_store_failed}} = CheckpointStore.write(via, 7)
   end
+
+  describe "retry policy helpers" do
+    alias Replicant.CheckpointStore
+
+    test "permanent_reason?/1 is true for structural faults, false for transient" do
+      assert CheckpointStore.permanent_reason?(:checkpoint_store_schema_mismatch)
+      assert CheckpointStore.permanent_reason?(:config_invalid)
+      refute CheckpointStore.permanent_reason?(:checkpoint_store_failed)
+    end
+
+    test "retry_decision/2 retries while attempts remain, else halts (max 0 = halt-now)" do
+      assert CheckpointStore.retry_decision(0, 2) == :retry
+      assert CheckpointStore.retry_decision(1, 2) == :retry
+      assert CheckpointStore.retry_decision(2, 2) == :halt
+      assert CheckpointStore.retry_decision(0, 0) == :halt
+    end
+
+    test "emit_retrying/3 fires a value-free [:checkpoint_store, :retrying] event" do
+      :telemetry.attach(
+        {__MODULE__, :retrying},
+        [:replicant, :checkpoint_store, :retrying],
+        fn _n, _m, meta, pid -> send(pid, {:retrying, meta}) end,
+        self()
+      )
+
+      CheckpointStore.emit_retrying("rep_x", 3, 5)
+      assert_received {:retrying, %{slot_name: "rep_x", attempt: 3, max_retries: 5}}
+    after
+      :telemetry.detach({__MODULE__, :retrying})
+    end
+  end
 end
