@@ -56,4 +56,28 @@ defmodule Replicant.QueryBuilder do
       {:ok, "SELECT active FROM pg_replication_slots WHERE slot_name = '#{slot_name}' LIMIT 1;"}
     end
   end
+
+  @doc """
+  Query returning `wal_status` and `conflicting` for the replication slot — the
+  PG16 invalidation signals (spec §8). `wal_status = 'lost'` means WAL the slot
+  needs was removed (`max_slot_wal_keep_size` exceeded); `conflicting = true`
+  means a standby recovery conflict invalidated the slot. Both are unrecoverable
+  data gaps → fail-closed halt. (PG16 has no `invalidation_reason` column — that
+  is PG17+; `wal_status`/`conflicting` are the PG16-correct signals.)
+  """
+  @spec slot_invalidation_status(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def slot_invalidation_status(slot_name) do
+    with :ok <- Identifier.validate(slot_name) do
+      {:ok,
+       "SELECT wal_status, conflicting FROM pg_replication_slots " <>
+         "WHERE slot_name = '#{slot_name}' LIMIT 1;"}
+    end
+  end
+
+  @doc "Query returning `pg_is_in_recovery()` — `true` on a standby (spec §8 R-ISO advisory)."
+  @spec is_in_recovery() :: String.t()
+  # Name mirrors PostgreSQL's own `pg_is_in_recovery()` function (not an Elixir
+  # boolean predicate — it builds a SQL string), so it is exempt from the `?` rule.
+  # credo:disable-for-next-line Credo.Check.Readability.PredicateFunctionNames
+  def is_in_recovery, do: "SELECT pg_is_in_recovery();"
 end

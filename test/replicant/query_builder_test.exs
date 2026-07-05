@@ -40,4 +40,28 @@ defmodule Replicant.QueryBuilderTest do
       assert {:error, :invalid_identifier} = QueryBuilder.slot_exists("x;--")
     end
   end
+
+  describe "slot_invalidation_status/1" do
+    test "selects the PG16 invalidation signals (wal_status + conflicting), validated" do
+      assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders")
+      # PG16 real columns (probed against 16.13): wal_status text + conflicting bool.
+      # invalidation_reason is PG17+ and must NOT appear (it errors on PG16).
+      assert sql =~ "wal_status"
+      assert sql =~ "conflicting"
+      refute sql =~ "invalidation_reason"
+      assert sql =~ "pg_replication_slots"
+      assert sql =~ "slot_name = 'replicant_orders'"
+    end
+
+    test "rejects an invalid slot name (no raw interpolation into SQL)" do
+      assert {:error, :invalid_identifier} =
+               QueryBuilder.slot_invalidation_status("orders'; DROP")
+    end
+  end
+
+  describe "is_in_recovery/0" do
+    test "returns the pg_is_in_recovery() probe (no identifier to validate)" do
+      assert QueryBuilder.is_in_recovery() == "SELECT pg_is_in_recovery();"
+    end
+  end
 end
