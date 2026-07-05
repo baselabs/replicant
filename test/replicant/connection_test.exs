@@ -536,6 +536,7 @@ defmodule Replicant.ConnectionTest do
       # A live paced-retry timer (still mid-fault: store_retry_count > 0) disconnects so the
       # framework re-runs the connect chain and re-reads the store.
       live = %{slot_name: "rep_timer", store_retry_count: 1}
+
       assert {:disconnect, :checkpoint_store_retry} =
                Replicant.Connection.handle_info(:store_retry_reconnect, live)
 
