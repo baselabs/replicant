@@ -267,14 +267,42 @@ defmodule Replicant.ConnectionTest do
       :telemetry.detach({__MODULE__, :inval})
     end
 
-    test "an absent slot advances to create_slot" do
+    test "an absent slot with an EMPTY checkpoint advances to create_slot (first run / go-forward)" do
       result = [%Postgrex.Result{rows: []}]
 
       assert {:query, sql, new_state} =
-               Connection.handle_result(result, state(step: :invalidation_check))
+               Connection.handle_result(
+                 result,
+                 state(step: :invalidation_check, checkpoint_lsn: 0)
+               )
 
       assert sql =~ "CREATE_REPLICATION_SLOT conn_test"
       assert new_state.step == :create_slot
+    end
+
+    test "an absent slot with a NON-EMPTY checkpoint halts fail-closed (data gap — never silently recreate)" do
+      # The sink has durable state (checkpoint > 0) but the slot is gone. Creating a
+      # fresh slot would stream from its creation LSN, silently skipping the WAL
+      # between the checkpoint and now (spec §8: never silently drop and recreate).
+      :telemetry.attach(
+        {__MODULE__, :data_gap},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:data_gap, meta}) end,
+        self()
+      )
+
+      result = [%Postgrex.Result{rows: []}]
+
+      assert {:disconnect, :data_gap} =
+               Connection.handle_result(
+                 result,
+                 state(step: :invalidation_check, checkpoint_lsn: 0x500)
+               )
+
+      # NEVER a {:query, CREATE_REPLICATION_SLOT ...} — the disconnect shape structurally
+      # excludes slot recreation.
+      assert_received {:data_gap, %{reason: :data_gap}}
+      :telemetry.detach({__MODULE__, :data_gap})
     end
 
     test "a valid slot streams from the durable checkpoint LSN" do

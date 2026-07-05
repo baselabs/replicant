@@ -167,6 +167,18 @@ defmodule Replicant.Connection do
 
   def handle_result([%Postgrex.Result{rows: rows}], %{step: :invalidation_check} = state) do
     case classify_slot_status(rows) do
+      :absent when state.checkpoint_lsn > 0 ->
+        # DATA GAP (spec §8): the sink has durable state (checkpoint > 0) but the slot
+        # is gone (dropped/rebuilt/restored-from-backup). A fresh slot would begin
+        # streaming at its creation LSN, silently skipping every transaction between
+        # the sink's checkpoint and now — unrecoverable loss. Halt fail-closed with a
+        # distinct data-gap signal; NEVER silently recreate. (An EMPTY checkpoint —
+        # nil or a §14.15 read-fault, both read as 0 — is a genuine first run / go
+        # forward and DOES create the slot below.)
+        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: :data_gap})
+        Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_with_checkpoint})
+        {:disconnect, :data_gap}
+
       :absent ->
         {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
         {:query, sql, %{state | step: :create_slot}}
