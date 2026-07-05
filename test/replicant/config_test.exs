@@ -213,7 +213,55 @@ defmodule Replicant.ConfigTest do
     test "a valid :checkpoint_store is normalised onto the config" do
       opts = base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], table: "cp"]]
       assert {:ok, cfg} = Config.validate(opts)
-      assert cfg.checkpoint_store == [connection: [hostname: "db"], table: "cp"]
+
+      assert Keyword.take(cfg.checkpoint_store, [:connection, :table]) ==
+               [connection: [hostname: "db"], table: "cp"]
+
+      assert Keyword.get(cfg.checkpoint_store, :max_retries) == 5
+    end
+
+    test "retry opts default to max_retries 5 / retry_backoff_ms 1000 when omitted" do
+      {:ok, cfg} =
+        Config.validate(base_opts() ++ [checkpoint_store: [connection: [hostname: "db"]]])
+
+      assert Keyword.get(cfg.checkpoint_store, :max_retries) == 5
+      assert Keyword.get(cfg.checkpoint_store, :retry_backoff_ms) == 1000
+    end
+
+    test "explicit retry opts are preserved; max_retries: 0 (halt-now) is allowed" do
+      opts =
+        base_opts() ++
+          [
+            checkpoint_store: [
+              connection: [hostname: "db"],
+              max_retries: 0,
+              retry_backoff_ms: 250
+            ]
+          ]
+
+      {:ok, cfg} = Config.validate(opts)
+      assert Keyword.get(cfg.checkpoint_store, :max_retries) == 0
+      assert Keyword.get(cfg.checkpoint_store, :retry_backoff_ms) == 250
+    end
+
+    test "a negative max_retries or non-positive backoff is a config error" do
+      bad_n = base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], max_retries: -1]]
+      assert {:error, :config_invalid} = Config.validate(bad_n)
+
+      bad_b =
+        base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], retry_backoff_ms: 0]]
+
+      assert {:error, :config_invalid} = Config.validate(bad_b)
+
+      bad_type =
+        base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], retry_backoff_ms: "100"]]
+
+      assert {:error, :config_invalid} = Config.validate(bad_type)
+
+      bad_float =
+        base_opts() ++ [checkpoint_store: [connection: [hostname: "db"], max_retries: 1.5]]
+
+      assert {:error, :config_invalid} = Config.validate(bad_float)
     end
 
     test "lib mode does NOT require the sink to implement checkpoint/0" do

@@ -144,8 +144,9 @@ defmodule Replicant.Config do
 
       {:ok, store} when is_list(store) ->
         with conn when is_list(conn) and conn != [] <- Keyword.get(store, :connection),
-             :ok <- validate_store_table(Keyword.get(store, :table)) do
-          {:ok, store}
+             :ok <- validate_store_table(Keyword.get(store, :table)),
+             {:ok, max_retries, backoff} <- validate_retry_opts(store) do
+          {:ok, Keyword.merge(store, max_retries: max_retries, retry_backoff_ms: backoff)}
         else
           {:error, :invalid_identifier} = err -> err
           _ -> {:error, :config_invalid}
@@ -158,6 +159,20 @@ defmodule Replicant.Config do
 
   defp validate_store_table(nil), do: :ok
   defp validate_store_table(table), do: Identifier.validate(table)
+
+  # Retry policy (spec §6/§7): `max_retries` is a non-negative integer (0 = halt-now,
+  # opting out of retry); `retry_backoff_ms` is a positive integer. Defaults 5 / 1000 →
+  # the default pipeline tolerates ~5s of store outage before halting.
+  defp validate_retry_opts(store) do
+    max_retries = Keyword.get(store, :max_retries, 5)
+    backoff = Keyword.get(store, :retry_backoff_ms, 1000)
+
+    if is_integer(max_retries) and max_retries >= 0 and is_integer(backoff) and backoff > 0 do
+      {:ok, max_retries, backoff}
+    else
+      {:error, :config_invalid}
+    end
+  end
 
   defp fetch_connection(opts) do
     case Keyword.get(opts, :connection) do
