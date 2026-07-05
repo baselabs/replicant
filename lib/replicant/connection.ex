@@ -471,12 +471,15 @@ defmodule Replicant.Connection do
     end
   end
 
-  # Read the retry policy. Config normalizes these onto :checkpoint_store; the defaults here
-  # mirror Config's (spec §6) and defend a directly-constructed config map in tests.
-  defp max_retries(%{checkpoint_store: store}), do: Keyword.get(store, :max_retries, 5)
+  # Read the retry policy. Config normalizes these onto :checkpoint_store; the fallback is
+  # the single-source default on CheckpointStore (spec §6), defending a directly-constructed
+  # config map in tests.
+  defp max_retries(%{checkpoint_store: store}),
+    do: Keyword.get(store, :max_retries, Replicant.CheckpointStore.default_max_retries())
 
   defp retry_backoff_ms(%{checkpoint_store: store}),
-    do: Keyword.get(store, :retry_backoff_ms, 1000)
+    do:
+      Keyword.get(store, :retry_backoff_ms, Replicant.CheckpointStore.default_retry_backoff_ms())
 
   @doc false
   # Keep the retry counter across a fault (accumulate toward the bound); reset to 0 on a

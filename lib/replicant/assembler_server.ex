@@ -41,8 +41,11 @@ defmodule Replicant.AssemblerServer do
   # Commit). No store I/O in init (fast boot; the CheckpointStore's own non-sync
   # connect owns resilience). A lib-mode assembler is NEVER built without a writer.
   defp build_assembler(slot_name, sink, store) when is_list(store) do
-    max_retries = Keyword.get(store, :max_retries, 5)
-    backoff = Keyword.get(store, :retry_backoff_ms, 1000)
+    max_retries =
+      Keyword.get(store, :max_retries, Replicant.CheckpointStore.default_max_retries())
+
+    backoff =
+      Keyword.get(store, :retry_backoff_ms, Replicant.CheckpointStore.default_retry_backoff_ms())
 
     writer = fn lsn ->
       write_with_retry(store_write(slot_name, lsn), slot_name, max_retries, backoff, 0)

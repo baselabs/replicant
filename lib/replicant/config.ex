@@ -9,7 +9,7 @@ defmodule Replicant.Config do
   `validate/1` then `guard/1` before spawning a pipeline.
   """
 
-  alias Replicant.{Connection, Identifier, Sink}
+  alias Replicant.{CheckpointStore, Connection, Identifier, Sink}
 
   @type t :: %{
           connection: keyword(),
@@ -164,8 +164,8 @@ defmodule Replicant.Config do
   # opting out of retry); `retry_backoff_ms` is a positive integer. Defaults 5 / 1000 →
   # the default pipeline tolerates ~5s of store outage before halting.
   defp validate_retry_opts(store) do
-    max_retries = Keyword.get(store, :max_retries, 5)
-    backoff = Keyword.get(store, :retry_backoff_ms, 1000)
+    max_retries = Keyword.get(store, :max_retries, CheckpointStore.default_max_retries())
+    backoff = Keyword.get(store, :retry_backoff_ms, CheckpointStore.default_retry_backoff_ms())
 
     if is_integer(max_retries) and max_retries >= 0 and is_integer(backoff) and backoff > 0 do
       {:ok, max_retries, backoff}

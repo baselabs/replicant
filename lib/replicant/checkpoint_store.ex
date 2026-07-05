@@ -192,6 +192,22 @@ defmodule Replicant.CheckpointStore do
     {:reply, {:error, e}, state}
   end
 
+  # The retry policy defaults (spec §6), owned once here and referenced by Config,
+  # Connection, and AssemblerServer (mirroring `Connection.default_max_inflight_lag/0`),
+  # so the default cannot drift across the three sites. Config is still the runtime source
+  # of truth (it validates + normalizes onto :checkpoint_store); these accessors are the
+  # single fallback the sites read for a directly-constructed store keyword.
+  @default_max_retries 5
+  @default_retry_backoff_ms 1000
+
+  @doc "Default `max_retries` when `:checkpoint_store` omits it (spec §6)."
+  @spec default_max_retries() :: non_neg_integer()
+  def default_max_retries, do: @default_max_retries
+
+  @doc "Default `retry_backoff_ms` when `:checkpoint_store` omits it (spec §6)."
+  @spec default_retry_backoff_ms() :: pos_integer()
+  def default_retry_backoff_ms, do: @default_retry_backoff_ms
+
   @doc """
   True when a store fault reason is PERMANENT (retrying cannot fix it): a wrong
   pre-existing column type (`:checkpoint_store_schema_mismatch`) or an invalid table

@@ -84,5 +84,13 @@ defmodule Replicant.CheckpointStoreFaultTest do
     after
       :telemetry.detach({__MODULE__, :retrying})
     end
+
+    test "default_max_retries/0 and default_retry_backoff_ms/0 are the single source (5 / 1000)" do
+      # The retry defaults live once here and are referenced by Config, Connection, and
+      # AssemblerServer (mirroring Connection.default_max_inflight_lag/0), so a drifted
+      # literal cannot silently mis-default one site.
+      assert CheckpointStore.default_max_retries() == 5
+      assert CheckpointStore.default_retry_backoff_ms() == 1000
+    end
   end
 end
