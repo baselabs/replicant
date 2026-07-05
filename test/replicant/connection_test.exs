@@ -531,6 +531,21 @@ defmodule Replicant.ConnectionTest do
       assert Replicant.Connection.reset_retry_count(3, :present) == 0
       assert Replicant.Connection.reset_retry_count(3, :empty) == 0
     end
+
+    test "handle_info(:store_retry_reconnect) disconnects a LIVE retry (count > 0) but ignores a STALE timer (count 0)" do
+      # A live paced-retry timer (still mid-fault: store_retry_count > 0) disconnects so the
+      # framework re-runs the connect chain and re-reads the store.
+      live = %{slot_name: "rep_timer", store_retry_count: 1}
+      assert {:disconnect, :checkpoint_store_retry} =
+               Replicant.Connection.handle_info(:store_retry_reconnect, live)
+
+      # A STALE timer: an independent replication-connection reconnect during the backoff
+      # window already re-read the (recovered) store, which reset store_retry_count to 0 and
+      # resumed streaming. The orphaned timer must be a no-op — disconnecting a recovered
+      # stream would be a spurious blip (cross-vendor closeout finding).
+      stale = %{slot_name: "rep_timer", store_retry_count: 0}
+      assert {:noreply, ^stale} = Replicant.Connection.handle_info(:store_retry_reconnect, stale)
+    end
   end
 
   # ---- connection opts precedence ----

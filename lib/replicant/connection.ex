@@ -346,12 +346,24 @@ defmodule Replicant.Connection do
     {:disconnect, :snapshot_failed}
   end
 
-  # The paced-retry timer fired: disconnect so `auto_reconnect` re-runs the FULL connect
-  # chain (fresh recovery + slot-invalidation + store read). The retry counter persists on
-  # the Connection struct across the disconnect (Postgrex.ReplicationConnection keeps
-  # mod_state), so attempts accumulate toward the bound.
-  def handle_info(:store_retry_reconnect, _state) do
+  # The paced-retry timer fired while a fault episode is still active (store_retry_count > 0):
+  # disconnect so `auto_reconnect` re-runs the FULL connect chain (fresh recovery +
+  # slot-invalidation + store read). The retry counter persists on the Connection struct
+  # across the disconnect (Postgrex.ReplicationConnection keeps mod_state), so attempts
+  # accumulate toward the bound.
+  def handle_info(:store_retry_reconnect, %{store_retry_count: count} = _state)
+      when count > 0 do
     {:disconnect, :checkpoint_store_retry}
+  end
+
+  # A STALE paced-retry timer: an independent replication-connection reconnect during the
+  # backoff window already re-ran `handle_connect`, and a recovered store read reset
+  # `store_retry_count` to 0 (`reset_retry_count/2`) and resumed streaming. The timer was
+  # never canceled (it is fire-and-forget), so it must be a no-op here — disconnecting a
+  # recovered stream would be a spurious blip (a recovered read always zeroes the counter,
+  # so count == 0 uniquely marks "no active fault episode").
+  def handle_info(:store_retry_reconnect, state) do
+    {:noreply, state}
   end
 
   def handle_info(_other, state), do: {:noreply, state}
