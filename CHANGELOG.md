@@ -78,4 +78,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly-once, crash-and-resume (loss = 0), re-delivery dedup (effect-dup = 0),
   mid-transaction + during-keepalive kills, the §4 backpressure spike, and an
   independent PG16 `pgoutput`-conformance capture.
-- `postgrex ~> 0.22` dependency (co-resolves with `decimal ~> 3.1`).
+- `postgrex ~> 0.22.2` dependency (co-resolves with `decimal ~> 3.1`; floor is
+  0.22.2 for CVE-2026-32687).
+
+### Fixed — Plan 2 closeout review (2026-07-05)
+
+- **Data loss on a missing slot with a live checkpoint** — an absent
+  `pg_replication_slots` row was unconditionally recreated; with a non-empty sink
+  checkpoint the fresh slot streamed from its creation LSN, silently skipping the
+  WAL between the checkpoint and now. Now halts fail-closed with a `:data_gap`
+  signal when the checkpoint is non-empty; an empty checkpoint (first run /
+  go-forward) still creates the slot (spec §8 / §14.19).
+- **Over-advance on a sink-returned LSN** — the ack advanced to whatever LSN
+  `handle_transaction/1` returned; a value higher than the transaction's own
+  commit LSN would advance the slot past un-persisted WAL. The ack now uses the
+  known `txn.commit_lsn` (spec §2 / §14.20).
+- **Go-forward guard fail-open on an invalid `sink_kind`** — an unrecognized
+  `sink_kind/0` return was treated as the laxer `:append_log`; a typo could let an
+  empty `:state_mirror` sink start and partial-deliver. Unknown kinds now coerce to
+  the strict `:state_mirror` default.
+- **Caller `:connection` opts could override library control opts** — a caller
+  `sync_connect`/`name`/`auto_reconnect` in `:connection` won over the library's,
+  breaking the non-blocking facade or Registry wiring. The library's control opts
+  now take precedence.
+- **Sink write-fault recovery contract clarified** — a sink write fault is a
+  **permanent** fail-closed halt (operator restart required), not auto-retry
+  (spec §6 / §14.18).
