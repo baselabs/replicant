@@ -18,7 +18,18 @@ defmodule Replicant.SinkTest do
   alias Replicant.{Change, Sink, Test.RecordingSink, Transaction}
 
   setup do
-    {:ok, _pid} = RecordingSink.start_link()
+    {:ok, pid} = RecordingSink.start_link()
+
+    on_exit(fn ->
+      # Deterministic teardown: stopping the linked named Agent can race its own
+      # link-driven death (TOCTOU on Process.alive?/1), so tolerate a dead pid.
+      try do
+        Agent.stop(pid)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
     RecordingSink.reset()
     :ok
   end
