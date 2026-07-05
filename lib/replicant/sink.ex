@@ -55,6 +55,9 @@ defmodule Replicant.Sink do
   deleted upstream between a failed attempt and its retry survives as a ghost. The library
   guarantees at least one call per publication table (even a zero-row table), so the reset
   always fires. `context.snapshot_lsn` is the snapshot's consistent point.
+
+  A non-`:ok` return (or a raise/throw/exit) aborts and re-runs the WHOLE snapshot from
+  scratch — it is NOT a per-batch retry.
   """
   @callback handle_snapshot([Replicant.Change.t()], context) :: :ok | {:error, term()}
             when context: %{

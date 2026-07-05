@@ -97,11 +97,9 @@ defmodule Replicant.QueryBuilderTest do
   describe "publication_tables/1" do
     test "selects schema, table, and PG-quoted qualified name for the validated publication" do
       {:ok, sql} = QueryBuilder.publication_tables("orders_pub")
-      assert sql =~ "pg_publication_tables"
-      assert sql =~ "pubname = 'orders_pub'"
-      assert sql =~ "format('%I.%I', schemaname, tablename)"
-      assert sql =~ "schemaname"
-      assert sql =~ "tablename"
+
+      assert sql ==
+               "SELECT schemaname, tablename, format('%I.%I', schemaname, tablename) AS qualified FROM pg_publication_tables WHERE pubname = 'orders_pub'"
     end
 
     test "rejects a hostile publication name" do

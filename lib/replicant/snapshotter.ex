@@ -18,6 +18,11 @@ defmodule Replicant.Snapshotter do
   On success it sends `{:snapshot_done, consistent_point}`; on any fault
   `{:snapshot_failed, %Error{}}`. It reads on a SEPARATE connection, so it never blocks
   the Connection's keepalive path.
+
+  ## Source-side cost
+  The consistent-snapshot read holds a single long-running `REPEATABLE READ` transaction
+  open for the whole backfill (a slow sink extends it), which pins `xmin` on the source
+  and defers VACUUM there until the snapshot completes.
   """
 
   alias Replicant.{Change, Error, QueryBuilder, Telemetry}
@@ -72,8 +77,19 @@ defmodule Replicant.Snapshotter do
          consistent_point: cp
        }) do
     start_mono = System.monotonic_time(:millisecond)
-    {:ok, set_snapshot_sql} = QueryBuilder.set_transaction_snapshot(name)
-    {:ok, pub_tables_sql} = QueryBuilder.publication_tables(publication)
+
+    # Route a QueryBuilder validation failure (`{:error, reason}`) through the value-free
+    # `snapshot_error/1` (never a raw MatchError that could leak the reason), before any
+    # connection is opened.
+    with {:ok, set_snapshot_sql} <- QueryBuilder.set_transaction_snapshot(name),
+         {:ok, pub_tables_sql} <- QueryBuilder.publication_tables(publication) do
+      run_snapshot_txn(conn_opts, sink, cp, set_snapshot_sql, pub_tables_sql, start_mono)
+    else
+      {:error, reason} -> {:error, snapshot_error(reason)}
+    end
+  end
+
+  defp run_snapshot_txn(conn_opts, sink, cp, set_snapshot_sql, pub_tables_sql, start_mono) do
     {:ok, db} = Postgrex.start_link(conn_opts ++ [pool_size: 1])
 
     try do
@@ -107,6 +123,7 @@ defmodule Replicant.Snapshotter do
   # always fires (redo-safety, spec §6.1).
   defp copy_table(c, sink, cp, schema, table, qualified) do
     stream = Postgrex.stream(c, "SELECT * FROM #{qualified}", [], max_rows: @batch)
+    qualified_display = "#{schema}.#{table}"
 
     {dispatched?, count} =
       Enum.reduce(stream, {false, 0}, fn %Postgrex.Result{columns: cols, rows: rows},
@@ -115,15 +132,15 @@ defmodule Replicant.Snapshotter do
           {dispatched?, count}
         else
           changes = Enum.map(rows, &build_change(schema, table, cols, &1))
-          dispatch_batch!(c, sink, changes, cp, schema, table, not dispatched?)
+          dispatch_batch!(c, sink, changes, cp, qualified_display, not dispatched?)
           {true, count + length(rows)}
         end
       end)
 
-    unless dispatched?, do: dispatch_batch!(c, sink, [], cp, schema, table, true)
+    unless dispatched?, do: dispatch_batch!(c, sink, [], cp, qualified_display, true)
 
     Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
-      table: "#{schema}.#{table}",
+      table: qualified_display,
       change_count: count
     })
 
@@ -133,8 +150,8 @@ defmodule Replicant.Snapshotter do
   # Deliver one batch. A sink {:error, _} rolls the read transaction back with a
   # value-free token → the transaction returns {:error, :sink_snapshot_error}, scrubbed
   # by do_snapshot. A sink RAISE propagates out and is scrubbed by snapshot/1's rescue.
-  defp dispatch_batch!(c, sink, changes, cp, schema, table, first?) do
-    ctx = %{snapshot_lsn: cp, table: "#{schema}.#{table}", first_for_table?: first?}
+  defp dispatch_batch!(c, sink, changes, cp, qualified_display, first?) do
+    ctx = %{snapshot_lsn: cp, table: qualified_display, first_for_table?: first?}
 
     case sink.handle_snapshot(changes, ctx) do
       :ok -> :ok

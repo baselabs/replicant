@@ -26,7 +26,9 @@ defmodule Replicant.Config do
   plain-atom error: `:config_invalid` (missing/mis-shaped connection or opts),
   `:invalid_identifier` (slot/publication fails the Postgres-identifier
   allowlist), `:invalid_sink` (sink is not a module exporting the two mandatory
-  callbacks).
+  callbacks), `:conflicting_start_mode` (`go_forward_only: true` AND
+  `snapshot: true` — mutually exclusive start intents), `:snapshot_unsupported`
+  (`snapshot: true` but the sink is missing one/both snapshot callbacks).
   """
   @spec validate(keyword()) ::
           {:ok, t()}
@@ -69,6 +71,9 @@ defmodule Replicant.Config do
   `{:error, _}`) all pass — the read-fault path is deliberately fail-open (spec
   §14.15: a re-dispatched already-persisted txn is deduped by the §6 idempotent
   sink; only a definitive empty checkpoint proves partial-delivery risk).
+  `snapshot: true` ALSO bypasses the empty-checkpoint refusal (alongside
+  `go_forward_only: true`): the backfill IS the safe seed, so an empty checkpoint
+  is the expected first-run state, not a partial-delivery risk.
   """
   @spec guard(t()) :: :ok | {:error, :go_forward_required}
   def guard(%{sink: sink, go_forward_only: go_forward_only, snapshot: snapshot}) do
