@@ -158,6 +158,11 @@ defmodule Replicant.CheckpointStore do
   # (CaseClauseError). A returned `%Error{}` (schema mismatch, config) passes through unchanged.
   defp guarded(fun) do
     case fun.() do
+      # ORDER IS LOAD-BEARING: `%Error{}` is itself a `defexception`, so this pass-through
+      # clause MUST precede the `is_exception/1` scrub below — otherwise a returned
+      # `%Error{reason: :checkpoint_store_schema_mismatch}` (from probe_shape) would be
+      # re-scrubbed to `:checkpoint_store_failed`, losing the schema-mismatch classification.
+      # (The schema-mismatch integration test catches a reorder, but only when the DB is up.)
       {:error, %Error{}} = err -> err
       {:error, e} when is_exception(e) -> {:error, store_error(e)}
       other -> other
