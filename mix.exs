@@ -23,7 +23,7 @@ defmodule Replicant.MixProject do
       source_url: @source_url,
       homepage_url: @source_url,
       dialyzer: [
-        plt_add_apps: [:mix, :ex_unit, :decimal, :jason],
+        plt_add_apps: [:mix, :ex_unit, :decimal, :jason, :postgrex],
         plt_core_path: "priv/plts",
         plt_local_path: "priv/plts"
       ]
@@ -49,13 +49,15 @@ defmodule Replicant.MixProject do
       {:decimal, "~> 3.1"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.0"},
+      # Live streaming (Plan 2): the ReplicationConnection substrate. ~> 0.22 (NOT
+      # ~> 0.20 — 0.20 requires decimal ~> 1.5/2.0 and conflicts with decimal ~> 3.1;
+      # 0.22.2 requires decimal ~> 1.5 or ~> 2.0 or ~> 3.0 and accepts 3.1).
+      {:postgrex, "~> 0.22"},
       # Dev/Test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
       {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
-      # Plan 2 adds: {:postgrex, "~> 0.22"}  (NOT ~> 0.20 — 0.20 requires decimal
-      # ~> 1.5/2.0 and conflicts with decimal ~> 3.1; 0.22 accepts decimal ~> 3.0)
     ]
   end
 
