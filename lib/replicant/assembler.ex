@@ -458,10 +458,17 @@ defmodule Replicant.Assembler do
     duration = System.monotonic_time(:millisecond) - start_mono
 
     case result do
-      {:ok, lsn} ->
-        Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{commit_lsn: lsn})
+      {:ok, _lsn} ->
+        # Ack the KNOWN durable position — `txn.commit_lsn`, the LSN just committed —
+        # NOT the sink's returned value. A misbehaving sink returning a higher LSN
+        # would otherwise advance the slot past un-persisted WAL (loss). Per §6 a
+        # correct sink returns exactly `txn.commit_lsn`, so this is contract-equivalent
+        # for a correct sink and fail-safe against a buggy one.
+        Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{
+          commit_lsn: txn.commit_lsn
+        })
 
-        {:transaction, txn, lsn, reset(asm)}
+        {:transaction, txn, txn.commit_lsn, reset(asm)}
 
       {:error, _reason} ->
         sink_failed(asm, duration)

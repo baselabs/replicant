@@ -41,6 +41,17 @@ defmodule Replicant.AssemblerServerTest do
     def handle_transaction(_txn), do: {:error, :store_unreachable}
   end
 
+  # A misbehaving sink whose {:ok, lsn} return is HIGHER than the transaction's own
+  # commit LSN. The ack must NOT trust it (that would advance the slot past
+  # un-persisted WAL → loss); the connection is told the KNOWN txn.commit_lsn.
+  defmodule WrongHighLsnSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, nil}
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0x9999}
+  end
+
   setup do
     {:ok, pid} = RecordingSink.start_link()
 
@@ -74,6 +85,25 @@ defmodule Replicant.AssemblerServerTest do
     assert [{0x2A, [change]}] = RecordingSink.seen()
     assert change.op == :insert
     assert change.record["id"] == 1
+    refute :sys.get_state(pid).halted
+  end
+
+  test "the ack advances to txn.commit_lsn, NEVER a higher sink-returned LSN (no over-advance loss)" do
+    pid = start("srv_wrong_lsn", WrongHighLsnSink)
+    cast(pid, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
+    cast(pid, relation([col("id", "int4", [:key])]), 30)
+    cast(pid, %Insert{relation_id: 1, tuple_data: {"1"}}, 15)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x2A, end_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    # The sink returned {:ok, 0x9999}, but only 0x2A was durably committed. Acking
+    # 0x9999 would advance the slot past un-persisted WAL → loss.
+    assert_receive {:sink_committed, 0x2A}, 1000
+    refute_received {:sink_committed, 0x9999}
     refute :sys.get_state(pid).halted
   end
 
