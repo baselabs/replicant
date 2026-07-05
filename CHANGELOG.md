@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Bounded-retry-then-halt on checkpoint-store faults (`replicant-store-fault-retry`)
+
+- `:checkpoint_store` gains two retry-policy keys: `max_retries` (default 5, non-negative
+  integer; `0` = halt-now) and `retry_backoff_ms` (default 1000, positive integer). A
+  **transient** connect-read store fault now paces `max_retries` FRESH reconnects (each
+  re-runs the full connect chain, so slot invalidation is re-checked every attempt) instead
+  of retrying UNPACED forever; a **transient** mid-stream checkpoint write fault retries
+  `max_retries` times — blocking the serial applier, so **duplicate-bounded-to-one is
+  preserved** — instead of halting on the first fault. A **permanent** fault
+  (`:checkpoint_store_schema_mismatch` / `:config_invalid`) halts immediately, 0 retries. On
+  exhaustion the pipeline halts fail-closed via `Supervisor.halt` (**loss = 0 preserved**).
+  The default policy tolerates ~5s of store outage before halting. Sink-owned mode is
+  untouched. Resolves the checkpoint-store closeout design-decision **F3**.
+- New value-free telemetry `[:replicant, :checkpoint_store, :retrying]` (`slot_name`,
+  `attempt`, `max_retries`) fires on each retry; `attempt` + `max_retries` added to the
+  value-free telemetry allowlist.
+
 ### Added — Lib-owned checkpoint store (non-transactional sinks) (`replicant-checkpoint-store`)
 
 - A second checkpoint **mode**, selected once in `Replicant.Config` by the presence of a

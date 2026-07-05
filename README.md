@@ -146,7 +146,10 @@ into **lib mode**: the library writes the checkpoint to a durable Postgres table
 the sink persists (checkpoint-after-persist), so a non-transactional sink (files, S3,
 Kafka, external APIs) needs to implement only `handle_transaction/1`. The guarantee is
 **at-least-once, duplicate bounded to one transaction, never loss** — not effect-once (a
-non-transactional sink cannot dedup).
+non-transactional sink cannot dedup). A store outage (connect-read or mid-stream write) is
+bounded: the pipeline retries `max_retries` times (default 5) `retry_backoff_ms` apart
+(default 1000 ms — ~5s of outage tolerated) then halts fail-closed; a permanent fault
+(schema mismatch / invalid config) halts immediately.
 
 ## Development
 

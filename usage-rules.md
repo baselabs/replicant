@@ -61,7 +61,13 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   the library writes the checkpoint (`commit_lsn bigint`) to this durable Postgres table
   **after** the sink persists, so a non-transactional sink (files, S3, Kafka, external
   APIs) needs no atomic data+checkpoint unit. Value-free boundary; lazy table create +
-  shape-probe; a store read fault at connect fail-closes.
+  shape-probe. A store fault is bounded by two `:checkpoint_store` knobs — `max_retries`
+  (default 5) and `retry_backoff_ms` (default 1000) — shared by both fault sites: a
+  transient connect-read fault paces N fresh reconnects, a transient mid-stream write fault
+  retries N (blocking the applier, so dup-bounded-to-one holds), then both **halt
+  fail-closed** on exhaustion (`Supervisor.halt`, loss = 0). A permanent fault (schema
+  mismatch / `:config_invalid`) halts immediately; `max_retries: 0` opts out of retry
+  (halt-now). Each retry emits `[:replicant, :checkpoint_store, :retrying]`.
 - **`Replicant.QueryBuilder`** — builds the identifier-validated SQL used to
   create/manage slots and publications.
 - **`Replicant.Identifier`** — allowlist validation for slot, publication, and
