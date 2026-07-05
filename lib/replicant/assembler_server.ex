@@ -70,8 +70,14 @@ defmodule Replicant.AssemblerServer do
   # retries exhaust (up to `backoff × max_retries`); an external supervisor `:shutdown` still
   # preempts the sleep (this non-trapping GenServer cannot delay its own teardown), so pipeline
   # shutdown is never blocked.
+  #
+  # The `write_fun` contract is exactly `CheckpointStore.write/2`'s: `:ok | {:error, Error.t()}`
+  # (the store scrubs every Postgrex/DBConnection fault to a value-free `%Replicant.Error{}`
+  # before it returns). The spec is narrowed to that shape — not `{:error, term()}` — so the
+  # two-clause `case` below is TOTAL over the writer's actual return domain (dialyzer proves
+  # no other shape reaches it), rather than relying on a runtime catch-all.
   @spec write_with_retry(
-          (-> :ok | {:error, term()}),
+          (-> :ok | {:error, Replicant.Error.t()}),
           String.t(),
           non_neg_integer(),
           pos_integer(),
