@@ -55,6 +55,17 @@ defmodule Replicant do
   end
 
   @doc """
+  Parse a Postgres `pg_lsn` display string (`"0/16E3778"`) into the uint64 LSN —
+  the inverse of `lsn_to_string/1`. The two hex halves are `file`/`offset`;
+  `String.to_integer/2` accepts either case (Postgres renders uppercase).
+  """
+  @spec lsn_from_string(String.t()) :: lsn()
+  def lsn_from_string(string) when is_binary(string) do
+    [file, offset] = String.split(string, "/", parts: 2)
+    Bitwise.bsl(String.to_integer(file, 16), 32) + String.to_integer(offset, 16)
+  end
+
+  @doc """
   Start a CDC pipeline. Validates `opts`, enforces the go-forward-only start guard,
   and supervises a `Replicant.Connection` + `Replicant.AssemblerServer` under the
   pipeline `DynamicSupervisor`.

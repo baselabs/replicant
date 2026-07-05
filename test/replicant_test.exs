@@ -15,4 +15,16 @@ defmodule ReplicantTest do
       assert Bitwise.bsl(1, 32) > 0xFFFFFFFF
     end
   end
+
+  describe "lsn_from_string/1" do
+    test "inverts lsn_to_string/1 (pg_lsn display form ↔ uint64)" do
+      assert Replicant.lsn_from_string("0/16E3778") == 0x16E3778
+      assert Replicant.lsn_from_string("1/0") == 0x100000000
+      assert Replicant.lsn_from_string("0/0") == 0
+
+      for lsn <- [0, 0x16E3778, 0x100000000, 0xFFFFFFFFFF, 0xABCDEF12] do
+        assert lsn |> Replicant.lsn_to_string() |> Replicant.lsn_from_string() == lsn
+      end
+    end
+  end
 end
