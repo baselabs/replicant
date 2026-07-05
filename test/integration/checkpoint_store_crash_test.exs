@@ -7,8 +7,6 @@ defmodule Replicant.CheckpointStoreCrashTest do
   @cp_table "replicant_checkpoints_ci"
 
   setup do
-    unless PG16.enabled?(), do: :ok
-
     {:ok, ctrl} =
       Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.CpCtrlConn, pool_size: 3])
 
@@ -112,6 +110,31 @@ defmodule Replicant.CheckpointStoreCrashTest do
       PG16.wait_until(fn -> MapSet.subset?(MapSet.new([10, 11]), ledger_ids(ctrl)) end)
       PG16.wait_until(fn -> store_lsn(ctrl, slot) not in [nil, 0] end)
       assert store_lsn(ctrl, slot) > 0
+    end
+  end
+
+  test "a DELETE is delivered to the lib-mode sink and advances the checkpoint (op-agnostic, not INSERT-only)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      start_pipeline(slot)
+      insert(ctrl, 42)
+      PG16.wait_until(fn -> MapSet.member?(ledger_ids(ctrl), 42) end)
+      PG16.wait_until(fn -> store_lsn(ctrl, slot) not in [nil, 0] end)
+      lsn_after_insert = store_lsn(ctrl, slot)
+
+      # DELETE id 42. The sink records the id from `old_record` (a DELETE carries no
+      # `record`; the PK is present under DEFAULT replica identity), so the delete lands in
+      # the ledger too — proving the marquee's dup-never-loss invariant is observed for the
+      # DELETE op-class, not INSERT only, and that the op-agnostic checkpoint path (keyed on
+      # commit_lsn, no per-op branch) advances past the DELETE's LSN.
+      Postgrex.query!(ctrl, "DELETE FROM cp_orders WHERE id = $1", [42])
+      PG16.wait_until(fn -> id_count(ctrl, 42) >= 2 end)
+      PG16.wait_until(fn -> store_lsn(ctrl, slot) > lsn_after_insert end)
+
+      # Observed exactly once as INSERT and once as DELETE (never-loss for the DELETE), and
+      # the durable checkpoint advanced past the DELETE.
+      assert id_count(ctrl, 42) == 2
+      assert store_lsn(ctrl, slot) > lsn_after_insert
     end
   end
 

@@ -30,7 +30,12 @@ defmodule Replicant.Test.CheckpointRecordingSink do
   @impl Replicant.Sink
   def handle_transaction(%Replicant.Transaction{} = txn) do
     Enum.each(txn.changes, fn change ->
-      id = change.record && change.record["id"]
+      # A DELETE carries no `record` — its id is in `old_record` (the key columns, present
+      # under DEFAULT replica identity). Record whichever the op provides so the lib-mode
+      # dup-never-loss invariant is observed for the whole op-class (INSERT/UPDATE/DELETE),
+      # not INSERT only — the checkpoint/dedup path is op-agnostic (keyed on commit_lsn).
+      id =
+        (change.record && change.record["id"]) || (change.old_record && change.old_record["id"])
 
       if id do
         Postgrex.query!(

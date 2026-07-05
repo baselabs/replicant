@@ -7,8 +7,6 @@ defmodule Replicant.CheckpointStoreSnapshotTest do
   @cp_table "replicant_checkpoints_snap"
 
   setup do
-    unless PG16.enabled?(), do: :ok
-
     {:ok, ctrl} =
       Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.CpSnapCtrl, pool_size: 3])
 

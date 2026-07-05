@@ -6,7 +6,6 @@ defmodule Replicant.CheckpointStoreTest do
   alias Replicant.Test.PG16
 
   setup do
-    unless PG16.enabled?(), do: :ok
     {:ok, ctrl} = Postgrex.start_link(PG16.pg_opts())
     table = "rep_cp_#{System.unique_integer([:positive])}"
     slot = "rep_cps_#{System.unique_integer([:positive])}"
