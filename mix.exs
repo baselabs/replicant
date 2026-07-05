@@ -35,9 +35,10 @@ defmodule Replicant.MixProject do
   end
 
   def application do
-    # Plan 2 replaces this with mod: {Replicant.Application, []} to start the
-    # DynamicSupervisor. Plan 1 ships no supervised processes.
-    [extra_applications: [:logger]]
+    [
+      extra_applications: [:logger],
+      mod: {Replicant.Application, []}
+    ]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
