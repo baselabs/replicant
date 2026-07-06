@@ -85,6 +85,7 @@ defmodule Replicant.Connection do
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
           checkpoint_store: keyword() | nil,
+          batch_delivery: keyword() | nil,
           store_retry_count: non_neg_integer(),
           step: step()
         }
@@ -102,6 +103,7 @@ defmodule Replicant.Connection do
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
     checkpoint_store: nil,
+    batch_delivery: nil,
     store_retry_count: 0,
     step: :disconnected
   ]
@@ -153,6 +155,7 @@ defmodule Replicant.Connection do
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
        checkpoint_store: Map.get(config, :checkpoint_store),
+       batch_delivery: Map.get(config, :batch_delivery),
        store_retry_count: 0,
        step: :disconnected
      }}
@@ -278,7 +281,7 @@ defmodule Replicant.Connection do
     # On the FIRST frame of a (re)connected stream, report the floor to the AssemblerServer — it is
     # the cold-start component of the batch span-cap base `max(lib_checkpoint, stream_floor)` (§7),
     # so a large-absolute first-txn LSN on a fresh slot (lib_checkpoint 0) does not spuriously flush.
-    if is_nil(state.stream_floor_lsn) and lib_mode?(state) do
+    if is_nil(state.stream_floor_lsn) and batches?(state) do
       GenServer.cast(AssemblerServer.via(state.slot_name), {:stream_floor, stream_floor_lsn})
     end
 
@@ -324,7 +327,7 @@ defmodule Replicant.Connection do
     case write_snapshot_handoff(state, lsn) do
       :ok ->
         Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
-        if lib_mode?(state), do: seed_assembler(state, lsn)
+        prime_assembler(state, lsn)
 
         {:ok, sql} =
           QueryBuilder.start_replication(state.slot_name, state.publication, start_lsn: lsn)
@@ -409,6 +412,17 @@ defmodule Replicant.Connection do
   @spec lib_mode?(map()) :: boolean()
   def lib_mode?(%{checkpoint_store: store}), do: is_list(store)
   def lib_mode?(_), do: false
+
+  @doc false
+  @spec sink_owned_batch?(map()) :: boolean()
+  def sink_owned_batch?(%{checkpoint_store: store, batch_delivery: bd}),
+    do: not is_list(store) and is_list(bd)
+
+  def sink_owned_batch?(_), do: false
+
+  # Modes that use the assembler's LSN-span batch machinery (and therefore the stream floor):
+  # lib mode (batched checkpointing) OR sink-owned batch delivery.
+  defp batches?(state), do: lib_mode?(state) or sink_owned_batch?(state)
 
   @doc false
   @spec lib_go_forward_violation?(map()) :: boolean()
@@ -540,7 +554,7 @@ defmodule Replicant.Connection do
   end
 
   defp start_streaming(state) do
-    if lib_mode?(state), do: seed_assembler(state, state.checkpoint_lsn)
+    prime_assembler(state, state.checkpoint_lsn)
 
     {:ok, sql} =
       QueryBuilder.start_replication(state.slot_name, state.publication,
@@ -548,6 +562,22 @@ defmodule Replicant.Connection do
       )
 
     {:stream, sql, [], %{state | step: :streaming}}
+  end
+
+  # On every (re)connect prepare the assembler for the resumed stream: lib mode SEEDS the
+  # in-memory watermark from the connect-time store read; sink-owned batch mode DISCARDS any open
+  # batch (reset) so a transient reconnect re-buffers a fresh batch (spec §9; the span base
+  # lib_checkpoint is left to the assembler). Per-transaction sink-owned mode: no-op.
+  defp prime_assembler(state, seed_lsn) do
+    cond do
+      lib_mode?(state) -> seed_assembler(state, seed_lsn)
+      sink_owned_batch?(state) -> reset_assembler_batch(state)
+      true -> :ok
+    end
+  end
+
+  defp reset_assembler_batch(state) do
+    GenServer.cast(AssemblerServer.via(state.slot_name), {:reset_batch})
   end
 
   # Seed the lib-mode watermark from the SAME store read the connect used, before any

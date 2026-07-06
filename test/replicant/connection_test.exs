@@ -607,4 +607,52 @@ defmodule Replicant.ConnectionTest do
       :telemetry.detach({__MODULE__, :conn})
     end
   end
+
+  describe "sink-owned batch delivery casts (spec §6/§9)" do
+    # Register the TEST process as the assembler under {slot, :assembler} — the connection casts
+    # to AssemblerServer.via(slot), so casts arrive as {:"$gen_cast", msg} in the test mailbox.
+    # This is the file's existing pattern (connection_test.exs:101-108) — no stub GenServer.
+    defp bd_state(slot, step) do
+      %Replicant.Connection{
+        slot_name: slot,
+        publication: "p",
+        sink: Replicant.Test.RecordingSink,
+        connection: [hostname: "h"],
+        checkpoint_store: nil,
+        batch_delivery: [max_transactions: 10, max_delay_ms: 1000, max_span: 1_000_000],
+        checkpoint_lsn: 0,
+        received_lsn: 0,
+        stream_floor_lsn: nil,
+        step: step
+      }
+    end
+
+    test "the first XLogData frame casts {:stream_floor} to the assembler in sink-owned batch mode" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_bd_floor", :assembler}, nil)
+      # A DECODABLE Begin payload (connection_test.exs:102) so forward_message succeeds and does
+      # NOT halt on a decode failure; wal_end = 999 is the stream floor.
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      frame = <<?w, 0::64, 999::64, 0::64, begin_payload::binary>>
+
+      assert {:noreply, _state} =
+               Replicant.Connection.handle_data(frame, bd_state("conn_bd_floor", :streaming))
+
+      # {:stream_floor} is cast BEFORE forward_message (connection.ex:281-283), so it arrives.
+      assert_receive {:"$gen_cast", {:stream_floor, 999}}
+    end
+
+    test "start_streaming casts {:reset_batch} in sink-owned batch mode" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_bd_reset", :assembler}, nil)
+      # handle_result([%Postgrex.Result{}], %{step: :create_slot}) routes to start_streaming
+      # (connection.ex:226-229), which primes the assembler → {:reset_batch} for sink-owned batch.
+      # The :create_slot handle_result clause matches on the struct type alone (connection.ex:226).
+      assert {:stream, _sql, [], _state} =
+               Replicant.Connection.handle_result(
+                 [%Postgrex.Result{}],
+                 bd_state("conn_bd_reset", :create_slot)
+               )
+
+      assert_receive {:"$gen_cast", {:reset_batch}}
+    end
+  end
 end
