@@ -55,4 +55,23 @@ defmodule Replicant.Decoder.DecoderTest do
       assert {:error, _} = Decoder.decode(<<"Z">>)
     end
   end
+
+  describe "streaming message structs (spec §5)" do
+    alias Replicant.Decoder.Messages.{Insert, StreamAbort, StreamCommit, StreamStart, StreamStop}
+
+    test "the four stream-control structs exist with their documented fields" do
+      assert %StreamStart{xid: 7, first_segment: true}.first_segment == true
+      assert %StreamStop{} == %StreamStop{}
+
+      assert %StreamCommit{xid: 7, commit_lsn: 100, end_lsn: 101, commit_timestamp: nil}.commit_lsn ==
+               100
+
+      assert %StreamAbort{xid: 7, subxid: 8}.subxid == 8
+    end
+
+    test "change structs carry an optional xid (nil for non-streamed)" do
+      assert %Insert{relation_id: 1, tuple_data: {}}.xid == nil
+      assert %Insert{relation_id: 1, tuple_data: {}, xid: 515_103}.xid == 515_103
+    end
+  end
 end
