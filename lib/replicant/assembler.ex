@@ -637,13 +637,16 @@ defmodule Replicant.Assembler do
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}
 
-      {:error, store_reason} ->
+      {:error, _store_reason} ->
         Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
           slot_name: asm.slot_name,
           reason: :checkpoint_store_failed
         })
 
-        {:error, %Error{reason: store_reason}, asm}
+        # Scrub to the fixed value-free atom (Critical Rule 1), matching the per-txn `commit_txn`
+        # path — the writer type is `{:error, term()}`, so a value-bearing term must never cross
+        # into %Error{}. The specific reason is not consumed downstream (Supervisor.halt ignores it).
+        {:error, %Error{reason: :checkpoint_store_failed}, asm}
     end
   end
 

@@ -779,6 +779,21 @@ defmodule Replicant.AssemblerTest do
       assert asm.lib_checkpoint == 0
     end
 
+    test "flush_batch scrubs a value-bearing write-fault reason to :checkpoint_store_failed (value-free, Critical Rule 1)" do
+      # The checkpoint_writer type is (lsn -> :ok | {:error, term()}); a writer returning a
+      # value-bearing term must NOT leak it into %Error{} (the per-txn commit_txn path already
+      # collapses any {:error, _} to :checkpoint_store_failed — flush_batch must match).
+      writer = fn _lsn -> {:error, %{row_payload: "secret"}} end
+      asm = batched(writer, max_transactions: 1, max_delay_ms: 1000, max_span: 1_000_000)
+
+      assert {:flush, :max_transactions, asm} = commit_txn(asm, 100)
+
+      assert {:error, %Replicant.Error{reason: :checkpoint_store_failed}, asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      assert asm.lib_checkpoint == 0
+    end
+
     test "flush_batch with no open batch is :empty (a stale flush-timer fire is a no-op)" do
       writer = fn _lsn -> :ok end
       asm = batched(writer, max_transactions: 5, max_delay_ms: 1000, max_span: 1_000_000)
