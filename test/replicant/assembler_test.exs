@@ -1029,7 +1029,16 @@ defmodule Replicant.AssemblerTest do
   end
 
   describe "streaming reassembly (spec §5) — StreamStart/Stop + accumulate" do
-    alias Replicant.Decoder.Messages.{Insert, Relation, StreamStart, StreamStop}
+    alias Replicant.Decoder.Messages.{
+      Delete,
+      Insert,
+      Relation,
+      StreamStart,
+      StreamStop,
+      Truncate,
+      Update
+    }
+
     alias Replicant.Decoder.Messages.Relation.Column
 
     defp streamed(max_concurrent \\ 64) do
@@ -1041,6 +1050,19 @@ defmodule Replicant.AssemblerTest do
         id: rid,
         namespace: "public",
         name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, rel)
+      asm
+    end
+
+    defp with_named_relation(asm, rid, name) do
+      rel = %Relation{
+        id: rid,
+        namespace: "public",
+        name: name,
         replica_identity: :default,
         columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
       }
@@ -1100,6 +1122,71 @@ defmodule Replicant.AssemblerTest do
       asm = Assembler.reset_streams(asm)
       assert asm.stream_txns == %{}
       assert asm.current_stream_xid == nil
+    end
+
+    test "a streamed Truncate of multiple relations accumulates each tagged, reversed for rids order" do
+      asm =
+        streamed()
+        |> with_named_relation(1, "t1")
+        |> with_named_relation(2, "t2")
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      {:ok, asm} = Assembler.handle_message(asm, %Truncate{xid: 100, truncated_relations: [1, 2]})
+
+      # `stream_accumulate_truncate` does `Enum.reverse(tagged, buf.changes)`: rids [1, 2] → tagged
+      # [t1, t2] reversed onto the (empty) buffer yields head-first [t2, t1]. Head = newest, so a
+      # commit-time `Enum.reverse` (Task 6) restores the delivered order to rids order [t1, t2].
+      # This exact shape regresses if `Enum.reverse/2` were dropped or replaced with `++`.
+      assert [
+               {100, %Replicant.Change{op: :truncate, table: "t2"}},
+               {100, %Replicant.Change{op: :truncate, table: "t1"}}
+             ] = asm.stream_txns[100].changes
+    end
+
+    test "a streamed change with no open stream segment halts fail-closed" do
+      # No StreamStart → current_stream_xid is nil; a streamed row must halt, never accumulate.
+      asm = streamed() |> with_relation(1)
+
+      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+               Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+    end
+
+    test "a streamed change for an uncached relation halts fail-closed" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # relation 999 was never cached → the table cannot be identified → halt (never emit a
+      # table-less change that would be checkpointed as success).
+      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+               Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 999, tuple_data: {"1"}})
+    end
+
+    test "streamed Update and Delete accumulate tagged with their subxid" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      update = %Update{
+        xid: 100,
+        relation_id: 1,
+        tuple_data: {"9"},
+        old_tuple_data: nil,
+        changed_key_tuple_data: {"5"}
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, update)
+      assert [{100, %Replicant.Change{op: :update}}] = asm.stream_txns[100].changes
+
+      delete = %Delete{
+        xid: 101,
+        relation_id: 1,
+        old_tuple_data: nil,
+        changed_key_tuple_data: {"9"}
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, delete)
+      # newest-first: the Delete (subxid 101) heads the buffer, the Update (subxid 100) follows.
+      assert [{101, %Replicant.Change{op: :delete}}, {100, %Replicant.Change{op: :update}}] =
+               asm.stream_txns[100].changes
     end
   end
 end
