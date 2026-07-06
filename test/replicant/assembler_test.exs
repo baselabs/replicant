@@ -1171,6 +1171,15 @@ defmodule Replicant.AssemblerTest do
                Assembler.handle_message(asm, %Truncate{xid: 100, truncated_relations: [1, 999]})
     end
 
+    test "a streamed Truncate with no open stream segment halts fail-closed" do
+      # No StreamStart → current_stream_xid is nil; a streamed truncate must halt, never accumulate
+      # (fault-path symmetry with the streamed-row no-open-segment halt).
+      asm = streamed() |> with_relation(1)
+
+      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+               Assembler.handle_message(asm, %Truncate{xid: 100, truncated_relations: [1]})
+    end
+
     test "streamed Update and Delete accumulate tagged with their subxid" do
       asm = streamed() |> with_relation(1)
       {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
