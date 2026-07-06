@@ -232,7 +232,8 @@ defmodule Replicant.Assembler do
         # matrix): halt fail-closed with the spec-named reason so an operator can distinguish a
         # stream-count overflow (tune max_concurrent_txns) from a generic config error.
         {:halt,
-         %Error{reason: :too_many_streams, shape: "too many concurrent streamed transactions"}, asm}
+         %Error{reason: :too_many_streams, shape: "too many concurrent streamed transactions"},
+         asm}
 
       true ->
         {:ok,
