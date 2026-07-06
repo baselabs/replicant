@@ -1109,12 +1109,14 @@ defmodule Replicant.AssemblerTest do
       assert asm.stream_txns[100].byte_size == 42
     end
 
-    test "exceeding max_concurrent_txns halts fail-closed" do
+    test "exceeding max_concurrent_txns halts fail-closed with the spec-§8 :too_many_streams reason" do
       asm = streamed(1)
       {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
       {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
 
-      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+      # spec §8 names this halt :too_many_streams (distinct from the generic :config_invalid) so a
+      # stream-count overflow is distinguishable for operator triage.
+      assert {:halt, %Replicant.Error{reason: :too_many_streams}, _} =
                Assembler.handle_message(asm, %StreamStart{xid: 200, first_segment: true})
     end
 
@@ -1333,6 +1335,69 @@ defmodule Replicant.AssemblerTest do
       # buffer cleared / stream state reset
       refute Map.has_key?(asm.stream_txns, 100)
       assert asm.current_stream_xid == nil
+    end
+
+    test "an EMPTY StreamCommit does NOT {:skipped}-ack ahead of an OPEN batch — folds into it (CV1 loss guard, spec §7)" do
+      # In batch mode a buffered data txn is not yet durable-checkpointed (lib+batch defers the store
+      # write to flush; sink-owned defers delivery to flush). An empty streamed txn must NOT
+      # {:skipped}-ack its (higher) commit_lsn — that would advance confirmed_flush PAST the buffered,
+      # un-checkpointed txn and lose it on a crash-before-flush. It must fold its lsn INTO the batch.
+      asm =
+        %{
+          Replicant.Assembler.new(StreamDeliverSink,
+            mode: :lib,
+            checkpoint_writer: fn _lsn -> :ok end,
+            slot_name: "rep_stream_batch",
+            lib_checkpoint: 0,
+            batch: [max_transactions: 100, max_delay_ms: 1000, max_span: 1_000_000],
+            max_concurrent_txns: 64
+          )
+          | stream_floor: 0
+        }
+        |> with_relation(1)
+
+      # A data streamed txn at lsn 900 BUFFERS (batch open, checkpoint NOT yet written).
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"5"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # lib+batch delivers the DATA txn per-txn (consume its :delivered), but the checkpoint is deferred.
+      assert_received {:delivered, %Replicant.Transaction{commit_lsn: 900}}
+      assert asm.pending_lsn == 900
+      assert asm.batch_count == 1
+
+      # An EMPTY streamed txn at lsn 1000 arrives WHILE the 900-batch is still open (un-checkpointed).
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 200, first_segment: true})
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      result =
+        Assembler.handle_message(asm, %StreamCommit{
+          xid: 200,
+          commit_lsn: 1000,
+          end_lsn: 1001,
+          commit_timestamp: nil
+        })
+
+      # It MUST NOT {:skipped}-ack 1000 ahead of the un-checkpointed 900-batch (that ack would advance
+      # the slot past un-checkpointed WAL → loss). It folds 1000 into the batch; the flush acks it only
+      # after the buffered data is durable.
+      refute match?({:skipped, _, _}, result)
+      assert {:buffered, folded} = result
+      assert folded.pending_lsn == 1000
+      # the empty txn is NOT counted as a delivered txn and delivered nothing.
+      assert folded.batch_count == 1
+      refute_received {:delivered, _}
     end
 
     test "a StreamCommit at or below the sink checkpoint is pre-skipped (effect-once)" do

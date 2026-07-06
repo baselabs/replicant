@@ -228,8 +228,11 @@ defmodule Replicant.Assembler do
         {:ok, %{asm | current_stream_xid: xid}}
 
       map_size(asm.stream_txns) >= (asm.max_concurrent_txns || 64) ->
+        # More than max_concurrent_txns concurrent in-progress streamed transactions (spec §8 halt
+        # matrix): halt fail-closed with the spec-named reason so an operator can distinguish a
+        # stream-count overflow (tune max_concurrent_txns) from a generic config error.
         {:halt,
-         %Error{reason: :config_invalid, shape: "too many concurrent streamed transactions"}, asm}
+         %Error{reason: :too_many_streams, shape: "too many concurrent streamed transactions"}, asm}
 
       true ->
         {:ok,
@@ -263,12 +266,15 @@ defmodule Replicant.Assembler do
          asm}
 
       {:ok, buf} ->
-        changes =
+        # Replay newest-first buffer → commit order in ONE pass: `Enum.map_reduce` restores order
+        # (the buffer is `reverse`d), stamps the commit-granularity commit_lsn + ascending ordinal
+        # (streamed changes have no LSN before commit, spec §5), AND yields the change_count from the
+        # same traversal — mirroring the single-pass `Enum.map_reduce` the v1 Truncate clause uses.
+        {changes, change_count} =
           buf.changes
           |> Enum.reverse()
-          |> Enum.with_index()
-          |> Enum.map(fn {{_subxid, change}, ordinal} ->
-            %{change | commit_lsn: lsn, ordinal: ordinal}
+          |> Enum.map_reduce(0, fn {_subxid, change}, ordinal ->
+            {%{change | commit_lsn: lsn, ordinal: ordinal}, ordinal + 1}
           end)
 
         asm = %{asm | stream_txns: Map.delete(asm.stream_txns, top), current_stream_xid: nil}
@@ -279,12 +285,10 @@ defmodule Replicant.Assembler do
           # by v1 (PG15+ never sends an empty non-streamed Commit). Suppress delivery so a streamed
           # transaction is indistinguishable from a non-streamed one at the sink (spec §7); emit
           # neither `:assembled` nor `:stream:committed` (consistent with v1, which never sees the
-          # empty txn — a "committed" signal for a txn the sink never sees would mislead). Still
-          # return `{:skipped, lsn, asm}` so the Connection advances the slot to `lsn` and the txn is
-          # not re-streamed (loss=0 — an empty txn carries no effect).
-          {:skipped, lsn, asm}
+          # empty txn — a "committed" signal for a txn the sink never sees would mislead).
+          suppress_empty_stream_commit(asm, lsn)
         else
-          deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes)
+          deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count)
         end
     end
   end
@@ -463,22 +467,23 @@ defmodule Replicant.Assembler do
     {:halt, %Error{reason: :unsupported_message}, asm}
   end
 
-  # The non-empty StreamCommit delivery path: emit the assembled + stream:committed telemetry, then
-  # pre-skip at/below the watermark (effect-once, §2) else deliver via the shared apply_sink/2 —
-  # extracted verbatim from the StreamCommit clause to keep it within credo's nesting depth. An empty
-  # streamed txn never reaches here (it is suppressed in the StreamCommit clause, spec §7).
-  defp deliver_stream_commit(asm, lsn, ts, byte_size, changes) do
+  # The non-empty StreamCommit delivery path (the pre-computed `change_count` comes from the replay
+  # map_reduce): emit the assembled + stream:committed telemetry, then pre-skip at/below the watermark
+  # (effect-once, §2) else deliver via the shared apply_sink/2 — a separate clause to keep the
+  # StreamCommit body within credo's nesting depth. An empty streamed txn never reaches here (it is
+  # suppressed in the StreamCommit clause, spec §7).
+  defp deliver_stream_commit(asm, lsn, ts, byte_size, changes, change_count) do
     txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: changes}
 
     Telemetry.event([:replicant, :transaction, :assembled], %{}, %{
-      change_count: length(changes),
+      change_count: change_count,
       commit_lsn: lsn,
       byte_size: byte_size,
       lag_ms: lag_ms(ts)
     })
 
     Telemetry.event([:replicant, :stream, :committed], %{}, %{
-      change_count: length(changes),
+      change_count: change_count,
       commit_lsn: lsn,
       byte_size: byte_size
     })
@@ -487,6 +492,28 @@ defmodule Replicant.Assembler do
       {:skipped, lsn, asm}
     else
       apply_sink(asm, txn)
+    end
+  end
+
+  # An empty streamed txn (spec §7 suppression) carries no changes to deliver, but it MUST NOT
+  # `{:skipped}`-ack ahead of an OPEN batch: in batch mode a buffered-but-unflushed txn has a
+  # commit_lsn BELOW this lsn (commit order), and `{:skipped}` acks the slot to `lsn` immediately
+  # (assembler_server.ex dispatch), which would advance `confirmed_flush` past that un-delivered /
+  # un-checkpointed WAL — a crash before flush then drops it (loss). When a batch is open, fold the
+  # empty txn's lsn INTO the batch (advance `pending_lsn` and re-check the span cap): the eventual
+  # flush acks it only AFTER the buffered data is durable, with no delivery, no `batch_count`
+  # increment, and `batch_txns` untouched (so a sink-owned flush never calls `handle_batch([])`).
+  # With no batch open there is nothing un-durable below this lsn, so skip-ack immediately —
+  # matching the non-batch path and v1-indistinguishability (spec §7). loss=0, effect-once preserved.
+  defp suppress_empty_stream_commit(%__MODULE__{} = asm, lsn) do
+    if batch_pending?(asm) do
+      asm = %{asm | pending_lsn: lsn}
+
+      if lsn - span_base(asm) >= Keyword.fetch!(asm.batch, :max_span),
+        do: {:flush, :max_span, asm},
+        else: {:buffered, asm}
+    else
+      {:skipped, lsn, asm}
     end
   end
 

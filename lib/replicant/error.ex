@@ -17,6 +17,7 @@ defmodule Replicant.Error do
           | :schema_change_destructive
           | :slot_invalidated
           | :config_invalid
+          | :too_many_streams
           | :snapshot_failed
           | :checkpoint_store_failed
           | :checkpoint_store_schema_mismatch
