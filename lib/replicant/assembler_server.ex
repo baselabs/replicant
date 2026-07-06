@@ -31,8 +31,16 @@ defmodule Replicant.AssemblerServer do
   def init(opts) do
     slot_name = Keyword.fetch!(opts, :slot_name)
     sink = Keyword.fetch!(opts, :sink)
-    asm = build_assembler(slot_name, sink, Keyword.get(opts, :checkpoint_store))
-    {:ok, %{slot_name: slot_name, asm: asm, halted: false}}
+
+    asm =
+      build_assembler(
+        slot_name,
+        sink,
+        Keyword.get(opts, :checkpoint_store),
+        Keyword.get(opts, :batch)
+      )
+
+    {:ok, %{slot_name: slot_name, asm: asm, halted: false, conn_pid: nil, batch_timer: nil}}
   end
 
   # Lib mode: bind the writer to the pipeline's CheckpointStore (the watermark is
@@ -40,7 +48,7 @@ defmodule Replicant.AssemblerServer do
   # store read it does on connect — one read, deterministic ordering before any
   # Commit). No store I/O in init (fast boot; the CheckpointStore's own non-sync
   # connect owns resilience). A lib-mode assembler is NEVER built without a writer.
-  defp build_assembler(slot_name, sink, store) when is_list(store) do
+  defp build_assembler(slot_name, sink, store, batch) when is_list(store) do
     max_retries =
       Keyword.get(store, :max_retries, Replicant.CheckpointStore.default_max_retries())
 
@@ -51,10 +59,15 @@ defmodule Replicant.AssemblerServer do
       write_with_retry(store_write(slot_name, lsn), slot_name, max_retries, backoff, 0)
     end
 
-    Assembler.new(sink, mode: :lib, checkpoint_writer: writer, slot_name: slot_name)
+    Assembler.new(sink,
+      mode: :lib,
+      checkpoint_writer: writer,
+      slot_name: slot_name,
+      batch: batch
+    )
   end
 
-  defp build_assembler(_slot_name, sink, nil), do: Assembler.new(sink)
+  defp build_assembler(_slot_name, sink, nil, _batch), do: Assembler.new(sink)
 
   # The store write as a 0-arity thunk (so the retry loop can re-invoke it).
   defp store_write(slot_name, lsn) do
@@ -113,6 +126,7 @@ defmodule Replicant.AssemblerServer do
   end
 
   def handle_cast({:message, message, bytes, from}, state) do
+    state = %{state | conn_pid: from}
     asm = Assembler.observe_bytes(state.asm, bytes)
     dispatch(Assembler.handle_message(asm, message), from, state)
   end
@@ -145,14 +159,75 @@ defmodule Replicant.AssemblerServer do
     {:noreply, %{state | asm: asm}}
   end
 
+  defp dispatch({:buffered, asm}, _from, state) do
+    # Batch still open, no ack yet; arm the flush timer if this txn just opened the batch.
+    {:noreply, ensure_batch_timer(%{state | asm: asm})}
+  end
+
+  defp dispatch({:flush, reason, asm}, _from, state) do
+    do_flush(%{state | asm: asm}, reason)
+  end
+
   defp dispatch({:halt, reason, _asm}, _from, state) do
-    # Fail-closed: destructive schema change / sink write fault / unidentifiable
-    # relation. `reason` is already value-free (a %SchemaChange{} or a value-free
-    # %Error{} from the assembler's boundary). Terminate the whole pipeline
-    # permanently; mark halted so no further WAL is processed in the teardown
-    # window. Do NOT self-crash (a crash exit would race :one_for_all restart
-    # before the DynamicSupervisor terminates the pipeline).
+    # Fail-closed: destructive schema change / sink write fault / unidentifiable relation.
+    # `reason` is already value-free. Terminate the whole pipeline permanently; cancel the
+    # flush timer and mark halted so a stale :batch_timeout cannot drive a store write during
+    # teardown (spec §9). Do NOT self-crash (a crash exit would race :one_for_all restart).
     Replicant.Supervisor.halt(state.slot_name, reason)
-    {:noreply, %{state | halted: true}}
+    {:noreply, %{cancel_batch_timer(state) | halted: true}}
+  end
+
+  # The batch flush-timer fired. Guard on BOTH the terminal `halted` state AND a still-open
+  # batch: a stale timer (the batch already flushed by a count/span trigger, or the pipeline
+  # halted mid-retry) must be a no-op and never drive a store write during teardown (spec §9;
+  # connection.ex stale-timer precedent + the replicant-otp-async-lifetime-hygiene rule).
+  @impl true
+  def handle_info(:batch_timeout, %{halted: true} = state), do: {:noreply, state}
+
+  def handle_info(:batch_timeout, state) do
+    if Assembler.batch_pending?(state.asm) do
+      do_flush(state, :max_delay_ms)
+    else
+      {:noreply, %{state | batch_timer: nil}}
+    end
+  end
+
+  def handle_info(_other, state), do: {:noreply, state}
+
+  # Flush the open batch: write ONE checkpoint at the batch's highest LSN and ack it. A write
+  # fault halts fail-closed (buffer discarded, no ack). `:empty` (a stale timer with no open
+  # batch) is a no-op. `conn_pid` is the Connection captured from the last {:message, ...} cast.
+  defp do_flush(state, reason) do
+    state = cancel_batch_timer(state)
+
+    case Assembler.flush_batch(state.asm, reason) do
+      {:ok, lsn, asm} ->
+        send(state.conn_pid, {:sink_committed, lsn})
+        {:noreply, %{state | asm: asm}}
+
+      {:error, error, asm} ->
+        Replicant.Supervisor.halt(state.slot_name, error)
+        {:noreply, %{state | asm: asm, halted: true}}
+
+      :empty ->
+        {:noreply, state}
+    end
+  end
+
+  # Arm the max_delay_ms flush timer once per batch (on the txn that OPENS the batch). Bound to
+  # the batch state: canceled on every flush, and its fire is guarded (see handle_info) so a
+  # stale timer never flushes a recovered/absent batch (spec §9; replicant-otp-async-lifetime).
+  defp ensure_batch_timer(%{batch_timer: nil, asm: asm} = state) do
+    delay = Keyword.fetch!(asm.batch, :max_delay_ms)
+    %{state | batch_timer: Process.send_after(self(), :batch_timeout, delay)}
+  end
+
+  defp ensure_batch_timer(state), do: state
+
+  defp cancel_batch_timer(%{batch_timer: nil} = state), do: state
+
+  defp cancel_batch_timer(%{batch_timer: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | batch_timer: nil}
   end
 end

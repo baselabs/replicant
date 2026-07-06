@@ -63,7 +63,11 @@ defmodule Replicant.Assembler do
           mode: :sink_owned | :lib,
           checkpoint_writer: (lsn() -> :ok | {:error, term()}) | nil,
           lib_checkpoint: lsn() | nil,
-          slot_name: String.t() | nil
+          slot_name: String.t() | nil,
+          batch: keyword() | nil,
+          batch_count: non_neg_integer(),
+          pending_lsn: lsn() | nil,
+          batch_base_lsn: lsn() | nil
         }
 
   @type buffer :: %{
@@ -82,7 +86,11 @@ defmodule Replicant.Assembler do
     mode: :sink_owned,
     checkpoint_writer: nil,
     lib_checkpoint: nil,
-    slot_name: nil
+    slot_name: nil,
+    batch: nil,
+    batch_count: 0,
+    pending_lsn: nil,
+    batch_base_lsn: nil
   ]
 
   @doc """
@@ -103,7 +111,8 @@ defmodule Replicant.Assembler do
       mode: Keyword.get(opts, :mode, :sink_owned),
       checkpoint_writer: Keyword.get(opts, :checkpoint_writer),
       lib_checkpoint: Keyword.get(opts, :lib_checkpoint),
-      slot_name: Keyword.get(opts, :slot_name)
+      slot_name: Keyword.get(opts, :slot_name),
+      batch: Keyword.get(opts, :batch)
     }
   end
 
@@ -129,6 +138,8 @@ defmodule Replicant.Assembler do
     * `{:ok, t()}` — accumulated, no boundary crossed.
     * `{:transaction, Transaction.t(), lsn(), t()}` — Commit, sink committed.
     * `{:skipped, lsn(), t()}` — Commit but `commit_lsn <= checkpoint` (watermark skip).
+    * `{:buffered, t()}` — lib+batch: applied to the sink, checkpoint pending (no ack yet).
+    * `{:flush, reason, t()}` — lib+batch: the count/span cap tripped; the AssemblerServer must flush.
     * `{:schema_change, SchemaChange.t(), t()}` — additive schema change applied.
     * `{:halt, SchemaChange.t() | term(), t()}` — destructive schema change, sink
       failure, an unidentifiable-relation row, or a value-bearing raise (e.g.
@@ -146,6 +157,8 @@ defmodule Replicant.Assembler do
           | {:transaction, Transaction.t(), lsn(), t()}
           | {:skipped, lsn(), t()}
           | {:schema_change, SchemaChange.t(), t()}
+          | {:buffered, t()}
+          | {:flush, atom(), t()}
           | {:halt, term(), t()}
   def handle_message(asm, message) do
     do_handle_message(asm, message)
@@ -501,32 +514,11 @@ defmodule Replicant.Assembler do
 
     case result do
       {:ok, _lsn} ->
-        # Lib mode: persist the checkpoint to the store BEFORE announcing "committed"
-        # (checkpoint-after-persist). A write fault halts fail-closed — never ack
-        # without a durable checkpoint. Sink-owned: write_checkpoint/2 is a no-op.
-        case write_checkpoint(asm, txn.commit_lsn) do
-          :ok ->
-            # Ack the KNOWN durable position — `txn.commit_lsn`, the LSN just committed —
-            # NOT the sink's returned value. A misbehaving sink returning a higher LSN
-            # would otherwise advance the slot past un-persisted WAL (loss). Per §6 a
-            # correct sink returns exactly `txn.commit_lsn`, so this is contract-equivalent
-            # for a correct sink and fail-safe against a buggy one.
-            Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{
-              commit_lsn: txn.commit_lsn
-            })
-
-            {:transaction, txn, txn.commit_lsn, advance(asm, txn.commit_lsn)}
-
-          {:error, _} ->
-            # Triage fidelity: label a checkpoint-store WRITE fault as a checkpoint_store
-            # failure (not :sink_failed) — the sink persisted fine; the store write did not.
-            Telemetry.event([:replicant, :checkpoint_store, :failed], %{duration: duration}, %{
-              slot_name: asm.slot_name,
-              reason: :checkpoint_store_failed
-            })
-
-            {:halt, %Error{reason: :checkpoint_store_failed}, asm}
-        end
+        # lib+batch: buffer the durable txn and defer the store write/ack to the batch
+        # flush (spec §7). Per-txn (sink-owned or lib-non-batch): checkpoint-after-persist.
+        if batching?(asm),
+          do: buffer_txn(asm, txn, duration),
+          else: commit_txn(asm, txn, duration)
 
       {:error, _reason} ->
         sink_failed(asm, duration)
@@ -544,6 +536,35 @@ defmodule Replicant.Assembler do
     end
   end
 
+  # Per-transaction commit (sink-owned or lib-non-batch): persist the checkpoint to the store
+  # BEFORE announcing "committed" (checkpoint-after-persist). A write fault halts fail-closed —
+  # never ack without a durable checkpoint. Sink-owned: write_checkpoint/2 is a no-op.
+  defp commit_txn(%__MODULE__{} = asm, %Transaction{} = txn, duration) do
+    case write_checkpoint(asm, txn.commit_lsn) do
+      :ok ->
+        # Ack the KNOWN durable position — `txn.commit_lsn`, the LSN just committed —
+        # NOT the sink's returned value. A misbehaving sink returning a higher LSN
+        # would otherwise advance the slot past un-persisted WAL (loss). Per §6 a
+        # correct sink returns exactly `txn.commit_lsn`, so this is contract-equivalent
+        # for a correct sink and fail-safe against a buggy one.
+        Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{
+          commit_lsn: txn.commit_lsn
+        })
+
+        {:transaction, txn, txn.commit_lsn, advance(asm, txn.commit_lsn)}
+
+      {:error, _} ->
+        # Triage fidelity: label a checkpoint-store WRITE fault as a checkpoint_store
+        # failure (not :sink_failed) — the sink persisted fine; the store write did not.
+        Telemetry.event([:replicant, :checkpoint_store, :failed], %{duration: duration}, %{
+          slot_name: asm.slot_name,
+          reason: :checkpoint_store_failed
+        })
+
+        {:halt, %Error{reason: :checkpoint_store_failed}, asm}
+    end
+  end
+
   # Sink-owned: the sink already wrote its own checkpoint atomically. Lib mode:
   # write via the injected writer. A writer raise/exit (e.g. a dead
   # CheckpointStore) is caught value-free and categorised :checkpoint_store_failed
@@ -558,6 +579,77 @@ defmodule Replicant.Assembler do
   catch
     _kind, _reason -> {:error, :checkpoint_store_failed}
   end
+
+  # --- batched checkpointing (spec §7) ---
+
+  defp batching?(%__MODULE__{mode: :lib, batch: batch}), do: is_list(batch)
+  defp batching?(_asm), do: false
+
+  # The sink persisted the txn's DATA per-txn (announce [:sink, :committed] now); DEFER the
+  # store checkpoint write + ack to the batch flush. Accumulate into the open batch and signal
+  # a flush when the count OR the LSN-span cap trips. The span base is the FIRST buffered txn's
+  # LSN (robust for an empty-checkpoint first run, where lib_checkpoint is 0 but the stream
+  # starts at a large absolute LSN); the max_delay_ms timer is the AssemblerServer's third
+  # trigger. `lib_checkpoint` is NOT advanced here — only at flush (spec §9 invariant).
+  defp buffer_txn(%__MODULE__{} = asm, %Transaction{commit_lsn: lsn} = _txn, duration) do
+    Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{commit_lsn: lsn})
+
+    base = asm.batch_base_lsn || lsn
+    count = asm.batch_count + 1
+    asm = %{reset(asm) | batch_count: count, pending_lsn: lsn, batch_base_lsn: base}
+
+    cond do
+      count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
+      lsn - base >= Keyword.fetch!(asm.batch, :max_span) -> {:flush, :max_span, asm}
+      true -> {:buffered, asm}
+    end
+  end
+
+  @doc """
+  Flush the open batch (spec §7): write ONE store checkpoint at the batch's highest committed
+  LSN via the injected `checkpoint_writer` (which carries the bounded retry), advance the
+  in-memory watermark to it (keeping `lib_checkpoint` == the durable store checkpoint, spec §9),
+  and reset the accumulators. Emits `[:replicant, :checkpoint_store, :batch_flushed]` on success
+  (value-free: slot_name + counts + the trigger `reason`). A write fault returns
+  `{:error, %Error{}, t()}` so the AssemblerServer halts fail-closed WITHOUT advancing — the whole
+  batch re-delivers on restart (dup ≤ batch, never loss). `:empty` when no batch is open (a stale
+  flush-timer fire — the pending_lsn is nil).
+  """
+  @spec flush_batch(t(), atom()) :: {:ok, lsn(), t()} | {:error, Error.t(), t()} | :empty
+  def flush_batch(%__MODULE__{pending_lsn: nil}, _reason), do: :empty
+
+  def flush_batch(%__MODULE__{pending_lsn: lsn} = asm, reason) do
+    case write_checkpoint(asm, lsn) do
+      :ok ->
+        Telemetry.event([:replicant, :checkpoint_store, :batch_flushed], %{}, %{
+          slot_name: asm.slot_name,
+          change_count: asm.batch_count,
+          byte_size: lsn - (asm.batch_base_lsn || lsn),
+          reason: reason
+        })
+
+        {:ok, lsn,
+         %{
+           asm
+           | batch_count: 0,
+             pending_lsn: nil,
+             batch_base_lsn: nil,
+             lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
+         }}
+
+      {:error, store_reason} ->
+        Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
+          slot_name: asm.slot_name,
+          reason: :checkpoint_store_failed
+        })
+
+        {:error, %Error{reason: store_reason}, asm}
+    end
+  end
+
+  @doc "True when a batch is open (buffered, not yet flushed) — the flush-timer relevance guard (spec §9)."
+  @spec batch_pending?(t()) :: boolean()
+  def batch_pending?(%__MODULE__{pending_lsn: lsn}), do: is_integer(lsn)
 
   # Advance the in-memory lib watermark on a durable commit (lib mode) and reset
   # the buffer. Sink-owned: a bare buffer reset (the watermark lives in the sink).

@@ -704,4 +704,106 @@ defmodule Replicant.AssemblerTest do
       asm
     end
   end
+
+  describe "batched checkpointing (lib mode, spec §7)" do
+    defmodule BatchSink do
+      def handle_transaction(%Replicant.Transaction{} = txn), do: {:ok, txn.commit_lsn}
+    end
+
+    alias Replicant.Decoder.Messages.{Begin, Commit}
+
+    defp batched(writer, policy) do
+      Replicant.Assembler.new(BatchSink,
+        mode: :lib,
+        checkpoint_writer: writer,
+        slot_name: "rep_batch",
+        lib_checkpoint: 0,
+        batch: policy
+      )
+    end
+
+    # Drive one committed txn (Begin(lsn) → Commit(lsn)) through `asm`, returning the result.
+    defp commit_txn(asm, lsn) do
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: lsn, xid: lsn})
+      Assembler.handle_message(asm, %Commit{lsn: lsn, commit_timestamp: nil})
+    end
+
+    test "a txn under the count/span cap is BUFFERED (no writer call, watermark not advanced)" do
+      parent = self()
+      writer = fn lsn -> send(parent, {:wrote, lsn}) && :ok end
+      asm = batched(writer, max_transactions: 3, max_delay_ms: 1000, max_span: 1_000_000)
+
+      assert {:buffered, asm} = commit_txn(asm, 100)
+      refute_received {:wrote, _}
+      assert Assembler.batch_pending?(asm)
+      # lib_checkpoint stays at the pre-batch value until a flush (per-batch advance).
+      assert asm.lib_checkpoint == 0
+    end
+
+    test "reaching max_transactions returns {:flush, :max_transactions, _}; flush_batch writes once and advances the watermark per-batch" do
+      parent = self()
+      writer = fn lsn -> send(parent, {:wrote, lsn}) && :ok end
+      asm = batched(writer, max_transactions: 2, max_delay_ms: 1000, max_span: 1_000_000)
+
+      assert {:buffered, asm} = commit_txn(asm, 100)
+      assert {:flush, :max_transactions, asm} = commit_txn(asm, 200)
+      refute_received {:wrote, _}
+
+      assert {:ok, 200, asm} = Assembler.flush_batch(asm, :max_transactions)
+      assert_received {:wrote, 200}
+      # ONE write for the whole batch, at the highest LSN; watermark now == durable checkpoint.
+      assert asm.lib_checkpoint == 200
+      refute Assembler.batch_pending?(asm)
+    end
+
+    test "the LSN-span cap trips {:flush, :max_span, _} before the count cap" do
+      writer = fn _lsn -> :ok end
+      asm = batched(writer, max_transactions: 100, max_delay_ms: 1000, max_span: 10)
+
+      # base = first txn lsn (100); span 0 < 10 → buffered.
+      assert {:buffered, asm} = commit_txn(asm, 100)
+      # second txn lsn 115 → span = 115 - 100 = 15 >= 10 → flush by span.
+      assert {:flush, :max_span, _asm} = commit_txn(asm, 115)
+    end
+
+    test "flush_batch on a WRITE fault returns {:error, %Error{}, _} and does NOT advance the watermark" do
+      writer = fn _lsn -> {:error, :checkpoint_store_failed} end
+      asm = batched(writer, max_transactions: 1, max_delay_ms: 1000, max_span: 1_000_000)
+
+      assert {:flush, :max_transactions, asm} = commit_txn(asm, 100)
+
+      assert {:error, %Replicant.Error{reason: :checkpoint_store_failed}, asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      # fail-closed: the batch is NOT checkpointed, so the watermark stays behind → restart re-delivers.
+      assert asm.lib_checkpoint == 0
+    end
+
+    test "flush_batch with no open batch is :empty (a stale flush-timer fire is a no-op)" do
+      writer = fn _lsn -> :ok end
+      asm = batched(writer, max_transactions: 5, max_delay_ms: 1000, max_span: 1_000_000)
+      assert :empty = Assembler.flush_batch(asm, :max_delay_ms)
+    end
+
+    test "a re-delivered txn <= the watermark is SKIPPED in batch mode (never buffered; watermark unchanged, spec §12.4)" do
+      writer = fn _lsn -> :ok end
+      # Seed a durable watermark; on resume the slot re-delivers txns <= it, which MUST pre-skip
+      # (not buffer) so a skip-ack can never exceed the durable checkpoint (spec §9 invariant).
+      asm =
+        %{
+          batched(writer, max_transactions: 5, max_delay_ms: 1000, max_span: 1_000_000)
+          | lib_checkpoint: 500
+        }
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 300, xid: 1})
+
+      assert {:skipped, 300, asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 300, commit_timestamp: nil})
+
+      # The skip opened NO batch and did NOT advance the watermark past the durable checkpoint.
+      refute Assembler.batch_pending?(asm)
+      assert asm.batch_count == 0
+      assert asm.lib_checkpoint == 500
+    end
+  end
 end

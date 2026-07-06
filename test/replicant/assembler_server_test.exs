@@ -235,4 +235,152 @@ defmodule Replicant.AssemblerServerTest do
       assert :counters.get(calls, 1) == 1
     end
   end
+
+  describe "batched checkpointing (spec §7/§9)" do
+    defmodule BatchOkSink do
+      @behaviour Replicant.Sink
+      @impl true
+      def checkpoint, do: {:ok, nil}
+      @impl true
+      def handle_transaction(txn), do: {:ok, txn.commit_lsn}
+    end
+
+    # Inject a lib+batch assembler (a stub writer that acks to the test) into a running server,
+    # bypassing the CheckpointStore wiring — the seed test (above) uses the same pattern.
+    defp inject_batched(pid, slot, writer, policy) do
+      :sys.replace_state(pid, fn st ->
+        asm =
+          Replicant.Assembler.new(BatchOkSink,
+            mode: :lib,
+            checkpoint_writer: writer,
+            slot_name: slot,
+            lib_checkpoint: 0,
+            batch: policy
+          )
+
+        %{st | asm: asm}
+      end)
+    end
+
+    # Cache the relation once (id 1), then per-txn Begin(lsn)/Insert/Commit(lsn).
+    defp cache_relation(pid), do: cast(pid, relation([col("id", "int4", [:key])]), 30)
+
+    defp drive_txn(pid, lsn) do
+      cast(pid, %Begin{final_lsn: lsn, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: lsn}, 20)
+      cast(pid, %Insert{relation_id: 1, tuple_data: {"1"}}, 15)
+
+      cast(
+        pid,
+        %Commit{lsn: lsn, end_lsn: lsn, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+        8
+      )
+    end
+
+    test "buffers under the count cap (no ack) then flushes ONE ack at the cap" do
+      pid = start("srv_batch_count", RecordingSink)
+      test = self()
+
+      inject_batched(pid, "srv_batch_count", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+        max_transactions: 2,
+        max_delay_ms: 60_000,
+        max_span: 1_000_000
+      )
+
+      cache_relation(pid)
+      drive_txn(pid, 100)
+      refute_receive {:sink_committed, _}, 100
+      drive_txn(pid, 200)
+      assert_receive {:sink_committed, 200}, 1000
+      assert_received {:wrote, 200}
+      refute :sys.get_state(pid).halted
+    end
+
+    test "a partial batch flushes on the max_delay_ms timer (low-traffic safety valve)" do
+      pid = start("srv_batch_timer", RecordingSink)
+      test = self()
+
+      inject_batched(pid, "srv_batch_timer", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+        max_transactions: 100,
+        max_delay_ms: 50,
+        max_span: 1_000_000
+      )
+
+      cache_relation(pid)
+      drive_txn(pid, 100)
+      # Under the count cap → buffered; the timer flushes it within max_delay_ms.
+      assert_receive {:sink_committed, 100}, 1000
+      assert_received {:wrote, 100}
+    end
+
+    test "a stale :batch_timeout after a count-flush is inert and does not disrupt the next batch" do
+      pid = start("srv_batch_stale", RecordingSink)
+
+      inject_batched(pid, "srv_batch_stale", fn _lsn -> :ok end,
+        max_transactions: 2,
+        max_delay_ms: 60_000,
+        max_span: 1_000_000
+      )
+
+      cache_relation(pid)
+      drive_txn(pid, 100)
+      drive_txn(pid, 200)
+      assert_receive {:sink_committed, 200}, 1000
+
+      # A leftover timer fires after the batch already flushed by the count cap. It is inert —
+      # protected by BOTH the handle_info batch_pending? guard AND flush_batch's :empty clause
+      # (defense-in-depth; either alone suffices, so this asserts the INVARIANT, not one guard):
+      # no spurious ack, and the NEXT batch still flushes correctly (state not corrupted). Removing
+      # flush_batch's :empty clause makes this crash on the stale timeout (a red gate).
+      send(pid, :batch_timeout)
+      refute_receive {:sink_committed, _}, 100
+
+      drive_txn(pid, 300)
+      drive_txn(pid, 400)
+      assert_receive {:sink_committed, 400}, 1000
+      refute :sys.get_state(pid).halted
+    end
+
+    test "a :batch_timeout AFTER a halt is a no-op even with a batch OPEN (halted guard — OTP async-lifetime)" do
+      pid = start("srv_batch_halted", RecordingSink)
+      test = self()
+
+      inject_batched(pid, "srv_batch_halted", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+        max_transactions: 5,
+        max_delay_ms: 60_000,
+        max_span: 1_000_000
+      )
+
+      cache_relation(pid)
+      # OPEN a batch (pending_lsn set) → batch_pending? is TRUE, so ONLY the halted guard can
+      # stop a flush. This test goes RED if handle_info(:batch_timeout, %{halted: true}) is removed
+      # (the general clause would flush the pending batch and ack it).
+      drive_txn(pid, 100)
+      refute_receive {:sink_committed, _}, 100
+
+      :sys.replace_state(pid, fn st -> %{st | halted: true} end)
+      send(pid, :batch_timeout)
+      refute_receive {:sink_committed, _}, 100
+      refute_received {:wrote, _}
+      assert :sys.get_state(pid).halted
+    end
+
+    test "a batch-flush WRITE fault halts fail-closed and sends NO ack (buffer discarded)" do
+      pid = start("srv_batch_failwrite", RecordingSink)
+
+      inject_batched(
+        pid,
+        "srv_batch_failwrite",
+        fn _lsn -> {:error, :checkpoint_store_failed} end,
+        max_transactions: 1,
+        max_delay_ms: 60_000,
+        max_span: 1_000_000
+      )
+
+      cache_relation(pid)
+      drive_txn(pid, 100)
+      # get_state flushes the mailbox → the flush + halt are processed before we read.
+      assert :sys.get_state(pid).halted
+      refute_received {:sink_committed, _}
+    end
+  end
 end
