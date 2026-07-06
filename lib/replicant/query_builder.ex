@@ -24,6 +24,10 @@ defmodule Replicant.QueryBuilder do
   `opts[:start_lsn]` is a `Replicant.lsn/0` (`non_neg_integer`, default `0`). A
   non-integer or negative value raises (caller contract, not attacker input) —
   pass the uint64 WAL position from `checkpoint/0`.
+
+  `opts[:streaming]`, when truthy, selects `proto_version '2', streaming 'on'`
+  (in-progress transaction streaming, spec §5). Absent or falsy (the default)
+  emits the byte-for-byte v1 command (`proto_version '1'`, no streaming clause).
   """
   @spec start_replication(String.t(), String.t(), keyword()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
@@ -33,9 +37,14 @@ defmodule Replicant.QueryBuilder do
       start_lsn = Keyword.get(opts, :start_lsn, 0)
       lsn_literal = Replicant.lsn_to_string(start_lsn)
 
+      proto =
+        if Keyword.get(opts, :streaming),
+          do: "proto_version '2', streaming 'on'",
+          else: "proto_version '1'"
+
       {:ok,
        "START_REPLICATION SLOT #{slot_name} LOGICAL #{lsn_literal} " <>
-         "(proto_version '1', publication_names '#{publication}')"}
+         "(#{proto}, publication_names '#{publication}')"}
     end
   end
 

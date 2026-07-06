@@ -24,6 +24,23 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
+  describe "start_replication streaming (spec §5)" do
+    alias Replicant.QueryBuilder
+
+    test "defaults to proto_version 1 with no streaming clause" do
+      assert {:ok, sql} = QueryBuilder.start_replication("s", "p", start_lsn: 0)
+      assert sql =~ "proto_version '1'"
+      refute sql =~ "streaming"
+    end
+
+    test "streaming: true selects proto_version 2 and streaming 'on'" do
+      assert {:ok, sql} = QueryBuilder.start_replication("s", "p", start_lsn: 0, streaming: true)
+      assert sql =~ "proto_version '2'"
+      assert sql =~ "streaming 'on'"
+      assert sql =~ "publication_names 'p'"
+    end
+  end
+
   describe "create_durable_slot/1 + publication_exists/1 + slot_exists/1" do
     test "validated names produce slot/publication commands" do
       {:ok, a} = QueryBuilder.create_durable_slot("orders_slot")
