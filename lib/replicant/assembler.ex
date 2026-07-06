@@ -66,6 +66,7 @@ defmodule Replicant.Assembler do
           slot_name: String.t() | nil,
           batch: keyword() | nil,
           batch_count: non_neg_integer(),
+          batch_txns: [Transaction.t()],
           pending_lsn: lsn() | nil,
           stream_floor: lsn() | nil
         }
@@ -89,6 +90,7 @@ defmodule Replicant.Assembler do
     slot_name: nil,
     batch: nil,
     batch_count: 0,
+    batch_txns: [],
     pending_lsn: nil,
     stream_floor: nil
   ]
@@ -585,6 +587,9 @@ defmodule Replicant.Assembler do
   defp batching?(%__MODULE__{mode: :lib, batch: batch}), do: is_list(batch)
   defp batching?(_asm), do: false
 
+  defp sink_owned_batching?(%__MODULE__{mode: :sink_owned, batch: batch}), do: is_list(batch)
+  defp sink_owned_batching?(_asm), do: false
+
   # The sink persisted the txn's DATA per-txn (announce [:sink, :committed] now); DEFER the
   # store checkpoint write + ack to the batch flush. Accumulate into the open batch and signal
   # a flush when the count OR the LSN-span cap trips. Per spec §4/§7/decision-log #7 the span is
@@ -626,7 +631,68 @@ defmodule Replicant.Assembler do
   @spec flush_batch(t(), atom()) :: {:ok, lsn(), t()} | {:error, Error.t(), t()} | :empty
   def flush_batch(%__MODULE__{pending_lsn: nil}, _reason), do: :empty
 
-  def flush_batch(%__MODULE__{pending_lsn: lsn} = asm, reason) do
+  def flush_batch(%__MODULE__{} = asm, reason) do
+    if sink_owned_batching?(asm),
+      do: flush_sink_batch(asm, reason),
+      else: flush_lib_batch(asm, reason)
+  end
+
+  # Sink-owned batch delivery (spec §6): deliver the whole buffered batch as ONE atomic
+  # handle_batch/1 call. On {:ok, _} advance the span base to the batch's highest LSN and reset
+  # the buffer; the AssemblerServer then acks pending_lsn (§9 durability-before-ack). A sink
+  # fault (return, raise, throw, exit) is scrubbed value-free (Critical Rule 1) — an N-txn
+  # throw/exit reason can embed any buffered row (a GenServer.call timeout carrying the txn), so
+  # the reason is NEVER inspected; only an exception module name is kept, exactly as apply_sink
+  # does for handle_transaction (assembler.ex:504-536).
+  defp flush_sink_batch(%__MODULE__{pending_lsn: lsn} = asm, reason) do
+    start_mono = System.monotonic_time(:millisecond)
+    txns = Enum.reverse(asm.batch_txns)
+
+    result =
+      try do
+        asm.sink.handle_batch(txns)
+      rescue
+        e -> {:sink_raised, e}
+      catch
+        kind, reason -> {:sink_caught, kind, reason}
+      end
+
+    duration = System.monotonic_time(:millisecond) - start_mono
+
+    case result do
+      {:ok, _returned} ->
+        Telemetry.event([:replicant, :sink, :batch_committed], %{duration: duration}, %{
+          change_count: asm.batch_count,
+          commit_lsn: lsn,
+          reason: reason
+        })
+
+        {:ok, lsn,
+         %{
+           asm
+           | batch_count: 0,
+             pending_lsn: nil,
+             batch_txns: [],
+             lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
+         }}
+
+      {:error, _reason} ->
+        sink_batch_failed(asm, duration)
+
+      {:sink_raised, e} ->
+        sink_batch_failed(asm, duration, safe_shape(e))
+
+      {:sink_caught, _kind, _reason} ->
+        sink_batch_failed(asm, duration)
+    end
+  end
+
+  defp sink_batch_failed(asm, duration, shape \\ nil) do
+    Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{reason: :sink_failed})
+    {:error, %Error{reason: :sink_failed, shape: shape}, asm}
+  end
+
+  defp flush_lib_batch(%__MODULE__{pending_lsn: lsn} = asm, reason) do
     case write_checkpoint(asm, lsn) do
       :ok ->
         Telemetry.event([:replicant, :checkpoint_store, :batch_flushed], %{}, %{
@@ -670,7 +736,7 @@ defmodule Replicant.Assembler do
   """
   @spec reset_batch(t()) :: t()
   def reset_batch(%__MODULE__{} = asm),
-    do: %{asm | batch_count: 0, pending_lsn: nil}
+    do: %{asm | batch_count: 0, pending_lsn: nil, batch_txns: []}
 
   @doc """
   Record the per-stream floor (the Connection's first-frame `wal_end` — where PG actually began

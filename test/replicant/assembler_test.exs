@@ -843,4 +843,107 @@ defmodule Replicant.AssemblerTest do
       assert asm.lib_checkpoint == 500
     end
   end
+
+  describe "batch delivery (sink-owned, spec §6) — flush_batch delivers via handle_batch" do
+    # These unit tests call Assembler.flush_batch/2 DIRECTLY (in the test process), so the sink's
+    # handle_batch runs in the test process → `self()` IS the test pid. No Application env needed.
+    defmodule DeliverSink do
+      def checkpoint, do: {:ok, nil}
+
+      def handle_batch(txns) do
+        send(self(), {:delivered, txns})
+        {:ok, List.last(txns).commit_lsn}
+      end
+    end
+
+    defmodule ErrorBatchSink do
+      def checkpoint, do: {:ok, nil}
+      def handle_batch(_txns), do: {:error, %{secret: "row"}}
+    end
+
+    defmodule RaisingBatchSink do
+      def checkpoint, do: {:ok, nil}
+      def handle_batch(_txns), do: raise(ArgumentError, "boom")
+    end
+
+    defmodule ExitingBatchSink do
+      def checkpoint, do: {:ok, nil}
+      # struct-shaped exit reason (a buffered row) → a safe_shape(reason) regression in the
+      # catch arm would surface inspect(Replicant.Transaction) here, turning shape: nil red.
+      def handle_batch(_txns), do: exit(%Replicant.Transaction{commit_lsn: 999, changes: []})
+    end
+
+    # A sink-owned batch assembler with a manually-seeded buffer (Task 4 wires apply_sink to
+    # populate it; here we test flush_batch in isolation). batch_txns is stored newest-first
+    # (prepend), so flush_batch must reverse it to ascending commit-LSN order.
+    defp buffered(sink, txns) do
+      lsns = Enum.map(txns, & &1.commit_lsn)
+
+      %{
+        Replicant.Assembler.new(sink,
+          batch: [max_transactions: 10, max_delay_ms: 1000, max_span: 1_000_000]
+        )
+        | batch_txns: Enum.reverse(txns),
+          batch_count: length(txns),
+          pending_lsn: Enum.max(lsns)
+      }
+    end
+
+    test "flush_batch delivers the buffered txns as ONE handle_batch call in ascending LSN order, advances the span base, emits [:sink, :batch_committed]" do
+      t1 = %Replicant.Transaction{commit_lsn: 100, changes: []}
+      t2 = %Replicant.Transaction{commit_lsn: 200, changes: []}
+      asm = buffered(DeliverSink, [t1, t2])
+
+      test = self()
+
+      :telemetry.attach(
+        {__MODULE__, :bd_committed},
+        [:replicant, :sink, :batch_committed],
+        fn _e, _m, meta, _ -> send(test, {:tel, meta}) end,
+        nil
+      )
+
+      assert {:ok, 200, asm} = Assembler.flush_batch(asm, :max_transactions)
+      assert_received {:delivered, [^t1, ^t2]}
+      assert asm.lib_checkpoint == 200
+      refute Assembler.batch_pending?(asm)
+      assert asm.batch_txns == []
+      assert_received {:tel, %{change_count: 2, commit_lsn: 200, reason: :max_transactions}}
+      :telemetry.detach({__MODULE__, :bd_committed})
+    end
+
+    test "a handle_batch {:error, _} halts fail-closed (value-free :sink_failed), watermark unchanged" do
+      asm = buffered(ErrorBatchSink, [%Replicant.Transaction{commit_lsn: 100, changes: []}])
+
+      assert {:error, %Replicant.Error{reason: :sink_failed, shape: nil}, asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      assert asm.lib_checkpoint == nil
+    end
+
+    test "a handle_batch raise is scrubbed value-free to :sink_failed (only the module name kept)" do
+      asm = buffered(RaisingBatchSink, [%Replicant.Transaction{commit_lsn: 100, changes: []}])
+
+      assert {:error, %Replicant.Error{reason: :sink_failed, shape: shape}, _asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      assert shape == inspect(ArgumentError)
+    end
+
+    test "a handle_batch exit is scrubbed WITHOUT inspecting the reason (Critical Rule 1)" do
+      asm = buffered(ExitingBatchSink, [%Replicant.Transaction{commit_lsn: 100, changes: []}])
+
+      assert {:error, %Replicant.Error{reason: :sink_failed, shape: nil}, _asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+    end
+
+    test "flush_batch with no open batch is :empty" do
+      asm =
+        Replicant.Assembler.new(DeliverSink,
+          batch: [max_transactions: 5, max_delay_ms: 1000, max_span: 1_000_000]
+        )
+
+      assert :empty = Assembler.flush_batch(asm, :max_delay_ms)
+    end
+  end
 end
