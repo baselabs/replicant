@@ -13,6 +13,7 @@ defmodule Replicant.Config do
 
   @type t :: %{
           optional(:batch) => keyword() | nil,
+          optional(:batch_delivery) => keyword() | nil,
           connection: keyword(),
           slot_name: String.t(),
           publication: String.t(),
@@ -30,7 +31,9 @@ defmodule Replicant.Config do
   allowlist), `:invalid_sink` (sink is not a module exporting the two mandatory
   callbacks), `:conflicting_start_mode` (`go_forward_only: true` AND
   `snapshot: true` — mutually exclusive start intents), `:snapshot_unsupported`
-  (`snapshot: true` but the sink is missing one/both snapshot callbacks).
+  (`snapshot: true` but the sink is missing one/both snapshot callbacks),
+  `:batch_unsupported` (`batch_delivery` is set but the sink does not implement
+  `handle_batch/1`).
   """
   @spec validate(keyword()) ::
           {:ok, t()}
@@ -39,14 +42,16 @@ defmodule Replicant.Config do
              | :invalid_identifier
              | :invalid_sink
              | :conflicting_start_mode
-             | :snapshot_unsupported}
+             | :snapshot_unsupported
+             | :batch_unsupported}
   def validate(opts) when is_list(opts) do
     with {:ok, connection} <- fetch_connection(opts),
          {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
          {:ok, publication} <- fetch_identifier(opts, :publication),
          {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
-         {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
+         {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
+         {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          snapshot = Keyword.get(opts, :snapshot, false) == true,
@@ -62,7 +67,8 @@ defmodule Replicant.Config do
          snapshot: snapshot,
          max_inflight_lag: max_inflight_lag,
          checkpoint_store: checkpoint_store,
-         batch: batch
+         batch: batch,
+         batch_delivery: batch_delivery
        }}
     end
   end
@@ -150,6 +156,19 @@ defmodule Replicant.Config do
     end
   end
 
+  # Batch delivery (spec §6) is opt-in via a TOP-LEVEL :batch_delivery keyword (a sibling of
+  # :sink), sink-owned mode only. It is mutually exclusive with :checkpoint_store — a lib-mode
+  # (non-transactional) sink cannot honor handle_batch/1's atomic data+checkpoint contract, so
+  # the combination is rejected fail-closed rather than silently ignored. The knobs are the same
+  # two positive integers as lib-mode :batch, with the same DERIVED max_span (never a user knob).
+  defp fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag) do
+    cond do
+      not Keyword.has_key?(opts, :batch_delivery) -> {:ok, nil}
+      is_list(checkpoint_store) -> {:error, :config_invalid}
+      true -> normalize_batch(Keyword.get(opts, :batch_delivery), max_inflight_lag)
+    end
+  end
+
   defp normalize_batch(nil, _max_inflight_lag), do: {:ok, nil}
 
   defp normalize_batch(batch, max_inflight_lag) when is_list(batch) do
@@ -228,15 +247,19 @@ defmodule Replicant.Config do
     end
   end
 
-  # In lib mode (a present :checkpoint_store) the library owns the checkpoint, so the sink
-  # need not implement checkpoint/0 — only handle_transaction/1 is mandatory. Sink-owned
-  # mode still requires both callbacks.
-  defp fetch_sink(opts, lib_mode?) do
+  # Callback requirements by mode. Batch-delivery mode requires handle_batch/1 (the delivery
+  # callback) AND checkpoint/0 (the resume/go-forward watermark) — but NOT handle_transaction/1,
+  # which is never called under batch delivery. Lib mode and per-transaction sink-owned mode are
+  # unchanged. All checks are runtime function_exported?/3 (the callbacks are @optional_callbacks).
+  defp fetch_sink(opts, lib_mode?, batch_mode?) do
     sink = Keyword.get(opts, :sink)
 
     cond do
       not (is_atom(sink) and sink != nil and Code.ensure_loaded?(sink)) ->
         {:error, :invalid_sink}
+
+      batch_mode? ->
+        fetch_batch_sink(sink)
 
       not function_exported?(sink, :handle_transaction, 1) ->
         {:error, :invalid_sink}
@@ -249,6 +272,16 @@ defmodule Replicant.Config do
 
       true ->
         {:error, :invalid_sink}
+    end
+  end
+
+  # A batch-delivery sink must export handle_batch/1 (the delivery callback) and checkpoint/0
+  # (the resume/go-forward watermark). handle_transaction/1 is never called in this mode.
+  defp fetch_batch_sink(sink) do
+    cond do
+      not Sink.supports_batch?(sink) -> {:error, :batch_unsupported}
+      not function_exported?(sink, :checkpoint, 0) -> {:error, :invalid_sink}
+      true -> {:ok, sink}
     end
   end
 end

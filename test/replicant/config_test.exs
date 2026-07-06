@@ -9,6 +9,20 @@ defmodule Replicant.Test.CpStubSink do
   def handle_transaction(%Replicant.Transaction{} = txn), do: {:ok, txn.commit_lsn}
 end
 
+# A batch-delivery sink: handle_batch/1 + checkpoint/0, NO handle_transaction/1. Plain module
+# (no @behaviour) so it is a faithful fixture regardless of which callbacks the behaviour marks
+# optional at this task's commit point (mirrors Replicant.Test.CpStubSink's rationale).
+defmodule Replicant.Test.BatchOnlySink do
+  def checkpoint, do: {:ok, nil}
+  def handle_batch(_transactions), do: {:ok, 0}
+end
+
+# handle_batch/1 present but checkpoint/0 absent — the watermark read the go-forward guard and
+# resume dedup require. Must be rejected :invalid_sink.
+defmodule Replicant.Test.BatchNoCheckpointSink do
+  def handle_batch(_transactions), do: {:ok, 0}
+end
+
 defmodule Replicant.ConfigTest do
   use ExUnit.Case, async: true
 
@@ -390,6 +404,73 @@ defmodule Replicant.ConfigTest do
         assert {:error, :config_invalid} = Config.validate(opts),
                "expected non-list batch #{inspect(bad)} to be rejected"
       end
+    end
+  end
+
+  describe "batch_delivery (sink-owned atomic batch delivery, spec §6)" do
+    defp bd_base(sink, extra \\ []) do
+      [connection: [hostname: "h"], slot_name: "s", publication: "p", sink: sink] ++ extra
+    end
+
+    test "a valid batch_delivery normalises the two knobs and DERIVES max_span = max_inflight_lag/4" do
+      assert {:ok, cfg} =
+               Config.validate(
+                 bd_base(Replicant.Test.BatchOnlySink,
+                   batch_delivery: [max_transactions: 25, max_delay_ms: 250]
+                 )
+               )
+
+      assert Keyword.get(cfg.batch_delivery, :max_transactions) == 25
+      assert Keyword.get(cfg.batch_delivery, :max_delay_ms) == 250
+      assert Keyword.get(cfg.batch_delivery, :max_span) == div(64 * 1024 * 1024, 4)
+    end
+
+    test "batch_delivery knobs default to 100 / 1000 when omitted" do
+      assert {:ok, cfg} =
+               Config.validate(bd_base(Replicant.Test.BatchOnlySink, batch_delivery: []))
+
+      assert Keyword.get(cfg.batch_delivery, :max_transactions) == 100
+      assert Keyword.get(cfg.batch_delivery, :max_delay_ms) == 1000
+    end
+
+    test "batch_delivery + checkpoint_store is rejected :config_invalid (batch-delivery needs sink-owned atomicity)" do
+      opts =
+        bd_base(Replicant.Test.BatchOnlySink,
+          batch_delivery: [],
+          checkpoint_store: [connection: [hostname: "db"]]
+        )
+
+      assert {:error, :config_invalid} = Config.validate(opts)
+    end
+
+    test "batch_delivery on a sink WITHOUT handle_batch/1 is rejected :batch_unsupported" do
+      opts = bd_base(Replicant.Test.CpStubSink, batch_delivery: [])
+      assert {:error, :batch_unsupported} = Config.validate(opts)
+    end
+
+    test "a batch sink WITHOUT checkpoint/0 is rejected :invalid_sink (checkpoint is the resume/go-forward watermark)" do
+      opts = bd_base(Replicant.Test.BatchNoCheckpointSink, batch_delivery: [])
+      assert {:error, :invalid_sink} = Config.validate(opts)
+    end
+
+    test "a batch sink need NOT implement handle_transaction/1" do
+      # BatchOnlySink has handle_batch/1 + checkpoint/0 but no handle_transaction/1 — valid.
+      assert {:ok, _cfg} =
+               Config.validate(bd_base(Replicant.Test.BatchOnlySink, batch_delivery: []))
+    end
+
+    test "mis-shaped batch_delivery knobs are rejected :config_invalid" do
+      for bad <- [[max_transactions: 0], [max_delay_ms: -1], [max_transactions: "x"], :not_a_list] do
+        opts = bd_base(Replicant.Test.BatchOnlySink, batch_delivery: bad)
+
+        assert {:error, :config_invalid} = Config.validate(opts),
+               "expected batch_delivery #{inspect(bad)} to be rejected"
+      end
+    end
+
+    test "no batch_delivery → cfg.batch_delivery is nil (per-transaction path unchanged)" do
+      assert {:ok, cfg} = Config.validate(bd_base(Replicant.Test.RecordingSink))
+      assert cfg.batch_delivery == nil
     end
   end
 end
