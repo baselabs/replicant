@@ -50,7 +50,19 @@ defmodule Replicant.Assembler do
     Transaction
   }
 
-  alias Messages.{Begin, Commit, Delete, Insert, Origin, Relation, Truncate, Type, Update}
+  alias Messages.{
+    Begin,
+    Commit,
+    Delete,
+    Insert,
+    Origin,
+    Relation,
+    StreamStart,
+    StreamStop,
+    Truncate,
+    Type,
+    Update
+  }
 
   @type lsn :: Replicant.lsn()
 
@@ -68,13 +80,21 @@ defmodule Replicant.Assembler do
           batch_count: non_neg_integer(),
           batch_txns: [Transaction.t()],
           pending_lsn: lsn() | nil,
-          stream_floor: lsn() | nil
+          stream_floor: lsn() | nil,
+          stream_txns: %{non_neg_integer() => stream_buf()},
+          current_stream_xid: non_neg_integer() | nil,
+          max_concurrent_txns: pos_integer() | nil
         }
 
   @type buffer :: %{
           begin_lsn: lsn() | nil,
           xid: non_neg_integer() | nil,
           changes: [Change.t()],
+          byte_size: non_neg_integer()
+        }
+
+  @type stream_buf :: %{
+          changes: [{non_neg_integer(), Change.t()}],
           byte_size: non_neg_integer()
         }
 
@@ -92,7 +112,10 @@ defmodule Replicant.Assembler do
     batch_count: 0,
     batch_txns: [],
     pending_lsn: nil,
-    stream_floor: nil
+    stream_floor: nil,
+    stream_txns: %{},
+    current_stream_xid: nil,
+    max_concurrent_txns: nil
   ]
 
   @doc """
@@ -114,7 +137,8 @@ defmodule Replicant.Assembler do
       checkpoint_writer: Keyword.get(opts, :checkpoint_writer),
       lib_checkpoint: Keyword.get(opts, :lib_checkpoint),
       slot_name: Keyword.get(opts, :slot_name),
-      batch: Keyword.get(opts, :batch)
+      batch: Keyword.get(opts, :batch),
+      max_concurrent_txns: Keyword.get(opts, :max_concurrent_txns)
     }
   end
 
@@ -128,6 +152,17 @@ defmodule Replicant.Assembler do
   payload never crashes here.
   """
   @spec observe_bytes(t(), non_neg_integer()) :: t()
+  # A streamed segment's bytes route to its stream buffer. The `is_map_key/2` guard makes
+  # this clause NEVER `Map.fetch!`-raise on an absent buffer — `observe_bytes/2` runs OUTSIDE
+  # `handle_message/2`'s value-free rescue (it is called by `AssemblerServer.handle_cast`), so
+  # a raise here would be an unguarded GenServer crash, not a value-free halt. With no open
+  # stream (or an absent buffer) this clause is skipped and the `txn:` clauses below apply.
+  def observe_bytes(%__MODULE__{current_stream_xid: xid, stream_txns: streams} = asm, bytes)
+      when is_integer(xid) and is_integer(bytes) and bytes >= 0 and is_map_key(streams, xid) do
+    buf = Map.fetch!(streams, xid)
+    %{asm | stream_txns: Map.put(streams, xid, %{buf | byte_size: buf.byte_size + bytes})}
+  end
+
   def observe_bytes(%__MODULE__{txn: nil} = asm, _bytes), do: asm
 
   def observe_bytes(%__MODULE__{txn: buffer} = asm, bytes)
@@ -174,6 +209,73 @@ defmodule Replicant.Assembler do
 
   defp do_handle_message(%__MODULE__{} = asm, %Begin{final_lsn: lsn, xid: xid}) do
     {:ok, %{asm | txn: %{begin_lsn: lsn, xid: xid, changes: [], byte_size: 0}, ordinal: 0}}
+  end
+
+  # --- streaming reassembly (spec §5) ---
+  #
+  # These clauses MUST precede the `txn: nil` "row before Begin" guard below: a streamed
+  # change has NO open `txn` buffer, so the guard would otherwise mis-halt it as a "row before
+  # Begin". They match only STREAMED traffic — StreamStart/StreamStop, and Insert/Update/Delete/
+  # Truncate guarded on `is_integer(xid)` (a non-streamed message carries `xid: nil` and skips
+  # these to reach the v1 clauses unchanged). Streamed Relation/Type messages fall through to the
+  # existing v1 clauses (relation schema is cached globally, not per-stream — correct).
+
+  defp do_handle_message(%__MODULE__{} = asm, %StreamStart{xid: xid}) do
+    cond do
+      Map.has_key?(asm.stream_txns, xid) ->
+        {:ok, %{asm | current_stream_xid: xid}}
+
+      map_size(asm.stream_txns) >= (asm.max_concurrent_txns || 64) ->
+        {:halt,
+         %Error{reason: :config_invalid, shape: "too many concurrent streamed transactions"}, asm}
+
+      true ->
+        {:ok,
+         %{
+           asm
+           | current_stream_xid: xid,
+             stream_txns: Map.put(asm.stream_txns, xid, %{changes: [], byte_size: 0})
+         }}
+    end
+  end
+
+  defp do_handle_message(%__MODULE__{} = asm, %StreamStop{}) do
+    {:ok, %{asm | current_stream_xid: nil}}
+  end
+
+  defp do_handle_message(%__MODULE__{} = asm, %Insert{
+         xid: sx,
+         relation_id: rid,
+         tuple_data: tuple
+       })
+       when is_integer(sx) do
+    stream_accumulate(asm, :insert, rid, tuple, nil, sx)
+  end
+
+  defp do_handle_message(%__MODULE__{} = asm, %Update{
+         xid: sx,
+         relation_id: rid,
+         tuple_data: tuple,
+         old_tuple_data: old_tuple,
+         changed_key_tuple_data: key_tuple
+       })
+       when is_integer(sx) do
+    stream_accumulate(asm, :update, rid, tuple, old_spec(old_tuple, key_tuple), sx)
+  end
+
+  defp do_handle_message(%__MODULE__{} = asm, %Delete{
+         xid: sx,
+         relation_id: rid,
+         old_tuple_data: old_tuple,
+         changed_key_tuple_data: key_tuple
+       })
+       when is_integer(sx) do
+    stream_accumulate(asm, :delete, rid, nil, old_spec(old_tuple, key_tuple), sx)
+  end
+
+  defp do_handle_message(%__MODULE__{} = asm, %Truncate{xid: sx, truncated_relations: rids})
+       when is_integer(sx) do
+    stream_accumulate_truncate(asm, rids, sx)
   end
 
   # A row/commit message that arrives before any Begin is malformed → fail-closed
@@ -365,6 +467,72 @@ defmodule Replicant.Assembler do
         projected = Map.fetch!(asm.projected, rid)
         change = build_change(op, rel, projected, new_tuple, old_spec, buffer.begin_lsn, ordinal)
         {:ok, %{asm | txn: %{buffer | changes: [change | buffer.changes]}, ordinal: ordinal + 1}}
+    end
+  end
+
+  # --- streamed change accumulation (spec §5) ---
+
+  # Append a streamed row change to its top-level xid's buffer, tagged with the change's own
+  # (sub)transaction id (spec §5) — commit_lsn/ordinal are stamped at StreamCommit replay
+  # (streamed changes have no LSN before commit). A change outside a StreamStart segment, or for
+  # an uncached relation, halts fail-closed.
+  defp stream_accumulate(%__MODULE__{current_stream_xid: nil} = asm, _op, _rid, _new, _old, _sx),
+    do:
+      {:halt, %Error{reason: :config_invalid, shape: "streamed change outside a stream segment"},
+       asm}
+
+  defp stream_accumulate(
+         %__MODULE__{current_stream_xid: top, relations: relations} = asm,
+         op,
+         rid,
+         new_tuple,
+         old_spec,
+         subxid
+       ) do
+    case Map.get(relations, rid) do
+      nil ->
+        {:halt, %Error{reason: :config_invalid, shape: "streamed row for uncached relation"}, asm}
+
+      %Relation{} = rel ->
+        projected = Map.fetch!(asm.projected, rid)
+        change = build_change(op, rel, projected, new_tuple, old_spec, nil, 0)
+        buf = Map.fetch!(asm.stream_txns, top)
+        buf = %{buf | changes: [{subxid, change} | buf.changes]}
+        {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
+    end
+  end
+
+  defp stream_accumulate_truncate(%__MODULE__{current_stream_xid: nil} = asm, _rids, _sx),
+    do:
+      {:halt,
+       %Error{reason: :config_invalid, shape: "streamed truncate outside a stream segment"}, asm}
+
+  defp stream_accumulate_truncate(
+         %__MODULE__{current_stream_xid: top, relations: relations} = asm,
+         rids,
+         subxid
+       ) do
+    if Enum.all?(rids, &Map.has_key?(relations, &1)) do
+      tagged =
+        Enum.map(rids, fn rid ->
+          rel = Map.fetch!(relations, rid)
+
+          {subxid,
+           %Change{
+             op: :truncate,
+             schema: rel.namespace,
+             table: rel.name,
+             commit_lsn: nil,
+             ordinal: 0
+           }}
+        end)
+
+      buf = Map.fetch!(asm.stream_txns, top)
+      buf = %{buf | changes: Enum.reverse(tagged, buf.changes)}
+      {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
+    else
+      {:halt, %Error{reason: :config_invalid, shape: "streamed truncate for uncached relation"},
+       asm}
     end
   end
 
@@ -774,6 +942,11 @@ defmodule Replicant.Assembler do
   @spec reset_batch(t()) :: t()
   def reset_batch(%__MODULE__{} = asm),
     do: %{asm | batch_count: 0, pending_lsn: nil, batch_txns: []}
+
+  @doc "Discard all in-progress streamed transactions (on reconnect); loss=0 by re-stream (spec §9)."
+  @spec reset_streams(t()) :: t()
+  def reset_streams(%__MODULE__{} = asm),
+    do: %{asm | stream_txns: %{}, current_stream_xid: nil}
 
   @doc """
   Record the per-stream floor (the Connection's first-frame `wal_end` — where PG actually began

@@ -1027,4 +1027,79 @@ defmodule Replicant.AssemblerTest do
       assert :empty = Assembler.flush_batch(asm, :max_delay_ms)
     end
   end
+
+  describe "streaming reassembly (spec §5) — StreamStart/Stop + accumulate" do
+    alias Replicant.Decoder.Messages.{Insert, Relation, StreamStart, StreamStop}
+    alias Replicant.Decoder.Messages.Relation.Column
+
+    defp streamed(max_concurrent \\ 64) do
+      Replicant.Assembler.new(Replicant.Test.RecordingSink, max_concurrent_txns: max_concurrent)
+    end
+
+    defp with_relation(asm, rid) do
+      rel = %Relation{
+        id: rid,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, rel)
+      asm
+    end
+
+    test "StreamStart opens a top-xid buffer; a streamed Insert accumulates tagged with its subxid" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      assert asm.current_stream_xid == 100
+      assert Map.has_key?(asm.stream_txns, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"5"}})
+
+      assert [{100, %Replicant.Change{op: :insert, table: "t"}}] = asm.stream_txns[100].changes
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      assert asm.current_stream_xid == nil
+    end
+
+    test "a streamed change under a SUBTRANSACTION is tagged with the subxid, not the top xid" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 101, relation_id: 1, tuple_data: {"2"}})
+
+      # newest-first; both live under top-xid 100's buffer, tagged 100 and 101.
+      assert [{101, _}, {100, _}] = asm.stream_txns[100].changes
+    end
+
+    test "observe_bytes attributes a streamed change's bytes to the current stream buffer" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      asm = Assembler.observe_bytes(asm, 42)
+      assert asm.stream_txns[100].byte_size == 42
+    end
+
+    test "exceeding max_concurrent_txns halts fail-closed" do
+      asm = streamed(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+               Assembler.handle_message(asm, %StreamStart{xid: 200, first_segment: true})
+    end
+
+    test "reset_streams/1 discards all in-progress stream buffers" do
+      asm = streamed()
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      asm = Assembler.reset_streams(asm)
+      assert asm.stream_txns == %{}
+      assert asm.current_stream_xid == nil
+    end
+  end
 end
