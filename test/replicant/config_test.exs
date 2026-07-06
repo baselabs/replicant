@@ -500,6 +500,11 @@ defmodule Replicant.ConfigTest do
       assert cfg.streaming == nil
     end
 
+    test "explicit streaming: nil disables streaming (v1 path), matching batch_delivery: nil" do
+      assert {:ok, cfg} = Config.validate(st_base(streaming: nil))
+      assert cfg.streaming == nil
+    end
+
     test "mis-shaped streaming is rejected :config_invalid" do
       for bad <- [
             [max_concurrent_txns: 0],
