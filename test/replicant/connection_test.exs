@@ -655,4 +655,56 @@ defmodule Replicant.ConnectionTest do
       assert_receive {:"$gen_cast", {:reset_batch}}
     end
   end
+
+  describe "streaming casts + in-stream tracking (spec §5/§9)" do
+    alias Replicant.Decoder.Messages.{StreamStart, StreamStop}
+
+    defp st_state(slot, step, in_stream \\ false) do
+      %Replicant.Connection{
+        slot_name: slot,
+        publication: "p",
+        sink: Replicant.Test.RecordingSink,
+        connection: [hostname: "h"],
+        checkpoint_store: nil,
+        batch_delivery: nil,
+        streaming: [max_concurrent_txns: 64],
+        checkpoint_lsn: 0,
+        received_lsn: 0,
+        stream_floor_lsn: nil,
+        in_stream: in_stream,
+        step: step
+      }
+    end
+
+    test "a StreamStart frame is forwarded and flips in_stream true; StreamStop flips it back" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_st", :assembler}, nil)
+      # ?w frame wrapping a StreamStart payload (S <xid::32> <first::8>)
+      start_frame = <<?w, 0::64, 10::64, 0::64, "S", 100::32, 1::8>>
+
+      assert {:noreply, s1} =
+               Replicant.Connection.handle_data(start_frame, st_state("conn_st", :streaming))
+
+      assert_receive {:"$gen_cast", {:message, %StreamStart{xid: 100}, _, _}}
+      assert s1.in_stream == true
+
+      stop_frame = <<?w, 0::64, 11::64, 0::64, "E">>
+      assert {:noreply, s2} = Replicant.Connection.handle_data(stop_frame, s1)
+      assert_receive {:"$gen_cast", {:message, %StreamStop{}, _, _}}
+      assert s2.in_stream == false
+    end
+
+    test "start_streaming casts {:reset_streams} and resets in_stream in streaming mode" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_st2", :assembler}, nil)
+
+      assert {:stream, sql, [], state} =
+               Replicant.Connection.handle_result([%Postgrex.Result{}], %{
+                 st_state("conn_st2", :create_slot, true)
+                 | step: :create_slot
+               })
+
+      assert sql =~ "proto_version '2'"
+      assert_receive {:"$gen_cast", {:reset_streams}}
+      assert state.in_stream == false
+    end
+  end
 end

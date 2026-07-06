@@ -86,6 +86,8 @@ defmodule Replicant.Connection do
           max_inflight_lag: pos_integer(),
           checkpoint_store: keyword() | nil,
           batch_delivery: keyword() | nil,
+          streaming: keyword() | nil,
+          in_stream: boolean(),
           store_retry_count: non_neg_integer(),
           step: step()
         }
@@ -104,6 +106,8 @@ defmodule Replicant.Connection do
     max_inflight_lag: @default_max_inflight_lag,
     checkpoint_store: nil,
     batch_delivery: nil,
+    streaming: nil,
+    in_stream: false,
     store_retry_count: 0,
     step: :disconnected
   ]
@@ -156,6 +160,8 @@ defmodule Replicant.Connection do
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
+       streaming: Map.get(config, :streaming),
+       in_stream: false,
        store_retry_count: 0,
        step: :disconnected
      }}
@@ -330,7 +336,10 @@ defmodule Replicant.Connection do
         prime_assembler(state, lsn)
 
         {:ok, sql} =
-          QueryBuilder.start_replication(state.slot_name, state.publication, start_lsn: lsn)
+          QueryBuilder.start_replication(state.slot_name, state.publication,
+            start_lsn: lsn,
+            streaming: streaming?(state)
+          )
 
         {:stream, sql, [],
          %{
@@ -338,7 +347,8 @@ defmodule Replicant.Connection do
            | step: :streaming,
              checkpoint_lsn: lsn,
              received_lsn: lsn,
-             stream_floor_lsn: nil
+             stream_floor_lsn: nil,
+             in_stream: false
          }}
 
       {:error, _} ->
@@ -423,6 +433,11 @@ defmodule Replicant.Connection do
   # Modes that use the assembler's LSN-span batch machinery (and therefore the stream floor):
   # lib mode (batched checkpointing) OR sink-owned batch delivery.
   defp batches?(state), do: lib_mode?(state) or sink_owned_batch?(state)
+
+  # proto-v2 streaming of in-progress transactions is enabled (spec §5). Orthogonal to the
+  # checkpoint mode (lib / sink-owned / per-txn) — a `:streaming` keyword turns it on.
+  defp streaming?(%{streaming: s}), do: is_list(s)
+  defp streaming?(_), do: false
 
   @doc false
   @spec lib_go_forward_violation?(map()) :: boolean()
@@ -523,20 +538,33 @@ defmodule Replicant.Connection do
   end
 
   defp forward_message(payload, state) do
-    case Decoder.decode(payload) do
+    case Decoder.decode(payload, streaming: state.in_stream) do
       {:ok, message} ->
         GenServer.cast(
           AssemblerServer.via(state.slot_name),
           {:message, message, byte_size(payload), self()}
         )
 
-        {:noreply, state}
+        {:noreply, update_in_stream(state, message)}
 
       {:error, error} ->
         Replicant.Supervisor.halt(state.slot_name, error)
         {:disconnect, :decode_failure}
     end
   end
+
+  # Track the streaming decode context: StreamStart opens it (the following change messages carry
+  # the (sub)xid prefix that only decodes correctly with streaming: true), StreamStop closes it.
+  # Reset to false on every (re)connect (see start_streaming / snapshot handoff) so a mid-stream
+  # reconnect never leaves the flag stale (spec §9; a stale flag would mis-frame the next decode —
+  # a streamed change read as v1, or vice versa — into a value-free halt).
+  defp update_in_stream(state, %Replicant.Decoder.Messages.StreamStart{}),
+    do: %{state | in_stream: true}
+
+  defp update_in_stream(state, %Replicant.Decoder.Messages.StreamStop{}),
+    do: %{state | in_stream: false}
+
+  defp update_in_stream(state, _message), do: state
 
   # Fail-closed lag-halt (spec §4): the sink is not draining fast enough — the
   # in-flight window is exceeded. Surface it with value-free telemetry (the `reason`
@@ -558,10 +586,11 @@ defmodule Replicant.Connection do
 
     {:ok, sql} =
       QueryBuilder.start_replication(state.slot_name, state.publication,
-        start_lsn: state.checkpoint_lsn
+        start_lsn: state.checkpoint_lsn,
+        streaming: streaming?(state)
       )
 
-    {:stream, sql, [], %{state | step: :streaming}}
+    {:stream, sql, [], %{state | step: :streaming, in_stream: false}}
   end
 
   # On every (re)connect prepare the assembler for the resumed stream: lib mode SEEDS the
@@ -569,11 +598,20 @@ defmodule Replicant.Connection do
   # batch (reset) so a transient reconnect re-buffers a fresh batch (spec §9; the span base
   # lib_checkpoint is left to the assembler). Per-transaction sink-owned mode: no-op.
   defp prime_assembler(state, seed_lsn) do
+    # Streaming is orthogonal to the checkpoint mode: on every (re)connect discard any
+    # partially-buffered streamed transactions (spec §9) so a mid-stream reconnect never
+    # replays a half-received in-progress txn. Runs before the mode-specific seed/reset.
+    if streaming?(state), do: reset_assembler_streams(state)
+
     cond do
       lib_mode?(state) -> seed_assembler(state, seed_lsn)
       sink_owned_batch?(state) -> reset_assembler_batch(state)
       true -> :ok
     end
+  end
+
+  defp reset_assembler_streams(state) do
+    GenServer.cast(AssemblerServer.via(state.slot_name), {:reset_streams})
   end
 
   defp reset_assembler_batch(state) do
