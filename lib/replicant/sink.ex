@@ -32,6 +32,16 @@ defmodule Replicant.Sink do
   implement `checkpoint/0`. `Config` enforces `checkpoint/0` presence at start for
   sink-owned mode. The guarantee is at-least-once, dup bounded to one transaction,
   never loss — NOT effect-once (a non-transactional sink cannot dedup).
+
+  ## Batched checkpointing (lib mode)
+
+  When `:checkpoint_store` carries a `:batch` option, the library writes the checkpoint and
+  advances the slot ack once per BATCH of up to `max_transactions` transactions (or every
+  `max_delay_ms`, or when the batch's WAL span reaches an auto-derived lag-safety cap) — but
+  `handle_transaction/1` is still called PER TRANSACTION and the contract is unchanged. This
+  amortizes the per-transaction checkpoint-store round-trip. The trade-off is honest: a crash
+  or graceful stop mid-batch re-delivers up to one batch (dup ≤ `max_transactions`), never loss.
+  Absent `:batch`, checkpointing stays per-transaction (dup ≤ one transaction).
   """
 
   @doc "Last durably-persisted commit LSN, for resume AND as the dedup watermark."

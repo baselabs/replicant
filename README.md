@@ -166,21 +166,25 @@ identifier-validation, and tenant-blind invariants — live in
 ## Roadmap
 
 **Plan 1 (offline core)**, **Plan 2 (live streaming + exactly-once)**,
-**initial snapshot / backfill (`replicant-snapshot`)**, and the
-**lib-owned checkpoint store (`replicant-checkpoint-store`)** have all shipped: decode /
+**initial snapshot / backfill (`replicant-snapshot`)**, the
+**lib-owned checkpoint store (`replicant-checkpoint-store`)**, and
+**batched checkpointing (`replicant-batching`)** have all shipped: decode /
 assemble / validate / redact, plus the `Postgrex.ReplicationConnection` that owns the
 slot with ack-after-checkpoint, slot-invalidation fail-closed halt, the bounded
 in-flight window, a real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0,
 the `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN backfill that seeds a mirror
-from a populated source gap-free and dup-free, and a lib-owned checkpoint mode for
+from a populated source gap-free and dup-free, a lib-owned checkpoint mode for
 **non-transactional** sinks (a durable Postgres checkpoint written after persist —
-at-least-once, dup bounded to one transaction, never loss).
+at-least-once, dup bounded to one transaction, never loss), and opt-in batched
+checkpointing that defers the lib-owned checkpoint write + ack to once per batch
+of transactions.
+
+- **Batched checkpointing (lib mode):** add `batch: [max_transactions: N, max_delay_ms: T]` under `:checkpoint_store` to checkpoint once per batch of N transactions (dup ≤ one batch, never loss).
 
 The remaining slices are the spec §3 non-goals, each a named future subsystem
 that composes on this streaming core (the v1 primitive is fail-closed without
 it):
 
-- multi-transaction batching (`replicant-batching`),
 - `pgoutput` proto ≥ 2 in-progress-transaction streaming (`replicant-streaming`), and
 - the Ash / tenancy / classification sink (`ash_replicant`, a sibling library).
 

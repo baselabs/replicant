@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Batched checkpointing (lib mode) (`replicant-batching`)
+
+- **Batched checkpointing (lib mode).** Opt-in `checkpoint_store: [batch: [max_transactions: 100, max_delay_ms: 1000]]` defers the lib-owned checkpoint write + slot ack to once per batch, amortizing the per-transaction store round-trip. Sink delivery stays per-transaction; the sink contract is unchanged. loss=0 is unconditional; the crash/stop dup bound widens to one batch. An auto LSN-span cap (`max_inflight_lag/4`) keeps a batch from self-tripping the §4 in-flight-lag halt.
+
 ### Added — Bounded-retry-then-halt on checkpoint-store faults (`replicant-store-fault-retry`)
 
 - `:checkpoint_store` gains two retry-policy keys: `max_retries` (default 5, non-negative

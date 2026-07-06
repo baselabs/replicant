@@ -95,6 +95,7 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   crash between persist and checkpoint re-delivers exactly one transaction on resume:
   **duplicate bounded to one transaction, never loss.** A non-transactional sink cannot
   dedup — do not claim effect-once for it.
+- **Batching is opt-in and lib-mode only.** `checkpoint_store: [batch: [max_transactions: N, max_delay_ms: T]]`. It batches the checkpoint write + ack, NOT sink delivery (`handle_transaction/1` is still per-transaction). A crash or graceful stop mid-batch re-delivers up to one batch — size `max_transactions` for your dup tolerance. Do not set `:batch` at the top level (it belongs under `:checkpoint_store`; a misplaced top-level `:batch` is rejected at start).
 - **Unchanged TOAST is a sentinel, not a value.** It surfaces only as
   `Replicant.Change`'s `unchanged` list of column names, never in `record`.
   Sinks must leave those columns untouched on upsert.
