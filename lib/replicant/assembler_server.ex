@@ -37,7 +37,8 @@ defmodule Replicant.AssemblerServer do
         slot_name,
         sink,
         Keyword.get(opts, :checkpoint_store),
-        Keyword.get(opts, :batch)
+        Keyword.get(opts, :batch),
+        Keyword.get(opts, :streaming)
       )
 
     {:ok, %{slot_name: slot_name, asm: asm, halted: false, conn_pid: nil, batch_timer: nil}}
@@ -48,7 +49,7 @@ defmodule Replicant.AssemblerServer do
   # store read it does on connect — one read, deterministic ordering before any
   # Commit). No store I/O in init (fast boot; the CheckpointStore's own non-sync
   # connect owns resilience). A lib-mode assembler is NEVER built without a writer.
-  defp build_assembler(slot_name, sink, store, batch) when is_list(store) do
+  defp build_assembler(slot_name, sink, store, batch, streaming) when is_list(store) do
     max_retries =
       Keyword.get(store, :max_retries, Replicant.CheckpointStore.default_max_retries())
 
@@ -63,11 +64,20 @@ defmodule Replicant.AssemblerServer do
       mode: :lib,
       checkpoint_writer: writer,
       slot_name: slot_name,
-      batch: batch
+      batch: batch,
+      max_concurrent_txns: stream_limit(streaming)
     )
   end
 
-  defp build_assembler(_slot_name, sink, nil, batch), do: Assembler.new(sink, batch: batch)
+  defp build_assembler(_slot_name, sink, nil, batch, streaming),
+    do: Assembler.new(sink, batch: batch, max_concurrent_txns: stream_limit(streaming))
+
+  # The per-stream concurrency cap (spec §7): `nil` when streaming is not configured (the assembler
+  # falls back to its own default), else the caller's `:max_concurrent_txns`.
+  defp stream_limit(nil), do: nil
+
+  defp stream_limit(streaming) when is_list(streaming),
+    do: Keyword.get(streaming, :max_concurrent_txns)
 
   # The store write as a 0-arity thunk (so the retry loop can re-invoke it).
   defp store_write(slot_name, lsn) do
@@ -150,6 +160,13 @@ defmodule Replicant.AssemblerServer do
   # lib_checkpoint (the span base) is left intact — it equals the last delivered batch's LSN.
   def handle_cast({:reset_batch}, %{asm: asm} = state) do
     {:noreply, cancel_batch_timer(%{state | asm: Assembler.reset_batch(asm)})}
+  end
+
+  # Streaming: on every (re)connect the Connection casts {:reset_streams}, discarding any
+  # in-progress streamed transactions so a transient reconnect re-streams them from the durable
+  # checkpoint (effect-once by spec §9; loss=0 by re-stream). A no-op when no stream is open.
+  def handle_cast({:reset_streams}, %{asm: asm} = state) do
+    {:noreply, %{state | asm: Assembler.reset_streams(asm)}}
   end
 
   # The Connection reports the per-stream floor (its first XLogData frame's wal_end — where PG began

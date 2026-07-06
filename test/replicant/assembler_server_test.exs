@@ -474,4 +474,28 @@ defmodule Replicant.AssemblerServerTest do
       refute_received {:wrote, _}
     end
   end
+
+  describe "streaming (spec §7/§9)" do
+    alias Replicant.Decoder.Messages.StreamStart
+
+    test "the server builds a stream-capable assembler and {:reset_streams} discards open streams" do
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_stream",
+          sink: Replicant.Test.RecordingSink,
+          streaming: [max_concurrent_txns: 8]
+        )
+
+      assert :sys.get_state(pid).asm.max_concurrent_txns == 8
+
+      GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
+      :sys.get_state(pid)
+      assert Map.has_key?(:sys.get_state(pid).asm.stream_txns, 100)
+
+      GenServer.cast(pid, {:reset_streams})
+      state = :sys.get_state(pid)
+      assert state.asm.stream_txns == %{}
+      assert state.asm.current_stream_xid == nil
+    end
+  end
 end
