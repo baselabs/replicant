@@ -67,7 +67,7 @@ defmodule Replicant.AssemblerServer do
     )
   end
 
-  defp build_assembler(_slot_name, sink, nil, _batch), do: Assembler.new(sink)
+  defp build_assembler(_slot_name, sink, nil, batch), do: Assembler.new(sink, batch: batch)
 
   # The store write as a 0-arity thunk (so the retry loop can re-invoke it).
   defp store_write(slot_name, lsn) do
@@ -141,6 +141,15 @@ defmodule Replicant.AssemblerServer do
   def handle_cast({:seed_lib_checkpoint, lsn}, %{asm: asm} = state) when is_integer(lsn) do
     asm = %{Assembler.reset_batch(asm) | lib_checkpoint: lsn}
     {:noreply, cancel_batch_timer(%{state | asm: asm})}
+  end
+
+  # Sink-owned batch mode: on every (re)connect the Connection casts {:reset_batch} (start_streaming
+  # + snapshot handoff), discarding any open in-memory batch and canceling the flush timer — so a
+  # transient reconnect matches the crash/stop→resume model (un-delivered txns re-stream and
+  # re-buffer as a FRESH batch; effect-once holds, the durable sink checkpoint gates every ack).
+  # lib_checkpoint (the span base) is left intact — it equals the last delivered batch's LSN.
+  def handle_cast({:reset_batch}, %{asm: asm} = state) do
+    {:noreply, cancel_batch_timer(%{state | asm: Assembler.reset_batch(asm)})}
   end
 
   # The Connection reports the per-stream floor (its first XLogData frame's wal_end — where PG began

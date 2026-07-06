@@ -387,6 +387,57 @@ defmodule Replicant.AssemblerServerTest do
       refute_received {:sink_committed, _}
     end
 
+    # Runs in the AssemblerServer process (not the test), so it reports via Application env — safe
+    # because assembler_server_test.exs is `async: false`. checkpoint/0 is the resume watermark.
+    defmodule SrvBatchSink do
+      def checkpoint, do: {:ok, nil}
+
+      def handle_batch(txns) do
+        send(
+          Application.get_env(:replicant, :srv_batch_pid),
+          {:batch, Enum.map(txns, & &1.commit_lsn)}
+        )
+
+        {:ok, List.last(txns).commit_lsn}
+      end
+    end
+
+    test "a sink-owned batch pipeline delivers via handle_batch at the count cap, then {:reset_batch} discards an open batch" do
+      Application.put_env(:replicant, :srv_batch_pid, self())
+      on_exit(fn -> Application.delete_env(:replicant, :srv_batch_pid) end)
+
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_bd",
+          sink: SrvBatchSink,
+          batch: [max_transactions: 2, max_delay_ms: 60_000, max_span: 1_000_000]
+        )
+
+      # cache_relation/1 (assembler_server_test.exs helper) caches relation id 1 FIRST — every
+      # batched test in this block does so, else drive_txn's %Insert{relation_id: 1} halts
+      # :config_invalid ("row for uncached relation", assembler.ex:358-360). drive_txn/2 + cast/3
+      # are existing helpers (assembler_server_test.exs:26,268) casting {:message, ..., self()}.
+      cache_relation(pid)
+      # Seed stream_floor so the span cap does not fire.
+      GenServer.cast(pid, {:stream_floor, 0})
+      drive_txn(pid, 100)
+      :sys.get_state(pid)
+      refute_received {:batch, _}
+      drive_txn(pid, 200)
+      assert_receive {:batch, [100, 200]}
+
+      # Open a new batch, then {:reset_batch} must discard it (no delivery on the next timer/flush).
+      drive_txn(pid, 300)
+      GenServer.cast(pid, {:reset_batch})
+      state = :sys.get_state(pid)
+      refute Replicant.Assembler.batch_pending?(state.asm)
+      assert state.asm.batch_txns == []
+
+      # {:reset_batch} must also CANCEL the armed flush timer (not just clear the batch) —
+      # else a re-buffered batch rides the stale timer's window. Timer was armed by txn 300.
+      assert state.batch_timer == nil
+    end
+
     test "a reconnect re-seed discards the open batch — no stale accumulators across reconnect (CV1)" do
       pid = start("srv_batch_reseed", RecordingSink)
       test = self()
