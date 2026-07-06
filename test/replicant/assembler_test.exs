@@ -873,6 +873,16 @@ defmodule Replicant.AssemblerTest do
       def handle_batch(_txns), do: exit(%Replicant.Transaction{commit_lsn: 999, changes: []})
     end
 
+    defmodule UnexpectedReturnBatchSink do
+      def checkpoint, do: {:ok, nil}
+      # A NON-conforming NORMAL return (not {:ok,_}/{:error,_}) embedding a row value. The `try`
+      # wraps only the handle_batch CALL, so this return reaches the result `case`; without a
+      # value-free catch-all it raises CaseClauseError inlining the term → an uncontrolled
+      # Rule-1 leak into the OTP crash log (do_flush has no outer rescue). Effect-once/spec §8.
+      def handle_batch(_txns),
+        do: {:committed, %Replicant.Transaction{commit_lsn: 700, changes: []}}
+    end
+
     # A sink-owned batch assembler with a manually-seeded buffer (Task 4 wires apply_sink to
     # populate it; here we test flush_batch in isolation). batch_txns is stored newest-first
     # (prepend), so flush_batch must reverse it to ascending commit-LSN order.
@@ -993,6 +1003,19 @@ defmodule Replicant.AssemblerTest do
 
       assert {:error, %Replicant.Error{reason: :sink_failed, shape: nil}, _asm} =
                Assembler.flush_batch(asm, :max_transactions)
+    end
+
+    test "an UNEXPECTED handle_batch return shape halts fail-closed value-free (no CaseClauseError leak, Critical Rule 1)" do
+      asm =
+        buffered(UnexpectedReturnBatchSink, [%Replicant.Transaction{commit_lsn: 100, changes: []}])
+
+      # Must NOT raise CaseClauseError (which would inline the returned term — a buffered row —
+      # into an uncontrolled crash outside the value-free boundary). A non-conforming return
+      # halts fail-closed value-free, exactly like {:error, _}: no term, no module name.
+      assert {:error, %Replicant.Error{reason: :sink_failed, shape: nil}, asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      assert asm.lib_checkpoint == nil
     end
 
     test "flush_batch with no open batch is :empty" do

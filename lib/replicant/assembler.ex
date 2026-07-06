@@ -714,6 +714,13 @@ defmodule Replicant.Assembler do
 
       {:sink_caught, _kind, _reason} ->
         sink_batch_failed(asm, duration)
+
+      # A non-conforming return (not {:ok,_}/{:error,_}) must NOT raise CaseClauseError here:
+      # this runs via do_flush, OUTSIDE handle_message/2's value-free rescue, so the raised
+      # term (a buffered row) would leak into the OTP crash log. Halt fail-closed value-free,
+      # never inspecting the returned term (Critical Rule 1; spec §8 unexpected-return row).
+      _unexpected ->
+        sink_batch_failed(asm, duration)
     end
   end
 
