@@ -12,6 +12,17 @@ defmodule Replicant.SinkTest.AppendLogSink do
   def sink_kind, do: :append_log
 end
 
+defmodule Replicant.SinkTest.BatchCapable do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_batch(_transactions), do: {:ok, 0}
+end
+
 defmodule Replicant.SinkTest.SnapshotCapable do
   @moduledoc false
   @behaviour Replicant.Sink
@@ -117,6 +128,18 @@ defmodule Replicant.SinkTest do
       assert Code.ensure_loaded?(Replicant.Test.WriteOnlySink)
       assert function_exported?(Replicant.Test.WriteOnlySink, :handle_transaction, 1)
       refute function_exported?(Replicant.Test.WriteOnlySink, :checkpoint, 0)
+    end
+
+    test "handle_batch/1 and handle_transaction/1 are optional callbacks" do
+      optional = Replicant.Sink.behaviour_info(:optional_callbacks)
+      assert {:handle_batch, 1} in optional
+      assert {:handle_transaction, 1} in optional
+    end
+
+    test "supports_batch?/1 reflects handle_batch/1 presence" do
+      # RecordingSink implements handle_transaction/1 but NOT handle_batch/1.
+      refute Sink.supports_batch?(RecordingSink)
+      assert Sink.supports_batch?(Replicant.SinkTest.BatchCapable)
     end
   end
 end

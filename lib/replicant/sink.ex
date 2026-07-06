@@ -11,13 +11,17 @@ defmodule Replicant.Sink do
   |---|---|---|
   | `c:checkpoint/0` | in sink-owned mode | last durably-persisted commit LSN (`nil` = never). In **lib mode** (`:checkpoint_store` configured) the library owns the checkpoint and this callback is not required. |
   | `c:handle_transaction/1` | **yes** | persist the txn + checkpoint atomically, return `{:ok, lsn}` |
+  | `c:handle_batch/1` | in batch-delivery mode | deliver N txns + checkpoint atomically (spec §6) |
   | `c:handle_schema_change/2` | no | accept/decline a `SchemaChange`; default halts destructive |
   | `c:sink_kind/0` | no | `:state_mirror` (default) or `:append_log` |
   | `c:handle_snapshot/2` | no | persist a snapshot batch; redo-safe reset on `first_for_table?` |
   | `c:handle_snapshot_complete/1` | no | snapshot handoff commit; persist `checkpoint := snapshot_lsn` |
 
-  These are all `@optional_callbacks` so a minimal sink implementing only the two
-  mandatory callbacks compiles with zero warnings under `--warnings-as-errors`. The
+  Every callback is an `@optional_callback`, so any sink compiles clean under
+  `--warnings-as-errors` regardless of which it implements — the behaviour imposes no
+  compile-time obligation. Which callbacks are actually REQUIRED is enforced at start by
+  `Config`, per mode: `handle_transaction/1` (default sink-owned) or `handle_batch/1`
+  (batch-delivery mode), plus `checkpoint/0` in sink-owned mode. The
   Assembler dispatches the optional ones via `function_exported?/3`, providing the
   documented default. The two snapshot callbacks come as a pair — `supports_snapshot?/1`
   gates `snapshot: true` on BOTH being present.
@@ -42,6 +46,16 @@ defmodule Replicant.Sink do
   amortizes the per-transaction checkpoint-store round-trip. The trade-off is honest: a crash
   or graceful stop mid-batch re-delivers up to one batch (dup ≤ `max_transactions`), never loss.
   Absent `:batch`, checkpointing stays per-transaction (dup ≤ one transaction).
+
+  ## Batched delivery (sink-owned mode)
+
+  When the top-level `batch_delivery` config is set, delivery routes through `c:handle_batch/1`
+  instead of `c:handle_transaction/1`: the library accumulates committed transactions and hands
+  the sink a batch to persist (rows + checkpoint) in one atomic write. Because the write is
+  atomic, effect-once is PRESERVED (dup = 0), stronger than lib-mode batched checkpointing's
+  dup ≤ `max_transactions`. `batch_delivery` is sink-owned only (mutually exclusive with
+  `:checkpoint_store`) and requires the sink to implement `c:handle_batch/1`
+  (`supports_batch?/1`); a sink missing it is rejected at start (`:batch_unsupported`).
   """
 
   @doc "Last durably-persisted commit LSN, for resume AND as the dedup watermark."
@@ -52,6 +66,23 @@ defmodule Replicant.Sink do
   LSN. Idempotency: skip if `txn.commit_lsn <= checkpoint()`; upsert rows by PK.
   """
   @callback handle_transaction(Replicant.Transaction.t()) ::
+              {:ok, Replicant.lsn()} | {:error, term()}
+
+  @doc """
+  Optional. Deliver a BATCH of committed transactions as ONE atomic unit (spec §6). Enabled by
+  the top-level `batch_delivery` config (sink-owned mode only). `transactions` arrives in
+  ascending `commit_lsn` order; persist ALL of their rows AND `checkpoint := the last (highest)
+  commit_lsn` in ONE atomic database transaction (or, at minimum, checkpoint-after-all-persist),
+  returning that LSN. Idempotency is unchanged: skip any `commit_lsn <= checkpoint`; upsert rows
+  by PK.
+
+  HARD OBLIGATION: the data + checkpoint write is atomic. The effect-once guarantee (dup = 0
+  across a mid-batch teardown) rests on it, exactly as `handle_snapshot/2`'s redo-safety rests on
+  `first_for_table?`. A non-`{:ok, _}` return (or a raise/throw/exit) halts the pipeline
+  fail-closed; the batch is discarded un-acked and re-delivered on resume (deduped to zero net
+  effect by the idempotent sink).
+  """
+  @callback handle_batch([Replicant.Transaction.t()]) ::
               {:ok, Replicant.lsn()} | {:error, term()}
 
   @doc """
@@ -98,6 +129,8 @@ defmodule Replicant.Sink do
 
   @optional_callbacks [
     checkpoint: 0,
+    handle_transaction: 1,
+    handle_batch: 1,
     handle_schema_change: 2,
     sink_kind: 0,
     handle_snapshot: 2,
@@ -134,5 +167,15 @@ defmodule Replicant.Sink do
   def supports_snapshot?(module) do
     function_exported?(module, :handle_snapshot, 2) and
       function_exported?(module, :handle_snapshot_complete, 1)
+  end
+
+  @doc """
+  True when `module` implements `handle_batch/1` — the config gate for `batch_delivery`
+  (spec §6). A `batch_delivery` config whose sink is missing this callback is rejected at
+  start (`:batch_unsupported`) rather than silently falling back to per-transaction delivery.
+  """
+  @spec supports_batch?(module()) :: boolean()
+  def supports_batch?(module) do
+    function_exported?(module, :handle_batch, 1)
   end
 end
