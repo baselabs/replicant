@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Sink-owned atomic batch delivery (`replicant-batch-delivery`)
+
+- **Sink-owned atomic batch delivery** (`batch_delivery:`): an optional `handle_batch/1` sink
+  callback delivering N committed transactions as one atomic unit, amortizing a transactional
+  sink's per-commit cost. Preserves effect-once (dup=0, loss=0). Opt-in via a top-level
+  `batch_delivery: [max_transactions: 100, max_delay_ms: 1000]` (sink-owned only; mutually
+  exclusive with `checkpoint_store`). Emits `[:replicant, :sink, :batch_committed]`.
+
 ### Added — Batched checkpointing (lib mode) (`replicant-batching`)
 
 - **Batched checkpointing (lib mode).** Opt-in `checkpoint_store: [batch: [max_transactions: 100, max_delay_ms: 1000]]` defers the lib-owned checkpoint write + slot ack to once per batch, amortizing the per-transaction store round-trip. Sink delivery stays per-transaction; the sink contract is unchanged. loss=0 is unconditional; the crash/stop dup bound widens to one batch. An auto LSN-span cap (`max_inflight_lag/4`) keeps a batch from self-tripping the §4 in-flight-lag halt.

@@ -151,6 +151,47 @@ bounded: the pipeline retries `max_retries` times (default 5) `retry_backoff_ms`
 (default 1000 ms — ~5s of outage tolerated) then halts fail-closed; a permanent fault
 (schema mismatch / invalid config) halts immediately.
 
+**Sink-owned atomic batch delivery (transactional sinks).** For a **transactional sink** that
+can persist multiple rows + checkpoint in one database transaction, pass a top-level
+`batch_delivery: [max_transactions: 100, max_delay_ms: 1000]` to accumulate committed
+transactions and deliver them as a batch:
+
+```elixir
+Replicant.start_link(
+  connection: [hostname: "standby.internal", port: 5432, username: "u",
+               password: "p", database: "orders", ssl: true],
+  slot_name: "replicant_orders",
+  publication: "orders_pub",
+  sink: MyApp.OrdersSink,
+  batch_delivery: [max_transactions: 100, max_delay_ms: 1000],
+  go_forward_only: false
+)
+
+defmodule MyApp.OrdersSink do
+  @behaviour Replicant.Sink
+
+  @impl true
+  def checkpoint, do: {:ok, MyApp.Repo.last_committed_lsn()}
+
+  @impl true
+  def handle_batch(transactions) do
+    # In ONE DB transaction: skip any commit_lsn <= checkpoint, else upsert all
+    # rows from all transactions by table PK, and persist the batch's highest
+    # commit_lsn as the new checkpoint. Then:
+    {:ok, List.last(transactions).commit_lsn}
+  end
+end
+```
+
+The batch flushes when it reaches `max_transactions` transactions, after `max_delay_ms`
+milliseconds idle, or when the batch's WAL span (LSN-span lag) hits an auto-derived
+safety cap (derived from `:max_inflight_lag`). Because the rows + checkpoint write is
+atomic, effect-once is **preserved** (dup=0, loss=0) — stronger than lib-mode's
+`checkpoint_store: [batch: …]` which is per-transaction delivery with batched checkpointing.
+The sink must implement both `checkpoint/0` (resume) and `handle_batch/1`; it cannot
+use `checkpoint_store`, and any `handle_transaction/1` implementation is ignored.
+Emits `[:replicant, :sink, :batch_committed]` telemetry once per flush.
+
 ## Development
 
 ```bash

@@ -29,15 +29,23 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   UPDATE did not touch (never a value — sinks must leave those columns alone).
 - **`Replicant.SchemaChange`** — a detected DDL-shape change (column add/drop,
   type change, replica-identity change). Destructive changes halt fail-closed.
-- **`Replicant.Sink`** — the behaviour a consumer implements: receives one
-  `Replicant.Transaction` at a time and must durably persist it (or raise)
-  before the slot advances past its `commit_lsn`. Optional snapshot callbacks
-  (`handle_snapshot/2` + `handle_snapshot_complete/1`) let a sink be bootstrapped
+- **`Replicant.Sink`** — the behaviour a consumer implements. In the default **sink-owned
+  transaction mode** (`batch_delivery` not set), receives one `Replicant.Transaction` at a time
+  and must durably persist it (or raise) before the slot advances past its `commit_lsn`. When
+  **sink-owned batch delivery** is enabled (`batch_delivery: [max_transactions: N, max_delay_ms: T]`),
+  receives N committed transactions in a single `handle_batch/1` call and must persist all rows
+  + checkpoint atomically — the transaction is atomic and the effect-once guarantee (dup=0, loss=0)
+  rests on it. Transactions arrive in ascending `commit_lsn` order; the sink must skip any
+  `commit_lsn <= checkpoint` and upsert rows by table PK. A non-`{:ok, _}` return (or a
+  raise/throw/exit) halts the pipeline fail-closed; the batch is discarded un-acked and
+  re-delivered on resume, deduped to zero net effect by the idempotent sink. Optional snapshot
+  callbacks (`handle_snapshot/2` + `handle_snapshot_complete/1`) let a sink be bootstrapped
   from a populated source: batches of `%Change{op: :snapshot}` rows (upsert by PK;
   clear the table when `first_for_table?` is true — a hard redo-safety obligation),
   then a durable handoff checkpoint at the snapshot's consistent point. In **lib mode**
   (`:checkpoint_store` configured) the library owns the checkpoint, so a sink implements
   only `handle_transaction/1` — `checkpoint/0` is optional there; its returned LSN is ignored.
+  Batch delivery is mutually exclusive with lib mode.
 - **`Replicant.Decoder`** — `decode/1` wraps the vendored `pgoutput` byte
   parser; catches and redacts any raise into a value-free `Replicant.Error`.
 - **`Replicant.Assembler`** — groups decoded messages into
@@ -96,6 +104,7 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   **duplicate bounded to one transaction, never loss.** A non-transactional sink cannot
   dedup — do not claim effect-once for it.
 - **Batching is opt-in and lib-mode only.** `checkpoint_store: [batch: [max_transactions: N, max_delay_ms: T]]`. It batches the checkpoint write + ack, NOT sink delivery (`handle_transaction/1` is still per-transaction). A crash or graceful stop mid-batch re-delivers up to one batch — size `max_transactions` for your dup tolerance. Do not set `:batch` at the top level (it belongs under `:checkpoint_store`; a misplaced top-level `:batch` is rejected at start).
+- **Sink-owned atomic batch delivery (`handle_batch/1`) preserves effect-once.** The `batch_delivery: [max_transactions: N, max_delay_ms: T]` config (top-level, sink-owned only; mutually exclusive with `:checkpoint_store`) routes delivery through `handle_batch/1` instead of `handle_transaction/1`. The HARD OBLIGATION is that the data + checkpoint write is ATOMIC — the effect-once guarantee (dup=0 across mid-batch teardown) rests on it. Transactions arrive in ascending `commit_lsn` order; the sink must skip any `commit_lsn <= checkpoint` and upsert rows by table PK, exactly as `handle_transaction/1` does. A non-`{:ok, _}` return (or a raise/throw/exit) halts the pipeline fail-closed; the batch is discarded un-acked and re-delivered on resume, deduped to zero net effect by the idempotent sink.
 - **Unchanged TOAST is a sentinel, not a value.** It surfaces only as
   `Replicant.Change`'s `unchanged` list of column names, never in `record`.
   Sinks must leave those columns untouched on upsert.
