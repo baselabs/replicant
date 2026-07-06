@@ -1161,6 +1161,16 @@ defmodule Replicant.AssemblerTest do
                Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 999, tuple_data: {"1"}})
     end
 
+    test "a streamed Truncate touching an uncached relation halts fail-closed" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # relation 1 is cached but 999 is not → `Enum.all?(rids, &Map.has_key?(relations, &1))` fails
+      # → the whole truncate halts (fault-path symmetry with the streamed-row uncached-relation halt).
+      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+               Assembler.handle_message(asm, %Truncate{xid: 100, truncated_relations: [1, 999]})
+    end
+
     test "streamed Update and Delete accumulate tagged with their subxid" do
       asm = streamed() |> with_relation(1)
       {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
