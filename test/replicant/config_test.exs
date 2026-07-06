@@ -302,4 +302,83 @@ defmodule Replicant.ConfigTest do
       assert Config.guard(cfg) == :ok
     end
   end
+
+  describe "batching (:batch under :checkpoint_store, spec §7)" do
+    test "a valid :batch normalises the two knobs and DERIVES max_span = max_inflight_lag/4" do
+      opts =
+        base_opts() ++
+          [
+            max_inflight_lag: 64 * 1024 * 1024,
+            checkpoint_store: [
+              connection: [hostname: "db"],
+              batch: [max_transactions: 50, max_delay_ms: 250]
+            ]
+          ]
+
+      assert {:ok, cfg} = Config.validate(opts)
+      assert Keyword.get(cfg.batch, :max_transactions) == 50
+      assert Keyword.get(cfg.batch, :max_delay_ms) == 250
+      # DERIVED, never a user knob: a quarter of the in-flight-lag ceiling.
+      assert Keyword.get(cfg.batch, :max_span) == div(64 * 1024 * 1024, 4)
+    end
+
+    test "batch knobs default to max_transactions 100 / max_delay_ms 1000 when omitted" do
+      opts =
+        base_opts() ++
+          [checkpoint_store: [connection: [hostname: "db"], batch: []]]
+
+      {:ok, cfg} = Config.validate(opts)
+      assert Keyword.get(cfg.batch, :max_transactions) == 100
+      assert Keyword.get(cfg.batch, :max_delay_ms) == 1000
+      # default max_inflight_lag (64 MiB) → max_span = 16 MiB
+      assert Keyword.get(cfg.batch, :max_span) ==
+               div(Replicant.Connection.default_max_inflight_lag(), 4)
+    end
+
+    test "max_span tracks a custom max_inflight_lag (the cap is auto-derived, not fixed)" do
+      opts =
+        base_opts() ++
+          [
+            max_inflight_lag: 4096,
+            checkpoint_store: [connection: [hostname: "db"], batch: []]
+          ]
+
+      {:ok, cfg} = Config.validate(opts)
+      assert Keyword.get(cfg.batch, :max_span) == 1024
+    end
+
+    test "no :batch → cfg.batch is nil (per-transaction path unchanged)" do
+      {:ok, cfg} =
+        Config.validate(base_opts() ++ [checkpoint_store: [connection: [hostname: "db"]]])
+
+      assert cfg.batch == nil
+    end
+
+    test "sink-owned mode (no checkpoint_store) → cfg.batch is nil" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.batch == nil
+    end
+
+    test "a non-positive max_transactions or max_delay_ms is a config error" do
+      for bad_key <- [:max_transactions, :max_delay_ms], bad <- [0, -1, "5", 1.5] do
+        opts =
+          base_opts() ++
+            [checkpoint_store: [connection: [hostname: "db"], batch: [{bad_key, bad}]]]
+
+        assert {:error, :config_invalid} = Config.validate(opts),
+               "expected #{bad_key}=#{inspect(bad)} to be rejected"
+      end
+    end
+
+    test "a misplaced TOP-LEVEL :batch (belongs under :checkpoint_store) is rejected fail-closed" do
+      opts =
+        base_opts() ++
+          [
+            checkpoint_store: [connection: [hostname: "db"]],
+            batch: [max_transactions: 10]
+          ]
+
+      assert {:error, :config_invalid} = Config.validate(opts)
+    end
+  end
 end

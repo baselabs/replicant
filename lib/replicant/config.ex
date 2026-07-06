@@ -12,6 +12,7 @@ defmodule Replicant.Config do
   alias Replicant.{CheckpointStore, Connection, Identifier, Sink}
 
   @type t :: %{
+          optional(:batch) => keyword() | nil,
           connection: keyword(),
           slot_name: String.t(),
           publication: String.t(),
@@ -46,6 +47,7 @@ defmodule Replicant.Config do
          {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
+         {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          snapshot = Keyword.get(opts, :snapshot, false) == true,
          :ok <- validate_start_mode(go_forward_only, snapshot),
@@ -59,7 +61,8 @@ defmodule Replicant.Config do
          go_forward_only: go_forward_only,
          snapshot: snapshot,
          max_inflight_lag: max_inflight_lag,
-         checkpoint_store: checkpoint_store
+         checkpoint_store: checkpoint_store,
+         batch: batch
        }}
     end
   end
@@ -133,6 +136,41 @@ defmodule Replicant.Config do
       {:ok, _bad} -> {:error, :config_invalid}
     end
   end
+
+  # Batching (spec §7) is opt-in via a NESTED :batch under :checkpoint_store — whose presence
+  # IS lib mode — so batching in sink-owned mode is structurally unreachable. A misplaced
+  # TOP-LEVEL :batch (a sibling of :checkpoint_store, the likely mistake) is a config error,
+  # never silently ignored. The two user knobs are positive integers; the lag-safety cap
+  # max_span is DERIVED = div(max_inflight_lag, 4) (never a user knob).
+  defp fetch_batch(opts, checkpoint_store, max_inflight_lag) do
+    cond do
+      Keyword.has_key?(opts, :batch) -> {:error, :config_invalid}
+      not is_list(checkpoint_store) -> {:ok, nil}
+      true -> normalize_batch(Keyword.get(checkpoint_store, :batch), max_inflight_lag)
+    end
+  end
+
+  defp normalize_batch(nil, _max_inflight_lag), do: {:ok, nil}
+
+  defp normalize_batch(batch, max_inflight_lag) when is_list(batch) do
+    max_transactions = Keyword.get(batch, :max_transactions, 100)
+    max_delay_ms = Keyword.get(batch, :max_delay_ms, 1000)
+
+    if positive_integer?(max_transactions) and positive_integer?(max_delay_ms) do
+      {:ok,
+       [
+         max_transactions: max_transactions,
+         max_delay_ms: max_delay_ms,
+         max_span: div(max_inflight_lag, 4)
+       ]}
+    else
+      {:error, :config_invalid}
+    end
+  end
+
+  defp normalize_batch(_bad, _max_inflight_lag), do: {:error, :config_invalid}
+
+  defp positive_integer?(n), do: is_integer(n) and n > 0
 
   # A present :checkpoint_store must be a keyword with a non-empty :connection list and,
   # if given, a :table that passes the identifier allowlist (Critical Rule 2). Absent →
