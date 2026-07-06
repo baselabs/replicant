@@ -196,7 +196,9 @@ defmodule Replicant.AssemblerServer do
 
   # Flush the open batch: write ONE checkpoint at the batch's highest LSN and ack it. A write
   # fault halts fail-closed (buffer discarded, no ack). `:empty` (a stale timer with no open
-  # batch) is a no-op. `conn_pid` is the Connection captured from the last {:message, ...} cast.
+  # batch) is a no-op. `conn_pid` is the Connection captured from the last {:message, ...} cast —
+  # a flush is reachable ONLY after a `{:buffered}` dispatch opened the batch (from that same cast),
+  # so `conn_pid` is always a live pid here, never nil.
   defp do_flush(state, reason) do
     state = cancel_batch_timer(state)
 
