@@ -326,12 +326,15 @@ defmodule Replicant.AssemblerServerTest do
       drive_txn(pid, 200)
       assert_receive {:sink_committed, 200}, 1000
 
-      # A leftover timer fires after the batch already flushed by the count cap. Here pending_lsn
-      # is nil, so handle_info's `batch_pending?` guard short-circuits to the no-op branch and never
-      # calls flush_batch — the stale timer is inert: no spurious ack, and the NEXT batch still
-      # flushes correctly (state not corrupted). This test red-gates the `batch_pending?` guard
-      # (removing it routes the stale timer into a flush); flush_batch's `:empty` clause is the
-      # second layer, red-gated separately by the assembler "no open batch is :empty" test.
+      # A leftover timer fires after the batch already flushed by the count cap. It is inert by
+      # DEFENSE-IN-DEPTH: after the flush pending_lsn is nil, so handle_info's `batch_pending?` guard
+      # short-circuits to a no-op; and even if it didn't, flush_batch's `:empty` clause is a no-op.
+      # Each layer backstops the other, so this test red-gates the COMPOSITE invariant, NOT either
+      # guard alone — removing ONLY `batch_pending?` still lands on `:empty` (green), removing ONLY
+      # `:empty` never reaches flush_batch (green); only removing BOTH reddens it (a stale flush of
+      # the empty batch). The `:empty` clause is red-gated individually by the assembler "no open
+      # batch is :empty" test. Asserts: no spurious ack, and the NEXT batch still flushes (state not
+      # corrupted).
       send(pid, :batch_timeout)
       refute_receive {:sink_committed, _}, 100
 
