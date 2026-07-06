@@ -756,14 +756,36 @@ defmodule Replicant.AssemblerTest do
       refute Assembler.batch_pending?(asm)
     end
 
-    test "the LSN-span cap trips {:flush, :max_span, _} before the count cap" do
+    test "the LSN-span cap trips {:flush, :max_span, _} — span measured from max(lib_checkpoint, stream_floor), NOT the first buffered txn (spec §4/§7/decision-log #7)" do
       writer = fn _lsn -> :ok end
-      asm = batched(writer, max_transactions: 100, max_delay_ms: 1000, max_span: 10)
+      # Fresh-ish: lib_checkpoint 0, stream_floor 100 → span base = max(0, 100) = 100.
+      asm = %{
+        batched(writer, max_transactions: 100, max_delay_ms: 1000, max_span: 10)
+        | stream_floor: 100
+      }
 
-      # base = first txn lsn (100); span 0 < 10 → buffered.
-      assert {:buffered, asm} = commit_txn(asm, 100)
-      # second txn lsn 115 → span = 115 - 100 = 15 >= 10 → flush by span.
-      assert {:flush, :max_span, _asm} = commit_txn(asm, 115)
+      assert {:buffered, asm} = commit_txn(asm, 105)
+      # span = 105 - 100 = 5 < 10 → buffered.
+      assert {:buffered, asm} = commit_txn(asm, 108)
+      # span = 108 - 100 = 8 < 10 → buffered.
+      # Third txn lsn 112: span = 112 - 100 = 12 >= 10 → flush by span. (Measured from the FLOOR 100,
+      # not the first buffered txn 105 — under the old batch_base_lsn base this would be 112-105=7 and
+      # would NOT flush; this is the ratified `pending_lsn − max(lib_checkpoint, stream_floor)`.)
+      assert {:flush, :max_span, _asm} = commit_txn(asm, 112)
+    end
+
+    test "span base is max(lib_checkpoint, stream_floor): a large absolute first-txn LSN on a fresh slot (lib_checkpoint 0) does NOT spuriously span-flush (cold-start fix)" do
+      writer = fn _lsn -> :ok end
+
+      # Fresh slot: lib_checkpoint 0 but the stream started at a large absolute LSN (stream_floor).
+      # Without the floor, span would be `1_000_050 − 0` → a spurious flush of the first txn.
+      asm = %{
+        batched(writer, max_transactions: 100, max_delay_ms: 1000, max_span: 100)
+        | stream_floor: 1_000_000
+      }
+
+      # span = 1_000_050 - max(0, 1_000_000) = 50 < 100 → buffered, batching NOT defeated.
+      assert {:buffered, _asm} = commit_txn(asm, 1_000_050)
     end
 
     test "flush_batch on a WRITE fault returns {:error, %Error{}, _} and does NOT advance the watermark" do

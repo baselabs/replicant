@@ -274,6 +274,14 @@ defmodule Replicant.Connection do
     # began streaming at (its clamped `confirmed_flush_lsn`), so lag is measured
     # relative to the stream, never absolute 0.
     stream_floor_lsn = state.stream_floor_lsn || wal_end
+
+    # On the FIRST frame of a (re)connected stream, report the floor to the AssemblerServer — it is
+    # the cold-start component of the batch span-cap base `max(lib_checkpoint, stream_floor)` (§7),
+    # so a large-absolute first-txn LSN on a fresh slot (lib_checkpoint 0) does not spuriously flush.
+    if is_nil(state.stream_floor_lsn) and lib_mode?(state) do
+      GenServer.cast(AssemblerServer.via(state.slot_name), {:stream_floor, stream_floor_lsn})
+    end
+
     received_lsn = max(state.received_lsn, wal_end)
     state = %{state | received_lsn: received_lsn, stream_floor_lsn: stream_floor_lsn}
     lag = inflight_lag(state)

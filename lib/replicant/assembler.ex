@@ -67,7 +67,7 @@ defmodule Replicant.Assembler do
           batch: keyword() | nil,
           batch_count: non_neg_integer(),
           pending_lsn: lsn() | nil,
-          batch_base_lsn: lsn() | nil
+          stream_floor: lsn() | nil
         }
 
   @type buffer :: %{
@@ -90,7 +90,7 @@ defmodule Replicant.Assembler do
     batch: nil,
     batch_count: 0,
     pending_lsn: nil,
-    batch_base_lsn: nil
+    stream_floor: nil
   ]
 
   @doc """
@@ -587,23 +587,31 @@ defmodule Replicant.Assembler do
 
   # The sink persisted the txn's DATA per-txn (announce [:sink, :committed] now); DEFER the
   # store checkpoint write + ack to the batch flush. Accumulate into the open batch and signal
-  # a flush when the count OR the LSN-span cap trips. The span base is the FIRST buffered txn's
-  # LSN (robust for an empty-checkpoint first run, where lib_checkpoint is 0 but the stream
-  # starts at a large absolute LSN); the max_delay_ms timer is the AssemblerServer's third
-  # trigger. `lib_checkpoint` is NOT advanced here — only at flush (spec §9 invariant).
+  # a flush when the count OR the LSN-span cap trips. Per spec §4/§7/decision-log #7 the span is
+  # `pending_lsn − max(lib_checkpoint, stream_floor)` — the batch's contribution to the §4 in-flight
+  # lag, mirroring the Connection's own lag floor (`max(checkpoint_lsn, stream_floor_lsn)`,
+  # connection.ex:499). `stream_floor` (the stream's start position, from the Connection's first
+  # frame) makes this robust on a fresh slot where lib_checkpoint is 0 but stream LSNs are
+  # large-absolute — without it the first txn would spuriously span-flush. The max_delay_ms timer is
+  # the AssemblerServer's third trigger. `lib_checkpoint` is NOT advanced here — only at flush (§9).
   defp buffer_txn(%__MODULE__{} = asm, %Transaction{commit_lsn: lsn} = _txn, duration) do
     Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{commit_lsn: lsn})
 
-    base = asm.batch_base_lsn || lsn
     count = asm.batch_count + 1
-    asm = %{reset(asm) | batch_count: count, pending_lsn: lsn, batch_base_lsn: base}
+    asm = %{reset(asm) | batch_count: count, pending_lsn: lsn}
 
     cond do
       count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
-      lsn - base >= Keyword.fetch!(asm.batch, :max_span) -> {:flush, :max_span, asm}
+      lsn - span_base(asm) >= Keyword.fetch!(asm.batch, :max_span) -> {:flush, :max_span, asm}
       true -> {:buffered, asm}
     end
   end
+
+  # The span-cap base (spec §7): the un-checkpointed window's start = the higher of the durable
+  # watermark and the per-stream floor, mirroring the §4 lag floor. On a fresh slot lib_checkpoint
+  # is 0 so the floor dominates; after the first flush the watermark dominates.
+  defp span_base(%__MODULE__{lib_checkpoint: cp, stream_floor: floor}),
+    do: max(cp || 0, floor || 0)
 
   @doc """
   Flush the open batch (spec §7): write ONE store checkpoint at the batch's highest committed
@@ -624,7 +632,7 @@ defmodule Replicant.Assembler do
         Telemetry.event([:replicant, :checkpoint_store, :batch_flushed], %{}, %{
           slot_name: asm.slot_name,
           change_count: asm.batch_count,
-          byte_size: lsn - (asm.batch_base_lsn || lsn),
+          byte_size: lsn - span_base(asm),
           reason: reason
         })
 
@@ -633,7 +641,6 @@ defmodule Replicant.Assembler do
            asm
            | batch_count: 0,
              pending_lsn: nil,
-             batch_base_lsn: nil,
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}
 
@@ -663,7 +670,17 @@ defmodule Replicant.Assembler do
   """
   @spec reset_batch(t()) :: t()
   def reset_batch(%__MODULE__{} = asm),
-    do: %{asm | batch_count: 0, pending_lsn: nil, batch_base_lsn: nil}
+    do: %{asm | batch_count: 0, pending_lsn: nil}
+
+  @doc """
+  Record the per-stream floor (the Connection's first-frame `wal_end` — where PG actually began
+  streaming). It is the cold-start component of the span-cap base `max(lib_checkpoint, stream_floor)`
+  (spec §7): on a fresh slot lib_checkpoint is 0, so measuring the batch's lag from the stream floor
+  (not absolute 0) is what keeps a large-absolute first-txn LSN from spuriously span-flushing.
+  """
+  @spec put_stream_floor(t(), lsn()) :: t()
+  def put_stream_floor(%__MODULE__{} = asm, floor) when is_integer(floor),
+    do: %{asm | stream_floor: floor}
 
   # Advance the in-memory lib watermark on a durable commit (lib mode) and reset
   # the buffer. Sink-owned: a bare buffer reset (the watermark lives in the sink).

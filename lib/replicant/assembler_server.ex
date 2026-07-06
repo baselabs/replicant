@@ -143,6 +143,13 @@ defmodule Replicant.AssemblerServer do
     {:noreply, cancel_batch_timer(%{state | asm: asm})}
   end
 
+  # The Connection reports the per-stream floor (its first XLogData frame's wal_end — where PG began
+  # streaming) once per (re)connect. It is the cold-start component of the batch span-cap base
+  # `max(lib_checkpoint, stream_floor)` (spec §7). A no-op in sink-owned mode.
+  def handle_cast({:stream_floor, floor}, %{asm: asm} = state) when is_integer(floor) do
+    {:noreply, %{state | asm: Assembler.put_stream_floor(asm, floor)}}
+  end
+
   defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}
 
   defp dispatch({:transaction, _txn, lsn, asm}, from, state) do
