@@ -889,6 +889,64 @@ defmodule Replicant.AssemblerTest do
       }
     end
 
+    alias Replicant.Decoder.Messages.{Begin, Commit}
+
+    # Drive one committed txn (Begin(lsn) → Commit(lsn), no changes) through `asm`.
+    defp bd_commit(asm, lsn) do
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: lsn, xid: lsn})
+      Assembler.handle_message(asm, %Commit{lsn: lsn, commit_timestamp: nil})
+    end
+
+    defp sink_batched(sink, policy) do
+      %{Replicant.Assembler.new(sink, batch: policy) | stream_floor: 0}
+    end
+
+    test "a committed txn is BUFFERED (handle_batch NOT called; not delivered until flush)" do
+      asm =
+        sink_batched(DeliverSink, max_transactions: 3, max_delay_ms: 1000, max_span: 1_000_000)
+
+      assert {:buffered, asm} = bd_commit(asm, 100)
+      refute_received {:delivered, _}
+      assert Assembler.batch_pending?(asm)
+      assert [%Replicant.Transaction{commit_lsn: 100}] = asm.batch_txns
+    end
+
+    test "reaching max_transactions returns {:flush, :max_transactions, _} carrying the ordered buffer" do
+      asm =
+        sink_batched(DeliverSink, max_transactions: 2, max_delay_ms: 1000, max_span: 1_000_000)
+
+      assert {:buffered, asm} = bd_commit(asm, 100)
+      assert {:flush, :max_transactions, asm} = bd_commit(asm, 200)
+      # buffered newest-first; flush_batch reverses to ascending order.
+      assert [%{commit_lsn: 200}, %{commit_lsn: 100}] = asm.batch_txns
+
+      assert {:ok, 200, _asm} = Assembler.flush_batch(asm, :max_transactions)
+      assert_received {:delivered, [%{commit_lsn: 100}, %{commit_lsn: 200}]}
+    end
+
+    test "the LSN-span cap trips {:flush, :max_span, _} measured from max(lib_checkpoint, stream_floor)" do
+      asm = %{
+        sink_batched(DeliverSink, max_transactions: 100, max_delay_ms: 1000, max_span: 10)
+        | stream_floor: 100
+      }
+
+      assert {:buffered, asm} = bd_commit(asm, 105)
+      assert {:flush, :max_span, _asm} = bd_commit(asm, 112)
+    end
+
+    test "a re-delivered txn <= the live sink checkpoint is SKIPPED, never buffered" do
+      # DeliverSink.checkpoint/0 returns {:ok, nil}; use a sink whose checkpoint is 500.
+      defmodule At500Sink do
+        def checkpoint, do: {:ok, 500}
+        def handle_batch(_txns), do: {:ok, 0}
+      end
+
+      asm = sink_batched(At500Sink, max_transactions: 5, max_delay_ms: 1000, max_span: 1_000_000)
+      assert {:skipped, 300, asm} = bd_commit(asm, 300)
+      refute Assembler.batch_pending?(asm)
+      assert asm.batch_txns == []
+    end
+
     test "flush_batch delivers the buffered txns as ONE handle_batch call in ascending LSN order, advances the span base, emits [:sink, :batch_committed]" do
       t1 = %Replicant.Transaction{commit_lsn: 100, changes: []}
       t2 = %Replicant.Transaction{commit_lsn: 200, changes: []}

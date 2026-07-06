@@ -500,7 +500,15 @@ defmodule Replicant.Assembler do
     end
   end
 
-  defp apply_sink(%__MODULE__{sink: sink} = asm, %Transaction{} = txn) do
+  defp apply_sink(%__MODULE__{} = asm, %Transaction{} = txn) do
+    if sink_owned_batching?(asm),
+      do: buffer_for_delivery(asm, txn),
+      else: deliver_now(asm, txn)
+  end
+
+  # Per-transaction delivery (sink-owned non-batch, and lib mode, incl. lib+batch which buffers
+  # AFTER the sink returns {:ok, _}). Verbatim prior apply_sink/2 body — unchanged.
+  defp deliver_now(%__MODULE__{sink: sink} = asm, %Transaction{} = txn) do
     start_mono = System.monotonic_time(:millisecond)
 
     result =
@@ -604,6 +612,28 @@ defmodule Replicant.Assembler do
 
     count = asm.batch_count + 1
     asm = %{reset(asm) | batch_count: count, pending_lsn: lsn}
+
+    cond do
+      count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
+      lsn - span_base(asm) >= Keyword.fetch!(asm.batch, :max_span) -> {:flush, :max_span, asm}
+      true -> {:buffered, asm}
+    end
+  end
+
+  # Sink-owned batch delivery (spec §6): buffer the committed txn (NO sink call) and signal a
+  # flush when the count OR the LSN-span cap trips (span base = max(lib_checkpoint, stream_floor),
+  # spec §7 — identical to lib-batch). lib_checkpoint is NOT advanced here — only at flush (§9).
+  # No [:sink, :committed] event: the txn is not delivered until flush_batch calls handle_batch.
+  # Stored newest-first (prepend); flush_sink_batch reverses to ascending commit-LSN order.
+  defp buffer_for_delivery(%__MODULE__{} = asm, %Transaction{commit_lsn: lsn} = txn) do
+    count = asm.batch_count + 1
+
+    asm = %{
+      reset(asm)
+      | batch_count: count,
+        pending_lsn: lsn,
+        batch_txns: [txn | asm.batch_txns]
+    }
 
     cond do
       count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
