@@ -65,10 +65,14 @@ defmodule Replicant.StreamingTest do
       # dup=0, load-bearing: EXACTLY ONE transaction is delivered to the sink and it carries the DATA
       # (2000 committed changes = 1..1000 + 1501..2500, sub-aborted 1001..1500 excluded). st_sink_calls
       # is append-only (no PK).
-      #   - calls_count == 1 proves NO empty/extra delivery: the empty streamed txn that pgoutput v2
-      #     emits for a spilled unpublished-only txn is SUPPRESSED (assembler.ex StreamCommit guard),
-      #     so a streamed txn is indistinguishable from a non-streamed one at the sink (spec §7). A
-      #     re-delivery of the data txn would also push this to 2.
+      #   - calls_count == 1 proves NO empty/extra delivery: the sink's ~2000-row writeback to the
+      #     UNPUBLISHED tables (st_sink_rows/cp/calls — created by reset_schema but NOT in st_pub, which
+      #     publishes only st_orders) spills past the 64kB work_mem and pgoutput v2 streams it as an
+      #     empty published-change txn; the assembler.ex StreamCommit guard SUPPRESSES it so a streamed
+      #     txn is indistinguishable from a non-streamed one at the sink (spec §7). This is a LIVE
+      #     integration red-gate: reverting that guard makes THIS assertion go red here (got 2), so it
+      #     complements the synthetic assembler unit test. A re-delivery of the data txn also pushes
+      #     this to 2.
       #   - data_calls == [2000] proves the exact filtered change set (a sub-abort leak would push n to
       #     2500) AND dup=0 (a re-delivery adds a second n>0 row). Having BOTH is strongest.
       assert calls_count(ctrl) == 1
@@ -227,8 +231,11 @@ defmodule Replicant.StreamingTest do
 
   # The `n` (change count) of every DATA-carrying delivered transaction (n > 0), ascending. One data
   # txn in a test → a single-element list; a duplicate re-delivery → two elements (append-only ledger,
-  # no PK, so it cannot be masked). n=0 background empty transactions are excluded — the pipeline
-  # delivers them by design and they are not duplicates of the data txn.
+  # no PK, so it cannot be masked). Empty streamed transactions are now SUPPRESSED — the StreamCommit
+  # guard returns {:skipped} and never delivers them (spec §7 v1-indistinguishability), so no n=0 row
+  # is expected from a streamed empty txn. The `WHERE n > 0` filter is therefore defense-in-depth: it
+  # documents the data-vs-empty distinction and isolates dup detection to the data txn, rather than
+  # working around delivered empties (there are none). See calls_count/1 for the total-delivery gate.
   defp data_calls(c) do
     %Postgrex.Result{rows: rows} =
       Postgrex.query!(c, "SELECT n FROM st_sink_calls WHERE n > 0 ORDER BY lsn", [])
