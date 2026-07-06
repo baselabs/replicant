@@ -43,9 +43,9 @@ defmodule Replicant.Pipeline do
 
   defp checkpoint_store_child(_config), do: []
 
-  defp assembler_opts(%{checkpoint_store: store, slot_name: slot, sink: sink})
+  defp assembler_opts(%{checkpoint_store: store, slot_name: slot, sink: sink} = config)
        when is_list(store),
-       do: [slot_name: slot, sink: sink, checkpoint_store: store]
+       do: [slot_name: slot, sink: sink, checkpoint_store: store, batch: Map.get(config, :batch)]
 
   defp assembler_opts(%{slot_name: slot, sink: sink}),
     do: [slot_name: slot, sink: sink]

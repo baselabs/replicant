@@ -94,4 +94,27 @@ defmodule Replicant.PipelineTest do
 
     assert [] == Registry.lookup(Replicant.Registry, {config.slot_name, :checkpoint_store})
   end
+
+  test "lib-mode batch config threads the normalised batch policy to the AssemblerServer" do
+    slot = "pl_batch_#{System.unique_integer([:positive])}"
+    batch = [max_transactions: 7, max_delay_ms: 250, max_span: 16_000_000]
+
+    config = %{
+      connection: [hostname: "127.0.0.1", port: 1],
+      slot_name: slot,
+      publication: "p",
+      sink: Replicant.Test.RecordingSink,
+      go_forward_only: false,
+      snapshot: false,
+      max_inflight_lag: 64 * 1024 * 1024,
+      checkpoint_store: [connection: [hostname: "127.0.0.1", port: 1], table: "cp"],
+      batch: batch
+    }
+
+    {:ok, _sup} = Replicant.Pipeline.start_link(config)
+    on_exit(fn -> Replicant.Supervisor.stop_pipeline(slot) end)
+
+    [{asm_pid, _}] = Registry.lookup(Replicant.Registry, {slot, :assembler})
+    assert :sys.get_state(asm_pid).asm.batch == batch
+  end
 end
