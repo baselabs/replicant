@@ -62,13 +62,16 @@ defmodule Replicant.StreamingTest do
       # Nested-savepoint sub-abort: 1001..1500 (opened under sp1/sp2, rolled back to sp1) are ABSENT.
       assert Enum.all?(1001..1500, fn id -> not MapSet.member?(row_ids(ctrl), id) end)
 
-      # dup=0, load-bearing: the DATA transaction (2000 committed changes = 1..1000 + 1501..2500,
-      # sub-aborted 1001..1500 excluded) is delivered EXACTLY ONCE. st_sink_calls is append-only (no
-      # PK), so a re-delivery of the streamed txn would add a SECOND n>0 row → this goes red. The row's
-      # n == 2000 is a second, independent proof of the sub-abort filter (a leak would push n to 2500).
-      # We count only n>0 rows because the busy PG16 emits background EMPTY transactions (n=0) that the
-      # pipeline delivers by design (both v1 Commit and StreamCommit apply the sink unconditionally —
-      # there is no empty-xact suppression); those are not duplicates of the data txn.
+      # dup=0, load-bearing: EXACTLY ONE transaction is delivered to the sink and it carries the DATA
+      # (2000 committed changes = 1..1000 + 1501..2500, sub-aborted 1001..1500 excluded). st_sink_calls
+      # is append-only (no PK).
+      #   - calls_count == 1 proves NO empty/extra delivery: the empty streamed txn that pgoutput v2
+      #     emits for a spilled unpublished-only txn is SUPPRESSED (assembler.ex StreamCommit guard),
+      #     so a streamed txn is indistinguishable from a non-streamed one at the sink (spec §7). A
+      #     re-delivery of the data txn would also push this to 2.
+      #   - data_calls == [2000] proves the exact filtered change set (a sub-abort leak would push n to
+      #     2500) AND dup=0 (a re-delivery adds a second n>0 row). Having BOTH is strongest.
+      assert calls_count(ctrl) == 1
       assert data_calls(ctrl) == [2000]
     end
   end
@@ -106,9 +109,11 @@ defmodule Replicant.StreamingTest do
 
       assert MapSet.subset?(MapSet.new(1..2000), row_ids(ctrl))
 
-      # dup=0: the 2000-change data txn is re-streamed EXACTLY ONCE on resume (the pre-fault attempt's
-      # ledger row rolled back atomically with the CHECK-violating checkpoint write). A duplicate would
-      # add a second n>0 row. n=0 background empty txns are excluded — see the marquee's note.
+      # dup=0: EXACTLY ONE transaction is delivered on resume — the 2000-change data txn re-streamed
+      # once (the pre-fault attempt's ledger row rolled back atomically with the CHECK-violating
+      # checkpoint write). calls_count == 1 proves no empty/extra delivery (empty streamed txns are
+      # suppressed, spec §7); data_calls == [2000] proves the exact change set + no duplicate.
+      assert calls_count(ctrl) == 1
       assert data_calls(ctrl) == [2000]
       assert Enum.all?(1..2000, fn id -> row_count(ctrl, id) == 1 end)
     end
@@ -121,8 +126,9 @@ defmodule Replicant.StreamingTest do
       stream = attach_stream_probe()
       insert(ctrl, 1)
       PG16.wait_until(fn -> MapSet.member?(row_ids(ctrl), 1) end, 800)
-      # dup=0: the single-row data txn is delivered exactly once (n=1). n=0 background empty txns
-      # excluded — the pipeline delivers them by design (no empty-xact suppression), not duplicates.
+      # dup=0: EXACTLY ONE transaction is delivered and it carries the single-row data txn (n=1).
+      # calls_count == 1 proves no empty/extra delivery; data_calls == [1] proves the change set.
+      assert calls_count(ctrl) == 1
       assert data_calls(ctrl) == [1]
       assert Registry.lookup(Replicant.Registry, {slot, :pipeline}) != []
       # A single-row txn is well below 64kB → it goes via the v1 Commit path, NOT StreamCommit.
@@ -228,6 +234,15 @@ defmodule Replicant.StreamingTest do
       Postgrex.query!(c, "SELECT n FROM st_sink_calls WHERE n > 0 ORDER BY lsn", [])
 
     Enum.map(rows, fn [n] -> n end)
+  end
+
+  # The TOTAL number of transactions delivered to the sink — one st_sink_calls row per
+  # handle_transaction call (append-only ledger, includes n=0). With empty streamed txns suppressed
+  # (assembler.ex StreamCommit guard, spec §7), a scenario delivering one data txn must count EXACTLY
+  # 1: no empty streamed txn is delivered, and a re-delivery of the data txn would push this to 2.
+  defp calls_count(c) do
+    %Postgrex.Result{rows: [[n]]} = Postgrex.query!(c, "SELECT count(*) FROM st_sink_calls", [])
+    n
   end
 
   defp cp_lsn(c) do

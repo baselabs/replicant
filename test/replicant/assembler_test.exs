@@ -1311,6 +1311,30 @@ defmodule Replicant.AssemblerTest do
       refute_received {:delivered, _}
     end
 
+    test "an EMPTY StreamCommit is SUPPRESSED (skipped, sink NOT called) — v1-indistinguishable" do
+      # A transaction that spills past logical_decoding_work_mem but touches only UNPUBLISHED
+      # tables is emitted by pgoutput v2 as StreamStart/Stop/Commit with zero published changes,
+      # whereas v1 skips it entirely (PG15+). Suppress the empty streamed txn so a streamed txn is
+      # indistinguishable from a non-streamed one at the sink (spec §7); still advance the slot so
+      # it is not re-streamed (loss=0 — it carries no effect).
+      asm = deliver_streamed(StreamDeliverSink, 100)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:skipped, 900, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # The sink was never called for the empty txn.
+      refute_received {:delivered, _}
+      # buffer cleared / stream state reset
+      refute Map.has_key?(asm.stream_txns, 100)
+      assert asm.current_stream_xid == nil
+    end
+
     test "a StreamCommit at or below the sink checkpoint is pre-skipped (effect-once)" do
       asm = deliver_streamed(StreamAt500Sink, 100)
 

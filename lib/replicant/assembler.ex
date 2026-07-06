@@ -248,9 +248,10 @@ defmodule Replicant.Assembler do
   # StreamCommit: replay the buffered streamed changes into a complete %Transaction{}, stamping the
   # transaction-granularity commit_lsn and ascending ordinals AT REPLAY (streamed changes have no
   # LSN before commit — spec §5). Storage is newest-first, so `Enum.reverse` restores commit order;
-  # subxid tags are dropped here (sub-aborts already filtered the buffer at StreamAbort time). Then
-  # pre-skip if at/below the watermark (effect-once, §2) else deliver via the shared apply_sink/2 —
-  # structurally mirroring the v1 Commit clause's stamp+skip?+deliver path.
+  # subxid tags are dropped here (sub-aborts already filtered the buffer at StreamAbort time). An
+  # EMPTY streamed txn (no published changes) is suppressed here to stay v1-indistinguishable at the
+  # sink (spec §7). Otherwise pre-skip if at/below the watermark (effect-once, §2) else deliver via
+  # the shared apply_sink/2 — structurally mirroring the v1 Commit clause's stamp+skip?+deliver path.
   defp do_handle_message(%__MODULE__{} = asm, %StreamCommit{
          xid: top,
          commit_lsn: lsn,
@@ -270,27 +271,20 @@ defmodule Replicant.Assembler do
             %{change | commit_lsn: lsn, ordinal: ordinal}
           end)
 
-        txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: changes}
-
-        Telemetry.event([:replicant, :transaction, :assembled], %{}, %{
-          change_count: length(changes),
-          commit_lsn: lsn,
-          byte_size: buf.byte_size,
-          lag_ms: lag_ms(ts)
-        })
-
-        Telemetry.event([:replicant, :stream, :committed], %{}, %{
-          change_count: length(changes),
-          commit_lsn: lsn,
-          byte_size: buf.byte_size
-        })
-
         asm = %{asm | stream_txns: Map.delete(asm.stream_txns, top), current_stream_xid: nil}
 
-        if skip?(asm, txn) do
+        if changes == [] do
+          # An EMPTY streamed transaction (e.g. a spilled transaction with no changes for the
+          # publication) is emitted by pgoutput v2 as StreamStart/Stop/Commit, but SKIPPED entirely
+          # by v1 (PG15+ never sends an empty non-streamed Commit). Suppress delivery so a streamed
+          # transaction is indistinguishable from a non-streamed one at the sink (spec §7); emit
+          # neither `:assembled` nor `:stream:committed` (consistent with v1, which never sees the
+          # empty txn — a "committed" signal for a txn the sink never sees would mislead). Still
+          # return `{:skipped, lsn, asm}` so the Connection advances the slot to `lsn` and the txn is
+          # not re-streamed (loss=0 — an empty txn carries no effect).
           {:skipped, lsn, asm}
         else
-          apply_sink(asm, txn)
+          deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes)
         end
     end
   end
@@ -467,6 +461,33 @@ defmodule Replicant.Assembler do
     # Any message the decoder could not classify has already been turned into an
     # error at the boundary; reaching here means an unhandled but decodable shape.
     {:halt, %Error{reason: :unsupported_message}, asm}
+  end
+
+  # The non-empty StreamCommit delivery path: emit the assembled + stream:committed telemetry, then
+  # pre-skip at/below the watermark (effect-once, §2) else deliver via the shared apply_sink/2 —
+  # extracted verbatim from the StreamCommit clause to keep it within credo's nesting depth. An empty
+  # streamed txn never reaches here (it is suppressed in the StreamCommit clause, spec §7).
+  defp deliver_stream_commit(asm, lsn, ts, byte_size, changes) do
+    txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: changes}
+
+    Telemetry.event([:replicant, :transaction, :assembled], %{}, %{
+      change_count: length(changes),
+      commit_lsn: lsn,
+      byte_size: byte_size,
+      lag_ms: lag_ms(ts)
+    })
+
+    Telemetry.event([:replicant, :stream, :committed], %{}, %{
+      change_count: length(changes),
+      commit_lsn: lsn,
+      byte_size: byte_size
+    })
+
+    if skip?(asm, txn) do
+      {:skipped, lsn, asm}
+    else
+      apply_sink(asm, txn)
+    end
   end
 
   # --- relation + schema change ---
