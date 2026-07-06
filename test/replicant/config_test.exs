@@ -380,5 +380,16 @@ defmodule Replicant.ConfigTest do
 
       assert {:error, :config_invalid} = Config.validate(opts)
     end
+
+    test "a non-list :batch value (e.g. a bare atom/string) is rejected fail-closed" do
+      for bad <- ["on", :yes, 5] do
+        opts =
+          base_opts() ++
+            [checkpoint_store: [connection: [hostname: "db"], batch: bad]]
+
+        assert {:error, :config_invalid} = Config.validate(opts),
+               "expected non-list batch #{inspect(bad)} to be rejected"
+      end
+    end
   end
 end
