@@ -706,5 +706,19 @@ defmodule Replicant.ConnectionTest do
       assert_receive {:"$gen_cast", {:reset_streams}}
       assert state.in_stream == false
     end
+
+    test "the snapshot handoff resets a STALE in_stream, casts {:reset_streams}, and negotiates proto-v2" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_st3", :assembler}, nil)
+      # State at the snapshot-handoff point after a mid-stream reconnect during the snapshot:
+      # in_stream is STALE true. The second (re)connect entry point must reset it symmetrically.
+      st = %{st_state("conn_st3", :snapshotting, true) | snapshot: true, checkpoint_lsn: 0}
+
+      assert {:stream, sql, [], state} =
+               Replicant.Connection.handle_info({:snapshot_done, 0x16E3778}, st)
+
+      assert sql =~ "proto_version '2'"
+      assert_receive {:"$gen_cast", {:reset_streams}}
+      assert state.in_stream == false
+    end
   end
 end

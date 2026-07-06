@@ -556,8 +556,8 @@ defmodule Replicant.Connection do
   # Track the streaming decode context: StreamStart opens it (the following change messages carry
   # the (sub)xid prefix that only decodes correctly with streaming: true), StreamStop closes it.
   # Reset to false on every (re)connect (see start_streaming / snapshot handoff) so a mid-stream
-  # reconnect never leaves the flag stale (spec §9; a stale flag would mis-frame the next decode —
-  # a streamed change read as v1, or vice versa — into a value-free halt).
+  # reconnect never leaves the flag stale (spec §9; a stale flag would mis-frame the next streamed
+  # change-message decode — I/U/D, whose (sub)xid prefix strip mis-parses → value-free halt).
   defp update_in_stream(state, %Replicant.Decoder.Messages.StreamStart{}),
     do: %{state | in_stream: true}
 
