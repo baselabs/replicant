@@ -57,7 +57,14 @@ defmodule Replicant.Decoder.DecoderTest do
   end
 
   describe "streaming message structs (spec §5)" do
-    alias Replicant.Decoder.Messages.{Insert, StreamAbort, StreamCommit, StreamStart, StreamStop}
+    alias Replicant.Decoder.Messages.{
+      Insert,
+      StreamAbort,
+      StreamCommit,
+      StreamStart,
+      StreamStop,
+      Truncate
+    }
 
     test "the four stream-control structs exist with their documented fields" do
       assert %StreamStart{xid: 7, first_segment: true}.first_segment == true
@@ -96,9 +103,12 @@ defmodule Replicant.Decoder.DecoderTest do
       assert {:ok, %Insert{xid: 515_103, relation_id: 42, tuple_data: {"x"}}} =
                Decoder.decode(streamed, streaming: true)
 
-      # Same bytes under the v1 (non-streaming) decoder mis-frame → NOT an Insert.
-      # (The v1 clause reads relation_id=515103 then expects "N" but finds the oid bytes.)
-      refute match?({:ok, %Insert{}}, Decoder.decode(streamed, streaming: false))
+      # Under the v1 (non-streaming) decoder the same bytes mis-frame: the leading xid is read as
+      # relation_id and the remaining bytes don't match the v1 Insert body, so it falls to the
+      # Unsupported catch-all — a value-free :unsupported_message, proving the streaming flag is
+      # load-bearing (spec §7). No row values leak.
+      assert {:error, %Replicant.Error{reason: :unsupported_message}} =
+               Decoder.decode(streamed, streaming: false)
     end
 
     test "a non-streamed Insert still decodes without xid under the default (v1) path" do
@@ -106,6 +116,23 @@ defmodule Replicant.Decoder.DecoderTest do
 
       assert {:ok, %Insert{xid: nil, relation_id: 42, tuple_data: {"x"}}} =
                Decoder.decode(v1)
+    end
+
+    test "a STREAMED Truncate (xid-prefixed) strips the xid, decodes the v1 body, re-attaches xid" do
+      # v1 Truncate wire (decode_message_impl): "T" <n_relations::32> <options::8> <oid::32...>.
+      # options=0 → [], two relation oids 100 and 200. The streamed form prefixes the xid AFTER
+      # the type byte: "T" <xid::32> <v1-truncate-body>. A structurally-different delegated type
+      # than Insert (relation-count + option byte + oid list, no "N"/tuple-data) — exercises the
+      # xid-strip + put_xid round-trip on a second shape.
+      streamed_truncate = <<"T", 515_103::32, 2::32, 0::8, 100::32, 200::32>>
+
+      assert {:ok,
+              %Truncate{
+                xid: 515_103,
+                number_of_relations: 2,
+                options: [],
+                truncated_relations: [100, 200]
+              }} = Decoder.decode(streamed_truncate, streaming: true)
     end
   end
 end
