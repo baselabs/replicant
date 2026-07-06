@@ -450,18 +450,26 @@ defmodule Replicant.AssemblerServerTest do
 
       cache_relation(pid)
       drive_txn(pid, 100)
-      # A batch is OPEN (buffered, un-checkpointed).
-      assert Replicant.Assembler.batch_pending?(:sys.get_state(pid).asm)
+
+      # A batch is OPEN (buffered, un-checkpointed) and its flush timer is ARMED (max_delay_ms set).
+      state_before = :sys.get_state(pid)
+      assert Replicant.Assembler.batch_pending?(state_before.asm)
+      assert is_reference(state_before.batch_timer)
 
       # A mid-stream Connection reconnect re-seeds the durable checkpoint. The stale in-memory batch
       # MUST be discarded: its txns re-stream from the durable checkpoint and re-buffer as a FRESH
       # batch, matching the crash/stop→restart dup model (bounds mid-reconnect dup to one batch;
       # stale accumulators would misalign flush boundaries). No spurious ack on the discard.
       GenServer.cast(pid, {:seed_lib_checkpoint, 500})
-      asm = :sys.get_state(pid).asm
+      state = :sys.get_state(pid)
+      asm = state.asm
       refute Replicant.Assembler.batch_pending?(asm)
       assert asm.batch_count == 0
       assert asm.lib_checkpoint == 500
+      # {:seed_lib_checkpoint} must ALSO cancel the now-stale flush timer (same OTP-async-lifetime
+      # hygiene as {:reset_batch}) — else the orphaned timer fires against the re-buffered fresh
+      # batch. Load-bearing: dropping cancel_batch_timer/1 from the handler reddens this.
+      assert state.batch_timer == nil
       refute_received {:sink_committed, _}
       refute_received {:wrote, _}
     end
