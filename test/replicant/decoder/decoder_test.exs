@@ -134,5 +134,35 @@ defmodule Replicant.Decoder.DecoderTest do
                 truncated_relations: [100, 200]
               }} = Decoder.decode(streamed_truncate, streaming: true)
     end
+
+    test "byte-level tampering of a streamed frame's xid-prefixed body is caught value-free (spec §12.2, Rule 1)" do
+      # A streamed Insert = "I" <xid::32> <rel::32> "N" <ncols::16> <col...>. Tamper the body so the
+      # column length (99) overruns the actual bytes: the vendored parser raises reading past the end,
+      # and decode/1's boundary rescue MUST scrub it to a value-free error carrying NO row bytes.
+      sentinel = "SENTINEL_ROW_SECRET"
+      tampered = <<"I", 515_103::32, 42::32, "N", 1::16, "t", 99::32, sentinel::binary>>
+
+      assert {:error, %Replicant.Error{reason: reason} = err} =
+               Decoder.decode(tampered, streaming: true)
+
+      # value-free fail-closed: a tampered streamed frame surfaces as :decode_failure (a parser raise)
+      # or :unsupported_message (a mis-frame to the catch-all) — never a silently mis-parsed struct.
+      assert reason in [:decode_failure, :unsupported_message]
+      # Rule 1: no raw row byte leaks through the error's rendered message or inspect.
+      refute Exception.message(err) =~ sentinel
+      refute inspect(err) =~ sentinel
+    end
+
+    test "a streamed change frame truncated WITHIN the xid field is caught value-free (spec §12.2)" do
+      # Only 2 of the xid's 4 bytes present: the streaming delegation clause (which needs xid::32)
+      # cannot match, and the v1 fallback cannot frame it either → a value-free error, never a crash
+      # and never a mis-parsed struct.
+      truncated = <<"I", 515_103::16>>
+
+      assert {:error, %Replicant.Error{reason: reason}} =
+               Decoder.decode(truncated, streaming: true)
+
+      assert reason in [:decode_failure, :unsupported_message]
+    end
   end
 end
