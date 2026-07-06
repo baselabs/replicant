@@ -131,11 +131,16 @@ defmodule Replicant.AssemblerServer do
     dispatch(Assembler.handle_message(asm, message), from, state)
   end
 
-  # The Connection seeds the lib-mode watermark from its connect-time store read,
-  # before streaming. A no-op in sink-owned mode (the assembler ignores
-  # lib_checkpoint there).
+  # The Connection seeds the lib-mode watermark from its connect-time store read, before streaming.
+  # This fires on EVERY (re)connect. Re-seed the watermark AND discard any open in-memory batch:
+  # on a mid-stream reconnect the un-checkpointed batch re-streams from the durable checkpoint and
+  # re-buffers as a FRESH batch, so a transient reconnect matches the crash/stop→resume dup model
+  # (bounds dup to one batch per reconnect; a surviving stale batch would misalign flush boundaries
+  # and compound dup under flapping — CV1 closeout). Cancel the now-stale flush timer. A no-op in
+  # sink-owned mode / on the initial connect (no batch open). Never checkpoints — loss=0 by re-delivery.
   def handle_cast({:seed_lib_checkpoint, lsn}, %{asm: asm} = state) when is_integer(lsn) do
-    {:noreply, %{state | asm: %{asm | lib_checkpoint: lsn}}}
+    asm = %{Assembler.reset_batch(asm) | lib_checkpoint: lsn}
+    {:noreply, cancel_batch_timer(%{state | asm: asm})}
   end
 
   defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}

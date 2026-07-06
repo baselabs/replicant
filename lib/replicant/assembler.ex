@@ -654,6 +654,17 @@ defmodule Replicant.Assembler do
   @spec batch_pending?(t()) :: boolean()
   def batch_pending?(%__MODULE__{pending_lsn: lsn}), do: is_integer(lsn)
 
+  @doc """
+  Discard any open batch — clear the accumulators without checkpointing (spec §9). Used on a
+  mid-stream Connection reconnect re-seed: the un-checkpointed batch re-streams from the durable
+  checkpoint and re-buffers as a FRESH batch, so a transient reconnect matches the crash/stop→resume
+  dup model (bounds dup to one batch per reconnect; stale accumulators would misalign flush
+  boundaries). Never writes a checkpoint — loss=0 holds by re-delivery.
+  """
+  @spec reset_batch(t()) :: t()
+  def reset_batch(%__MODULE__{} = asm),
+    do: %{asm | batch_count: 0, pending_lsn: nil, batch_base_lsn: nil}
+
   # Advance the in-memory lib watermark on a durable commit (lib mode) and reset
   # the buffer. Sink-owned: a bare buffer reset (the watermark lives in the sink).
   defp advance(%__MODULE__{mode: :lib} = asm, lsn),

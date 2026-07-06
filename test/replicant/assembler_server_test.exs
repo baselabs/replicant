@@ -386,5 +386,33 @@ defmodule Replicant.AssemblerServerTest do
       assert :sys.get_state(pid).halted
       refute_received {:sink_committed, _}
     end
+
+    test "a reconnect re-seed discards the open batch — no stale accumulators across reconnect (CV1)" do
+      pid = start("srv_batch_reseed", RecordingSink)
+      test = self()
+
+      inject_batched(pid, "srv_batch_reseed", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+        max_transactions: 5,
+        max_delay_ms: 60_000,
+        max_span: 1_000_000
+      )
+
+      cache_relation(pid)
+      drive_txn(pid, 100)
+      # A batch is OPEN (buffered, un-checkpointed).
+      assert Replicant.Assembler.batch_pending?(:sys.get_state(pid).asm)
+
+      # A mid-stream Connection reconnect re-seeds the durable checkpoint. The stale in-memory batch
+      # MUST be discarded: its txns re-stream from the durable checkpoint and re-buffer as a FRESH
+      # batch, matching the crash/stop→restart dup model (bounds mid-reconnect dup to one batch;
+      # stale accumulators would misalign flush boundaries). No spurious ack on the discard.
+      GenServer.cast(pid, {:seed_lib_checkpoint, 500})
+      asm = :sys.get_state(pid).asm
+      refute Replicant.Assembler.batch_pending?(asm)
+      assert asm.batch_count == 0
+      assert asm.lib_checkpoint == 500
+      refute_received {:sink_committed, _}
+      refute_received {:wrote, _}
+    end
   end
 end
