@@ -14,6 +14,7 @@ defmodule Replicant.Config do
   @type t :: %{
           optional(:batch) => keyword() | nil,
           optional(:batch_delivery) => keyword() | nil,
+          optional(:streaming) => keyword() | nil,
           connection: keyword(),
           slot_name: String.t(),
           publication: String.t(),
@@ -53,6 +54,7 @@ defmodule Replicant.Config do
          {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
+         {:ok, streaming} <- fetch_streaming(opts),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          snapshot = Keyword.get(opts, :snapshot, false) == true,
          :ok <- validate_start_mode(go_forward_only, snapshot),
@@ -68,7 +70,8 @@ defmodule Replicant.Config do
          max_inflight_lag: max_inflight_lag,
          checkpoint_store: checkpoint_store,
          batch: batch,
-         batch_delivery: batch_delivery
+         batch_delivery: batch_delivery,
+         streaming: streaming
        }}
     end
   end
@@ -166,6 +169,26 @@ defmodule Replicant.Config do
       not Keyword.has_key?(opts, :batch_delivery) -> {:ok, nil}
       is_list(checkpoint_store) -> {:error, :config_invalid}
       true -> normalize_batch(Keyword.get(opts, :batch_delivery), max_inflight_lag)
+    end
+  end
+
+  # Streaming (spec §7) is opt-in via a TOP-LEVEL :streaming keyword. Presence enables
+  # proto_version 2 + streaming 'on' and in-memory whole reassembly. max_concurrent_txns bounds
+  # the in-progress stream_txns map (default 64). Orthogonal to every checkpoint/delivery mode.
+  defp fetch_streaming(opts) do
+    cond do
+      not Keyword.has_key?(opts, :streaming) ->
+        {:ok, nil}
+
+      not is_list(Keyword.get(opts, :streaming)) ->
+        {:error, :config_invalid}
+
+      true ->
+        max_concurrent = Keyword.get(Keyword.fetch!(opts, :streaming), :max_concurrent_txns, 64)
+
+        if positive_integer?(max_concurrent),
+          do: {:ok, [max_concurrent_txns: max_concurrent]},
+          else: {:error, :config_invalid}
     end
   end
 

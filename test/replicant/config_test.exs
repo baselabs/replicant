@@ -473,4 +473,43 @@ defmodule Replicant.ConfigTest do
       assert cfg.batch_delivery == nil
     end
   end
+
+  describe "streaming (proto-v2 in-progress streaming, spec §7)" do
+    defp st_base(extra \\ []) do
+      [
+        connection: [hostname: "h"],
+        slot_name: "s",
+        publication: "p",
+        sink: Replicant.Test.RecordingSink
+      ] ++
+        extra
+    end
+
+    test "a valid streaming config normalises max_concurrent_txns" do
+      assert {:ok, cfg} = Config.validate(st_base(streaming: [max_concurrent_txns: 16]))
+      assert Keyword.get(cfg.streaming, :max_concurrent_txns) == 16
+    end
+
+    test "max_concurrent_txns defaults to 64 when omitted" do
+      assert {:ok, cfg} = Config.validate(st_base(streaming: []))
+      assert Keyword.get(cfg.streaming, :max_concurrent_txns) == 64
+    end
+
+    test "no streaming key → cfg.streaming is nil (v1 path)" do
+      assert {:ok, cfg} = Config.validate(st_base())
+      assert cfg.streaming == nil
+    end
+
+    test "mis-shaped streaming is rejected :config_invalid" do
+      for bad <- [
+            [max_concurrent_txns: 0],
+            [max_concurrent_txns: -1],
+            [max_concurrent_txns: "x"],
+            :not_a_list
+          ] do
+        assert {:error, :config_invalid} = Config.validate(st_base(streaming: bad)),
+               "expected streaming #{inspect(bad)} rejected"
+      end
+    end
+  end
 end
