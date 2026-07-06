@@ -1033,6 +1033,8 @@ defmodule Replicant.AssemblerTest do
       Delete,
       Insert,
       Relation,
+      StreamAbort,
+      StreamCommit,
       StreamStart,
       StreamStop,
       Truncate,
@@ -1158,7 +1160,11 @@ defmodule Replicant.AssemblerTest do
       # relation 999 was never cached → the table cannot be identified → halt (never emit a
       # table-less change that would be checkpointed as success).
       assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
-               Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 999, tuple_data: {"1"}})
+               Assembler.handle_message(asm, %Insert{
+                 xid: 100,
+                 relation_id: 999,
+                 tuple_data: {"1"}
+               })
     end
 
     test "a streamed Truncate touching an uncached relation halts fail-closed" do
@@ -1206,6 +1212,164 @@ defmodule Replicant.AssemblerTest do
       # newest-first: the Delete (subxid 101) heads the buffer, the Update (subxid 100) follows.
       assert [{101, %Replicant.Change{op: :delete}}, {100, %Replicant.Change{op: :update}}] =
                asm.stream_txns[100].changes
+    end
+
+    # --- Task 6: StreamCommit reassembly + StreamAbort ---
+    #
+    # Named `Stream*Sink` to avoid redefining the same-name `DeliverSink`/`At500Sink` modules in
+    # the "batch delivery" describe block (which carry handle_batch/1, not handle_transaction/1) —
+    # a redefinition warning fails `--warnings-as-errors`.
+    defmodule StreamDeliverSink do
+      def checkpoint, do: {:ok, nil}
+
+      def handle_transaction(txn) do
+        send(self(), {:delivered, txn})
+        {:ok, txn.commit_lsn}
+      end
+    end
+
+    defmodule StreamAt500Sink do
+      def checkpoint, do: {:ok, 500}
+      def handle_transaction(txn), do: {:ok, txn.commit_lsn}
+    end
+
+    defp deliver_streamed(sink, xid) do
+      asm = %{Replicant.Assembler.new(sink, max_concurrent_txns: 64) | stream_floor: 0}
+      asm = with_relation(asm, 1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: xid, first_segment: true})
+      asm
+    end
+
+    test "StreamCommit replays the buffer into a complete %Transaction{} (ascending, commit_lsn + ordinals stamped) via handle_transaction" do
+      asm = deliver_streamed(StreamDeliverSink, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"2"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:transaction, txn, 900, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      assert [
+               %Replicant.Change{record: %{"v" => 1}, commit_lsn: 900, ordinal: 0},
+               %Replicant.Change{record: %{"v" => 2}, commit_lsn: 900, ordinal: 1}
+             ] = txn.changes
+
+      assert txn.commit_lsn == 900
+      assert_received {:delivered, ^txn}
+      # buffer cleared
+      refute Map.has_key?(asm.stream_txns, 100)
+    end
+
+    test "StreamAbort(top, sub) drops ONLY the sub-aborted changes; the rest deliver on commit" do
+      asm = deliver_streamed(StreamDeliverSink, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      # savepoint
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 101, relation_id: 1, tuple_data: {"2"}})
+
+      # rollback
+      {:ok, asm} = Assembler.handle_message(asm, %StreamAbort{xid: 100, subxid: 101})
+      # post-rollback
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 102, relation_id: 1, tuple_data: {"3"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:transaction, txn, 900, _asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # 2 (subxid 101) filtered out
+      assert Enum.map(txn.changes, & &1.record["v"]) == [1, 3]
+    end
+
+    test "StreamAbort(top, top) discards the whole transaction (no delivery)" do
+      asm = deliver_streamed(StreamDeliverSink, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamAbort{xid: 100, subxid: 100})
+      refute Map.has_key?(asm.stream_txns, 100)
+      refute_received {:delivered, _}
+    end
+
+    test "a StreamCommit at or below the sink checkpoint is pre-skipped (effect-once)" do
+      asm = deliver_streamed(StreamAt500Sink, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:skipped, 300, _asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 300,
+                 end_lsn: 301,
+                 commit_timestamp: nil
+               })
+    end
+
+    test "StreamCommit for an unknown xid halts fail-closed" do
+      asm = %{
+        Replicant.Assembler.new(StreamDeliverSink, max_concurrent_txns: 64)
+        | stream_floor: 0
+      }
+
+      assert {:halt, %Replicant.Error{reason: :config_invalid}, _} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 999,
+                 commit_lsn: 1,
+                 end_lsn: 2,
+                 commit_timestamp: nil
+               })
+    end
+
+    test "a multi-relation streamed Truncate is DELIVERED in rids order (t1 ordinal 0, t2 ordinal 1)" do
+      asm =
+        %{Replicant.Assembler.new(StreamDeliverSink, max_concurrent_txns: 64) | stream_floor: 0}
+        |> with_named_relation(1, "t1")
+        |> with_named_relation(2, "t2")
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      {:ok, asm} = Assembler.handle_message(asm, %Truncate{xid: 100, truncated_relations: [1, 2]})
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:transaction, _txn, 900, _asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      assert_received {:delivered, txn}
+
+      # End-to-end order lock the Task-5 buffer-level test could not assert: the buffer stores
+      # truncate changes reversed (head-first [t2, t1]); commit-time Enum.reverse must restore rids
+      # order [t1, t2] with ascending ordinals. FAILS if the delivered order were reversed.
+      assert [
+               %Replicant.Change{op: :truncate, table: "t1", commit_lsn: 900, ordinal: 0},
+               %Replicant.Change{op: :truncate, table: "t2", commit_lsn: 900, ordinal: 1}
+             ] = txn.changes
     end
   end
 end

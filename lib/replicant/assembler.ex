@@ -57,6 +57,8 @@ defmodule Replicant.Assembler do
     Insert,
     Origin,
     Relation,
+    StreamAbort,
+    StreamCommit,
     StreamStart,
     StreamStop,
     Truncate,
@@ -241,6 +243,81 @@ defmodule Replicant.Assembler do
 
   defp do_handle_message(%__MODULE__{} = asm, %StreamStop{}) do
     {:ok, %{asm | current_stream_xid: nil}}
+  end
+
+  # StreamCommit: replay the buffered streamed changes into a complete %Transaction{}, stamping the
+  # transaction-granularity commit_lsn and ascending ordinals AT REPLAY (streamed changes have no
+  # LSN before commit — spec §5). Storage is newest-first, so `Enum.reverse` restores commit order;
+  # subxid tags are dropped here (sub-aborts already filtered the buffer at StreamAbort time). Then
+  # pre-skip if at/below the watermark (effect-once, §2) else deliver via the shared apply_sink/2 —
+  # structurally mirroring the v1 Commit clause's stamp+skip?+deliver path.
+  defp do_handle_message(%__MODULE__{} = asm, %StreamCommit{
+         xid: top,
+         commit_lsn: lsn,
+         commit_timestamp: ts
+       }) do
+    case Map.fetch(asm.stream_txns, top) do
+      :error ->
+        {:halt, %Error{reason: :config_invalid, shape: "stream commit for unknown transaction"},
+         asm}
+
+      {:ok, buf} ->
+        changes =
+          buf.changes
+          |> Enum.reverse()
+          |> Enum.with_index()
+          |> Enum.map(fn {{_subxid, change}, ordinal} ->
+            %{change | commit_lsn: lsn, ordinal: ordinal}
+          end)
+
+        txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: changes}
+
+        Telemetry.event([:replicant, :transaction, :assembled], %{}, %{
+          change_count: length(changes),
+          commit_lsn: lsn,
+          byte_size: buf.byte_size,
+          lag_ms: lag_ms(ts)
+        })
+
+        Telemetry.event([:replicant, :stream, :committed], %{}, %{
+          change_count: length(changes),
+          commit_lsn: lsn,
+          byte_size: buf.byte_size
+        })
+
+        asm = %{asm | stream_txns: Map.delete(asm.stream_txns, top), current_stream_xid: nil}
+
+        if skip?(asm, txn) do
+          {:skipped, lsn, asm}
+        else
+          apply_sink(asm, txn)
+        end
+    end
+  end
+
+  # Whole-transaction abort (subxid == top): discard the buffer, deliver nothing.
+  defp do_handle_message(%__MODULE__{} = asm, %StreamAbort{xid: top, subxid: sub})
+       when top == sub do
+    if Map.has_key?(asm.stream_txns, top) do
+      Telemetry.event([:replicant, :stream, :aborted], %{}, %{reason: :stream_abort})
+      cleared = if asm.current_stream_xid == top, do: nil, else: asm.current_stream_xid
+      {:ok, %{asm | stream_txns: Map.delete(asm.stream_txns, top), current_stream_xid: cleared}}
+    else
+      {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"}, asm}
+    end
+  end
+
+  # Subtransaction (savepoint) abort: drop the aborted subxid's changes, keep the rest in order.
+  defp do_handle_message(%__MODULE__{} = asm, %StreamAbort{xid: top, subxid: sub}) do
+    case Map.fetch(asm.stream_txns, top) do
+      :error ->
+        {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"},
+         asm}
+
+      {:ok, buf} ->
+        kept = Enum.reject(buf.changes, fn {subxid, _change} -> subxid == sub end)
+        {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, %{buf | changes: kept})}}
+    end
   end
 
   defp do_handle_message(%__MODULE__{} = asm, %Insert{
