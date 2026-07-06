@@ -26,6 +26,10 @@ defmodule Replicant.Decoder do
     Insert,
     Origin,
     Relation,
+    StreamAbort,
+    StreamCommit,
+    StreamStart,
+    StreamStop,
     Truncate,
     Type,
     Unsupported,
@@ -45,9 +49,11 @@ defmodule Replicant.Decoder do
   `{:error, %Error{reason: :decode_failure | :unsupported_message}}` — never
   raises, never surfaces raw bytes.
   """
-  @spec decode(binary()) :: {:ok, struct()} | {:error, Error.t()}
-  def decode(binary) when is_binary(binary) do
-    case decode_message(binary) do
+  @spec decode(binary(), keyword()) :: {:ok, struct()} | {:error, Error.t()}
+  def decode(binary, opts \\ []) when is_binary(binary) do
+    streaming? = Keyword.get(opts, :streaming, false)
+
+    case decode_message(binary, streaming?) do
       %Unsupported{} -> {:error, %Error{reason: :unsupported_message}}
       message -> {:ok, message}
     end
@@ -55,12 +61,45 @@ defmodule Replicant.Decoder do
     exception -> {:error, Error.decode_failure(exception)}
   end
 
-  # The raw vendored parser. Private: product code and tests reach pgoutput
-  # exclusively through `decode/1` (the value-free boundary). Keeping this private
-  # is part of the boundary — there is no way to bypass the scrub.
-  defp decode_message(message) when is_binary(message) do
-    decode_message_impl(message)
+  # Stream-control messages (spec §5) — unambiguous by type byte, decoded regardless
+  # of the streaming flag (they only occur mid-stream anyway).
+  defp decode_message(<<"S", xid::integer-32, first::integer-8>>, _streaming?),
+    do: %StreamStart{xid: xid, first_segment: first == 1}
+
+  defp decode_message(<<"E">>, _streaming?), do: %StreamStop{}
+
+  defp decode_message(
+         <<"c", xid::integer-32, _flags::integer-8, commit_lsn::binary-8, end_lsn::binary-8,
+           timestamp::integer-64>>,
+         _streaming?
+       ) do
+    %StreamCommit{
+      xid: xid,
+      commit_lsn: decode_lsn(commit_lsn),
+      end_lsn: decode_lsn(end_lsn),
+      commit_timestamp: pgtimestamp_to_timestamp(timestamp)
+    }
   end
+
+  defp decode_message(<<"A", xid::integer-32, subxid::integer-32>>, _streaming?),
+    do: %StreamAbort{xid: xid, subxid: subxid}
+
+  # A STREAMED change message carries an Int32 (sub)xid before the v1 body (spec §5).
+  # Strip it, decode the remainder through the v1 parser, and re-attach the xid — so the
+  # tuple/column parsing stays in ONE place. Only the xid-prefixed types delegate here;
+  # this clause is guarded on streaming?: true and precedes the v1 change clauses.
+  defp decode_message(<<type::integer-8, xid::integer-32, rest::binary>>, true)
+       when type in [?I, ?U, ?D, ?T, ?R, ?Y] do
+    put_xid(decode_message_impl(<<type::integer-8, rest::binary>>), xid)
+  end
+
+  # Non-streamed (v1) and all remaining types delegate to the shipped parser unchanged.
+  defp decode_message(binary, _streaming?), do: decode_message_impl(binary)
+
+  defp put_xid(%mod{} = msg, xid) when mod in [Insert, Update, Delete, Truncate, Relation, Type],
+    do: %{msg | xid: xid}
+
+  defp put_xid(msg, _xid), do: msg
 
   defp decode_message_impl(<<"B", lsn::binary-8, timestamp::integer-64, xid::integer-32>>) do
     %Begin{

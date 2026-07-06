@@ -73,5 +73,39 @@ defmodule Replicant.Decoder.DecoderTest do
       assert %Insert{relation_id: 1, tuple_data: {}}.xid == nil
       assert %Insert{relation_id: 1, tuple_data: {}, xid: 515_103}.xid == 515_103
     end
+
+    test "decodes Stream Start / Stop / Commit / Abort (unambiguous by type byte)" do
+      assert {:ok, %StreamStart{xid: 515_103, first_segment: true}} =
+               Decoder.decode(<<"S", 515_103::32, 1::8>>)
+
+      assert {:ok, %StreamStop{}} = Decoder.decode(<<"E">>)
+
+      # c: xid, flags(0), commit_lsn(8B pg_lsn), end_lsn(8B), commit_ts(i64). LSN 0/100 = 100.
+      assert {:ok, %StreamCommit{xid: 515_103, commit_lsn: 100, end_lsn: 101}} =
+               Decoder.decode(<<"c", 515_103::32, 0::8, 0::32, 100::32, 0::32, 101::32, 0::64>>)
+
+      assert {:ok, %StreamAbort{xid: 515_103, subxid: 515_104}} =
+               Decoder.decode(<<"A", 515_103::32, 515_104::32>>)
+    end
+
+    test "a STREAMED Insert (xid-prefixed) decodes only under streaming?: true" do
+      # streamed Insert = "I" <xid::32> <relation_oid::32> "N" <ncols::16> <tuple...>
+      # one text column 't' with value "x": "t" <len::32> "x"
+      streamed = <<"I", 515_103::32, 42::32, "N", 1::16, "t", 1::32, "x">>
+
+      assert {:ok, %Insert{xid: 515_103, relation_id: 42, tuple_data: {"x"}}} =
+               Decoder.decode(streamed, streaming: true)
+
+      # Same bytes under the v1 (non-streaming) decoder mis-frame → NOT an Insert.
+      # (The v1 clause reads relation_id=515103 then expects "N" but finds the oid bytes.)
+      refute match?({:ok, %Insert{}}, Decoder.decode(streamed, streaming: false))
+    end
+
+    test "a non-streamed Insert still decodes without xid under the default (v1) path" do
+      v1 = <<"I", 42::32, "N", 1::16, "t", 1::32, "x">>
+
+      assert {:ok, %Insert{xid: nil, relation_id: 42, tuple_data: {"x"}}} =
+               Decoder.decode(v1)
+    end
   end
 end
