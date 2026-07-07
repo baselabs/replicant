@@ -475,6 +475,137 @@ defmodule Replicant.AssemblerServerTest do
     end
   end
 
+  describe "spill (spec §5/§9)" do
+    alias Replicant.Decoder.Messages.{Insert, StreamCommit, StreamStart}
+    alias Replicant.Decoder.Messages.Relation
+    alias Replicant.Decoder.Messages.Relation.Column
+
+    test "the server builds a spill-capable assembler and signals {:spilled_bytes, total} to the connection after a spill" do
+      base = Path.join(System.tmp_dir!(), "srv_spill_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_sp",
+          sink: Replicant.Test.RecordingSink,
+          streaming: [max_concurrent_txns: 8, spill: [dir: base, max_spill_bytes: 1_000_000]],
+          max_inflight_lag: 100
+        )
+
+      state0 = :sys.get_state(pid)
+      assert state0.asm.spill == [dir: base, max_spill_bytes: 1_000_000]
+      assert state0.asm.max_inflight_lag == 100
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      GenServer.cast(pid, {:message, rel, 10, self()})
+      GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
+
+      for v <- 1..3,
+          do:
+            GenServer.cast(
+              pid,
+              {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}}, 60, self()}
+            )
+
+      # The AssemblerServer signals the Connection via a PLAIN send → its handle_info substrate
+      # (the same idiom the existing dispatch/3 uses for {:sink_committed, lsn}). Task 10's
+      # Connection handles {:spilled_bytes, total} in handle_info. So assert the plain message,
+      # NOT a {:"$gen_cast", ...} wrapper.
+      assert_receive {:spilled_bytes, total} when total > 0
+    end
+
+    test "a sub-bound message does NOT signal {:spilled_bytes} (the spilled_total != before guard)" do
+      base = Path.join(System.tmp_dir!(), "srv_nospill_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_nosp",
+          sink: Replicant.Test.RecordingSink,
+          streaming: [max_concurrent_txns: 8, spill: [dir: base, max_spill_bytes: 1_000_000]],
+          max_inflight_lag: 100
+        )
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      GenServer.cast(pid, {:message, rel, 10, self()})
+      GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
+      # ONE small Insert, 50 bytes — well UNDER max_inflight_lag: 100, so resident_total never
+      # crosses the bound and no spill fires. spilled_total stays 0, so `spilled_total != before`
+      # is false → NO {:spilled_bytes} signal. Guards against a false-positive send.
+      GenServer.cast(pid, {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}}, 50, self()})
+
+      refute_receive {:spilled_bytes, _}, 100
+      # No spill actually happened (sanity: the buffer stayed resident).
+      assert :sys.get_state(pid).asm.spilled_total == 0
+    end
+
+    test "a halt discards open spill files (reset_streams cleanup on the halted assembler, spec §5)" do
+      base = Path.join(System.tmp_dir!(), "srv_halt_spill_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_halt_sp",
+          sink: Replicant.Test.RecordingSink,
+          streaming: [max_concurrent_txns: 8, spill: [dir: base, max_spill_bytes: 1_000_000]],
+          max_inflight_lag: 100
+        )
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      GenServer.cast(pid, {:message, rel, 10, self()})
+      GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
+
+      for v <- 1..3,
+          do:
+            GenServer.cast(
+              pid,
+              {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}}, 60, self()}
+            )
+
+      # Force the spill and capture the on-disk file path from xid 100's stream buffer.
+      assert_receive {:spilled_bytes, total} when total > 0
+      state = :sys.get_state(pid)
+      spill_path = state.asm.stream_txns[100].spill.path
+      assert File.exists?(spill_path)
+
+      # Drive a HALT: a StreamCommit for an UNKNOWN top xid → {:halt, :config_invalid, asm} where the
+      # halted asm still carries xid 100's open (spilled) buffer. The {:halt} dispatch runs
+      # reset_streams |> reset_batch for the file-delete side effect. Supervisor.halt/2 spawns an
+      # UNLINKED teardown that Registry.lookup-misses in the unit context (no registered pipeline) and
+      # returns :ok — never errors/hangs — so the halt path completes cleanly here.
+      GenServer.cast(
+        pid,
+        {:message, %StreamCommit{xid: 999, commit_lsn: 0x50, end_lsn: 0x50, commit_timestamp: nil},
+         8, self()}
+      )
+
+      # get_state flushes the mailbox → the halt (and its spill-file discard) ran before we read.
+      assert :sys.get_state(pid).halted
+      refute File.exists?(spill_path)
+    end
+  end
+
   describe "streaming (spec §7/§9)" do
     alias Replicant.Decoder.Messages.StreamStart
 

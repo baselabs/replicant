@@ -50,7 +50,8 @@ defmodule Replicant.Pipeline do
          sink: sink,
          checkpoint_store: store,
          batch: Map.get(config, :batch),
-         streaming: Map.get(config, :streaming)
+         streaming: Map.get(config, :streaming),
+         max_inflight_lag: Map.get(config, :max_inflight_lag)
        ]
 
   defp assembler_opts(%{slot_name: slot, sink: sink} = config),
@@ -58,6 +59,7 @@ defmodule Replicant.Pipeline do
       slot_name: slot,
       sink: sink,
       batch: Map.get(config, :batch_delivery),
-      streaming: Map.get(config, :streaming)
+      streaming: Map.get(config, :streaming),
+      max_inflight_lag: Map.get(config, :max_inflight_lag)
     ]
 end

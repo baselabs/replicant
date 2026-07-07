@@ -38,7 +38,8 @@ defmodule Replicant.AssemblerServer do
         sink,
         Keyword.get(opts, :checkpoint_store),
         Keyword.get(opts, :batch),
-        Keyword.get(opts, :streaming)
+        Keyword.get(opts, :streaming),
+        Keyword.get(opts, :max_inflight_lag)
       )
 
     {:ok, %{slot_name: slot_name, asm: asm, halted: false, conn_pid: nil, batch_timer: nil}}
@@ -49,7 +50,8 @@ defmodule Replicant.AssemblerServer do
   # store read it does on connect — one read, deterministic ordering before any
   # Commit). No store I/O in init (fast boot; the CheckpointStore's own non-sync
   # connect owns resilience). A lib-mode assembler is NEVER built without a writer.
-  defp build_assembler(slot_name, sink, store, batch, streaming) when is_list(store) do
+  defp build_assembler(slot_name, sink, store, batch, streaming, max_inflight_lag)
+       when is_list(store) do
     max_retries =
       Keyword.get(store, :max_retries, Replicant.CheckpointStore.default_max_retries())
 
@@ -65,12 +67,23 @@ defmodule Replicant.AssemblerServer do
       checkpoint_writer: writer,
       slot_name: slot_name,
       batch: batch,
-      max_concurrent_txns: stream_limit(streaming)
+      max_concurrent_txns: stream_limit(streaming),
+      spill: stream_spill(streaming),
+      max_inflight_lag: max_inflight_lag
     )
   end
 
-  defp build_assembler(_slot_name, sink, nil, batch, streaming),
-    do: Assembler.new(sink, batch: batch, max_concurrent_txns: stream_limit(streaming))
+  # Sink-owned mode still passes `slot_name` — spill names its per-stream subdir after the slot
+  # (spec §5), so the assembler needs it even without a checkpoint writer.
+  defp build_assembler(slot_name, sink, nil, batch, streaming, max_inflight_lag),
+    do:
+      Assembler.new(sink,
+        slot_name: slot_name,
+        batch: batch,
+        max_concurrent_txns: stream_limit(streaming),
+        spill: stream_spill(streaming),
+        max_inflight_lag: max_inflight_lag
+      )
 
   # The per-stream concurrency cap (spec §7): `nil` when streaming is not configured (the assembler
   # falls back to its own default), else the caller's `:max_concurrent_txns`.
@@ -78,6 +91,11 @@ defmodule Replicant.AssemblerServer do
 
   defp stream_limit(streaming) when is_list(streaming),
     do: Keyword.get(streaming, :max_concurrent_txns)
+
+  # The nested spill config (spec §5): `nil` when streaming (or its `:spill`) is absent (spill
+  # disabled), else the caller's `[dir: _, max_spill_bytes: _]`.
+  defp stream_spill(nil), do: nil
+  defp stream_spill(streaming) when is_list(streaming), do: Keyword.get(streaming, :spill)
 
   # The store write as a 0-arity thunk (so the retry loop can re-invoke it).
   defp store_write(slot_name, lsn) do
@@ -137,8 +155,14 @@ defmodule Replicant.AssemblerServer do
 
   def handle_cast({:message, message, bytes, from}, state) do
     state = %{state | conn_pid: from}
+    before = state.asm.spilled_total
     asm = Assembler.observe_bytes(state.asm, bytes)
-    dispatch(Assembler.handle_message(asm, message), from, state)
+    # A spill flushed a stream buffer's tail to disk: signal the Connection so it can extend its
+    # in-flight lag window past the resident-only accounting (spec §5). Value-free — carries only the
+    # cumulative spilled byte count, never a row value. Plain send → the Connection's handle_info,
+    # matching the {:sink_committed, _} dispatch idiom (Task 10 handles it there).
+    if asm.spilled_total != before, do: send(from, {:spilled_bytes, asm.spilled_total})
+    dispatch(Assembler.handle_message(asm, message), from, %{state | asm: asm})
   end
 
   # The Connection seeds the lib-mode watermark from its connect-time store read, before streaming.
@@ -206,12 +230,17 @@ defmodule Replicant.AssemblerServer do
     do_flush(%{state | asm: asm}, reason)
   end
 
-  defp dispatch({:halt, reason, _asm}, _from, state) do
+  defp dispatch({:halt, reason, halted_asm}, _from, state) do
     # Fail-closed: destructive schema change / sink write fault / unidentifiable relation.
     # `reason` is already value-free. Terminate the whole pipeline permanently; cancel the
     # flush timer and mark halted so a stale :batch_timeout cannot drive a store write during
     # teardown (spec §9). Do NOT self-crash (a crash exit would race :one_for_all restart).
     Replicant.Supervisor.halt(state.slot_name, reason)
+    # Discard any open spill files: a halt tears the pipeline down without a reset cast, so the
+    # halted assembler's stream/batch spill files would leak on disk otherwise (spec §5 cleanup).
+    # The returned assembler is dropped — this process is terminating; we run the resets purely
+    # for the file-delete side effect.
+    _ = halted_asm |> Replicant.Assembler.reset_streams() |> Replicant.Assembler.reset_batch()
     {:noreply, %{cancel_batch_timer(state) | halted: true}}
   end
 
