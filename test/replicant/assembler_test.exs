@@ -1787,4 +1787,251 @@ defmodule Replicant.AssemblerTest do
       refute inspect(err) <> Exception.message(err) =~ "SEKRET"
     end
   end
+
+  describe "spill × sink-owned batch (spec §5/§6) — spill-file ownership migrates into the batch" do
+    # Cross-mode composition (Task 8): a SPILLED streamed txn in a SINK-OWNED batch is only BUFFERED
+    # at StreamCommit (not delivered until flush), so its spill file must SURVIVE from StreamCommit
+    # to flush/reset — the deliver_now delete never runs for this path (it routes to
+    # buffer_for_delivery). The migrated path is recorded on `batch_spill_paths` and deleted exactly
+    # once at flush (handle_batch re-reads the Reader from the file) OR at reset_batch — no orphan,
+    # no use-after-delete, no double-delete (per-txn / lib+batch use deliver_now and never record).
+    defmodule SpillBatchSink do
+      def checkpoint, do: {:ok, nil}
+
+      def handle_batch(txns) do
+        Enum.each(txns, fn t ->
+          Enum.each(t.changes, fn c -> send(self(), {:bd, c.record["v"]}) end)
+        end)
+
+        {:ok, List.last(txns).commit_lsn}
+      end
+    end
+
+    defp spill_batch_asm(base, sink) do
+      alias Replicant.Decoder.Messages.Relation
+      alias Replicant.Decoder.Messages.Relation.Column
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      asm = %{
+        Replicant.Assembler.new(sink,
+          batch: [max_transactions: 100, max_delay_ms: 1000, max_span: 1_000_000],
+          max_concurrent_txns: 64,
+          spill: [dir: base, max_spill_bytes: 1_000_000],
+          max_inflight_lag: 120,
+          slot_name: "sp"
+        )
+        | stream_floor: 0
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, rel)
+      asm
+    end
+
+    # Stream one txn (top-level `xid`) whose rows carry the distinct integer values in `values`,
+    # forced to spill by observing 60 payload bytes per row over the 120-byte RAM bound. Leaves the
+    # segment closed (StreamStop) — ready for the caller's StreamCommit. Returns {asm, spill_path}.
+    defp stream_spilled_txn(asm, xid, values) do
+      alias Replicant.Decoder.Messages.{Insert, StreamStart, StreamStop}
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: xid, first_segment: true})
+
+      asm =
+        Enum.reduce(values, asm, fn v, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: xid, relation_id: 1, tuple_data: {"#{v}"}})
+
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      {asm, asm.stream_txns[xid].spill.path}
+    end
+
+    defp spill_batch_setup(base, sink) do
+      spill_batch_asm(base, sink) |> stream_spilled_txn(100, 1..3)
+    end
+
+    setup do
+      base = Path.join(System.tmp_dir!(), "asm_spill_batch_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+      %{base: base}
+    end
+
+    test "a spilled txn in a sink-owned batch migrates its spill file to the batch; flush deletes it (no orphan, no use-after-delete)",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.StreamCommit
+      {asm, path} = spill_batch_setup(base, SpillBatchSink)
+      assert File.exists?(path)
+
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # migrated onto the batch accumulator; the stream buffer is gone; the file SURVIVES (buffered,
+      # not yet delivered — deliver_now's delete never ran for this sink-owned-batch path).
+      assert path in asm.batch_spill_paths
+      refute Map.has_key?(asm.stream_txns, 100)
+      assert File.exists?(path)
+
+      # flush delivers (handle_batch re-reads the Reader from the file) THEN deletes it exactly once.
+      # Assert ALL THREE rows in order — proving handle_batch read the WHOLE migrated Reader from the
+      # file (not a half-exhausted stream), not just the first frame.
+      assert {:ok, 900, asm} = Assembler.flush_batch(asm, :max_transactions)
+      assert_received {:bd, 1}
+      assert_received {:bd, 2}
+      assert_received {:bd, 3}
+      assert asm.batch_spill_paths == []
+      refute File.exists?(path)
+    end
+
+    test "reset_batch (mid-batch reconnect) deletes a migrated spill file — no orphan", %{
+      base: base
+    } do
+      alias Replicant.Decoder.Messages.StreamCommit
+      {asm, path} = spill_batch_setup(base, SpillBatchSink)
+
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      assert path in asm.batch_spill_paths
+      assert File.exists?(path)
+
+      asm = Assembler.reset_batch(asm)
+      assert asm.batch_spill_paths == []
+      refute File.exists?(path)
+    end
+
+    test "TWO spilled txns in one sink-owned batch: BOTH files migrate (prepend accumulation), BOTH survive to flush, BOTH deleted after — no orphan",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.StreamCommit
+
+      # Two sequential spilled streamed txns (xid 100 rows 1,2,3; xid 200 rows 4,5,6) buffered into the
+      # SAME open batch. This is the composition behavior Task 8 exists for: `prepend_path` must
+      # ACCUMULATE both paths so ALL survive to flush and ALL are deleted — a single-txn test can't
+      # catch a bug where recording replaces instead of accumulates (only the last file would delete).
+      asm = spill_batch_asm(base, SpillBatchSink)
+      {asm, path1} = stream_spilled_txn(asm, 100, 1..3)
+
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      {asm, path2} = stream_spilled_txn(asm, 200, 4..6)
+
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 200,
+                 commit_lsn: 1000,
+                 end_lsn: 1001,
+                 commit_timestamp: nil
+               })
+
+      # BOTH distinct paths recorded (accumulated, not replaced) and BOTH files exist after buffering.
+      assert path1 != path2
+      assert path1 in asm.batch_spill_paths
+      assert path2 in asm.batch_spill_paths
+      assert File.exists?(path1)
+      assert File.exists?(path2)
+
+      # flush delivers rows from BOTH txns (handle_batch re-reads BOTH migrated Readers), THEN deletes
+      # BOTH files exactly once — the list clears and neither file orphans.
+      assert {:ok, 1000, asm} = Assembler.flush_batch(asm, :max_transactions)
+      assert_received {:bd, 1}
+      assert_received {:bd, 2}
+      assert_received {:bd, 3}
+      assert_received {:bd, 4}
+      assert_received {:bd, 5}
+      assert_received {:bd, 6}
+      assert asm.batch_spill_paths == []
+      refute File.exists?(path1)
+      refute File.exists?(path2)
+    end
+
+    test "lib+batch: a spilled txn is delivered per-txn and its file is deleted by deliver_now — NO path recorded (disjoint from sink-owned batch)",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{Insert, Relation, StreamCommit, StreamStart, StreamStop}
+      alias Replicant.Decoder.Messages.Relation.Column
+
+      # Lib mode + checkpoint-batch: the sink persists per-txn (handle_transaction) and only the
+      # CHECKPOINT is batched. So a spilled txn routes through deliver_now, which deletes the file
+      # after the sink returns {:ok, _} durable — and buffer_txn (lib+batch) records NO spill path.
+      defmodule LibBatchSpillSink do
+        def handle_transaction(txn) do
+          _ = Enum.to_list(txn.changes)
+          {:ok, txn.commit_lsn}
+        end
+      end
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      asm =
+        %{
+          Replicant.Assembler.new(LibBatchSpillSink,
+            mode: :lib,
+            checkpoint_writer: fn _lsn -> :ok end,
+            slot_name: "rep_batch",
+            lib_checkpoint: 0,
+            batch: [max_transactions: 100, max_delay_ms: 1000, max_span: 1_000_000],
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120
+          )
+          | stream_floor: 0
+        }
+
+      {:ok, asm} = Assembler.handle_message(asm, rel)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      asm =
+        Enum.reduce(1..3, asm, fn v, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}})
+
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      path = asm.stream_txns[100].spill.path
+      assert File.exists?(path)
+
+      # lib+batch buffers the checkpoint (returns {:buffered, _}) AFTER the sink returns durable; the
+      # spill file is deleted by deliver_now's {:ok, _} branch, and NO path is recorded on the batch.
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      refute File.exists?(path)
+      assert asm.batch_spill_paths == []
+    end
+  end
 end

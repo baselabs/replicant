@@ -82,6 +82,7 @@ defmodule Replicant.Assembler do
           batch: keyword() | nil,
           batch_count: non_neg_integer(),
           batch_txns: [Transaction.t()],
+          batch_spill_paths: [String.t()],
           pending_lsn: lsn() | nil,
           stream_floor: lsn() | nil,
           stream_txns: %{non_neg_integer() => stream_buf()},
@@ -123,6 +124,7 @@ defmodule Replicant.Assembler do
     batch: nil,
     batch_count: 0,
     batch_txns: [],
+    batch_spill_paths: [],
     pending_lsn: nil,
     stream_floor: nil,
     stream_txns: %{},
@@ -1004,11 +1006,12 @@ defmodule Replicant.Assembler do
   # `spill_path` (default nil) is the on-disk spill file backing a lazy-Reader `%Transaction{}`: for a
   # non-spilled txn it is nil and no file op happens (existing callers behave identically). For a
   # spilled txn delivered per-txn / lib+batch, the file is deleted AFTER the delivery is durable
-  # (commit_txn / buffer_txn). Sink-owned batch buffers the txn (with its Reader) and keeps the file
-  # until flush (Task 8), so it ignores `spill_path` here.
+  # (in deliver_now's {:ok, _} branch). Sink-owned batch buffers the txn (with its Reader) and keeps
+  # the file until flush/reset (Task 8), so it RECORDS `spill_path` on `batch_spill_paths` (via
+  # buffer_for_delivery/3) for a single delete at flush_sink_batch / reset_batch.
   defp apply_sink(%__MODULE__{} = asm, %Transaction{} = txn, spill_path \\ nil) do
     if sink_owned_batching?(asm),
-      do: buffer_for_delivery(asm, txn),
+      do: buffer_for_delivery(asm, txn, spill_path),
       else: deliver_now(asm, txn, spill_path)
   end
 
@@ -1146,14 +1149,22 @@ defmodule Replicant.Assembler do
   # spec §7 — identical to lib-batch). lib_checkpoint is NOT advanced here — only at flush (§9).
   # No [:sink, :committed] event: the txn is not delivered until flush_batch calls handle_batch.
   # Stored newest-first (prepend); flush_sink_batch reverses to ascending commit-LSN order.
-  defp buffer_for_delivery(%__MODULE__{} = asm, %Transaction{commit_lsn: lsn} = txn) do
+  #
+  # `spill_path` (nil for a non-spilled txn) is the on-disk file backing this buffered txn's lazy
+  # Reader: the sink-owned batch OWNS the file until flush/reset (the txn is buffered, not delivered,
+  # so the deliver_now delete never runs for this path). Record it on `batch_spill_paths` so
+  # flush_sink_batch / reset_batch delete it exactly once — no orphan, no use-after-delete (the
+  # flush's handle_batch re-reads the Reader from the file). No path is recorded for the per-txn /
+  # lib+batch paths (they route to deliver_now, which deletes there) — the two are disjoint.
+  defp buffer_for_delivery(%__MODULE__{} = asm, %Transaction{commit_lsn: lsn} = txn, spill_path) do
     count = asm.batch_count + 1
 
     asm = %{
       reset(asm)
       | batch_count: count,
         pending_lsn: lsn,
-        batch_txns: [txn | asm.batch_txns]
+        batch_txns: [txn | asm.batch_txns],
+        batch_spill_paths: prepend_path(asm.batch_spill_paths, spill_path)
     }
 
     cond do
@@ -1162,6 +1173,10 @@ defmodule Replicant.Assembler do
       true -> {:buffered, asm}
     end
   end
+
+  # A non-spilled txn (spill_path nil) records nothing; a spilled txn prepends its file path.
+  defp prepend_path(paths, nil), do: paths
+  defp prepend_path(paths, path) when is_binary(path), do: [path | paths]
 
   # The span-cap base (spec §7): the un-checkpointed window's start = the higher of the durable
   # watermark and the per-stream floor, mirroring the §4 lag floor. On a fresh slot lib_checkpoint
@@ -1218,12 +1233,18 @@ defmodule Replicant.Assembler do
           reason: reason
         })
 
+        # The batch is durable (handle_batch returned {:ok, _} having re-read each Reader from its
+        # spill file); delete the migrated spill files exactly once and clear the list. A non-spilled
+        # batch has an empty list → a harmless no-op.
+        Enum.each(asm.batch_spill_paths, &Spill.rm/1)
+
         {:ok, lsn,
          %{
            asm
            | batch_count: 0,
              pending_lsn: nil,
              batch_txns: [],
+             batch_spill_paths: [],
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}
 
@@ -1260,11 +1281,17 @@ defmodule Replicant.Assembler do
           reason: reason
         })
 
+        # lib+batch NEVER records a spill path (a spilled lib+batch txn is deleted by deliver_now
+        # after the sink returns durable — only the CHECKPOINT is batched). The list is therefore
+        # always [] here; the delete loop is a no-op kept for symmetry with flush_sink_batch.
+        Enum.each(asm.batch_spill_paths, &Spill.rm/1)
+
         {:ok, lsn,
          %{
            asm
            | batch_count: 0,
              pending_lsn: nil,
+             batch_spill_paths: [],
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}
 
@@ -1293,8 +1320,12 @@ defmodule Replicant.Assembler do
   boundaries). Never writes a checkpoint — loss=0 holds by re-delivery.
   """
   @spec reset_batch(t()) :: t()
-  def reset_batch(%__MODULE__{} = asm),
-    do: %{asm | batch_count: 0, pending_lsn: nil, batch_txns: []}
+  def reset_batch(%__MODULE__{batch_spill_paths: paths} = asm) do
+    # A discarded sink-owned batch re-streams from the durable checkpoint, so any migrated spill
+    # file must not survive (spec §5 reset cleanup). Delete the recorded files and clear the list.
+    Enum.each(paths, &Spill.rm/1)
+    %{asm | batch_count: 0, pending_lsn: nil, batch_txns: [], batch_spill_paths: []}
+  end
 
   @doc """
   Discard all in-progress streamed transactions (on reconnect); loss=0 by re-stream (spec §9). Any
