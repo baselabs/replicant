@@ -84,6 +84,8 @@ defmodule Replicant.Connection do
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
+          spilled_bytes: non_neg_integer(),
+          max_spill_bytes: non_neg_integer() | nil,
           checkpoint_store: keyword() | nil,
           batch_delivery: keyword() | nil,
           streaming: keyword() | nil,
@@ -104,6 +106,8 @@ defmodule Replicant.Connection do
     checkpoint_state: :empty,
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
+    spilled_bytes: 0,
+    max_spill_bytes: nil,
     checkpoint_store: nil,
     batch_delivery: nil,
     streaming: nil,
@@ -158,6 +162,8 @@ defmodule Replicant.Connection do
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
+       spilled_bytes: 0,
+       max_spill_bytes: spill_ceiling(Map.get(config, :streaming)),
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
        streaming: Map.get(config, :streaming),
@@ -195,6 +201,7 @@ defmodule Replicant.Connection do
          store_retry_count: store_retry_count,
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
+         spilled_bytes: 0,
          step: :recovery_check
      }}
   end
@@ -295,7 +302,7 @@ defmodule Replicant.Connection do
     state = %{state | received_lsn: received_lsn, stream_floor_lsn: stream_floor_lsn}
     lag = inflight_lag(state)
 
-    if lag > state.max_inflight_lag do
+    if lag > effective_lag_bound(state) do
       halt_sink_too_slow(state, lag)
     else
       forward_message(payload, state)
@@ -387,6 +394,14 @@ defmodule Replicant.Connection do
     {:noreply, state}
   end
 
+  # The AssemblerServer reports its running spilled-byte total so the §4 numerator can subtract it
+  # (spilled bytes are on disk, not RAM). Coarse: the last value wins; a frame or two of staleness
+  # is acceptable for this guard (spec §9/§10). MUST precede the catch-all below, or the catch-all
+  # swallows it and the spill window never extends.
+  def handle_info({:spilled_bytes, total}, state) when is_integer(total) do
+    {:noreply, %{state | spilled_bytes: total}}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
   # ---- public helpers (unit-tested directly) ----
@@ -438,6 +453,17 @@ defmodule Replicant.Connection do
   # checkpoint mode (lib / sink-owned / per-txn) — a `:streaming` keyword turns it on.
   defp streaming?(%{streaming: s}), do: is_list(s)
   defp streaming?(_), do: false
+
+  # The disk spill ceiling (bytes) from `streaming[:spill][:max_spill_bytes]`, or nil when
+  # spill is not configured. Resolved once at `init/1` and extends the §4 halt ceiling.
+  defp spill_ceiling(streaming) when is_list(streaming) do
+    case Keyword.get(streaming, :spill) do
+      spill when is_list(spill) -> Keyword.get(spill, :max_spill_bytes)
+      _ -> nil
+    end
+  end
+
+  defp spill_ceiling(_), do: nil
 
   @doc false
   @spec lib_go_forward_violation?(map()) :: boolean()
@@ -528,14 +554,28 @@ defmodule Replicant.Connection do
 
   def reset_retry_count(_count, _success), do: 0
 
-  # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor.
-  # The floor is the higher of the durable `checkpoint_lsn` (once a commit advances
-  # it to a real absolute LSN) and the per-stream `stream_floor_lsn` (the position PG
-  # began streaming at, used before the first commit while checkpoint is still 0).
-  # A cheap two-integer subtraction — safe to call on the keepalive-free hot path.
-  defp inflight_lag(%{received_lsn: received, checkpoint_lsn: cp, stream_floor_lsn: floor}) do
-    received - max(cp, floor || received)
+  # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor,
+  # LESS the bytes already spilled to disk (§5 — spilled bytes are no longer resident,
+  # so they must not count toward the RAM-bounded numerator). The floor is the higher
+  # of the durable `checkpoint_lsn` (once a commit advances it to a real absolute LSN)
+  # and the per-stream `stream_floor_lsn` (the position PG began streaming at, used
+  # before the first commit while checkpoint is still 0). A cheap integer subtraction —
+  # safe to call on the keepalive-free hot path.
+  defp inflight_lag(%{
+         received_lsn: received,
+         checkpoint_lsn: cp,
+         stream_floor_lsn: floor,
+         spilled_bytes: spilled
+       }) do
+    received - max(cp, floor || received) - spilled
   end
+
+  # The §4 halt ceiling. No spill configured (`max_spill_bytes: nil`): the base
+  # `max_inflight_lag` (RAM-only bound, unchanged). Spill configured: extend the ceiling
+  # by the disk budget — resident lag may run up to RAM + disk before the sink is
+  # genuinely too slow (the numerator already subtracts the spilled bytes).
+  defp effective_lag_bound(%{max_inflight_lag: base, max_spill_bytes: nil}), do: base
+  defp effective_lag_bound(%{max_inflight_lag: base, max_spill_bytes: ceil}), do: base + ceil
 
   defp forward_message(payload, state) do
     case Decoder.decode(payload, streaming: state.in_stream) do
@@ -603,12 +643,28 @@ defmodule Replicant.Connection do
     # replays a half-received in-progress txn. Runs before the mode-specific seed/reset.
     if streaming?(state), do: reset_assembler_streams(state)
 
+    # Sweep THIS slot's spill subdir before the resumed stream (spec §5): removes any spill
+    # file a prior abnormal exit left. Per-slot and idempotent — safe here because no stream
+    # is active yet. A no-op when spill is not configured.
+    if spill_dir(state), do: Replicant.Spill.sweep_slot(spill_dir(state), state.slot_name)
+
     cond do
       lib_mode?(state) -> seed_assembler(state, seed_lsn)
       sink_owned_batch?(state) -> reset_assembler_batch(state)
       true -> :ok
     end
   end
+
+  # The configured spill directory from `streaming[:spill][:dir]`, or nil when spill is not
+  # configured. Used to sweep this slot's stale spill files at (re)connect setup.
+  defp spill_dir(%{streaming: streaming}) when is_list(streaming) do
+    case Keyword.get(streaming, :spill) do
+      spill when is_list(spill) -> Keyword.get(spill, :dir)
+      _ -> nil
+    end
+  end
+
+  defp spill_dir(_), do: nil
 
   defp reset_assembler_streams(state) do
     GenServer.cast(AssemblerServer.via(state.slot_name), {:reset_streams})

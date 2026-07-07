@@ -589,6 +589,18 @@ defmodule Replicant.ConnectionTest do
       assert new_state.step == :recovery_check
     end
 
+    test "a reconnect resets the spilled_bytes mirror to 0 (never carries a stale-high value)" do
+      # init/1 runs ONCE; RECONNECTS re-enter through handle_connect/1. The assembler zeroes its
+      # spilled_total on reconnect (reset_streams), but the {:spilled_bytes,_} signal only fires on
+      # a CHANGE during message observation — never on reset. So handle_connect MUST re-zero the
+      # Connection's mirror, or a stale-high spilled_bytes over-subtracts the §4 numerator and a
+      # slow-sink reconnect that does not re-spill evades the RAM-bound halt indefinitely.
+      {:query, _sql, new_state} =
+        Connection.handle_connect(state(spilled_bytes: 4242, step: :disconnected))
+
+      assert new_state.spilled_bytes == 0
+    end
+
     test "recovery_check emits [:connection, :connected] with the source kind" do
       :telemetry.attach(
         {__MODULE__, :conn},
@@ -719,6 +731,69 @@ defmodule Replicant.ConnectionTest do
       assert sql =~ "proto_version '2'"
       assert_receive {:"$gen_cast", {:reset_streams}}
       assert state.in_stream == false
+    end
+  end
+
+  describe "spill in-flight-lag accounting (spec §4/§9)" do
+    defp sp_state(slot, extra \\ %{}) do
+      Map.merge(
+        %Replicant.Connection{
+          slot_name: slot,
+          publication: "p",
+          sink: Replicant.Test.RecordingSink,
+          connection: [hostname: "h"],
+          checkpoint_store: nil,
+          batch_delivery: nil,
+          streaming: [max_concurrent_txns: 64, spill: [dir: "/tmp/x", max_spill_bytes: 500]],
+          checkpoint_lsn: 0,
+          received_lsn: 0,
+          stream_floor_lsn: 0,
+          in_stream: false,
+          spilled_bytes: 0,
+          max_spill_bytes: 500,
+          max_inflight_lag: 100,
+          step: :streaming
+        },
+        extra
+      )
+    end
+
+    test "the halt ceiling is max_inflight_lag + max_spill_bytes (RAM + disk)" do
+      # received-floor 620, spilled 0 → resident lag 620 > 100 + 500 = 600 → halt
+      s = %{sp_state("c2") | received_lsn: 620, spilled_bytes: 0}
+      frame = <<?w, 0::64, 620::64, 0::64, "E">>
+      assert {:disconnect, :sink_too_slow} = Replicant.Connection.handle_data(frame, s)
+    end
+
+    test "spilled bytes lower the numerator so the SAME frame that halts at spilled=0 forwards when spilled is high" do
+      # WITHOUT the -spilled subtraction, received-floor 620 halts; WITH spilled=550,
+      # 620-550=70 < 600 → no halt (forwards)
+      {:ok, _} = Registry.register(Replicant.Registry, {"c2b", :assembler}, nil)
+      s = %{sp_state("c2b") | received_lsn: 620, spilled_bytes: 550}
+      frame = <<?w, 0::64, 620::64, 0::64, "E">>
+      refute match?({:disconnect, :sink_too_slow}, Replicant.Connection.handle_data(frame, s))
+    end
+
+    test "a {:spilled_bytes, total} message updates the connection's spilled counter (handled, not swallowed by the catch-all)" do
+      s = sp_state("c3")
+      assert {:noreply, s2} = Replicant.Connection.handle_info({:spilled_bytes, 400}, s)
+      assert s2.spilled_bytes == 400
+    end
+
+    test "a NON-spill connection (max_spill_bytes: nil) halts at EXACTLY max_inflight_lag (ceiling unchanged)" do
+      # No spill config → max_spill_bytes nil → effective_lag_bound returns the base
+      # max_inflight_lag verbatim (byte-identical to the pre-task §4 halt for existing users).
+      {:ok, _} = Registry.register(Replicant.Registry, {"c4", :assembler}, nil)
+
+      # floor 500, bound 100 → wal_end 601 gives lag 101 > 100 → halt.
+      halt_state = state(slot_name: "c4", stream_floor_lsn: 500, max_inflight_lag: 100)
+      halt_frame = <<?w, 0::64, 601::64, 0::64, "E">>
+      assert {:disconnect, :sink_too_slow} = Connection.handle_data(halt_frame, halt_state)
+
+      # wal_end 600 gives lag 100 == bound (not OVER) → forwards.
+      fwd_state = state(slot_name: "c4", stream_floor_lsn: 500, max_inflight_lag: 100)
+      fwd_frame = <<?w, 0::64, 600::64, 0::64, "E">>
+      assert {:noreply, _} = Connection.handle_data(fwd_frame, fwd_state)
     end
   end
 end
