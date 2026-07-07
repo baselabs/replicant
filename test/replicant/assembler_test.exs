@@ -1669,6 +1669,67 @@ defmodule Replicant.AssemblerTest do
       assert asm.spilled_total == 0
     end
 
+    test "a SPILLED StreamCommit whose sink FAULTS halts AND still deletes the spill file (no orphan on fault-halt, spec §8)",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{Insert, StreamCommit, StreamStart, StreamStop}
+
+      # A per-txn sink (handle_transaction/1, NO batch:) that FAULTS with {:error, :boom} — routes
+      # through deliver_now's {:error, _} branch → {:halt, :sink_failed}. The spilled file must be
+      # deleted despite the fault: at StreamCommit the buffer is already out of stream_txns and a
+      # per-txn path never records it on batch_spill_paths, so the halt's reset_streams/reset_batch
+      # cannot reach it — the delete must happen in deliver_now for ALL outcomes, not only {:ok}.
+      defmodule SpillFaultSink do
+        def checkpoint, do: {:ok, nil}
+        def handle_transaction(_txn), do: {:error, :boom}
+      end
+
+      asm =
+        %{
+          Replicant.Assembler.new(SpillFaultSink,
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120,
+            slot_name: "sp"
+          )
+          | stream_floor: 0
+        }
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # force spill: two inserts over the 120-byte RAM bound spill the tail to disk
+      asm =
+        Enum.reduce([1, 2], asm, fn v, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}})
+
+          Assembler.observe_bytes(acc, 80)
+        end)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"3"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      # the spill file exists on disk before StreamCommit
+      spill_path = asm.stream_txns[100].spill && asm.stream_txns[100].spill.path
+      assert spill_path && File.exists?(spill_path)
+
+      # StreamCommit delivers the spilled Reader %Transaction{} through the faulting sink → HALT
+      assert {:halt, %Replicant.Error{reason: :sink_failed}, _asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # ...and the spill file is cleaned up DESPITE the fault — not orphaned until the next reconnect
+      # sweep. (RED before the fix: the delete lived only in the {:ok, _lsn} branch, so this file
+      # survived the fault-halt → File.exists?(spill_path) == true.)
+      refute File.exists?(spill_path)
+    end
+
     test "a spill I/O fault (recorded on spill_fault) halts :spill_io_failed at StreamCommit", %{
       base: base
     } do

@@ -1005,10 +1005,11 @@ defmodule Replicant.Assembler do
 
   # `spill_path` (default nil) is the on-disk spill file backing a lazy-Reader `%Transaction{}`: for a
   # non-spilled txn it is nil and no file op happens (existing callers behave identically). For a
-  # spilled txn delivered per-txn / lib+batch, the file is deleted AFTER the delivery is durable
-  # (in deliver_now's {:ok, _} branch). Sink-owned batch buffers the txn (with its Reader) and keeps
-  # the file until flush/reset (Task 8), so it RECORDS `spill_path` on `batch_spill_paths` (via
-  # buffer_for_delivery/3) for a single delete at flush_sink_batch / reset_batch.
+  # spilled txn delivered per-txn / lib+batch, the file is deleted AFTER the sink call returns for
+  # ALL outcomes (in deliver_now, regardless of the result tuple — {:ok} durable OR fault-halt, spec
+  # §8). Sink-owned batch buffers the txn (with its Reader) and keeps the file until flush/reset (Task
+  # 8), so it RECORDS `spill_path` on `batch_spill_paths` (via buffer_for_delivery/3) for a single
+  # delete at flush_sink_batch / reset_batch — it never reaches deliver_now, so no double-delete.
   defp apply_sink(%__MODULE__{} = asm, %Transaction{} = txn, spill_path \\ nil) do
     if sink_owned_batching?(asm),
       do: buffer_for_delivery(asm, txn, spill_path),
@@ -1017,7 +1018,8 @@ defmodule Replicant.Assembler do
 
   # Per-transaction delivery (sink-owned non-batch, and lib mode, incl. lib+batch which buffers
   # AFTER the sink returns {:ok, _}). Prior apply_sink/2 body plus spill-path threading: `spill_path`
-  # is nil for a non-spilled txn (no file op) or the spilled file to delete after durable delivery.
+  # is nil for a non-spilled txn (no file op) or the spilled file to delete after the sink call
+  # returns — for ALL outcomes, so a fault-halt cannot orphan it (spec §8).
   defp deliver_now(%__MODULE__{sink: sink} = asm, %Transaction{} = txn, spill_path) do
     start_mono = System.monotonic_time(:millisecond)
 
@@ -1032,13 +1034,20 @@ defmodule Replicant.Assembler do
 
     duration = System.monotonic_time(:millisecond) - start_mono
 
+    # The spilled file is dead once the sink call returns — on {:ok} the data is durable; on a fault
+    # the pipeline halts and a restart re-streams a FRESH file. Delete it for ALL outcomes (spec §8)
+    # so a fault-halt can't orphan a 0600 spill file: at StreamCommit the buffer is already out of
+    # `stream_txns` and a per-txn / lib+batch path never records it on `batch_spill_paths`, so the
+    # halt's reset_streams |> reset_batch cannot reach it. Best-effort/value-free (no-op on a gone or
+    # already-faulted file — safe for the %Spill.Error{} Reader-fault branch). nil for a non-spilled
+    # txn (no file op). Sink-owned batch never reaches deliver_now (apply_sink routes it to
+    # buffer_for_delivery, which owns the path via batch_spill_paths) — no double-delete.
+    if spill_path, do: Spill.rm(spill_path)
+
     case result do
       {:ok, _lsn} ->
         # lib+batch: buffer the durable txn and defer the store write/ack to the batch
         # flush (spec §7). Per-txn (sink-owned or lib-non-batch): checkpoint-after-persist.
-        # A spilled txn's file is deleted here, after the sink returned {:ok, _} (durable).
-        if spill_path, do: Spill.rm(spill_path)
-
         if batching?(asm),
           do: buffer_txn(asm, txn, duration),
           else: commit_txn(asm, txn, duration)
