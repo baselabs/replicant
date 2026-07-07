@@ -1461,4 +1461,120 @@ defmodule Replicant.AssemblerTest do
              ] = txn.changes
     end
   end
+
+  describe "spill trigger (spec §5) — aggregate resident bytes cross the RAM bound" do
+    alias Replicant.Decoder.Messages.{Insert, StreamStart}
+    alias Replicant.Decoder.Messages.Relation
+    alias Replicant.Decoder.Messages.Relation.Column
+
+    defp spilled_asm(base) do
+      Replicant.Assembler.new(Replicant.Test.RecordingSink,
+        max_concurrent_txns: 64,
+        spill: [dir: base, max_spill_bytes: 1_000_000],
+        max_inflight_lag: 200,
+        slot_name: "sp"
+      )
+    end
+
+    defp with_rel(asm, rid) do
+      rel = %Relation{
+        id: rid,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, rel)
+      asm
+    end
+
+    setup do
+      base = Path.join(System.tmp_dir!(), "asm_spill_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+      %{base: base}
+    end
+
+    test "when aggregate resident bytes exceed max_inflight_lag, the largest buffer's tail spills to disk",
+         %{base: base} do
+      asm = spilled_asm(base) |> with_rel(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      # accumulate changes and observe payload bytes over the 200-byte RAM bound
+      asm =
+        Enum.reduce(1..5, asm, fn v, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}})
+
+          # 5 * 60 = 300 > 200 → spill fires
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      buf = asm.stream_txns[100]
+      # after spill, the resident tail is small (bytes below the bound) and a spill file exists
+      assert buf.spilled_bytes > 0
+      assert buf.resident_bytes <= 200
+      assert buf.spill != nil
+      assert File.exists?(buf.spill.path)
+      # total spilled tracked on the assembler for the Connection cast (Task 9)
+      assert asm.spilled_total == buf.spilled_bytes
+    end
+
+    test "with spill NOT configured, buffers never spill (unchanged in-memory behavior)", %{
+      base: _base
+    } do
+      asm =
+        Replicant.Assembler.new(Replicant.Test.RecordingSink, max_concurrent_txns: 64)
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      asm =
+        Enum.reduce(1..5, asm, fn v, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}})
+
+          Assembler.observe_bytes(acc, 1_000)
+        end)
+
+      assert asm.stream_txns[100].spill == nil
+      assert Map.get(asm, :spilled_total, 0) == 0
+    end
+
+    test "the LARGEST of several concurrent buffers is the one whose tail spills", %{base: base} do
+      # Two concurrent in-progress streamed transactions with DIFFERENT resident bytes. `observe_bytes`
+      # targets `current_stream_xid`, which a (re-entrant) StreamStart sets — so a StreamStart before
+      # each observe routes bytes to the intended buffer. Buffer B (xid 200, 160 resident) is strictly
+      # larger than buffer A (xid 100, 50 resident); crossing the 200-byte aggregate bound must spill
+      # B's tail and leave A resident — the defining `Enum.max_by` selection in spill_largest.
+      asm = spilled_asm(base) |> with_rel(1)
+
+      # A: xid 100, one insert, 50 resident bytes.
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"a"}})
+
+      asm = Assembler.observe_bytes(asm, 50)
+
+      # B: xid 200, two inserts, 160 resident bytes — crosses the aggregate bound (50 + 160 = 210 > 200).
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 200, first_segment: true})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 200, relation_id: 1, tuple_data: {"b"}})
+
+      asm = Assembler.observe_bytes(asm, 80)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 200, relation_id: 1, tuple_data: {"c"}})
+
+      asm = Assembler.observe_bytes(asm, 80)
+
+      # B (the larger buffer) spilled; A (the smaller) stayed fully resident.
+      assert asm.stream_txns[200].spill != nil
+      assert asm.stream_txns[200].spilled_bytes > 0
+      assert asm.stream_txns[200].resident_bytes == 0
+      assert asm.stream_txns[100].spill == nil
+      assert asm.stream_txns[100].resident_bytes == 50
+    end
+  end
 end
