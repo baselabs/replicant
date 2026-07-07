@@ -18,6 +18,8 @@ defmodule Replicant.Error do
           | :slot_invalidated
           | :config_invalid
           | :too_many_streams
+          | :spill_io_failed
+          | :spill_exhausted
           | :snapshot_failed
           | :checkpoint_store_failed
           | :checkpoint_store_schema_mismatch
