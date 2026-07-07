@@ -1595,5 +1595,196 @@ defmodule Replicant.AssemblerTest do
       assert asm.stream_txns[100].spill == nil
       assert asm.stream_txns[100].resident_bytes == 50
     end
+
+    test "a SPILLED StreamCommit delivers a lazy Reader %Transaction{} (effect-once), stamped + filtered, and deletes the spill file",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{
+        Insert,
+        StreamAbort,
+        StreamCommit,
+        StreamStart,
+        StreamStop
+      }
+
+      defmodule SpillDeliverSink do
+        def checkpoint, do: {:ok, nil}
+
+        def handle_transaction(txn) do
+          # consume the lazy changes WITHIN the call (single-pass) — send each record
+          Enum.each(txn.changes, fn c -> send(self(), {:row, c.record["v"], c.ordinal}) end)
+          {:ok, txn.commit_lsn}
+        end
+      end
+
+      asm =
+        %{
+          Replicant.Assembler.new(SpillDeliverSink,
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120,
+            slot_name: "sp"
+          )
+          | stream_floor: 0
+        }
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # force spill: subxid 100 rows 1,2 spilled; subxid 101 row 9 spilled then aborted; row 3 resident
+      asm =
+        Enum.reduce([{100, 1}, {100, 2}, {101, 9}], asm, fn {sx, v}, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: sx, relation_id: 1, tuple_data: {"#{v}"}})
+
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamAbort{xid: 100, subxid: 101})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"3"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      spill_path = asm.stream_txns[100].spill && asm.stream_txns[100].spill.path
+      assert spill_path && File.exists?(spill_path)
+
+      assert {:transaction, txn, 900, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      assert txn.commit_lsn == 900
+
+      # delivered effect-once: rows 1,2 (spilled) then 3 (resident); 9 (subxid 101) filtered; ordinals 0,1,2
+      assert_received {:row, 1, 0}
+      assert_received {:row, 2, 1}
+      assert_received {:row, 3, 2}
+      refute_received {:row, 9, _}
+      # spill file deleted after delivery; stream buffer cleared; spilled_total decremented
+      refute File.exists?(spill_path)
+      refute Map.has_key?(asm.stream_txns, 100)
+      assert asm.spilled_total == 0
+    end
+
+    test "a spill I/O fault (recorded on spill_fault) halts :spill_io_failed at StreamCommit", %{
+      base: base
+    } do
+      alias Replicant.Decoder.Messages.{StreamCommit, StreamStart}
+
+      asm =
+        %{spilled_asm(base) | spill_fault: %Replicant.Error{reason: :spill_io_failed}}
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      assert {:halt, %Replicant.Error{reason: :spill_io_failed}, _} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+    end
+
+    test "exceeding max_spill_bytes halts :spill_exhausted", %{base: base} do
+      alias Replicant.Decoder.Messages.{Insert, StreamStart}
+
+      asm =
+        %{
+          Replicant.Assembler.new(Replicant.Test.RecordingSink,
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 50],
+            max_inflight_lag: 40,
+            slot_name: "sp"
+          )
+          | stream_floor: 0
+        }
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      # spills a frame > 50 → :spill_exhausted recorded
+      asm = Assembler.observe_bytes(asm, 60)
+      assert %Replicant.Error{reason: :spill_exhausted} = asm.spill_fault
+    end
+
+    test "a Reader faulting mid-read (spill file gone) halts :spill_io_failed through deliver_now (NOT :sink_failed), value-free",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{Insert, StreamCommit, StreamStart, StreamStop}
+      alias Replicant.Decoder.Messages.Relation
+      alias Replicant.Decoder.Messages.Relation.Column
+
+      defmodule ForcingSink do
+        def checkpoint, do: {:ok, nil}
+
+        def handle_transaction(txn) do
+          # FORCE the lazy Reader inside the sink call — a missing spill file raises Spill.Error here.
+          _ = Enum.to_list(txn.changes)
+          {:ok, txn.commit_lsn}
+        end
+      end
+
+      # A `text` column so the secret string survives casting into `record["v"]` (an int4 column would
+      # reject "SEKRET" at accumulate time and never spill it) — makes the value-free refute non-vacuous.
+      text_rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "text", flags: [:key], type_modifier: nil}]
+      }
+
+      asm =
+        %{
+          Replicant.Assembler.new(ForcingSink,
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120,
+            slot_name: "sp"
+          )
+          | stream_floor: 0
+        }
+
+      {:ok, asm} = Assembler.handle_message(asm, text_rel)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+      # force a spill: the secret-bearing rows land on disk (subxid 100).
+      asm =
+        Enum.reduce(1..3, asm, fn _i, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{
+              xid: 100,
+              relation_id: 1,
+              tuple_data: {"SEKRET"}
+            })
+
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      spill_path = asm.stream_txns[100].spill && asm.stream_txns[100].spill.path
+      assert spill_path && File.exists?(spill_path)
+
+      # Delete the spill file BEFORE StreamCommit: at commit `Spill.close` frees the write fd, then the
+      # Reader re-opens the now-missing path → ENOENT → Spill.Error raised INSIDE the sink's force.
+      File.rm!(spill_path)
+
+      assert {:halt, %Replicant.Error{reason: :spill_io_failed} = err, _} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # The halt is attributed to :spill_io_failed by deliver_now (NOT :sink_failed) and carries the
+      # fixed reason ONLY — no spilled row bytes leak (Critical Rule 1, belt-and-suspenders).
+      refute inspect(err) <> Exception.message(err) =~ "SEKRET"
+    end
   end
 end

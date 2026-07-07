@@ -280,13 +280,21 @@ defmodule Replicant.Assembler do
     {:ok, %{asm | current_stream_xid: nil}}
   end
 
-  # StreamCommit: replay the buffered streamed changes into a complete %Transaction{}, stamping the
+  # A recorded spill fault (a disk-ceiling breach or an I/O fault flagged on `spill_fault` by the
+  # value-free `observe_bytes`/`maybe_spill` path, which runs OUTSIDE this rescue) halts the stream
+  # fail-closed at its commit boundary (spec §8) — never deliver a transaction assembled past a spill
+  # fault. Checked FIRST, before dispatching the StreamCommit, so it preempts both the spilled and
+  # the resident delivery paths.
+  defp do_handle_message(%__MODULE__{spill_fault: %Error{} = err} = asm, %StreamCommit{}),
+    do: {:halt, err, asm}
+
+  # StreamCommit: deliver the buffered streamed changes as a complete %Transaction{}, stamping the
   # transaction-granularity commit_lsn and ascending ordinals AT REPLAY (streamed changes have no
-  # LSN before commit — spec §5). Storage is newest-first, so `Enum.reverse` restores commit order;
-  # subxid tags are dropped here (sub-aborts already filtered the buffer at StreamAbort time). An
-  # EMPTY streamed txn (no published changes) is suppressed here to stay v1-indistinguishable at the
-  # sink (spec §7). Otherwise pre-skip if at/below the watermark (effect-once, §2) else deliver via
-  # the shared apply_sink/2 — structurally mirroring the v1 Commit clause's stamp+skip?+deliver path.
+  # LSN before commit — spec §5). A SPILLED buffer delivers a lazy `Spill.Reader` over its disk
+  # frames + resident tail; an unspilled buffer replays the in-memory list. An EMPTY streamed txn (no
+  # published changes, or all subxids aborted) is suppressed to stay v1-indistinguishable at the sink
+  # (spec §7). Otherwise pre-skip if at/below the watermark (effect-once, §2) else deliver via the
+  # shared apply_sink path — mirroring the v1 Commit clause's stamp+skip?+deliver structure.
   defp do_handle_message(%__MODULE__{} = asm, %StreamCommit{
          xid: top,
          commit_lsn: lsn,
@@ -298,42 +306,32 @@ defmodule Replicant.Assembler do
          asm}
 
       {:ok, buf} ->
-        # Replay newest-first buffer → commit order in ONE pass: `Enum.map_reduce` restores order
-        # (the buffer is `reverse`d), stamps the commit-granularity commit_lsn + ascending ordinal
-        # (streamed changes have no LSN before commit, spec §5), AND yields the change_count from the
-        # same traversal — mirroring the single-pass `Enum.map_reduce` the v1 Truncate clause uses.
-        {changes, change_count} =
-          buf.changes
-          |> Enum.reverse()
-          |> Enum.map_reduce(0, fn {_subxid, change}, ordinal ->
-            {%{change | commit_lsn: lsn, ordinal: ordinal}, ordinal + 1}
-          end)
-
-        asm = %{asm | stream_txns: Map.delete(asm.stream_txns, top), current_stream_xid: nil}
-
-        if changes == [] do
-          # An EMPTY streamed transaction (e.g. a spilled transaction with no changes for the
-          # publication) is emitted by pgoutput v2 as StreamStart/Stop/Commit, but SKIPPED entirely
-          # by v1 (PG15+ never sends an empty non-streamed Commit). Suppress delivery so a streamed
-          # transaction is indistinguishable from a non-streamed one at the sink (spec §7); emit
-          # neither `:assembled` nor `:stream:committed` (consistent with v1, which never sees the
-          # empty txn — a "committed" signal for a txn the sink never sees would mislead).
-          suppress_empty_stream_commit(asm, lsn)
-        else
-          deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count)
-        end
+        deliver_or_skip_stream(asm, top, buf, lsn, ts)
     end
   end
 
-  # Whole-transaction abort (subxid == top): discard the buffer, deliver nothing.
+  # Whole-transaction abort (subxid == top): discard the buffer, deliver nothing. Delete any open
+  # spill file (the aborted txn's disk frames must not survive — spec §5 commit/abort/reset cleanup)
+  # and decrement its spilled bytes from the assembler total.
   defp do_handle_message(%__MODULE__{} = asm, %StreamAbort{xid: top, subxid: sub})
        when top == sub do
-    if Map.has_key?(asm.stream_txns, top) do
-      Telemetry.event([:replicant, :stream, :aborted], %{}, %{reason: :stream_abort})
-      cleared = if asm.current_stream_xid == top, do: nil, else: asm.current_stream_xid
-      {:ok, %{asm | stream_txns: Map.delete(asm.stream_txns, top), current_stream_xid: cleared}}
-    else
-      {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"}, asm}
+    case Map.fetch(asm.stream_txns, top) do
+      {:ok, buf} ->
+        Telemetry.event([:replicant, :stream, :aborted], %{}, %{reason: :stream_abort})
+        if buf.spill, do: Spill.discard(buf.spill)
+        cleared = if asm.current_stream_xid == top, do: nil, else: asm.current_stream_xid
+
+        {:ok,
+         %{
+           asm
+           | stream_txns: Map.delete(asm.stream_txns, top),
+             current_stream_xid: cleared,
+             spilled_total: asm.spilled_total - buf.spilled_bytes
+         }}
+
+      :error ->
+        {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"},
+         asm}
     end
   end
 
@@ -501,6 +499,82 @@ defmodule Replicant.Assembler do
     # Any message the decoder could not classify has already been turned into an
     # error at the boundary; reaching here means an unhandled but decodable shape.
     {:halt, %Error{reason: :unsupported_message}, asm}
+  end
+
+  # Route a StreamCommit's buffer to empty-suppression, the unspilled in-memory replay, or the
+  # spilled lazy-Reader delivery. The buffer is removed from `stream_txns` and its spilled bytes are
+  # decremented from the assembler total up front (delivered once, effect-once) so every branch sees a
+  # clean assembler. `spilled_live` counts the NON-aborted spilled frames, so a spilled txn whose
+  # every spilled subxid later aborted is detected as EMPTY here (routed through the CV1 empty-
+  # suppression, spec §7 v1-indistinguishability) rather than delivered as an empty %Transaction{}.
+  defp deliver_or_skip_stream(%__MODULE__{} = asm, top, buf, lsn, ts) do
+    resident = Enum.reject(buf.changes, fn {sx, _c} -> MapSet.member?(buf.aborted, sx) end)
+
+    spilled_live =
+      Enum.reduce(buf.spilled_by_subxid, 0, fn {sx, c}, acc ->
+        if MapSet.member?(buf.aborted, sx), do: acc, else: acc + c
+      end)
+
+    asm = %{
+      asm
+      | stream_txns: Map.delete(asm.stream_txns, top),
+        current_stream_xid: nil,
+        spilled_total: asm.spilled_total - buf.spilled_bytes
+    }
+
+    cond do
+      resident == [] and spilled_live == 0 ->
+        # Empty after aborts (spilled or not) → v1-indistinguishable suppression (parent CV1, spec §7).
+        if buf.spill, do: Spill.rm(buf.spill.path)
+        suppress_empty_stream_commit(asm, lsn)
+
+      buf.spill == nil ->
+        # Unspilled, non-empty: the in-memory List replay (stamp commit_lsn + ordinals at replay).
+        {changes, change_count} = replay_resident(resident, lsn)
+        deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count)
+
+      true ->
+        # Spilled, non-empty: close the file for reading, deliver a lazy Reader over frames + tail.
+        :ok = Spill.close(buf.spill)
+        reader = Spill.Reader.new(buf.spill.path, resident, buf.aborted, lsn)
+        deliver_spilled_stream_commit(asm, lsn, ts, buf, reader)
+    end
+  end
+
+  # Replay the newest-first resident tail into commit order in ONE pass (`Enum.reverse` then
+  # `Enum.map_reduce`), stamping the commit-granularity commit_lsn + ascending ordinal (streamed
+  # changes have no LSN before commit, spec §5), yielding the change_count from the same traversal.
+  # Extracted VERBATIM from the shipped StreamCommit body to keep `deliver_or_skip_stream` within
+  # credo's nesting depth (mirrors the `deliver_stream_commit` extraction).
+  defp replay_resident(resident, lsn) do
+    resident
+    |> Enum.reverse()
+    |> Enum.map_reduce(0, fn {_subxid, change}, ordinal ->
+      {%{change | commit_lsn: lsn, ordinal: ordinal}, ordinal + 1}
+    end)
+  end
+
+  # Deliver a SPILLED streamed txn as a lazy `Spill.Reader` %Transaction{} (spec §5): the sink forces
+  # the enumeration inside its own call (single-pass; disk frames then resident tail, aborted subxids
+  # rejected, commit_lsn + ordinals stamped by the Reader). `change_count` is unknown without forcing
+  # the lazy reader, so the `[:stream, :committed]` telemetry omits it (the allowlist permits a
+  # subset). Pre-skip at/below the watermark (effect-once, §2) — delete the file, no delivery — else
+  # deliver via the shared apply_sink path, threading the spill PATH so cleanup happens after durable
+  # delivery (per-txn / lib+batch delete the file; sink-owned batch keeps it until flush, Task 8).
+  defp deliver_spilled_stream_commit(%__MODULE__{} = asm, lsn, ts, buf, reader) do
+    txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: reader}
+
+    Telemetry.event([:replicant, :stream, :committed], %{}, %{
+      commit_lsn: lsn,
+      byte_size: buf.byte_size
+    })
+
+    if skip?(asm, txn) do
+      Spill.rm(buf.spill.path)
+      {:skipped, lsn, asm}
+    else
+      apply_sink(asm, txn, buf.spill.path)
+    end
   end
 
   # The non-empty StreamCommit delivery path (the pre-computed `change_count` comes from the replay
@@ -927,15 +1001,21 @@ defmodule Replicant.Assembler do
     end
   end
 
-  defp apply_sink(%__MODULE__{} = asm, %Transaction{} = txn) do
+  # `spill_path` (default nil) is the on-disk spill file backing a lazy-Reader `%Transaction{}`: for a
+  # non-spilled txn it is nil and no file op happens (existing callers behave identically). For a
+  # spilled txn delivered per-txn / lib+batch, the file is deleted AFTER the delivery is durable
+  # (commit_txn / buffer_txn). Sink-owned batch buffers the txn (with its Reader) and keeps the file
+  # until flush (Task 8), so it ignores `spill_path` here.
+  defp apply_sink(%__MODULE__{} = asm, %Transaction{} = txn, spill_path \\ nil) do
     if sink_owned_batching?(asm),
       do: buffer_for_delivery(asm, txn),
-      else: deliver_now(asm, txn)
+      else: deliver_now(asm, txn, spill_path)
   end
 
   # Per-transaction delivery (sink-owned non-batch, and lib mode, incl. lib+batch which buffers
-  # AFTER the sink returns {:ok, _}). Verbatim prior apply_sink/2 body — unchanged.
-  defp deliver_now(%__MODULE__{sink: sink} = asm, %Transaction{} = txn) do
+  # AFTER the sink returns {:ok, _}). Prior apply_sink/2 body plus spill-path threading: `spill_path`
+  # is nil for a non-spilled txn (no file op) or the spilled file to delete after durable delivery.
+  defp deliver_now(%__MODULE__{sink: sink} = asm, %Transaction{} = txn, spill_path) do
     start_mono = System.monotonic_time(:millisecond)
 
     result =
@@ -953,9 +1033,23 @@ defmodule Replicant.Assembler do
       {:ok, _lsn} ->
         # lib+batch: buffer the durable txn and defer the store write/ack to the batch
         # flush (spec §7). Per-txn (sink-owned or lib-non-batch): checkpoint-after-persist.
+        # A spilled txn's file is deleted here, after the sink returned {:ok, _} (durable).
+        if spill_path, do: Spill.rm(spill_path)
+
         if batching?(asm),
           do: buffer_txn(asm, txn, duration),
           else: commit_txn(asm, txn, duration)
+
+      {:sink_raised, %Spill.Error{}} ->
+        # The lazy Reader raised a value-free Spill.Error while the sink forced its enumeration (a
+        # disk/decode fault mid-read, spec §5). Distinguish it from a sink fault: halt
+        # :spill_io_failed (NOT :sink_failed), keeping the fixed reason only — never the exception's
+        # message or any row byte (Critical Rule 1).
+        Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{
+          reason: :spill_io_failed
+        })
+
+        {:halt, %Error{reason: :spill_io_failed}, asm}
 
       {:error, _reason} ->
         sink_failed(asm, duration)
@@ -1202,10 +1296,16 @@ defmodule Replicant.Assembler do
   def reset_batch(%__MODULE__{} = asm),
     do: %{asm | batch_count: 0, pending_lsn: nil, batch_txns: []}
 
-  @doc "Discard all in-progress streamed transactions (on reconnect); loss=0 by re-stream (spec §9)."
+  @doc """
+  Discard all in-progress streamed transactions (on reconnect); loss=0 by re-stream (spec §9). Any
+  open spill file is deleted first (a reconnect re-streams from the durable checkpoint, so a stale
+  spill file must not survive — spec §5 reset cleanup), and `spilled_total` resets to 0.
+  """
   @spec reset_streams(t()) :: t()
-  def reset_streams(%__MODULE__{} = asm),
-    do: %{asm | stream_txns: %{}, current_stream_xid: nil}
+  def reset_streams(%__MODULE__{stream_txns: streams} = asm) do
+    Enum.each(streams, fn {_xid, buf} -> buf.spill && Spill.discard(buf.spill) end)
+    %{asm | stream_txns: %{}, current_stream_xid: nil, spilled_total: 0}
+  end
 
   @doc """
   Record the per-stream floor (the Connection's first-frame `wal_end` — where PG actually began
