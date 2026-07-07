@@ -546,7 +546,10 @@ defmodule Replicant.AssemblerServerTest do
       # ONE small Insert, 50 bytes — well UNDER max_inflight_lag: 100, so resident_total never
       # crosses the bound and no spill fires. spilled_total stays 0, so `spilled_total != before`
       # is false → NO {:spilled_bytes} signal. Guards against a false-positive send.
-      GenServer.cast(pid, {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}}, 50, self()})
+      GenServer.cast(
+        pid,
+        {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}}, 50, self()}
+      )
 
       refute_receive {:spilled_bytes, _}, 100
       # No spill actually happened (sanity: the buffer stayed resident).
@@ -596,8 +599,9 @@ defmodule Replicant.AssemblerServerTest do
       # returns :ok — never errors/hangs — so the halt path completes cleanly here.
       GenServer.cast(
         pid,
-        {:message, %StreamCommit{xid: 999, commit_lsn: 0x50, end_lsn: 0x50, commit_timestamp: nil},
-         8, self()}
+        {:message,
+         %StreamCommit{xid: 999, commit_lsn: 0x50, end_lsn: 0x50, commit_timestamp: nil}, 8,
+         self()}
       )
 
       # get_state flushes the mailbox → the halt (and its spill-file discard) ran before we read.
