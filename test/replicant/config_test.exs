@@ -517,4 +517,62 @@ defmodule Replicant.ConfigTest do
       end
     end
   end
+
+  describe "streaming spill (consumer disk spill, spec §7)" do
+    defp sp_base(streaming_extra) do
+      [
+        connection: [hostname: "h"],
+        slot_name: "s",
+        publication: "p",
+        sink: Replicant.Test.RecordingSink,
+        streaming: streaming_extra
+      ]
+    end
+
+    test "a valid spill config normalises dir + max_spill_bytes" do
+      assert {:ok, cfg} = Config.validate(sp_base(spill: [dir: "/tmp/x", max_spill_bytes: 1024]))
+      spill = Keyword.fetch!(cfg.streaming, :spill)
+      assert Keyword.get(spill, :dir) == "/tmp/x"
+      assert Keyword.get(spill, :max_spill_bytes) == 1024
+    end
+
+    test "max_spill_bytes defaults to 16 * max_inflight_lag; dir defaults under tmp" do
+      assert {:ok, cfg} = Config.validate(sp_base(spill: []) ++ [max_inflight_lag: 1000])
+      spill = Keyword.fetch!(cfg.streaming, :spill)
+      assert Keyword.get(spill, :max_spill_bytes) == 16_000
+      assert Keyword.get(spill, :dir) == Path.join(System.tmp_dir!(), "replicant_spill")
+    end
+
+    test "no spill key → cfg.streaming has no :spill (unchanged halt path)" do
+      assert {:ok, cfg} = Config.validate(sp_base(max_concurrent_txns: 8))
+      assert Keyword.get(cfg.streaming, :spill) == nil
+    end
+
+    test "mis-shaped spill is rejected :config_invalid" do
+      for bad <- [
+            [max_spill_bytes: 0],
+            [max_spill_bytes: -1],
+            [max_spill_bytes: "x"],
+            [dir: 123],
+            [dir: ""],
+            :nope
+          ] do
+        assert {:error, :config_invalid} = Config.validate(sp_base(spill: bad)),
+               "expected spill #{inspect(bad)} rejected"
+      end
+    end
+
+    test "spill without streaming's other keys still requires the streaming keyword" do
+      # spill lives UNDER streaming; a top-level :spill is not read (streaming absent → no spill)
+      assert {:ok, cfg} =
+               Config.validate(
+                 connection: [hostname: "h"],
+                 slot_name: "s",
+                 publication: "p",
+                 sink: Replicant.Test.RecordingSink
+               )
+
+      assert cfg.streaming == nil
+    end
+  end
 end

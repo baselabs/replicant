@@ -54,7 +54,7 @@ defmodule Replicant.Config do
          {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
-         {:ok, streaming} <- fetch_streaming(opts),
+         {:ok, streaming} <- fetch_streaming(opts, max_inflight_lag),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          snapshot = Keyword.get(opts, :snapshot, false) == true,
          :ok <- validate_start_mode(go_forward_only, snapshot),
@@ -177,7 +177,7 @@ defmodule Replicant.Config do
   # the in-progress stream_txns map (default 64). Orthogonal to every checkpoint/delivery mode.
   # Absent OR an explicit `nil` both disable it (parity with :batch_delivery); a non-list value
   # (e.g. an atom) is a config error, never silently ignored.
-  defp fetch_streaming(opts) do
+  defp fetch_streaming(opts, max_inflight_lag) do
     case Keyword.get(opts, :streaming) do
       nil ->
         {:ok, nil}
@@ -185,14 +185,34 @@ defmodule Replicant.Config do
       streaming when is_list(streaming) ->
         max_concurrent = Keyword.get(streaming, :max_concurrent_txns, 64)
 
-        if positive_integer?(max_concurrent),
-          do: {:ok, [max_concurrent_txns: max_concurrent]},
-          else: {:error, :config_invalid}
+        with true <- positive_integer?(max_concurrent),
+             {:ok, spill} <- fetch_spill(Keyword.get(streaming, :spill), max_inflight_lag) do
+          {:ok, [max_concurrent_txns: max_concurrent] ++ spill}
+        else
+          _ -> {:error, :config_invalid}
+        end
 
       _ ->
         {:error, :config_invalid}
     end
   end
+
+  # Spill (spec §7) is opt-in via a NESTED :spill under :streaming. Presence enables consumer disk
+  # spill. `dir` (default a replicant-owned subdir of System.tmp_dir!(), created 0700 in a later
+  # task) is where spill files live; `max_spill_bytes` (default 16 * max_inflight_lag) is the disk
+  # ceiling. Absent → no spill.
+  defp fetch_spill(nil, _max_inflight_lag), do: {:ok, []}
+
+  defp fetch_spill(spill, max_inflight_lag) when is_list(spill) do
+    dir = Keyword.get(spill, :dir, Path.join(System.tmp_dir!(), "replicant_spill"))
+    max_spill_bytes = Keyword.get(spill, :max_spill_bytes, 16 * max_inflight_lag)
+
+    if is_binary(dir) and dir != "" and positive_integer?(max_spill_bytes),
+      do: {:ok, [spill: [dir: dir, max_spill_bytes: max_spill_bytes]]},
+      else: {:error, :config_invalid}
+  end
+
+  defp fetch_spill(_bad, _max_inflight_lag), do: {:error, :config_invalid}
 
   defp normalize_batch(nil, _max_inflight_lag), do: {:ok, nil}
 
