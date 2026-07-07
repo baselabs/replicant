@@ -1302,6 +1302,25 @@ defmodule Replicant.AssemblerTest do
       assert Enum.map(txn.changes, & &1.record["v"]) == [1, 3]
     end
 
+    test "StreamAbort(top, sub) records the subxid in the buffer's aborted set (for spilled-frame filtering) AND still rejects the resident tail" do
+      asm = streamed() |> with_relation(1)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 101, relation_id: 1, tuple_data: {"2"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamAbort{xid: 100, subxid: 101})
+
+      buf = asm.stream_txns[100]
+      # aborted set records 101 (for filtering any 101 frames already on disk)
+      assert MapSet.member?(buf.aborted, 101)
+      # resident tail STILL reject-at-abort (shipped behavior): only subxid-100 change remains
+      assert [{100, _}] = buf.changes
+    end
+
     test "StreamAbort(top, top) discards the whole transaction (no delivery)" do
       asm = deliver_streamed(StreamDeliverSink, 100)
 

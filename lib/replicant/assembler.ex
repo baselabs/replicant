@@ -345,8 +345,12 @@ defmodule Replicant.Assembler do
          asm}
 
       {:ok, buf} ->
+        # In-memory tail: reject-at-abort (shipped behavior, unchanged). Already-spilled frames can't
+        # be rejected from an append-only file, so record `sub` in the aborted set — Task-8 replay
+        # skips any spilled frame tagged `sub` (spec §5).
         kept = Enum.reject(buf.changes, fn {subxid, _change} -> subxid == sub end)
-        {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, %{buf | changes: kept})}}
+        buf = %{buf | changes: kept, aborted: MapSet.put(buf.aborted, sub)}
+        {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
     end
   end
 
