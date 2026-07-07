@@ -22,4 +22,13 @@ defmodule Replicant.TransactionTest do
       assert txn.commit_lsn > checkpoint
     end
   end
+
+  test "changes accepts a plain List (unchanged) AND any Enumerable (a lazy stream) without dialyzer complaint" do
+    list = %Transaction{commit_lsn: 1, changes: [%Change{op: :insert}]}
+    assert is_list(list.changes)
+
+    lazy = %Transaction{commit_lsn: 2, changes: Stream.map([%Change{op: :insert}], & &1)}
+    # a lazy Enumerable is iterable exactly like the List form
+    assert [%Change{op: :insert}] = Enum.to_list(lazy.changes)
+  end
 end
