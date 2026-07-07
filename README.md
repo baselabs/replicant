@@ -192,6 +192,41 @@ The sink must implement both `checkpoint/0` (resume) and `handle_batch/1`; it ca
 use `checkpoint_store`, and any `handle_transaction/1` implementation is ignored.
 Emits `[:replicant, :sink, :batch_committed]` telemetry once per flush.
 
+**Consumer-side disk spill (oversized transactions).** By default a single in-progress streamed
+transaction is bounded by the §4 in-flight window: one larger than `max_inflight_lag` halts
+fail-closed. Opt into **disk spill** to reassemble such a transaction partly on disk and still deliver
+it effect-once:
+
+```elixir
+Replicant.start_link(
+  connection: [...], slot_name: "replicant_orders", publication: "orders_pub",
+  sink: MyApp.OrdersSink, go_forward_only: false,
+  max_inflight_lag: 64 * 1024 * 1024,
+  streaming: [
+    max_concurrent_txns: 64,
+    spill: [dir: "/var/lib/replicant/spill", max_spill_bytes: 1024 * 1024 * 1024]
+  ]
+)
+```
+
+A transaction whose resident bytes cross `max_inflight_lag` spills its oldest changes to a per-txn file
+under `dir`; at commit it is delivered as a **lazy, single-pass, disk-backed** `%Transaction{}` whose
+`changes` streams the spilled frames + the resident tail. There are **two ceilings**: the resident RAM
+bound `max_inflight_lag` (the spill trigger) and the disk bound `max_spill_bytes` (a transaction
+exceeding it halts `:spill_exhausted`). Defaults: `max_spill_bytes` is `16 × max_inflight_lag`; `dir`
+is a `0700` subdir of the OS temp dir.
+
+**Delivery obligation.** A spilled transaction's `changes` is a **single-pass** `Enumerable` valid only
+*during* the `handle_transaction/1` (or `handle_batch/1`) call — iterate it with `Enum`/`Stream` and do
+**not** call `length/1`, `Enum.to_list/1`, or re-iterate it (any of which forces the whole transaction
+back into RAM, defeating spill), and do not retain it past the call. The usual List-backed `changes`
+still works exactly as before; only an oversized spilled transaction delivers the lazy form.
+
+**Operator guidance.** Spill files are ephemeral non-fsync'd scratch (`0600`, value-free on fault),
+deleted on commit/abort/reset/halt and swept per-slot on (re)connect. Replicant does **not** encrypt
+them — if the source rows are sensitive, point `dir` at an encrypted/secure volume; a custom persistent
+`dir` is yours to clean on decommission (the default OS temp dir is cleared by the OS).
+
 ## Development
 
 ```bash
@@ -209,7 +244,9 @@ identifier-validation, and tenant-blind invariants — live in
 **Plan 1 (offline core)**, **Plan 2 (live streaming + exactly-once)**,
 **initial snapshot / backfill (`replicant-snapshot`)**, the
 **lib-owned checkpoint store (`replicant-checkpoint-store`)**, and
-**batched checkpointing (`replicant-batching`)** have all shipped: decode /
+**batched checkpointing (`replicant-batching`)**, **`pgoutput` v2 in-progress-transaction
+streaming (`replicant-streaming`)**, and **consumer-side disk spill for oversized transactions
+(`replicant-streaming-spill`)** have all shipped: decode /
 assemble / validate / redact, plus the `Postgrex.ReplicationConnection` that owns the
 slot with ack-after-checkpoint, slot-invalidation fail-closed halt, the bounded
 in-flight window, a real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0,
@@ -221,12 +258,13 @@ checkpointing that defers the lib-owned checkpoint write + ack to once per batch
 of transactions.
 
 - **Batched checkpointing (lib mode):** add `batch: [max_transactions: N, max_delay_ms: T]` under `:checkpoint_store` to checkpoint once per batch of N transactions (dup ≤ one batch, never loss).
+- **In-progress-transaction streaming (`replicant-streaming`):** opt-in `streaming: [max_concurrent_txns: N]` decodes `pgoutput` v2 Stream frames and reassembles each in-progress transaction in memory, delivering the complete `%Transaction{}` on Stream Commit through the unchanged sink contract.
+- **Consumer-side disk spill (`replicant-streaming-spill`):** add `spill: [dir: …, max_spill_bytes: …]` under `:streaming` so a single transaction larger than `max_inflight_lag` spills to disk and delivers effect-once as a lazy disk-backed `%Transaction.changes` (instead of the §4 fail-closed halt).
 
-The remaining slices are the spec §3 non-goals, each a named future subsystem
+The remaining slice is the last spec §3 non-goal, a named future subsystem
 that composes on this streaming core (the v1 primitive is fail-closed without
 it):
 
-- `pgoutput` proto ≥ 2 in-progress-transaction streaming (`replicant-streaming`), and
 - the Ash / tenancy / classification sink (`ash_replicant`, a sibling library).
 
 ## Credits

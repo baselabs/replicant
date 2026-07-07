@@ -23,7 +23,13 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `(file <<< 32) ||| offset`) and `lsn_to_string/1` (uppercase `"file/offset"`
   hex display, matching Postgres `pg_lsn`).
 - **`Replicant.Transaction`** — an assembled, committed transaction: ordered
-  changes plus the transaction's single `commit_lsn`.
+  changes plus the transaction's single `commit_lsn`. Ordinarily `changes` is a
+  `List`; for an oversized **spilled** streamed transaction (opt-in
+  `streaming: [spill: [dir: …, max_spill_bytes: …]]`) it is a lazy, single-pass,
+  disk-backed `Enumerable` (`Replicant.Spill.Reader`) valid only *during* the
+  `handle_transaction/1` / `handle_batch/1` call — iterate it with `Enum`/`Stream`,
+  never `length/1` / `Enum.to_list/1` (which force the whole transaction back into
+  RAM, defeating spill), and do not retain it past the call.
 - **`Replicant.Change`** — a single row change (`insert`/`update`/`delete`),
   the decoded `record`, and the `unchanged` list of TOASTed columns the source
   UPDATE did not touch (never a value — sinks must leave those columns alone).

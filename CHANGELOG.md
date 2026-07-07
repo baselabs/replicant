@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Consumer-side disk spill for oversized transactions (`replicant-streaming-spill`)
+
+- **Consumer-side disk spill** (opt-in `streaming: [spill: [dir: …, max_spill_bytes: …]]`): a single
+  in-progress streamed transaction **larger than `max_inflight_lag`** reassembles partly on disk and
+  delivers effect-once as a lazy, single-pass, disk-backed `%Transaction{changes: …}` (an
+  `Enumerable.t()`, `Replicant.Spill.Reader`) — instead of hitting the §4 fail-closed halt. Two
+  ceilings: resident RAM `max_inflight_lag` (the spill trigger) and disk `max_spill_bytes`
+  (`:spill_exhausted` halt; default `16 × max_inflight_lag`, `dir` default a `0700` subdir of
+  `System.tmp_dir!()`). The §4 in-flight-lag numerator is now `received − floor − spilled`. A new
+  `Replicant.Spill` module is the sole `File.*` + at-rest boundary (`0700` dir / `0600` per-txn files,
+  length-prefixed frames, per-slot startup sweep, value-free `:spill_io_failed`); spill files are
+  ephemeral non-fsync'd scratch, deleted on commit/abort/reset/halt. **Delivery obligation:** a spilled
+  txn's `changes` is single-pass and valid only during the `handle_transaction/1`/`handle_batch/1` call —
+  iterate it with `Enum`/`Stream` (never `length`/`Enum.to_list`, which would force the whole txn into
+  RAM); do not retain it past the call. Composes with the batch modes (a spilled txn buffered into a
+  sink-owned batch migrates its file to the batch, delivered/deleted at flush). Emits
+  `[:replicant, :stream, :spilled]`. No in-lib encryption — a persistent `dir` is the operator's to
+  place on a secure/encrypted volume and to clean on decommission.
+
 ### Added — Sink-owned atomic batch delivery (`replicant-batch-delivery`)
 
 - **Sink-owned atomic batch delivery** (`batch_delivery:`): an optional `handle_batch/1` sink
