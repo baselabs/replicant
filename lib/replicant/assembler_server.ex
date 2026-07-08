@@ -155,13 +155,12 @@ defmodule Replicant.AssemblerServer do
 
   def handle_cast({:message, message, bytes, from}, state) do
     state = %{state | conn_pid: from}
-    before = state.asm.spilled_total
+
+    # Account the WAL bytes + run the spill trigger (`observe_bytes` → `maybe_spill`): the assembler's
+    # byte-accurate spill trigger is the SOLE resident-RAM guarantee (spec §1). The Connection's §4
+    # backstop is a coarse total-in-flight liveness bound and does NOT mirror spilled bytes, so no
+    # {:spilled_bytes} signal is sent (CV3 closeout — the cross-process mirror was deleted).
     asm = Assembler.observe_bytes(state.asm, bytes)
-    # A spill flushed a stream buffer's tail to disk: signal the Connection so it can extend its
-    # in-flight lag window past the resident-only accounting (spec §5). Value-free — carries only the
-    # cumulative spilled byte count, never a row value. Plain send → the Connection's handle_info,
-    # matching the {:sink_committed, _} dispatch idiom (Task 10 handles it there).
-    if asm.spilled_total != before, do: send(from, {:spilled_bytes, asm.spilled_total})
     dispatch(Assembler.handle_message(asm, message), from, %{state | asm: asm})
   end
 

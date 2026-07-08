@@ -480,7 +480,7 @@ defmodule Replicant.AssemblerServerTest do
     alias Replicant.Decoder.Messages.Relation
     alias Replicant.Decoder.Messages.Relation.Column
 
-    test "the server builds a spill-capable assembler and signals {:spilled_bytes, total} to the connection after a spill" do
+    test "the server builds a spill-capable assembler and spills the largest buffer's tail when resident crosses max_inflight_lag" do
       base = Path.join(System.tmp_dir!(), "srv_spill_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(base) end)
 
@@ -514,14 +514,13 @@ defmodule Replicant.AssemblerServerTest do
               {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}}, 60, self()}
             )
 
-      # The AssemblerServer signals the Connection via a PLAIN send → its handle_info substrate
-      # (the same idiom the existing dispatch/3 uses for {:sink_committed, lsn}). Task 10's
-      # Connection handles {:spilled_bytes, total} in handle_info. So assert the plain message,
-      # NOT a {:"$gen_cast", ...} wrapper.
-      assert_receive {:spilled_bytes, total} when total > 0
+      # The spill trigger is the SOLE resident-RAM guarantee (CV3 — the {:spilled_bytes} cross-process
+      # mirror to the Connection was deleted). :sys.get_state is a synchronous call that drains the
+      # mailbox, so every prior cast is processed: assert the spill actually flushed to disk.
+      assert :sys.get_state(pid).asm.spilled_total > 0
     end
 
-    test "a sub-bound message does NOT signal {:spilled_bytes} (the spilled_total != before guard)" do
+    test "a sub-bound message does NOT spill (resident stays under max_inflight_lag)" do
       base = Path.join(System.tmp_dir!(), "srv_nospill_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(base) end)
 
@@ -544,15 +543,12 @@ defmodule Replicant.AssemblerServerTest do
       GenServer.cast(pid, {:message, rel, 10, self()})
       GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
       # ONE small Insert, 50 bytes — well UNDER max_inflight_lag: 100, so resident_total never
-      # crosses the bound and no spill fires. spilled_total stays 0, so `spilled_total != before`
-      # is false → NO {:spilled_bytes} signal. Guards against a false-positive send.
+      # crosses the bound and no spill fires: spilled_total stays 0 and the buffer stays resident.
       GenServer.cast(
         pid,
         {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}}, 50, self()}
       )
 
-      refute_receive {:spilled_bytes, _}, 100
-      # No spill actually happened (sanity: the buffer stayed resident).
       assert :sys.get_state(pid).asm.spilled_total == 0
     end
 
@@ -586,9 +582,10 @@ defmodule Replicant.AssemblerServerTest do
               {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}}, 60, self()}
             )
 
-      # Force the spill and capture the on-disk file path from xid 100's stream buffer.
-      assert_receive {:spilled_bytes, total} when total > 0
+      # Force the spill and capture the on-disk file path from xid 100's stream buffer. :sys.get_state
+      # drains the mailbox (all casts processed), so the spill has flushed before we read the path.
       state = :sys.get_state(pid)
+      assert state.asm.spilled_total > 0
       spill_path = state.asm.stream_txns[100].spill.path
       assert File.exists?(spill_path)
 
