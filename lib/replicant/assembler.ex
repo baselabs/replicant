@@ -1277,7 +1277,13 @@ defmodule Replicant.Assembler do
 
   defp sink_batch_failed(asm, duration, shape \\ nil) do
     Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{reason: :sink_failed})
-    {:error, %Error{reason: :sink_failed, shape: shape}, asm}
+
+    # Delete the migrated spill files on the fault branch too (CV1): a flush fault halts fail-closed
+    # and the batch re-streams from the durable checkpoint (fresh files) on restart, so the buffered
+    # spill files must not orphan (cleartext row values at rest). Mirrors the {:ok} branch's cleanup
+    # + deliver_now's fault cleanup (dab7f2f); clearing the list keeps a later reset_batch idempotent.
+    Enum.each(asm.batch_spill_paths, &Spill.rm/1)
+    {:error, %Error{reason: :sink_failed, shape: shape}, %{asm | batch_spill_paths: []}}
   end
 
   defp flush_lib_batch(%__MODULE__{pending_lsn: lsn} = asm, reason) do

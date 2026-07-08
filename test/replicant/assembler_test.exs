@@ -1868,6 +1868,11 @@ defmodule Replicant.AssemblerTest do
       end
     end
 
+    defmodule SpillBatchFaultSink do
+      def checkpoint, do: {:ok, nil}
+      def handle_batch(_txns), do: {:error, :boom}
+    end
+
     defp spill_batch_asm(base, sink) do
       alias Replicant.Decoder.Messages.Relation
       alias Replicant.Decoder.Messages.Relation.Column
@@ -1954,6 +1959,34 @@ defmodule Replicant.AssemblerTest do
       assert_received {:bd, 3}
       assert asm.batch_spill_paths == []
       refute File.exists?(path)
+    end
+
+    test "a handle_batch FAULT deletes the migrated spill file too — no cleartext orphan on the fail-closed halt (CV1)",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.StreamCommit
+      {asm, path} = spill_batch_setup(base, SpillBatchFaultSink)
+
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # The spilled txn is buffered; its migrated file is on disk (cleartext row values at rest).
+      assert path in asm.batch_spill_paths
+      assert File.exists?(path)
+
+      # handle_batch faults → flush halts fail-closed. The fault branch MUST delete the migrated
+      # spill file (the batch re-streams from the durable checkpoint on restart — fresh files), else
+      # the cleartext file orphans until the next per-slot startup sweep. Mirrors the {:ok} branch's
+      # cleanup + deliver_now's fault cleanup (dab7f2f).
+      assert {:error, %Replicant.Error{reason: :sink_failed}, asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      refute File.exists?(path)
+      assert asm.batch_spill_paths == []
     end
 
     test "reset_batch (mid-batch reconnect) deletes a migrated spill file — no orphan", %{
