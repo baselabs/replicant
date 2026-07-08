@@ -521,6 +521,64 @@ defmodule Replicant.AssemblerServerTest do
       assert_receive {:spilled_bytes, total} when total > 0
     end
 
+    test "a spilled txn COMMITTING re-casts {:spilled_bytes} with the LOWER total (frees disk bytes; the §4 numerator un-strands after a large spilled txn commits)" do
+      base = Path.join(System.tmp_dir!(), "srv_spdec_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+
+      defmodule ConsumingSink do
+        def checkpoint, do: {:ok, nil}
+
+        def handle_transaction(txn) do
+          # Consume the lazy Reader WITHIN the call (Enum, not Enum.to_list) — delivery contract.
+          Enum.each(txn.changes, fn _ -> :ok end)
+          {:ok, txn.commit_lsn}
+        end
+      end
+
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_spdec",
+          sink: ConsumingSink,
+          streaming: [max_concurrent_txns: 8, spill: [dir: base, max_spill_bytes: 1_000_000]],
+          max_inflight_lag: 100
+        )
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      GenServer.cast(pid, {:message, rel, 10, self()})
+      GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
+
+      for v <- 1..3,
+          do:
+            GenServer.cast(
+              pid,
+              {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}}, 60, self()}
+            )
+
+      GenServer.cast(pid, {:message, %Replicant.Decoder.Messages.StreamStop{}, 4, self()})
+
+      # The spill fires → an INCREASE cast.
+      assert_receive {:spilled_bytes, up} when up > 0
+
+      # The commit delivers the spilled txn and frees its disk bytes → spilled_total drops → a NET
+      # re-cast with the LOWER total (RED before the CV3 fix cast the delta, not the net total —
+      # the numerator would strand stale-high after the commit).
+      GenServer.cast(
+        pid,
+        {:message, %StreamCommit{xid: 100, commit_lsn: 900, end_lsn: 901, commit_timestamp: nil},
+         8, self()}
+      )
+
+      assert_receive {:spilled_bytes, down} when down < up
+      assert :sys.get_state(pid).asm.spilled_total == down
+    end
+
     test "a SINGLE row larger than max_inflight_lag spills — the bound-crossing change is appended BEFORE the spill trigger runs (CV2)" do
       base = Path.join(System.tmp_dir!(), "srv_bigrow_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(base) end)

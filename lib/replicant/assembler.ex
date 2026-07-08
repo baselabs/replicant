@@ -821,8 +821,9 @@ defmodule Replicant.Assembler do
 
         Telemetry.event([:replicant, :stream, :spilled], %{}, %{byte_size: wrote, change_count: 0})
 
-        # Disk ceiling (spec §8): the frame is already on disk; record the breach — the next message
-        # halts on spill_fault (Task 7). Do NOT deliver past the ceiling.
+        # Disk ceiling (spec §8): the frame is already on disk; record the breach on `spill_fault` —
+        # the next StreamCommit halts on it (do_handle_message's spill_fault clause matches
+        # `%StreamCommit{}` only; the halt is DEFERRED to a commit boundary). Do NOT deliver past it.
         if spilled_total > Keyword.fetch!(asm.spill, :max_spill_bytes) do
           # Surface the disk-ceiling breach as the advertised value-free event (spec §11): byte_size is
           # a count, reason is allowlisted (no telemetry.ex change). Lets operators observe exhaustion
