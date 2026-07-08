@@ -29,7 +29,10 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   disk-backed `Enumerable` (`Replicant.Spill.Reader`) valid only *during* the
   `handle_transaction/1` / `handle_batch/1` call — iterate it with `Enum`/`Stream`,
   never `length/1` / `Enum.to_list/1` (which force the whole transaction back into
-  RAM, defeating spill), and do not retain it past the call.
+  RAM, defeating spill), and do not retain it past the call. Spill emits value-free
+  `[:replicant, :stream, :spilled]` (a tail flushed to disk) and, when disk usage
+  would exceed `max_spill_bytes`, `[:replicant, :stream, :spill_exhausted]` before
+  the fail-closed halt — attach to alert operators on exhaustion.
 - **`Replicant.Change`** — a single row change (`insert`/`update`/`delete`),
   the decoded `record`, and the `unchanged` list of TOASTed columns the source
   UPDATE did not touch (never a value — sinks must leave those columns alone).

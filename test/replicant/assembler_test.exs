@@ -1811,8 +1811,18 @@ defmodule Replicant.AssemblerTest do
                })
     end
 
-    test "exceeding max_spill_bytes halts :spill_exhausted", %{base: base} do
+    test "exceeding max_spill_bytes halts :spill_exhausted AND emits the value-free [:stream, :spill_exhausted] event",
+         %{base: base} do
       alias Replicant.Decoder.Messages.{Insert, StreamStart}
+
+      test_pid = self()
+
+      :telemetry.attach(
+        {__MODULE__, :spill_exhausted},
+        [:replicant, :stream, :spill_exhausted],
+        fn _e, _m, meta, _ -> send(test_pid, {:exhausted, meta}) end,
+        nil
+      )
 
       asm =
         %{
@@ -1831,9 +1841,12 @@ defmodule Replicant.AssemblerTest do
       {:ok, asm} =
         Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
 
-      # spills a frame > 50 → :spill_exhausted recorded
+      # spills a frame > 50 → :spill_exhausted recorded AND the advertised event fires (value-free:
+      # byte_size is a count, reason is allowlisted). Deterministic — telemetry is synchronous.
       asm = Assembler.observe_bytes(asm, 60)
       assert %Replicant.Error{reason: :spill_exhausted} = asm.spill_fault
+      assert_received {:exhausted, %{reason: :spill_exhausted, byte_size: bytes}} when bytes > 50
+      :telemetry.detach({__MODULE__, :spill_exhausted})
     end
 
     test "a Reader faulting mid-read (spill file gone) halts :spill_io_failed through deliver_now (NOT :sink_failed), value-free",

@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Enumerable.t()`, `Replicant.Spill.Reader`) — instead of hitting the §4 fail-closed halt. Two
   ceilings: resident RAM `max_inflight_lag` (the spill trigger) and disk `max_spill_bytes`
   (`:spill_exhausted` halt; default `16 × max_inflight_lag`, `dir` default a `0700` subdir of
-  `System.tmp_dir!()`). The §4 in-flight-lag numerator is now `received − floor − spilled`. A new
+  `System.tmp_dir!()`). The §4 in-flight-lag numerator is `received − floor − spilled` (spilled bytes
+  are on disk, not RAM, so a legitimately-spilling txn is not counted toward the RAM halt) compared
+  to `max_inflight_lag + max_spill_bytes` (RAM + disk); resident RAM is bounded by the spill trigger.
+  A new
   `Replicant.Spill` module is the sole `File.*` + at-rest boundary (`0700` dir / `0600` per-txn files,
   length-prefixed frames, per-slot startup sweep, value-free `:spill_io_failed`); spill files are
   ephemeral non-fsync'd scratch, deleted on commit/abort/reset/halt. **Delivery obligation:** a spilled
@@ -23,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   iterate it with `Enum`/`Stream` (never `length`/`Enum.to_list`, which would force the whole txn into
   RAM); do not retain it past the call. Composes with the batch modes (a spilled txn buffered into a
   sink-owned batch migrates its file to the batch, delivered/deleted at flush). Emits
-  `[:replicant, :stream, :spilled]`. No in-lib encryption — a persistent `dir` is the operator's to
+  `[:replicant, :stream, :spilled]` and `[:replicant, :stream, :spill_exhausted]` (both value-free).
+  No in-lib encryption — a persistent `dir` is the operator's to
   place on a secure/encrypted volume and to clean on decommission.
 
 ### Added — Sink-owned atomic batch delivery (`replicant-batch-delivery`)

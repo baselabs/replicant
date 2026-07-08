@@ -118,17 +118,39 @@ defmodule Replicant.StreamingSpillTest do
     end
   end
 
-  test "disk ceiling: a txn exceeding max_spill_bytes halts :spill_exhausted", %{
-    ctrl: ctrl,
-    slot: slot,
-    spill_dir: spill_dir
-  } do
+  test "an oversized never-committing streamed txn halts fail-closed :sink_too_slow (the §4 backstop pre-empts the deferred disk-ceiling halt) and cleans up",
+       %{
+         ctrl: ctrl,
+         slot: slot,
+         spill_dir: spill_dir
+       } do
     if PG16.enabled?() do
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        {__MODULE__, ref, :disc},
+        [:replicant, :connection, :disconnected],
+        fn _e, _m, meta, _ -> send(test_pid, {:disc, ref, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref, :disc}) end)
+
       start_pipeline(slot, spill_dir, max_inflight_lag: 64 * 1024, max_spill_bytes: 128 * 1024)
 
       Postgrex.transaction(ctrl, fn c -> Enum.each(1..40_000, &insert(c, &1)) end,
         timeout: 120_000
       )
+
+      # A single in-progress txn far larger than max_inflight_lag + max_spill_bytes arrives as a
+      # burst: the Connection reads its WAL faster than the assembler spills it, so the §4
+      # in-flight-lag backstop (`received − floor − spilled` > RAM + disk) halts fail-closed FIRST.
+      # The disk-ceiling `:spill_exhausted` halt is DEFERRED to the next StreamCommit — which never
+      # arrives for a never-committing oversized txn — so it cannot fire here; the disk ceiling is
+      # covered deterministically at the unit level. Red-capable on the halt REASON (a wrong-reason
+      # halt would fail this), unlike the prior registry-only assertion.
+      assert_receive {:disc, ^ref, %{reason: :sink_too_slow}}, 20_000
 
       PG16.wait_until(
         fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
