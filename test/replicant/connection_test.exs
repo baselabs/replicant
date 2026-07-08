@@ -589,6 +589,18 @@ defmodule Replicant.ConnectionTest do
       assert new_state.step == :recovery_check
     end
 
+    test "a reconnect resets the spilled_bytes mirror to 0 (never carries a stale-high value)" do
+      # init/1 runs ONCE; RECONNECTS re-enter through handle_connect/1. The assembler zeroes its
+      # spilled_total on reconnect (reset_streams), but the {:spilled_bytes,_} signal only fires on
+      # a CHANGE during message observation — never on reset. So handle_connect MUST re-zero the
+      # Connection's mirror, or a stale-high spilled_bytes over-subtracts the §4 numerator and a
+      # slow-sink reconnect that does not re-spill evades the RAM-bound halt indefinitely.
+      {:query, _sql, new_state} =
+        Connection.handle_connect(state(spilled_bytes: 4242, step: :disconnected))
+
+      assert new_state.spilled_bytes == 0
+    end
+
     test "recovery_check emits [:connection, :connected] with the source kind" do
       :telemetry.attach(
         {__MODULE__, :conn},
@@ -737,6 +749,7 @@ defmodule Replicant.ConnectionTest do
           received_lsn: 0,
           stream_floor_lsn: 0,
           in_stream: false,
+          spilled_bytes: 0,
           max_spill_bytes: 500,
           max_inflight_lag: 100,
           step: :streaming
@@ -745,24 +758,26 @@ defmodule Replicant.ConnectionTest do
       )
     end
 
-    test "the §4 ceiling under spill is max_inflight_lag + max_spill_bytes; the numerator is total in-flight WAL (received − floor), NOT resident-minus-spilled (CV3)" do
-      # Total in-flight 620 > 100 + 500 = 600 → halt. The numerator does NOT subtract spilled bytes:
-      # under spill the resident-RAM guarantee is owned by the assembler spill trigger, and this
-      # backstop bounds the TOTAL un-checkpointed WAL (RAM + disk). Subtracting spilled here would
-      # double-count the disk budget and make the halt vacuous.
-      s = %{sp_state("c2") | received_lsn: 620}
+    test "the halt ceiling is max_inflight_lag + max_spill_bytes (RAM + disk)" do
+      # received-floor 620, spilled 0 → resident lag 620 > 100 + 500 = 600 → halt
+      s = %{sp_state("c2") | received_lsn: 620, spilled_bytes: 0}
       frame = <<?w, 0::64, 620::64, 0::64, "E">>
       assert {:disconnect, :sink_too_slow} = Replicant.Connection.handle_data(frame, s)
     end
 
-    test "a total in-flight WITHIN RAM + disk forwards — spill extends the §4 window past max_inflight_lag" do
-      # received − floor = 550: OVER the RAM bound (100) but UNDER the RAM+disk ceiling (600), so a
-      # legitimately-spilling stream proceeds instead of halting. RED-capable against a ceiling left
-      # at the base max_inflight_lag (550 > 100 would spuriously halt).
+    test "spilled bytes lower the numerator so the SAME frame that halts at spilled=0 forwards when spilled is high" do
+      # WITHOUT the -spilled subtraction, received-floor 620 halts; WITH spilled=550,
+      # 620-550=70 < 600 → no halt (forwards)
       {:ok, _} = Registry.register(Replicant.Registry, {"c2b", :assembler}, nil)
-      s = %{sp_state("c2b") | received_lsn: 550}
-      frame = <<?w, 0::64, 550::64, 0::64, "E">>
-      assert {:noreply, _} = Replicant.Connection.handle_data(frame, s)
+      s = %{sp_state("c2b") | received_lsn: 620, spilled_bytes: 550}
+      frame = <<?w, 0::64, 620::64, 0::64, "E">>
+      refute match?({:disconnect, :sink_too_slow}, Replicant.Connection.handle_data(frame, s))
+    end
+
+    test "a {:spilled_bytes, total} message updates the connection's spilled counter (handled, not swallowed by the catch-all)" do
+      s = sp_state("c3")
+      assert {:noreply, s2} = Replicant.Connection.handle_info({:spilled_bytes, 400}, s)
+      assert s2.spilled_bytes == 400
     end
 
     test "a NON-spill connection (max_spill_bytes: nil) halts at EXACTLY max_inflight_lag (ceiling unchanged)" do

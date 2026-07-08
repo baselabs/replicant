@@ -84,6 +84,7 @@ defmodule Replicant.Connection do
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
+          spilled_bytes: non_neg_integer(),
           max_spill_bytes: non_neg_integer() | nil,
           checkpoint_store: keyword() | nil,
           batch_delivery: keyword() | nil,
@@ -105,6 +106,7 @@ defmodule Replicant.Connection do
     checkpoint_state: :empty,
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
+    spilled_bytes: 0,
     max_spill_bytes: nil,
     checkpoint_store: nil,
     batch_delivery: nil,
@@ -160,6 +162,7 @@ defmodule Replicant.Connection do
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
+       spilled_bytes: 0,
        max_spill_bytes: spill_ceiling(Map.get(config, :streaming)),
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
@@ -198,6 +201,7 @@ defmodule Replicant.Connection do
          store_retry_count: store_retry_count,
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
+         spilled_bytes: 0,
          step: :recovery_check
      }}
   end
@@ -390,6 +394,14 @@ defmodule Replicant.Connection do
     {:noreply, state}
   end
 
+  # The AssemblerServer reports its running spilled-byte total so the §4 numerator can subtract it
+  # (spilled bytes are on disk, not RAM). Coarse: the last value wins; a frame or two of staleness
+  # is acceptable for this guard (spec §9/§10). MUST precede the catch-all below, or the catch-all
+  # swallows it and the spill window never extends.
+  def handle_info({:spilled_bytes, total}, state) when is_integer(total) do
+    {:noreply, %{state | spilled_bytes: total}}
+  end
+
   def handle_info(_other, state), do: {:noreply, state}
 
   # ---- public helpers (unit-tested directly) ----
@@ -542,30 +554,26 @@ defmodule Replicant.Connection do
 
   def reset_retry_count(_count, _success), do: 0
 
-  # In-flight WAL lag (bytes): the received frontier minus the confirmed-durable floor —
-  # the total un-checkpointed WAL span (a liveness/backlog proxy, spec §4), NOT a resident-RAM
-  # measure. Under spill the resident-RAM guarantee is owned by the assembler's byte-accurate
-  # spill trigger (§1, `maybe_spill/1`); this halt is only the coarse total-in-flight backstop,
-  # so its ceiling (`effective_lag_bound/1`) rises to RAM + disk accordingly — it must NOT also
-  # subtract spilled bytes, which would double-count the disk budget and make the backstop
-  # vacuous. The floor is the higher of the durable `checkpoint_lsn` (once a commit advances it
-  # to a real absolute LSN) and the per-stream `stream_floor_lsn` (the position PG began
-  # streaming at, used before the first commit while checkpoint is still 0). A cheap integer
-  # subtraction — safe to call on the keepalive-free hot path.
+  # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor,
+  # LESS the bytes already spilled to disk (§5 — spilled bytes are no longer resident,
+  # so they must not count toward the RAM-bounded numerator). The floor is the higher
+  # of the durable `checkpoint_lsn` (once a commit advances it to a real absolute LSN)
+  # and the per-stream `stream_floor_lsn` (the position PG began streaming at, used
+  # before the first commit while checkpoint is still 0). A cheap integer subtraction —
+  # safe to call on the keepalive-free hot path.
   defp inflight_lag(%{
          received_lsn: received,
          checkpoint_lsn: cp,
-         stream_floor_lsn: floor
+         stream_floor_lsn: floor,
+         spilled_bytes: spilled
        }) do
-    received - max(cp, floor || received)
+    received - max(cp, floor || received) - spilled
   end
 
-  # The §4 halt ceiling for the total-in-flight backlog (`inflight_lag/1`). No spill configured
-  # (`max_spill_bytes: nil`): the base `max_inflight_lag` (unchanged — with no spill, all in-flight
-  # WAL is resident). Spill configured: the total un-checkpointed WAL may legitimately run up to
-  # RAM + disk (resident bounded by `max_inflight_lag` via the spill trigger, PLUS up to
-  # `max_spill_bytes` on disk) before the sink is genuinely too slow, so the backstop rises to the
-  # sum. Resident RAM is bounded independently by the spill trigger, never by this ceiling.
+  # The §4 halt ceiling. No spill configured (`max_spill_bytes: nil`): the base
+  # `max_inflight_lag` (RAM-only bound, unchanged). Spill configured: extend the ceiling
+  # by the disk budget — resident lag may run up to RAM + disk before the sink is
+  # genuinely too slow (the numerator already subtracts the spilled bytes).
   defp effective_lag_bound(%{max_inflight_lag: base, max_spill_bytes: nil}), do: base
   defp effective_lag_bound(%{max_inflight_lag: base, max_spill_bytes: ceil}), do: base + ceil
 

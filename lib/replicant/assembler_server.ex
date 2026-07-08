@@ -159,12 +159,22 @@ defmodule Replicant.AssemblerServer do
     # Append the change (handle_message) BEFORE accounting its WAL bytes + running the spill trigger
     # (observe_bytes → maybe_spill): a change that crosses the RAM bound must be in the buffer when
     # maybe_spill flushes, else it stays resident + unaccounted and a single row > max_inflight_lag
-    # never spills (CV2). Only a non-terminal {:ok, asm} carries a live buffer to account; every
-    # terminal result (commit/skip/buffered/flush/schema/halt) already delivered or deleted its
-    # buffer, so its trivial frame bytes are skipped. The spill trigger is the SOLE resident-RAM
-    # guarantee (spec §1); the Connection's §4 backstop no longer mirrors spilled bytes (CV3).
+    # never spills (CV2). Only a non-terminal {:ok, asm} carries a live buffer to account.
+    #
+    # Then signal the Connection its NET spilled total (up on a fresh spill, DOWN when a spilled txn
+    # commits/aborts and frees disk) so the §4 in-flight-lag numerator can subtract spilled bytes
+    # (spec §5 — they are on disk, not RAM, so a legitimately-spilling txn does not trip the halt).
+    # Casting the NET post-dispatch total (not the observe delta) keeps the numerator from stranding
+    # stale-high after a large spilled txn commits. A plain send → the Connection's handle_info,
+    # matching the {:sink_committed, _} dispatch idiom.
+    before = state.asm.spilled_total
     result = account_after_handle(Assembler.handle_message(state.asm, message), bytes)
-    dispatch(result, from, state)
+    {:noreply, new_state} = disp = dispatch(result, from, state)
+
+    if new_state.asm.spilled_total != before,
+      do: send(from, {:spilled_bytes, new_state.asm.spilled_total})
+
+    disp
   end
 
   # The Connection seeds the lib-mode watermark from its connect-time store read, before streaming.
