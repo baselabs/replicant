@@ -78,8 +78,14 @@ defmodule Replicant.Spill.Reader do
   end
 
   defp decode_frame(bin) do
-    # :safe forbids atom/fun creation from disk bytes; any failure → value-free Spill.Error (no bytes).
-    :erlang.binary_to_term(bin, [:safe])
+    # :safe forbids atom/fun creation from disk bytes. Also validate the frame SHAPE at this at-rest
+    # deserialization boundary: a valid :safe term of the WRONG shape (corruption, or a tampered 0600
+    # file) must fail value-free as :spill_io_failed HERE, not slip through to a misattributed
+    # MatchError in raw_stream's {subxid, _} destructure (→ :sink_failed). Any failure → Spill.Error.
+    case :erlang.binary_to_term(bin, [:safe]) do
+      {subxid, %Replicant.Change{}} = frame when is_integer(subxid) -> frame
+      _ -> raise Spill.Error, reason: :spill_io_failed
+    end
   rescue
     _ -> reraise Spill.Error, [reason: :spill_io_failed], __STACKTRACE__
   end

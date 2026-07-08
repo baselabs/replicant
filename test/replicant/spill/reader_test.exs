@@ -62,6 +62,25 @@ defmodule Replicant.Spill.ReaderTest do
     assert err.reason == :spill_io_failed
   end
 
+  test "a :safe frame of the WRONG shape raises a value-free Spill.Error at the decode boundary (not a downstream MatchError)",
+       %{base: base} do
+    File.mkdir_p!(base)
+    path = Path.join(base, "100.spill")
+
+    # A valid :safe term (no atoms/funs, so binary_to_term SUCCEEDS) but NOT a {int, %Change{}} frame
+    # — e.g. corruption or a tampered 0600 file. It must be rejected at the decode boundary as
+    # :spill_io_failed, not pass through to a misattributed MatchError in raw_stream's {subxid, _} match.
+    bin = :erlang.term_to_binary({1, 2, 3})
+    File.write!(path, <<byte_size(bin)::32, bin::binary>>)
+
+    err =
+      assert_raise Replicant.Spill.Error, fn ->
+        Enum.to_list(Reader.new(path, [], MapSet.new(), 900))
+      end
+
+    assert err.reason == :spill_io_failed
+  end
+
   test "reading a Reader whose file was deleted raises a value-free Spill.Error (fail-loud, spec §8)",
        %{base: base} do
     path = spill_file(base, [{100, change(1)}])
