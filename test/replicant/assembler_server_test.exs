@@ -520,6 +520,45 @@ defmodule Replicant.AssemblerServerTest do
       assert :sys.get_state(pid).asm.spilled_total > 0
     end
 
+    test "a SINGLE row larger than max_inflight_lag spills — the bound-crossing change is appended BEFORE the spill trigger runs (CV2)" do
+      base = Path.join(System.tmp_dir!(), "srv_bigrow_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(base) end)
+
+      {:ok, pid} =
+        AssemblerServer.start_link(
+          slot_name: "srv_bigrow",
+          sink: Replicant.Test.RecordingSink,
+          streaming: [max_concurrent_txns: 8, spill: [dir: base, max_spill_bytes: 1_000_000]],
+          max_inflight_lag: 100
+        )
+
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "int4", flags: [:key], type_modifier: nil}]
+      }
+
+      GenServer.cast(pid, {:message, rel, 10, self()})
+      GenServer.cast(pid, {:message, %StreamStart{xid: 100, first_segment: true}, 4, self()})
+
+      # ONE Insert whose WAL bytes (250) exceed max_inflight_lag (100): the change is itself larger
+      # than the RAM bound, so it MUST spill. That requires the change to already be in the buffer
+      # when the spill trigger (maybe_spill) runs — i.e. handle_message (append) BEFORE observe_bytes.
+      GenServer.cast(
+        pid,
+        {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"x"}}, 250, self()}
+      )
+
+      buf = :sys.get_state(pid).asm.stream_txns[100]
+
+      # RED with observe-before-append: the change isn't in buf.changes when maybe_spill flushes →
+      # wrote 0, spilled_bytes stays 0 and the change stays resident (unaccounted, never spilled).
+      assert buf.spilled_bytes > 0
+      assert buf.changes == []
+    end
+
     test "a sub-bound message does NOT spill (resident stays under max_inflight_lag)" do
       base = Path.join(System.tmp_dir!(), "srv_nospill_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(base) end)

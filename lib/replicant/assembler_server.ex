@@ -156,12 +156,15 @@ defmodule Replicant.AssemblerServer do
   def handle_cast({:message, message, bytes, from}, state) do
     state = %{state | conn_pid: from}
 
-    # Account the WAL bytes + run the spill trigger (`observe_bytes` → `maybe_spill`): the assembler's
-    # byte-accurate spill trigger is the SOLE resident-RAM guarantee (spec §1). The Connection's §4
-    # backstop is a coarse total-in-flight liveness bound and does NOT mirror spilled bytes, so no
-    # {:spilled_bytes} signal is sent (CV3 closeout — the cross-process mirror was deleted).
-    asm = Assembler.observe_bytes(state.asm, bytes)
-    dispatch(Assembler.handle_message(asm, message), from, %{state | asm: asm})
+    # Append the change (handle_message) BEFORE accounting its WAL bytes + running the spill trigger
+    # (observe_bytes → maybe_spill): a change that crosses the RAM bound must be in the buffer when
+    # maybe_spill flushes, else it stays resident + unaccounted and a single row > max_inflight_lag
+    # never spills (CV2). Only a non-terminal {:ok, asm} carries a live buffer to account; every
+    # terminal result (commit/skip/buffered/flush/schema/halt) already delivered or deleted its
+    # buffer, so its trivial frame bytes are skipped. The spill trigger is the SOLE resident-RAM
+    # guarantee (spec §1); the Connection's §4 backstop no longer mirrors spilled bytes (CV3).
+    result = account_after_handle(Assembler.handle_message(state.asm, message), bytes)
+    dispatch(result, from, state)
   end
 
   # The Connection seeds the lib-mode watermark from its connect-time store read, before streaming.
@@ -198,6 +201,12 @@ defmodule Replicant.AssemblerServer do
   def handle_cast({:stream_floor, floor}, %{asm: asm} = state) when is_integer(floor) do
     {:noreply, %{state | asm: Assembler.put_stream_floor(asm, floor)}}
   end
+
+  # Account WAL bytes + run the spill trigger AFTER the change is appended (CV2). Only a non-terminal
+  # {:ok, asm} carries a resident buffer worth accounting; every terminal result already delivered or
+  # deleted its buffer, so its trivial frame bytes are skipped.
+  defp account_after_handle({:ok, asm}, bytes), do: {:ok, Assembler.observe_bytes(asm, bytes)}
+  defp account_after_handle(result, _bytes), do: result
 
   defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}
 
