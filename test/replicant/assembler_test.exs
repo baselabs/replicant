@@ -1669,6 +1669,67 @@ defmodule Replicant.AssemblerTest do
       assert asm.spilled_total == 0
     end
 
+    test "empty-suppression (all spilled subxids aborted) CLOSES the spill device, not just unlinks the file — no FD leak (:emfile guard)",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{
+        Insert,
+        StreamAbort,
+        StreamCommit,
+        StreamStart,
+        StreamStop
+      }
+
+      asm =
+        %{
+          Replicant.Assembler.new(Replicant.Test.RecordingSink,
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120,
+            slot_name: "sp"
+          )
+          | stream_floor: 0
+        }
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # 3 rows ALL under subxid 101, 60 bytes each → 180 > 120 forces a spill (a device opens; the
+      # whole resident tail flushes to disk). Aborting subxid 101 then makes every change (spilled +
+      # resident) aborted, so the StreamCommit routes to empty-suppression (resident == [] and
+      # spilled_live == 0) — the branch that (before the fix) unlinked the file but never closed the
+      # device.
+      asm =
+        Enum.reduce(1..3, asm, fn v, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{xid: 101, relation_id: 1, tuple_data: {"#{v}"}})
+
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamAbort{xid: 100, subxid: 101})
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      handle = asm.stream_txns[100].spill
+      assert handle != nil
+      assert File.exists?(handle.path)
+
+      assert {:skipped, 900, _asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # The device must be CLOSED (Spill.discard), not merely unlinked (Spill.rm): a write to a closed
+      # device errors value-free, proving the FD was released. RED with Spill.rm — the file is unlinked
+      # but the device stays open, so a POSIX write to the still-open (now-unlinked) inode succeeds.
+      change = %Replicant.Change{op: :insert, schema: "public", table: "t", record: %{"v" => 1}}
+
+      assert {:error, %Replicant.Error{reason: :spill_io_failed}} =
+               Replicant.Spill.append(handle, 101, change)
+    end
+
     test "a SPILLED StreamCommit whose sink FAULTS halts AND still deletes the spill file (no orphan on fault-halt, spec §8)",
          %{base: base} do
       alias Replicant.Decoder.Messages.{Insert, StreamCommit, StreamStart, StreamStop}

@@ -527,7 +527,10 @@ defmodule Replicant.Assembler do
     cond do
       resident == [] and spilled_live == 0 ->
         # Empty after aborts (spilled or not) → v1-indistinguishable suppression (parent CV1, spec §7).
-        if buf.spill, do: Spill.rm(buf.spill.path)
+        # Use Spill.discard (close + delete), NOT Spill.rm (delete only): this branch runs BEFORE the
+        # Spill.close below, so buf.spill is a live open device — Spill.rm would unlink the file but
+        # leak the FD (:emfile under repeated spill-then-all-aborted).
+        if buf.spill, do: Spill.discard(buf.spill)
         suppress_empty_stream_commit(asm, lsn)
 
       buf.spill == nil ->
