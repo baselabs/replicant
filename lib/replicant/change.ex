@@ -2,19 +2,19 @@ defmodule Replicant.Change do
   @moduledoc """
   One row change within a `Replicant.Transaction`.
 
-  ## Unchanged TOAST (spec §7)
+  ## Unchanged TOAST
   An UPDATE that does not touch a TOASTed column sends a sentinel, not the value.
   The sentinel is surfaced as a first-class `unchanged: [col]` list — it **never**
   appears in `record`. A sink upserting the row must leave those columns
   untouched. For sinks needing the full row on every UPDATE, document
   `REPLICA IDENTITY FULL` upstream.
 
-  ## Replica identity (spec §7)
+  ## Replica identity
   Under the default identity, a DELETE and an UPDATE's `old_record` carry only
   key columns. `old_record` is key-only unless the table is `REPLICA IDENTITY
   FULL`.
 
-  ## String keys (spec §10)
+  ## String keys
   Column names in `record` / `old_record` are **binaries**, never atoms — a wide
   or attacker-influenced schema must not exhaust the atom table.
   """

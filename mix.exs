@@ -67,11 +67,13 @@ defmodule Replicant.MixProject do
   defp package do
     [
       maintainers: ["rjpalermo"],
-      files: ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md),
+      files:
+        ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md AGENTS.md),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
-        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md",
+        "Documentation" => "https://hexdocs.pm/replicant"
       }
     ]
   end
@@ -86,8 +88,42 @@ defmodule Replicant.MixProject do
         "usage-rules.md",
         "CHANGELOG.md",
         "CONTRIBUTING.md",
+        "AGENTS.md",
         "LICENSE",
         "NOTICE"
+      ],
+      groups_for_extras: [
+        Guides: ["usage-rules.md"],
+        Project: ["CONTRIBUTING.md", "AGENTS.md", "LICENSE", "NOTICE"]
+      ],
+      groups_for_modules: [
+        "Core API": [Replicant, Replicant.Sink, Replicant.Config],
+        "Data structures": [
+          Replicant.Transaction,
+          Replicant.Change,
+          Replicant.SchemaChange,
+          Replicant.Error
+        ],
+        Observability: [Replicant.Telemetry],
+        Runtime: [
+          Replicant.Pipeline,
+          Replicant.Supervisor,
+          Replicant.Connection,
+          Replicant.AssemblerServer,
+          Replicant.Assembler,
+          Replicant.CheckpointStore,
+          Replicant.Snapshotter
+        ],
+        "Disk spill": [Replicant.Spill, Replicant.Spill.Reader, Replicant.Spill.Error],
+        "Decoding (pgoutput)": [
+          Replicant.Decoder,
+          Replicant.Decoder.Messages,
+          Replicant.Decoder.OidDatabase,
+          Replicant.Casting.Types,
+          Replicant.Casting.ArrayParser,
+          Replicant.Identifier,
+          Replicant.QueryBuilder
+        ]
       ]
     ]
   end

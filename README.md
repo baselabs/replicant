@@ -10,11 +10,14 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic) and
 `ash_age`. Multitenancy, classification, and Ash resources live one layer up,
 in a future `ash_replicant` sink adapter.
 
-> **Status:** live streaming has landed. Replicant owns the replication slot
-> via `Postgrex.ReplicationConnection`, acks only after the sink durably
-> commits (ack-after-checkpoint), halts fail-closed on slot invalidation, and
-> is proven by a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
-> See "How it streams" below.
+> **Status:** v1 is complete and production-hardened (v0.1.0). Replicant owns
+> the replication slot via `Postgrex.ReplicationConnection`, acks only after the
+> sink durably commits (ack-after-checkpoint), halts fail-closed on slot
+> invalidation, and is proven by a real-PG16 crash-injection suite
+> (loss = 0, effect-dup = 0). Initial snapshot/backfill, a lib-owned checkpoint
+> store for non-transactional sinks, batched checkpointing, sink-owned atomic
+> batch delivery, in-progress-transaction streaming, and consumer-side disk
+> spill for oversized transactions have all shipped. See "How it streams" below.
 
 ## Highlights
 
@@ -193,7 +196,7 @@ use `checkpoint_store`, and any `handle_transaction/1` implementation is ignored
 Emits `[:replicant, :sink, :batch_committed]` telemetry once per flush.
 
 **Consumer-side disk spill (oversized transactions).** By default a single in-progress streamed
-transaction is bounded by the §4 in-flight window: one larger than `max_inflight_lag` halts
+transaction is bounded by the in-flight window: one larger than `max_inflight_lag` halts
 fail-closed. Opt into **disk spill** to reassemble such a transaction partly on disk and still deliver
 it effect-once:
 
@@ -241,31 +244,20 @@ identifier-validation, and tenant-blind invariants — live in
 
 ## Roadmap
 
-**Plan 1 (offline core)**, **Plan 2 (live streaming + exactly-once)**,
-**initial snapshot / backfill (`replicant-snapshot`)**, the
-**lib-owned checkpoint store (`replicant-checkpoint-store`)**, and
-**batched checkpointing (`replicant-batching`)**, **`pgoutput` v2 in-progress-transaction
-streaming (`replicant-streaming`)**, and **consumer-side disk spill for oversized transactions
-(`replicant-streaming-spill`)** have all shipped: decode /
-assemble / validate / redact, plus the `Postgrex.ReplicationConnection` that owns the
-slot with ack-after-checkpoint, slot-invalidation fail-closed halt, the bounded
-in-flight window, a real-PG16 crash-injection suite proving loss = 0 / effect-dup = 0,
-the `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN backfill that seeds a mirror
-from a populated source gap-free and dup-free, a lib-owned checkpoint mode for
-**non-transactional** sinks (a durable Postgres checkpoint written after persist —
-at-least-once, dup bounded to one transaction, never loss), and opt-in batched
-checkpointing that defers the lib-owned checkpoint write + ack to once per batch
-of transactions.
+The v1 CDC core and every delivery slice have shipped and are closeout-reviewed
+against a real-PG16 crash-injection suite:
 
-- **Batched checkpointing (lib mode):** add `batch: [max_transactions: N, max_delay_ms: T]` under `:checkpoint_store` to checkpoint once per batch of N transactions (dup ≤ one batch, never loss).
-- **In-progress-transaction streaming (`replicant-streaming`):** opt-in `streaming: [max_concurrent_txns: N]` decodes `pgoutput` v2 Stream frames and reassembles each in-progress transaction in memory, delivering the complete `%Transaction{}` on Stream Commit through the unchanged sink contract.
-- **Consumer-side disk spill (`replicant-streaming-spill`):** add `spill: [dir: …, max_spill_bytes: …]` under `:streaming` so a single transaction larger than `max_inflight_lag` spills to disk and delivers effect-once as a lazy disk-backed `%Transaction.changes` (instead of the §4 fail-closed halt).
+- **Offline core** — decode / assemble / validate / redact behind the value-free boundary.
+- **Live streaming + exactly-once** — the `Postgrex.ReplicationConnection` that owns the slot with ack-after-checkpoint, slot-invalidation fail-closed halt, and the bounded in-flight window (loss = 0, effect-dup = 0).
+- **Initial snapshot / backfill** — `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN, gap-free and dup-free.
+- **Lib-owned checkpoint store** — a durable Postgres checkpoint written *after* persist for **non-transactional** sinks (at-least-once, dup bounded to one transaction, never loss), with bounded retry-then-halt on store faults.
+- **Batched checkpointing (lib mode)** and **sink-owned atomic batch delivery** — amortize the checkpoint write / the sink's own commit across a batch of transactions.
+- **In-progress-transaction streaming** (`pgoutput` v2) and **consumer-side disk spill** — reassemble and deliver a transaction larger than memory, effect-once, instead of halting.
 
-The remaining slice is the last spec §3 non-goal, a named future subsystem
-that composes on this streaming core (the v1 primitive is fail-closed without
-it):
+The one remaining piece is a sibling library, not a slice of this core:
 
-- the Ash / tenancy / classification sink (`ash_replicant`, a sibling library).
+- **`ash_replicant`** — the Ash / multitenancy / classification sink adapter, one
+  layer up from this tenant-blind core.
 
 ## Credits
 

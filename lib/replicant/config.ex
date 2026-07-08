@@ -1,7 +1,7 @@
 defmodule Replicant.Config do
   @moduledoc """
   Validates `Replicant.start_link/1` options and enforces the **go-forward-only
-  start guard** (spec §3/§6): a `:state_mirror` sink resuming from an empty
+  start guard**: a `:state_mirror` sink resuming from an empty
   checkpoint without `go_forward_only: true` would silently deliver partial data
   from the slot's creation point, so it is refused at start.
 
@@ -83,9 +83,9 @@ defmodule Replicant.Config do
   `:state_mirror` sink (default kind) with a **definitively empty** checkpoint
   (`{:ok, nil}`) and `go_forward_only: false`. An `:append_log` sink, a non-nil
   checkpoint, `go_forward_only: true`, OR a checkpoint READ fault (raise/exit/
-  `{:error, _}`) all pass — the read-fault path is deliberately fail-open (spec
-  §14.15: a re-dispatched already-persisted txn is deduped by the §6 idempotent
-  sink; only a definitive empty checkpoint proves partial-delivery risk).
+  `{:error, _}`) all pass — the read-fault path is deliberately fail-open (a
+  re-dispatched already-persisted txn is deduped by the idempotent sink; only a
+  definitive empty checkpoint proves partial-delivery risk).
   `snapshot: true` ALSO bypasses the empty-checkpoint refusal (alongside
   `go_forward_only: true`): the backfill IS the safe seed, so an empty checkpoint
   is the expected first-run state, not a partial-delivery risk.

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-08
+
+First public release: the complete v1 zero-loss streaming CDC core plus every
+delivery slice — initial snapshot/backfill, the lib-owned checkpoint store for
+non-transactional sinks, batched checkpointing, sink-owned atomic batch
+delivery, `pgoutput` proto-v2 in-progress-transaction streaming, and
+consumer-side disk spill for oversized transactions — each closeout-reviewed
+against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
+
 ### Added — Consumer-side disk spill for oversized transactions (`replicant-streaming-spill`)
 
 - **Consumer-side disk spill** (opt-in `streaming: [spill: [dir: …, max_spill_bytes: …]]`): a single
@@ -123,7 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`commit_lsn <= checkpoint`), additive/destructive schema-change classification
   with fail-closed halt, and synchronous per-transaction sink apply.
 - Data contract structs: `Replicant.Transaction`, `Replicant.Change` (+ `Change.Column`),
-  `Replicant.SchemaChange`; the LSN facade (`Replicant.lsn/0` uint64, `lsn_to_string/1`).
+  `Replicant.SchemaChange`; the LSN facade (`t:Replicant.lsn/0` uint64, `lsn_to_string/1`).
 - `Replicant.Sink` behaviour with `@optional_callbacks` (a minimal sink compiles clean).
 - Identifier allowlist (`Replicant.Identifier`) + validated slot/publication SQL builder
   (`Replicant.QueryBuilder`), hardening walex's raw interpolation against injection
@@ -166,7 +175,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Replicant.AssemblerServer` — a serial process that applies the sink synchronously
   off the keepalive path; halts fail-closed on a destructive schema change or a sink
   write fault. `Replicant.Pipeline` (`:one_for_all`) + `Replicant.Supervisor`
-  (`DynamicSupervisor`) + `Replicant.Application` + `Replicant.Registry`.
+  (`DynamicSupervisor`) + the OTP `Application` callback + a named `Registry`.
 - **Go-forward-only start guard** (`Replicant.Config`) — refuses a `:state_mirror`
   sink resuming from an empty checkpoint without `go_forward_only: true`.
 - **Bounded in-flight window + fail-closed "sink cannot keep up" lag-halt** (spec §4) —
@@ -206,3 +215,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sink write-fault recovery contract clarified** — a sink write fault is a
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
+
+[Unreleased]: https://github.com/baselabs/replicant/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/baselabs/replicant/releases/tag/v0.1.0

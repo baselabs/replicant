@@ -21,7 +21,7 @@ defmodule Replicant.QueryBuilder do
   @doc """
   Replication command that starts streaming WAL from `start_lsn` for the publication.
 
-  `opts[:start_lsn]` is a `Replicant.lsn/0` (`non_neg_integer`, default `0`). A
+  `opts[:start_lsn]` is a `t:Replicant.lsn/0` (`non_neg_integer`, default `0`). A
   non-integer or negative value raises (caller contract, not attacker input) —
   pass the uint64 WAL position from `checkpoint/0`.
 
@@ -137,7 +137,7 @@ defmodule Replicant.QueryBuilder do
 
   @doc """
   DDL creating the lib-owned checkpoint table if absent. `slot_name` is the PK, one
-  row per slot; `commit_lsn` is a `bigint` (the `Replicant.lsn/0` integer — no
+  row per slot; `commit_lsn` is a `bigint` (the `t:Replicant.lsn/0` integer — no
   `pg_lsn` text parse at the boundary). The table name is a validated identifier;
   `IF NOT EXISTS` is a name check only, so the caller MUST also shape-probe (see
   `checkpoint_column_probe/0`).
