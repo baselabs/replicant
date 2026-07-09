@@ -1,36 +1,39 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-07-08 · **Core HEAD:** `489c6b1` · **Branch:** `main`
+**Updated:** 2026-07-09 · **Core HEAD:** `6fe9d3c` · **Branch:** `main`
 
-Living tracker for what remains after the v1 zero-loss streaming core. The
-prose summary in [`README.md`](../README.md#roadmap) mirrors this; this file is
-the detailed source. Ranked by **value only** — build order follows what
-unlocks the most, never what is cheapest.
+> **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
+> written, so the historical commit SHAs cited in the slice rows below (e.g.
+> `489c6b1`, `6387e35`, `a6467af`, `2699e72`) **no longer resolve** to commits in
+> this repo. They are retained as a historical record of the lifecycle narrative,
+> not as addressable refs. The only authoritative current ref is the header HEAD
+> above. Test counts in the historical rows are likewise pre-rewrite and not
+> comparable to the current suite (350 unit / 38 integration at `6fe9d3c`).
 
-## Sequencing (user directive, 2026-07-05)
+## Status — both libraries PUBLISHED (2026-07-09)
 
-**One in-build project at a time.** `ash_replicant` (a separate standalone lib)
-does **not** start until `replicant` is **completed in full and published**.
-Everything below is replicant-internal until that gate clears.
+**The entire sequencing plan below is DONE.** All six §3 functional slices shipped
+and closed-out, `replicant` is published to Hex, and the downstream `ash_replicant`
+sink is built and published too:
 
-**Resolved (2026-07-05):** "completed in full" = build the remaining §3
-functional slices, THEN publish `replicant` to Hex, THEN start `ash_replicant`.
-Value-ranked build order: **(1) checkpoint-store → (2) batching → (3) proto≥2
-streaming.** checkpoint-store leads on value (unlocks a new sink class:
-non-transactional targets like files / external APIs) and on sequencing (it
-defines the full checkpoint model that batching's checkpoint-granularity change
-builds on). `ash_replicant`, a transactional Ash sink, needs none of the three —
-it is gated purely by the publish milestone, not by these slices. **Active:
-checkpoint-store CLOSEOUT-REVIEWED + RESOLVED 2026-07-05 (`/review-autopilot --fix`, HEAD `2d23832`) —
-graded 89/100, **→ 100 on the user ruling** for the sole design-decision (F3: spec §4/§8
-"halt fail-closed" on persistent store outage vs the shipped unpaced disconnect-retry; loss=0
-holds either way). 6 findings FIXED with proven-red-capable tests — 1 blocking (store-outage
-`DBConnection.ConnectionError` crashed the store GenServer), 1 should-fix (store call-exit
-crashed the Connection), 3 note, 1 advisory (DELETE op-class coverage); +5 tests → gate battery
-ALL-PASS 231/0, dialyzer 0. **F3 RESOLVED (user ruled 2026-07-05): pull §14.18 forward — the
-unpaced-retry interim is now RESOLVED by `replicant-store-fault-retry` (§14.18
-bounded-retry-then-halt, **shipped 2026-07-05**: transient blip self-heals within N,
-persistent outage retries N then HALTS + alerts).** **`replicant-batching` ✅ SHIPPED + CLOSED-OUT 2026-07-06 (exec-autopilot 5/5 then /review-autopilot --fix → 100/100 grader-verified). Both closeout design-decisions user-ratified + implemented: (1) LSN-span cap base → `max(lib_checkpoint, stream_floor)` (floor-corrected, spec §15 amendment; fixes fresh-slot cold-start); (2) batch discarded on mid-stream reconnect (spec §15 new §9 invariant). Cross-vendor Codex caught 2 uniques. Lib-mode batched-checkpointing only; sink-owned → `replicant-batch-delivery` ✅ executed 2026-07-06 (row 2b). [design](superpowers/specs/2026-07-05-replicant-batching-design.md).**
+- **`replicant` 0.1.0 — LIVE on public Hex** (published 2026-07-08). Every packaged
+  file at HEAD `6fe9d3c` is byte-identical to the published tarball; gate battery
+  green (compile -Werror, format, credo 911/0, dialyzer 0, hex.audit/deps.audit
+  clean, **unit 350/0 + integration 38/0** on live PG16).
+- **`ash_replicant` 0.2.0 — LIVE on Hex** (published 2026-07-09, tagged `v0.2.0`, repo
+  `/Users/rp/Developer/Base/ash_replicant`). The Ash/multitenancy/classification sink
+  adapter; consumes `{:replicant, "~> 0.1.0"}` from Hex; closed out 100/100, gate-green
+  (87 tests/0, dialyzer 0, credo 209/0). No longer "deferred" or a "skeleton".
+
+## Sequencing (user directive, 2026-07-05) — ✅ FULLY EXECUTED
+
+Historical record of the build order, now complete. **"One in-build project at a
+time":** `ash_replicant` was gated until `replicant` was "completed in full and
+published" = build the remaining §3 slices → publish `replicant` to Hex → start
+`ash_replicant`. Value-ranked order **(1) checkpoint-store → (2) batching → (3)
+proto≥2 streaming** was executed in full; each slice was closeout-reviewed
+(`/review-autopilot --fix`) to 100/100. With `replicant` 0.1.0 on Hex the gate
+cleared, and `ash_replicant` has since shipped through to its own 0.2.0 release.
 
 ## Shipped — v1 streaming core (fail-closed, reviewed, green)
 
@@ -40,17 +43,19 @@ persistent outage retries N then HALTS + alerts).** **`replicant-batching` ✅ S
 | Plan 2 — live streaming + exactly-once | `Connection` owns the slot, ack-after-checkpoint, slot-invalidation fail-closed halt, `AssemblerServer`, per-pipeline supervision, §4 bounded in-flight window, real-PG16 crash-injection (loss=0, effect-dup=0) | 89→100 |
 | replicant-snapshot — initial backfill | `snapshot: true`: `EXPORT_SNAPSHOT` → `COPY` at `consistent_point` → hand off at snapshot LSN, gap-free/dup-free; `handle_snapshot/2` + `handle_snapshot_complete/1`; mid-COPY crash halts `:snapshot_incomplete` | 100/100 |
 
-Test evidence (HEAD): unit 184/0, integration 197/0 (`2699e72`, one commit
-back; HEAD is a test-only de-flake), dialyzer 0.
+Test evidence at that milestone (pre-history-rewrite figures): unit 184/0,
+integration 197/0, dialyzer 0. **Current full suite at HEAD `6fe9d3c`: unit
+350/0 + integration 38/0, dialyzer 0** (see the Status section above).
 
-## Remaining — spec §3 non-goals, each a named future slice
+## Delivered — the spec §3 slices (all shipped + closed-out)
 
-The v1 primitive is **fail-closed without any of these** — absence refuses
-partial delivery rather than doing it silently.
+Each was a named slice the v1 primitive was **fail-closed without** — absence
+refused partial delivery rather than doing it silently. **All are now shipped,
+closeout-reviewed to 100/100, and in the published `replicant` 0.1.0.**
 
 | # | Slice | Unlocks | Depends on | Status |
 |---|---|---|---|---|
-| — | **`ash_replicant`** (standalone lib) | The first-class consumer: an Ash/Postgres sink adapter carrying multitenancy + classification, one layer up from the tenant-blind core. This is what turns the primitive into a usable product. | `replicant` published (gate) | **Deferred until `replicant` is published** (one in-build project at a time). Highest intrinsic value, sequenced last by directive. New repo at `/Users/rp/Developer/Base/ash_replicant` (bare skeleton). Sibling to `arcadic`→`ash_arcadic`. |
+| — | **`ash_replicant`** (standalone lib) | The first-class consumer: an Ash/Postgres sink adapter carrying multitenancy + classification, one layer up from the tenant-blind core. This is what turns the primitive into a usable product. | `replicant` published (gate cleared) | ✅ **BUILT + PUBLISHED — 0.2.0 on Hex** (2026-07-09, tagged `v0.2.0`; repo `/Users/rp/Developer/Base/ash_replicant`, HEAD `7b034e3`). Consumes `{:replicant, "~> 0.1.0"}` from Hex; closed out 100/100 (87 tests/0, dialyzer 0, credo 209/0). Sibling to `arcadic`→`ash_arcadic`. |
 | 1 | `replicant-checkpoint-store` | Non-transactional sinks (files, external APIs): a lib-owned checkpoint table with a mandatory checkpoint-**after**-persist write order (dup, never loss). | Core (shipped) | ✅ Shipped + closeout-ready 2026-07-05 (13/13 tasks, exec-autopilot) · `/review-autopilot --fix` HEAD `2d23832`: graded **89/100 → 100** on user ruling for the sole design-decision; 6 findings fixed, gate battery ALL-PASS 231/0 dialyzer 0. **F3 RESOLVED** (2026-07-05: build §14.18 next — spawns slice 1b). [design](superpowers/specs/2026-07-05-replicant-checkpoint-store-design.md) · [plan](superpowers/plans/2026-07-05-replicant-checkpoint-store.md) · [review](superpowers/reviews/2026-07-05-replicant-checkpoint-store-lens-reports.md) |
 | 1b | `replicant-store-fault-retry` (§14.18) | Bounded-retry-then-halt on a checkpoint-store fault: a transient blip self-heals within N; a persistent outage retries N times then **HALTS + alerts the operator** (replaces the current UNPACED connect-retry interim + the immediate mid-stream write halt). Closes checkpoint-store closeout F3. | `replicant-checkpoint-store` (shipped) | ✅ **Shipped 2026-07-05** (exec-autopilot; 7/7 tasks, per-task two-stage opus review; unit **224/0**, integration **25/0**, dialyzer 0, credo/format clean; 0 tier escalations, 3 test-hardening review-fix rounds T1/T5/T6). Closeout `/review-autopilot` pending. Design adversarially reviewed (9 challenges 8-acc/1-refuted); plan machine-gated + independently reviewed (5/5 fixed). [design](superpowers/specs/2026-07-05-replicant-store-fault-retry-design.md) · [plan](superpowers/plans/2026-07-05-replicant-store-fault-retry.md) |
 | 2 | `replicant-batching` | Throughput: batched **checkpointing** for lib mode — defer the lib-owned checkpoint write + slot ack to once per batch of N txns (sink delivery stays per-txn). Amortizes the synchronous serial store round-trip. Per-transaction checkpointing is the correctness baseline it optimizes. | Core + checkpoint-store + store-fault-retry (shipped) | ✅ **Shipped + closed-out 2026-07-06** (exec-autopilot 5 tasks 2 opus/3 sonnet, 0 tier escalations/0 review-fix rounds → `/review-autopilot --fix` **100/100 grader-verified**; post-fix HEAD `7bfa193`, unit **249/0** + integration **28/0**, dialyzer 0, credo **677/0**, format/compile clean). Commits: config `c22f03e`, assembler/server `2ef4d7d`, pipeline `3c4734b`, integration `ce9bf25`, docs `904d153`; closeout fixes `113a2a4`/`65040f3`/`7a9812f`/`c6c1c48`/`85672f1`/`7bfa193`. Both closeout design-decisions user-ratified + implemented (spec §15 amendments): LSN-span base → `max(lib_checkpoint, stream_floor)`; batch discarded on mid-stream reconnect. Cross-vendor Codex: 2 uniques (reconnect-stale-batch, value-free-leak). Opt-in `checkpoint_store: [batch: [max_transactions: 100, max_delay_ms: 1000]]` + auto LSN-span lag-cap (`max_inflight_lag/4`); dup bound widens to one batch (crash + graceful stop + mid-stream reconnect), loss=0 unconditional. Sink-owned batching → `replicant-batch-delivery` ✅ executed 2026-07-06 (row 2b). [design](superpowers/specs/2026-07-05-replicant-batching-design.md) · [plan](superpowers/plans/2026-07-05-replicant-batching.md) · [review](superpowers/reviews/2026-07-06-replicant-batching-lens-reports.md) |
@@ -59,17 +64,19 @@ partial delivery rather than doing it silently.
 | 3-spill | `replicant-streaming-spill` | Consumer-side disk spill so a single transaction **larger than memory** streams through without halting — the "unbounded single-txn size" capability. Carved from row 3 (its first-disk-I/O + PII-at-rest + OTP-lifetime risk surface earns its own review); row 3 is fail-closed without it (a too-large streamed txn halts, as under v1). | `replicant-streaming` | ✅ **Executed 2026-07-07** (exec-autopilot 12 tasks [9 opus / 3 sonnet] — 5 review-fix rounds, 0 tier escalations; unit **383/0** + integration **38/0** live PG16, dialyzer 0, credo 903/0, format/compile clean; range `9d9821e..473cef9`; gate-log `20260707-042549-spill-full-sweep-473cef984a`). Designed via brainstorm-autopilot Stage-6 fresh-context adversarial review (9 challenges / **4 blocking reworked**). **Delivery contract user-ratified — a >RAM txn delivers as a lazy disk-backed `%Transaction.changes` (`Enumerable.t()`); the parent's event-based "incremental streaming sink contract" non-goal is OBVIATED (not deferred) — lazy whole-`Transaction` changes gives the same memory capability while preserving atomicity.** Two ceilings: resident RAM `max_inflight_lag` (spill trigger) + disk `max_spill_bytes` (`:spill_exhausted` halt); §4 numerator now `received − floor − spilled` (the change the parent deferred here). One `Replicant.Spill` module = the sole `File.*` + at-rest boundary (0700 dir / 0600 files, global startup sweep, value-free `:spill_io_failed`); ephemeral non-fsync'd scratch (write-once-read-once-within-one-lifetime); no in-lib encryption (key-mgmt ownership, NOT Rule 5 — a clean future). **Plan-autopilot: 12 tasks (9 opus / 3 sonnet), machine-gated (plan-verify 0/0) + fresh-context reviewed (7 findings / 7 fixed — 2 blocking: `Error.reason()` enum gap → dialyzer fail; lib+batch spilled-file happy-path leak).** **Exec DONE — oversized-txn spill effect-once (dup=0) marquee GREEN on live PG16 (append-only ledger, `[:stream,:spilled]` probe fired), no stale spill files, both ceilings halt (`:spill_exhausted` disk + §4 RAM). The crash-injection marquee CAUGHT A REAL §8 BUG — a per-txn spilled delivery orphaned its spill file on a sink-fault halt (`deliver_now` deleted only on `{:ok}`) → fixed `dab7f2f`; a live-probe quality review also caught a §4-halt evasion (stale `spilled_bytes` mirror survived reconnect via `handle_connect`, `init/1` runs once) → fixed in `191284f`.** **CLOSED-OUT 2026-07-08 via `/review-autopilot --fix` (fresh-account resume): all 6 findings FIXED (TDD red→green), post-fix HEAD `489c6b1`; full battery GREEN (gate-log `20260708-064419-spill-closeout-fix2`, nonce `c40733be685617fe`): unit 387/0 + integration 38/0 live PG16, dialyzer 0, credo/format/compile clean. Fixes: CV1 `sink_batch_failed` deletes migrated spill files on the FAULT branch — no cleartext orphan (`9e57f11`); empty-suppression closes the spill FD via `Spill.discard` (not `Spill.rm`) — no `:emfile` leak (`97edc74`); CV2 append-before-account reorder so a single row > `max_inflight_lag` spills, `{:spilled_bytes}` cast now sends the NET post-dispatch total (`3ad3cbc`); `decode_frame` validates the frame shape at the at-rest boundary → value-free `:spill_io_failed` (`5561b23`); `:spill_exhausted` telemetry emitted at the disk-ceiling breach (`489c6b1`). **CV3 (§4 ceiling — this spec's own contradiction) resolved via Option A: the CODE is correct (`received−floor−spilled` vs the SUM `max_inflight_lag+max_spill_bytes`); §1/§4/§8 text wrongly said `max_inflight_lag` and was amended. A "Design 2" attempt to CHANGE the code (drop `−spilled`) was CAUGHT by the live disk-ceiling marquee (it made §4 pre-empt the disk ceiling → `:spill_exhausted` unreachable) and reverted — the `−spilled` numerator is LOAD-BEARING (adaptive: routes oversized single txns to the disk ceiling, non-spilling backlogs to §4).** Also de-vacuumed the "disk ceiling" marquee (it always halted via §4 `:sink_too_slow` — the disk-ceiling halt is deferred to `StreamCommit`, which a never-committing oversized txn never reaches — now asserts the real reason). See [[replicant-streaming-spill-slice]], [[replicant-fault-path-resource-cleanup]]. Spec closeout amendment added. [design](superpowers/specs/2026-07-06-replicant-streaming-spill-design.md) · [plan](superpowers/plans/2026-07-06-replicant-streaming-spill.md) · [review](superpowers/reviews/2026-07-07-streaming-spill-lens-reports.md) |
 | — | Multi-sink fan-out per slot | Deliberate non-goal, no slice: one slot = one sink = one checkpoint keeps the watermark tractable. Compose a dispatching sink or run multiple slots. | — | Won't build |
 
-## Why `ash_replicant` is #1 (value-only ranking)
+## Why `ash_replicant` was the #1 value item (retrospective)
+
+Value-ranking rationale, retained now that it has shipped as 0.2.0:
 
 - **It is the reason the core exists.** README states it outright: replicant is
   "the reliable CDC consumer sibling to `arcadic`," with multitenancy,
-  classification, and Ash resources living "one layer up, in a future
-  `ash_replicant` sink adapter." Until it exists, the core has no first-class
-  consumer.
-- **The other three optimize a primitive that already works.** Checkpoint-store,
-  batching, and proto-v2 each add value only under a specific pressure
-  (non-transactional sinks / throughput / unbounded single-txn size). None
-  delivers new end-user capability the way the consumer layer does.
-- **Building the real consumer first de-risks the rest.** It exercises the Sink
-  contract end-to-end and reveals whether checkpoint-store / batching are
-  actually needed, rather than building them speculatively.
+  classification, and Ash resources living "one layer up, in the
+  `ash_replicant` sink adapter." Without it the core had no first-class
+  consumer — `ash_replicant` 0.2.0 is now that consumer.
+- **The other slices optimized a primitive that already worked.** Checkpoint-store,
+  batching, and proto-v2 each added value only under a specific pressure
+  (non-transactional sinks / throughput / unbounded single-txn size); none
+  delivered new end-user capability the way the consumer layer does.
+- **Sequencing note.** Despite the #1 value ranking, the user directive built the
+  §3 slices *first* (one in-build project at a time) and gated `ash_replicant` on
+  the `replicant` publish — which is how it actually shipped.

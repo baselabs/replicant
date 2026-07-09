@@ -254,10 +254,11 @@ against a real-PG16 crash-injection suite:
 - **Batched checkpointing (lib mode)** and **sink-owned atomic batch delivery** — amortize the checkpoint write / the sink's own commit across a batch of transactions.
 - **In-progress-transaction streaming** (`pgoutput` v2) and **consumer-side disk spill** — reassemble and deliver a transaction larger than memory, effect-once, instead of halting.
 
-The one remaining piece is a sibling library, not a slice of this core:
+The sibling consumer library has also shipped, one layer up from this core:
 
-- **`ash_replicant`** — the Ash / multitenancy / classification sink adapter, one
-  layer up from this tenant-blind core.
+- **[`ash_replicant`](https://github.com/baselabs/ash_replicant)** — the Ash /
+  multitenancy / classification sink adapter (published `v0.2.0`), built on this
+  tenant-blind core via `{:replicant, "~> 0.1.0"}`.
 
 ## Credits
 
