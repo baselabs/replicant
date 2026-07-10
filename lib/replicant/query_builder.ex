@@ -188,4 +188,104 @@ defmodule Replicant.QueryBuilder do
   # boolean predicate — it builds a SQL string), so it is exempt from the `?` rule.
   # credo:disable-for-next-line Credo.Check.Readability.PredicateFunctionNames
   def is_in_recovery, do: "SELECT pg_is_in_recovery();"
+
+  @doc """
+  Query returning, per publication table, its ordered PRIMARY KEY columns — BOTH the
+  raw `attname` (to read `%Change{}.record` string keys) and the server-quoted form
+  via `quote_ident` (the ONLY form ever interpolated into keyset SQL — spec §6.6,
+  Critical Rule 2; the `format('%I')` precedent). Publication name is bound `$1`.
+  A publication table with NO primary key returns no row here (PK-less fallback,
+  spec §6.4). Row shape: `[schemaname, tablename, qualified, pk_raw, pk_quoted, pk_type_oids]`.
+  """
+  @spec pk_columns() :: String.t()
+  def pk_columns do
+    "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
+      "array_agg(a.attname ORDER BY k.ord) AS pk_raw, " <>
+      "array_agg(quote_ident(a.attname) ORDER BY k.ord) AS pk_quoted, " <>
+      "array_agg(a.atttypid::int ORDER BY k.ord) AS pk_type_oids " <>
+      "FROM pg_publication_tables p " <>
+      "JOIN pg_class c ON c.relname = p.tablename " <>
+      "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
+      "JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary " <>
+      "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true " <>
+      "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum " <>
+      "WHERE p.pubname = $1 " <>
+      "GROUP BY p.schemaname, p.tablename"
+  end
+
+  @doc """
+  Keyset chunk SELECT (spec §6.6). `qualified` and `pk_quoted` come from `pk_columns/0`
+  (server-quoted — never validated client-side, never raw). `bound_arity` is the number
+  of PK columns in the resume bound: `0` emits the first-chunk form (no WHERE);
+  `n > 0` emits a ROW() comparison whose bounds are BIND PARAMETERS `$2..$n+1`
+  (`$1` is the LIMIT) — a literal bound would be simultaneously an injection surface
+  and a Rule-1 leak into logged SQL text. An empty PK list is a caller error.
+  """
+  @spec keyset_chunk(String.t(), [String.t()], non_neg_integer()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def keyset_chunk(_qualified, [], _bound_arity), do: {:error, :invalid_identifier}
+
+  def keyset_chunk(qualified, pk_quoted, 0) do
+    {:ok,
+     "SELECT *#{rpk_select(pk_quoted)} FROM #{qualified} " <>
+       "ORDER BY #{Enum.join(pk_quoted, ", ")} LIMIT $1"}
+  end
+
+  def keyset_chunk(qualified, pk_quoted, bound_arity) when bound_arity == length(pk_quoted) do
+    params = Enum.map_join(2..(bound_arity + 1), ", ", &"$#{&1}")
+
+    {:ok,
+     "SELECT *#{rpk_select(pk_quoted)} FROM #{qualified} " <>
+       "WHERE (#{Enum.join(pk_quoted, ", ")}) > (#{params}) " <>
+       "ORDER BY #{Enum.join(pk_quoted, ", ")} LIMIT $1"}
+  end
+
+  # Trailing pg-canonical TEXT projections of the PK columns ("__rpk_1"…): the reader
+  # strips them from the record and casts them through the SAME Casting.Types path the
+  # stream uses — one canonical PK representation on both drop-set sides (plan review F1;
+  # a native-vs-cast term mismatch would make the drop-filter vacuous for uuid/timestamp
+  # PKs and silently break spec §2 convergence).
+  defp rpk_select(pk_quoted) do
+    pk_quoted
+    |> Enum.with_index(1)
+    |> Enum.map_join("", fn {col, i} -> ", #{col}::text AS __rpk_#{i}" end)
+  end
+
+  @doc """
+  Read-only watermark position (spec §2/§4): `pg_current_wal_lsn()` on a primary,
+  `pg_last_wal_replay_lsn()` on a standby (the chunk reader connects to the same host
+  as the replication connection, so its snapshot visibility is bounded by replay).
+  """
+  @spec watermark_lsn(boolean()) :: String.t()
+  def watermark_lsn(true), do: "SELECT pg_last_wal_replay_lsn()::text;"
+  def watermark_lsn(false), do: "SELECT pg_current_wal_lsn()::text;"
+
+  @doc "DDL creating the lib-owned snapshot-progress table if absent (token is an opaque bytea; spec §6.2)."
+  @spec progress_ensure_table(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def progress_ensure_table(table) do
+    with :ok <- Identifier.validate(table) do
+      {:ok,
+       "CREATE TABLE IF NOT EXISTS #{table} " <>
+         "(slot_name text PRIMARY KEY, token bytea NOT NULL, " <>
+         "updated_at timestamptz NOT NULL DEFAULT now())"}
+    end
+  end
+
+  @doc "Query reading the progress token for a slot. `slot_name` bound `$1`; only the validated table is interpolated."
+  @spec progress_read(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def progress_read(table) do
+    with :ok <- Identifier.validate(table) do
+      {:ok, "SELECT token FROM #{table} WHERE slot_name = $1"}
+    end
+  end
+
+  @doc "Upsert of the progress token for a slot. `slot_name`/`token` bound `$1`/`$2`."
+  @spec progress_upsert(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def progress_upsert(table) do
+    with :ok <- Identifier.validate(table) do
+      {:ok,
+       "INSERT INTO #{table} (slot_name, token, updated_at) VALUES ($1, $2, now()) " <>
+         "ON CONFLICT (slot_name) DO UPDATE SET token = EXCLUDED.token, updated_at = now()"}
+    end
+  end
 end

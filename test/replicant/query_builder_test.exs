@@ -158,4 +158,74 @@ defmodule Replicant.QueryBuilderTest do
       assert sql =~ "column_name = 'commit_lsn'"
     end
   end
+
+  describe "pk_columns/0" do
+    test "discovers ordered PK columns with server-quoted names, keyed by qualified table" do
+      sql = QueryBuilder.pk_columns()
+      assert sql =~ "pg_index"
+      assert sql =~ "indisprimary"
+      assert sql =~ "WITH ORDINALITY"
+      assert sql =~ "quote_ident(a.attname)"
+      assert sql =~ "atttypid"
+      # joins against pg_publication_tables by the bound publication name
+      assert sql =~ "pg_publication_tables"
+      assert sql =~ "pubname = $1"
+    end
+  end
+
+  describe "keyset_chunk/3" do
+    test "first chunk (no bound): ordered LIMIT-parameterized scan" do
+      {:ok, sql} =
+        QueryBuilder.keyset_chunk(~s(public."Orders"), [~s("id"), ~s("region")], 0)
+
+      assert sql ==
+               ~s(SELECT *, "id"::text AS __rpk_1, "region"::text AS __rpk_2 ) <>
+                 ~s(FROM public."Orders" ) <>
+                 ~s(ORDER BY "id", "region" LIMIT $1)
+    end
+
+    test "subsequent chunk: ROW() comparison with BOUND parameters, never literals" do
+      {:ok, sql} =
+        QueryBuilder.keyset_chunk(~s(public."Orders"), [~s("id"), ~s("region")], 2)
+
+      assert sql ==
+               ~s(SELECT *, "id"::text AS __rpk_1, "region"::text AS __rpk_2 ) <>
+                 ~s(FROM public."Orders" ) <>
+                 ~s{WHERE ("id", "region") > ($2, $3) } <>
+                 ~s(ORDER BY "id", "region" LIMIT $1)
+
+      refute sql =~ "ROW(1"
+    end
+
+    test "rejects an empty pk list" do
+      assert {:error, :invalid_identifier} = QueryBuilder.keyset_chunk("public.t", [], 0)
+    end
+  end
+
+  describe "watermark_lsn/1" do
+    test "primary uses pg_current_wal_lsn, standby uses pg_last_wal_replay_lsn" do
+      assert QueryBuilder.watermark_lsn(false) == "SELECT pg_current_wal_lsn()::text;"
+      assert QueryBuilder.watermark_lsn(true) == "SELECT pg_last_wal_replay_lsn()::text;"
+    end
+  end
+
+  describe "snapshot progress table builders" do
+    test "ensure/read/upsert follow the checkpoint-table shape with a bytea token" do
+      assert {:ok, ddl} = QueryBuilder.progress_ensure_table("replicant_snapshot_progress")
+      assert ddl =~ "CREATE TABLE IF NOT EXISTS replicant_snapshot_progress"
+      assert ddl =~ "slot_name text PRIMARY KEY"
+      assert ddl =~ "token bytea NOT NULL"
+
+      assert {:ok, read} = QueryBuilder.progress_read("replicant_snapshot_progress")
+      assert read == "SELECT token FROM replicant_snapshot_progress WHERE slot_name = $1"
+
+      assert {:ok, up} = QueryBuilder.progress_upsert("replicant_snapshot_progress")
+      assert up =~ "INSERT INTO replicant_snapshot_progress (slot_name, token, updated_at)"
+      assert up =~ "ON CONFLICT (slot_name) DO UPDATE SET token = EXCLUDED.token"
+    end
+
+    test "table names still pass the identifier allowlist" do
+      assert {:error, :invalid_identifier} = QueryBuilder.progress_read(~s(bad"name))
+    end
+  end
 end
