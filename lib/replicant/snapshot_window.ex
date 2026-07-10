@@ -284,25 +284,42 @@ defmodule Replicant.SnapshotWindow do
     do: %{w | tracking: Map.delete(w.tracking, qualified)}
 
   @doc """
-  Conservatively DISCARD a table's pending chunks and RESET its tracking entry
-  (spec §2/§5). Used by the applier when a delivered transaction's `changes` is a
-  lazy, single-pass spill-backed `Enumerable` (or is otherwise unavailable) and so
-  MUST NOT be enumerated to update the drop-set: the table's in-flight chunks are
-  dropped and the reader re-reads from durable progress. Convergence-safe
-  (discard-and-re-read — never data loss, never a chunk whose drop-set is now
-  unknowable). A no-op for a table that is not being tracked.
+  Conservatively DISCARD a table's pending chunks, RESET its tracking entry, AND
+  SIGNAL RE-READ (spec §2/§4/§5/§6.4). Used by the applier when a delivered
+  transaction's `changes` is a lazy, single-pass spill-backed `Enumerable` (or is
+  otherwise unavailable) and so MUST NOT be enumerated to update the drop-set: the
+  table's in-flight chunks are dropped and the reader re-reads from durable progress.
+
+  The tainted table is folded into `w.discarded` — the SAME reader-facing signal the
+  keyed drop-cap breach / keyless concurrent-write taint use (`apply_contention/3`) —
+  so the reader's next `open`/`deliver`/barrier for it returns `{:error,
+  :table_discarded}` and re-reads. Without this signal the reader would never learn
+  its chunks were dropped: its bound would advance, a later chunk would persist a
+  bound PAST the discarded chunks, and the discarded chunks' untouched rows would be
+  LOST (the confirmed data-loss hole). Convergence-safe (discard-and-re-read — never
+  data loss, never a chunk whose drop-set is now unknowable). A no-op for a table that
+  is not being tracked (no chunks to drop, nothing to re-read).
   """
   @spec taint_table(t(), String.t()) :: t()
-  def taint_table(%__MODULE__{tracking: tracking, pending: pending} = w, qualified) do
+  def taint_table(
+        %__MODULE__{tracking: tracking, pending: pending, discarded: discarded} = w,
+        qualified
+      ) do
     case Map.fetch(tracking, qualified) do
       :error ->
         w
 
-      {:ok, _entry} ->
+      {:ok, %{pk_raw: pk_raw}} ->
+        # Mirror apply_contention/3's reset: a KEYLESS table keeps `pk_raw == []` so a subsequent
+        # concurrent write stays detectable as contention; a KEYED table resets to unknown pk_raw
+        # (re-bound by the re-read's first chunk).
+        reset_pk_raw = if pk_raw == [], do: [], else: nil
+
         %{
           w
-          | tracking: Map.put(tracking, qualified, %{pks: MapSet.new(), pk_raw: nil}),
-            pending: Enum.reject(pending, &(&1.qualified == qualified))
+          | tracking: Map.put(tracking, qualified, %{pks: MapSet.new(), pk_raw: reset_pk_raw}),
+            pending: Enum.reject(pending, &(&1.qualified == qualified)),
+            discarded: Map.put(discarded, qualified, true)
         }
     end
   end

@@ -62,7 +62,8 @@ defmodule Replicant.Config do
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          {:ok, snapshot} <- fetch_snapshot(opts),
          :ok <- validate_start_mode(go_forward_only, snapshot),
-         :ok <- validate_snapshot_support(snapshot, sink, checkpoint_store != nil) do
+         :ok <- validate_snapshot_support(snapshot, sink, checkpoint_store != nil),
+         :ok <- validate_lib_batch_snapshot(batch, snapshot) do
       {:ok,
        %{
          connection: connection,
@@ -157,6 +158,23 @@ defmodule Replicant.Config do
     do: {:error, :conflicting_start_mode}
 
   defp validate_start_mode(_gfo, _snapshot), do: :ok
+
+  # Lib-mode batched checkpointing (`checkpoint_store: [batch: …]`) combined with an incremental
+  # snapshot is REFUSED fail-closed (`:config_invalid`, consistent with the batch_delivery +
+  # checkpoint_store mutually-exclusive-mode rejection above). In lib+batch every buffered txn is
+  # delivered-then-DISCARDED (`AssemblerServer.buffered_changes/1 == :unavailable`), so the drop-set
+  # can never learn its PKs — the incremental window can only TAINT (discard + re-read) the affected
+  # tables. Now that a taint SIGNALS re-read (the data-loss fix), lib+batch would re-read a
+  # backfilling table on EVERY concurrent write to it → livelock (no convergence). The proper fix
+  # (retain the discarded txn's PKs so lib+batch can DROP-FILTER instead of re-read) is a larger
+  # follow-up; until it lands the combination cannot hold BOTH loss=0 AND liveness, so it is rejected
+  # here. NOT rejected: lib-NON-batch + incremental (the drop-set tracks per-txn), sink-owned
+  # batch_delivery + incremental (a separate `:batch_delivery` field, not `:batch`), and incremental
+  # + spill (a rare taint → converges, never a per-write livelock).
+  defp validate_lib_batch_snapshot(batch, [mode: :incremental] ++ _) when is_list(batch),
+    do: {:error, :config_invalid}
+
+  defp validate_lib_batch_snapshot(_batch, _snapshot), do: :ok
 
   # v1 requires BOTH v1 snapshot callbacks (unchanged). Sink-owned incremental requires
   # handle_snapshot/2 + snapshot_progress/0 (spec §6.1); lib mode carries progress in the
