@@ -20,7 +20,7 @@ defmodule Replicant.Config do
           publication: String.t(),
           sink: module(),
           go_forward_only: boolean(),
-          snapshot: boolean(),
+          snapshot: boolean() | keyword(),
           max_inflight_lag: pos_integer(),
           checkpoint_store: keyword() | nil
         }
@@ -30,11 +30,15 @@ defmodule Replicant.Config do
   plain-atom error: `:config_invalid` (missing/mis-shaped connection or opts),
   `:invalid_identifier` (slot/publication fails the Postgres-identifier
   allowlist), `:invalid_sink` (sink is not a module exporting the two mandatory
-  callbacks), `:conflicting_start_mode` (`go_forward_only: true` AND
-  `snapshot: true` — mutually exclusive start intents), `:snapshot_unsupported`
-  (`snapshot: true` but the sink is missing one/both snapshot callbacks),
-  `:batch_unsupported` (`batch_delivery` is set but the sink does not implement
-  `handle_batch/1`).
+  callbacks), `:conflicting_start_mode` (`go_forward_only: true` AND any snapshot
+  intent — `snapshot: true` OR `snapshot: [mode: :incremental]` — mutually
+  exclusive start intents), `:snapshot_unsupported` (a snapshot intent whose sink
+  is missing the required callbacks for that mode: `snapshot: true` needs both v1
+  callbacks; sink-owned `snapshot: [mode: :incremental]` needs `handle_snapshot/2`
+  + `snapshot_progress/0`), `:batch_unsupported` (`batch_delivery` is set but the
+  sink does not implement `handle_batch/1`). A `snapshot` value that is neither a
+  boolean nor a `[mode: :incremental, ...]` keyword (or has non-positive knobs) is
+  `:config_invalid`.
   """
   @spec validate(keyword()) ::
           {:ok, t()}
@@ -56,9 +60,9 @@ defmodule Replicant.Config do
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
          {:ok, streaming} <- fetch_streaming(opts, max_inflight_lag),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
-         snapshot = Keyword.get(opts, :snapshot, false) == true,
+         {:ok, snapshot} <- fetch_snapshot(opts),
          :ok <- validate_start_mode(go_forward_only, snapshot),
-         :ok <- validate_snapshot_support(snapshot, sink) do
+         :ok <- validate_snapshot_support(snapshot, sink, checkpoint_store != nil) do
       {:ok,
        %{
          connection: connection,
@@ -98,7 +102,7 @@ defmodule Replicant.Config do
   def guard(%{sink: sink, go_forward_only: go_forward_only, snapshot: snapshot}) do
     cond do
       go_forward_only == true -> :ok
-      snapshot == true -> :ok
+      snapshot != false -> :ok
       Sink.sink_kind(sink) != :state_mirror -> :ok
       checkpoint_definitively_empty?(sink) -> {:error, :go_forward_required}
       true -> :ok
@@ -123,16 +127,53 @@ defmodule Replicant.Config do
     _kind, _reason -> :read_fault
   end
 
-  # go_forward_only and snapshot are mutually exclusive explicit start intents.
-  defp validate_start_mode(true, true), do: {:error, :conflicting_start_mode}
+  # snapshot: false | true (v1) | [mode: :incremental, chunk_rows: n, max_pending_chunks: m]
+  # (spec §6.5). Knobs default 1000 / 4; both positive integers. Unknown mode or any other
+  # shape → :config_invalid, never a silent fallback. The drop-set cap and pacing gate are
+  # DERIVED downstream (10 × chunk_rows; max_inflight_lag ÷ 2) — never user knobs.
+  defp fetch_snapshot(opts) do
+    case Keyword.get(opts, :snapshot, false) do
+      bool when is_boolean(bool) ->
+        {:ok, bool}
+
+      kw when is_list(kw) ->
+        chunk_rows = Keyword.get(kw, :chunk_rows, 1000)
+        max_pending = Keyword.get(kw, :max_pending_chunks, 4)
+
+        if Keyword.get(kw, :mode) == :incremental and positive_integer?(chunk_rows) and
+             positive_integer?(max_pending) do
+          {:ok, [mode: :incremental, chunk_rows: chunk_rows, max_pending_chunks: max_pending]}
+        else
+          {:error, :config_invalid}
+        end
+
+      _other ->
+        {:error, :config_invalid}
+    end
+  end
+
+  # go_forward_only and ANY snapshot intent (v1 or incremental) are mutually exclusive.
+  defp validate_start_mode(true, snapshot) when snapshot != false,
+    do: {:error, :conflicting_start_mode}
+
   defp validate_start_mode(_gfo, _snapshot), do: :ok
 
-  # snapshot: true requires BOTH snapshot callbacks — a partial sink is refused rather
-  # than half-running a backfill (spec §7).
-  defp validate_snapshot_support(false, _sink), do: :ok
+  # v1 requires BOTH v1 snapshot callbacks (unchanged). Sink-owned incremental requires
+  # handle_snapshot/2 + snapshot_progress/0 (spec §6.1); lib mode carries progress in the
+  # store, so only handle_snapshot/2 is required there. false → no snapshot → :ok.
+  defp validate_snapshot_support(false, _sink, _lib?), do: :ok
 
-  defp validate_snapshot_support(true, sink) do
+  defp validate_snapshot_support(true, sink, _lib?) do
     if Sink.supports_snapshot?(sink), do: :ok, else: {:error, :snapshot_unsupported}
+  end
+
+  defp validate_snapshot_support([mode: :incremental] ++ _ = _snapshot, sink, lib?) do
+    supported? =
+      if lib?,
+        do: function_exported?(sink, :handle_snapshot, 2),
+        else: Sink.supports_incremental_snapshot?(sink)
+
+    if supported?, do: :ok, else: {:error, :snapshot_unsupported}
   end
 
   # The bounded in-flight window ceiling (WAL bytes, spec §4). Omitted → the
@@ -247,6 +288,7 @@ defmodule Replicant.Config do
       {:ok, store} when is_list(store) ->
         with conn when is_list(conn) and conn != [] <- Keyword.get(store, :connection),
              :ok <- validate_store_table(Keyword.get(store, :table)),
+             :ok <- validate_store_table(Keyword.get(store, :progress_table)),
              {:ok, max_retries, backoff} <- validate_retry_opts(store) do
           {:ok, Keyword.merge(store, max_retries: max_retries, retry_backoff_ms: backoff)}
         else

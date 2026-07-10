@@ -575,4 +575,120 @@ defmodule Replicant.ConfigTest do
       assert cfg.streaming == nil
     end
   end
+
+  defmodule IncCfgSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+    def handle_snapshot(_changes, _ctx), do: :ok
+    def snapshot_progress, do: {:ok, nil}
+  end
+
+  defmodule NoProgressSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+    def handle_snapshot(_changes, _ctx), do: :ok
+    def handle_snapshot_complete(lsn), do: {:ok, lsn}
+  end
+
+  defmodule LibNoSnapshotSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+  end
+
+  describe "snapshot: [mode: :incremental]" do
+    defp inc_opts(sink, snapshot) do
+      [
+        connection: [hostname: "h", username: "u", password: "p", database: "d"],
+        slot_name: "s1",
+        publication: "p1",
+        sink: sink,
+        snapshot: snapshot
+      ]
+    end
+
+    test "normalizes with defaulted knobs" do
+      assert {:ok, cfg} = Config.validate(inc_opts(IncCfgSink, mode: :incremental))
+      assert cfg.snapshot == [mode: :incremental, chunk_rows: 1000, max_pending_chunks: 4]
+    end
+
+    test "accepts explicit positive knobs; rejects bad ones" do
+      assert {:ok, cfg} =
+               Config.validate(
+                 inc_opts(IncCfgSink, mode: :incremental, chunk_rows: 50, max_pending_chunks: 2)
+               )
+
+      assert cfg.snapshot[:chunk_rows] == 50
+
+      assert {:error, :config_invalid} =
+               Config.validate(inc_opts(IncCfgSink, mode: :incremental, chunk_rows: 0))
+
+      assert {:error, :config_invalid} =
+               Config.validate(inc_opts(IncCfgSink, mode: :incremental, max_pending_chunks: 0))
+    end
+
+    test "unknown mode / non-boolean-non-keyword snapshot stays :config_invalid" do
+      assert {:error, :config_invalid} = Config.validate(inc_opts(IncCfgSink, mode: :bogus))
+      assert {:error, :config_invalid} = Config.validate(inc_opts(IncCfgSink, :yes))
+    end
+
+    test "snapshot: true still normalizes to the v1 boolean" do
+      assert {:ok, cfg} = Config.validate(inc_opts(NoProgressSink, true))
+      assert cfg.snapshot == true
+    end
+
+    test "sink-owned incremental requires snapshot_progress/0 (fail-closed :snapshot_unsupported)" do
+      assert {:error, :snapshot_unsupported} =
+               Config.validate(inc_opts(NoProgressSink, mode: :incremental))
+    end
+
+    test "lib mode requires only handle_snapshot/2 (progress lives in the store)" do
+      opts =
+        inc_opts(NoProgressSink, mode: :incremental) ++
+          [
+            checkpoint_store: [
+              connection: [hostname: "h", username: "u", password: "p", database: "d"]
+            ]
+          ]
+
+      assert {:ok, _cfg} = Config.validate(opts)
+    end
+
+    test "lib-mode incremental WITHOUT handle_snapshot/2 is :snapshot_unsupported" do
+      opts =
+        inc_opts(LibNoSnapshotSink, mode: :incremental) ++
+          [
+            checkpoint_store: [
+              connection: [hostname: "h", username: "u", password: "p", database: "d"]
+            ]
+          ]
+
+      assert {:error, :snapshot_unsupported} = Config.validate(opts)
+    end
+
+    test "incremental + go_forward_only is :conflicting_start_mode" do
+      opts = inc_opts(IncCfgSink, mode: :incremental) ++ [go_forward_only: true]
+      assert {:error, :conflicting_start_mode} = Config.validate(opts)
+    end
+
+    test "guard/1: incremental intent bypasses the empty-checkpoint refusal like snapshot: true" do
+      {:ok, cfg} = Config.validate(inc_opts(IncCfgSink, mode: :incremental))
+      assert :ok = Config.guard(cfg)
+    end
+
+    test "a checkpoint_store :progress_table with an invalid identifier is rejected" do
+      opts =
+        inc_opts(NoProgressSink, mode: :incremental) ++
+          [
+            checkpoint_store: [
+              connection: [hostname: "h", username: "u", password: "p", database: "d"],
+              progress_table: ~s(bad"name)
+            ]
+          ]
+
+      assert {:error, :invalid_identifier} = Config.validate(opts)
+    end
+  end
 end
