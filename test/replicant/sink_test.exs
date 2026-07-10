@@ -56,6 +56,56 @@ defmodule Replicant.SinkTest.HalfSnapshot do
   # deliberately missing handle_snapshot_complete/1
 end
 
+defmodule Replicant.SinkTest.IncrementalCapableSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  @impl Replicant.Sink
+  def handle_snapshot(_changes, _ctx), do: :ok
+
+  @impl Replicant.Sink
+  def snapshot_progress, do: {:ok, nil}
+end
+
+defmodule Replicant.SinkTest.SnapshotOnlySink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  @impl Replicant.Sink
+  def handle_snapshot(_changes, _ctx), do: :ok
+
+  @impl Replicant.Sink
+  def handle_snapshot_complete(lsn), do: {:ok, lsn}
+end
+
+defmodule Replicant.SinkTest.ProgressOnlySink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  @impl Replicant.Sink
+  def snapshot_progress, do: {:ok, nil}
+
+  # deliberately missing handle_snapshot/2
+end
+
 defmodule Replicant.SinkTest do
   use ExUnit.Case, async: false
 
@@ -140,6 +190,24 @@ defmodule Replicant.SinkTest do
       # RecordingSink implements handle_transaction/1 but NOT handle_batch/1.
       refute Sink.supports_batch?(RecordingSink)
       assert Sink.supports_batch?(Replicant.SinkTest.BatchCapable)
+    end
+  end
+
+  describe "supports_incremental_snapshot?/1" do
+    test "requires handle_snapshot/2 AND snapshot_progress/0" do
+      assert Sink.supports_incremental_snapshot?(Replicant.SinkTest.IncrementalCapableSink)
+      refute Sink.supports_incremental_snapshot?(Replicant.SinkTest.SnapshotOnlySink)
+      refute Sink.supports_incremental_snapshot?(Replicant.SinkTest.ProgressOnlySink)
+    end
+
+    test "handle_snapshot_complete/1 is NOT required for incremental (never called there)" do
+      refute function_exported?(
+               Replicant.SinkTest.IncrementalCapableSink,
+               :handle_snapshot_complete,
+               1
+             )
+
+      assert Sink.supports_incremental_snapshot?(Replicant.SinkTest.IncrementalCapableSink)
     end
   end
 end

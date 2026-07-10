@@ -16,6 +16,7 @@ defmodule Replicant.Sink do
   | `c:sink_kind/0` | no | `:state_mirror` (default) or `:append_log` |
   | `c:handle_snapshot/2` | no | persist a snapshot batch; redo-safe reset on `first_for_table?` |
   | `c:handle_snapshot_complete/1` | no | snapshot handoff commit; persist `checkpoint := snapshot_lsn` |
+  | `c:snapshot_progress/0` | in incremental-snapshot mode | most recent persisted `context.progress` resume token (`nil` = no backfill in progress / never started) |
 
   Every callback is an `@optional_callback`, so any sink compiles clean under
   `--warnings-as-errors` regardless of which it implements — the behaviour imposes no
@@ -23,8 +24,11 @@ defmodule Replicant.Sink do
   `Config`, per mode: `handle_transaction/1` (default sink-owned) or `handle_batch/1`
   (batch-delivery mode), plus `checkpoint/0` in sink-owned mode. The
   Assembler dispatches the optional ones via `function_exported?/3`, providing the
-  documented default. The two snapshot callbacks come as a pair — `supports_snapshot?/1`
-  gates `snapshot: true` on BOTH being present.
+  documented default. The snapshot callbacks gate in two pairs: `supports_snapshot?/1`
+  gates `snapshot: true` on `handle_snapshot/2` + `handle_snapshot_complete/1` BOTH being
+  present; `supports_incremental_snapshot?/1` gates `snapshot: [mode: :incremental]` on
+  `handle_snapshot/2` + `snapshot_progress/0` (`handle_snapshot_complete/1` is NOT
+  required for incremental).
 
   ## Lib mode (non-transactional sinks)
 
@@ -98,24 +102,31 @@ defmodule Replicant.Sink do
 
   @doc """
   Optional. Persist a batch of snapshot (backfill) rows for `context.table` — each a
-  `%Replicant.Change{op: :snapshot}` — upserting by table PK. Do NOT advance the
-  checkpoint here (that is `c:handle_snapshot_complete/1`).
+  `%Replicant.Change{op: :snapshot}` — upserting by table PK.
 
-  REDO-SAFETY — a hard obligation, not advisory: when `context.first_for_table?` is
-  `true`, the sink MUST clear this table's prior mirror state atomically with (or before)
-  applying the batch. A sink that ignores `first_for_table?` forfeits redo-safety — a row
-  deleted upstream between a failed attempt and its retry survives as a ghost. The library
-  guarantees at least one call per publication table (even a zero-row table), so the reset
-  always fires. `context.snapshot_lsn` is the snapshot's consistent point.
+  This callback serves BOTH snapshot modes with mode-conditional obligations
+  (spec §6.1 — normative):
 
-  A non-`:ok` return (or a raise/throw/exit) aborts and re-runs the WHOLE snapshot from
-  scratch — it is NOT a per-batch retry.
+  | Obligation | v1 (`snapshot: true`) | incremental (`snapshot: [mode: :incremental]`) |
+  |---|---|---|
+  | Non-`:ok` return / raise | aborts + re-runs the WHOLE snapshot | halts fail-closed; resume re-delivers from the last durable chunk |
+  | `first_for_table?` | true on the first batch per table, EVERY attempt — clear the table's prior mirror state | true on a table's first chunk of a FRESH run AND on every PK-less-table redo attempt — same clearing obligation |
+  | Checkpoint | never advance here | never advance here |
+  | `context.progress` | absent | sink-owned mode MUST persist the token atomically with the chunk (effect-once); ignoring it degrades resume to restart-from-zero (safe, dup-only) |
+  | `context.backfill_complete?` | absent | true ONLY on the dedicated final call (`changes: []`), delivered at-least-once until durable |
+  | Completion | `c:handle_snapshot_complete/1` follows | `c:handle_snapshot_complete/1` is NEVER called (it would REGRESS the stream-advanced checkpoint) |
+
+  In BOTH modes, the library guarantees at least one call per publication table (even a
+  zero-row table), so `first_for_table?` always fires and the redo-safety reset always
+  happens. `context.snapshot_lsn` is the snapshot's consistent point.
   """
   @callback handle_snapshot([Replicant.Change.t()], context) :: :ok | {:error, term()}
             when context: %{
-                   snapshot_lsn: Replicant.lsn(),
-                   table: String.t(),
-                   first_for_table?: boolean()
+                   required(:snapshot_lsn) => Replicant.lsn(),
+                   required(:table) => String.t(),
+                   required(:first_for_table?) => boolean(),
+                   optional(:progress) => binary() | nil,
+                   optional(:backfill_complete?) => boolean()
                  }
 
   @doc """
@@ -127,6 +138,15 @@ defmodule Replicant.Sink do
   @callback handle_snapshot_complete(snapshot_lsn :: Replicant.lsn()) ::
               {:ok, Replicant.lsn()} | {:error, term()}
 
+  @doc """
+  Optional (REQUIRED for sink-owned incremental snapshot — `Config` gates on it).
+  Return the most recent `context.progress` token persisted atomically with a chunk
+  (`nil` = no backfill in progress / never started). Read ONCE at pipeline start
+  for resume. A read fault halts fail-closed — the resume decision is not
+  dedup-recoverable (spec §6.1/§8).
+  """
+  @callback snapshot_progress() :: {:ok, binary() | nil} | {:error, term()}
+
   @optional_callbacks [
     checkpoint: 0,
     handle_transaction: 1,
@@ -134,7 +154,8 @@ defmodule Replicant.Sink do
     handle_schema_change: 2,
     sink_kind: 0,
     handle_snapshot: 2,
-    handle_snapshot_complete: 1
+    handle_snapshot_complete: 1,
+    snapshot_progress: 0
   ]
 
   @doc """
@@ -167,6 +188,18 @@ defmodule Replicant.Sink do
   def supports_snapshot?(module) do
     function_exported?(module, :handle_snapshot, 2) and
       function_exported?(module, :handle_snapshot_complete, 1)
+  end
+
+  @doc """
+  True when `module` implements `handle_snapshot/2` AND `snapshot_progress/0` — the
+  config gate for sink-owned `snapshot: [mode: :incremental]` (spec §6.1).
+  `handle_snapshot_complete/1` is deliberately NOT required: incremental never calls
+  it. A partial sink is rejected at start (`:snapshot_unsupported`), fail-closed.
+  """
+  @spec supports_incremental_snapshot?(module()) :: boolean()
+  def supports_incremental_snapshot?(module) do
+    function_exported?(module, :handle_snapshot, 2) and
+      function_exported?(module, :snapshot_progress, 0)
   end
 
   @doc """
