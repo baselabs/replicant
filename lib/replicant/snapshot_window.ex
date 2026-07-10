@@ -90,15 +90,8 @@ defmodule Replicant.SnapshotWindow do
   """
   @spec track_capped(t(), [Change.t()]) :: {t(), [String.t()]}
   def track_capped(%__MODULE__{} = w, changes) do
-    {tracking, touched} =
-      Enum.reduce(changes, {w.tracking, MapSet.new()}, fn %Change{} = c, {acc, seen} ->
-        qualified = "#{c.schema}.#{c.table}"
-
-        case Map.fetch(acc, qualified) do
-          {:ok, entry} -> {Map.put(acc, qualified, put_pk(entry, c)), MapSet.put(seen, qualified)}
-          :error -> {acc, seen}
-        end
-      end)
+    {tracking, touched, untrackable} =
+      Enum.reduce(changes, {w.tracking, MapSet.new(), []}, &track_change/2)
 
     keyed_breached =
       for {q, %{pks: pks, pk_raw: pk_raw}} <- tracking,
@@ -111,8 +104,34 @@ defmodule Replicant.SnapshotWindow do
           match?({:ok, %{pk_raw: []}}, Map.fetch(tracking, q)),
           do: q
 
-    apply_contention(w, tracking, keyed_breached ++ keyless_contended)
+    apply_contention(w, tracking, Enum.uniq(keyed_breached ++ keyless_contended ++ untrackable))
   end
+
+  # Fold ONE change into the (tracking, touched, untrackable) accumulator. Only OPEN tables (in
+  # `acc`) are tracked; a change whose PK-record is nil (TRUNCATE / REPLICA-IDENTITY-NOTHING delete)
+  # has no per-row PK → its table joins `untrackable` (the caller taints it: discard + re-read,
+  # NEVER a `pk_tuple(nil, …)` crash). Every other change adds its resolved PK to the drop-set.
+  defp track_change(%Change{schema: s, table: t} = c, {acc, seen, untr}) do
+    qualified = "#{s}.#{t}"
+
+    case {Map.fetch(acc, qualified), pk_record(c)} do
+      {:error, _} ->
+        {acc, seen, untr}
+
+      {{:ok, _entry}, nil} ->
+        {acc, seen, [qualified | untr]}
+
+      {{:ok, entry}, rec} ->
+        {Map.put(acc, qualified, put_pk(entry, rec)), MapSet.put(seen, qualified), untr}
+    end
+  end
+
+  # The record image whose PK identifies the changed row for drop-filtering. A DELETE carries only
+  # its key columns in `old_record` (its `record` is nil — pgoutput delete semantics); every other
+  # op (insert/update/snapshot) carries the new row in `record`. A nil result — a TRUNCATE, or a
+  # delete under REPLICA IDENTITY NOTHING — has no per-row PK, so the caller taints the table.
+  defp pk_record(%Change{op: :delete, old_record: old}), do: old
+  defp pk_record(%Change{record: record}), do: record
 
   defp apply_contention(w, tracking, []), do: {%{w | tracking: tracking}, []}
 
@@ -155,11 +174,13 @@ defmodule Replicant.SnapshotWindow do
   # breach discards + re-reads (never data loss, per the moduledoc convergence-safety
   # note), and it collapses to distinct PK tuples once the first chunk runs
   # rebind_pk_raw.
-  defp put_pk(%{pks: pks, pk_raw: nil} = entry, c),
-    do: %{entry | pks: MapSet.put(pks, {:record, c.record})}
+  # `rec` is the resolved PK-bearing record image (see `pk_record/1`) — NEVER nil (a nil source is
+  # routed to taint in `track_capped`, so `pk_tuple` can never hit `Map.get(nil, …)`).
+  defp put_pk(%{pks: pks, pk_raw: nil} = entry, rec),
+    do: %{entry | pks: MapSet.put(pks, {:record, rec})}
 
-  defp put_pk(%{pks: pks, pk_raw: pk_raw} = entry, c),
-    do: %{entry | pks: MapSet.put(pks, pk_tuple(c.record, pk_raw))}
+  defp put_pk(%{pks: pks, pk_raw: pk_raw} = entry, rec),
+    do: %{entry | pks: MapSet.put(pks, pk_tuple(rec, pk_raw))}
 
   defp pk_tuple(record, pk_raw), do: Enum.map(pk_raw, &Map.get(record, &1))
 

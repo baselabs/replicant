@@ -17,6 +17,26 @@ defmodule Replicant.SnapshotWindowTest do
       record: %{"id" => id, "v" => v}
     }
 
+  # A DELETE carries its PK in `old_record` only; `record` is nil (pgoutput delete semantics).
+  defp delete_change(table, id),
+    do: %Replicant.Change{
+      op: :delete,
+      schema: "public",
+      table: table,
+      record: nil,
+      old_record: %{"id" => id}
+    }
+
+  # A TRUNCATE carries no row image at all — record and old_record both nil.
+  defp truncate_change(table),
+    do: %Replicant.Change{
+      op: :truncate,
+      schema: "public",
+      table: table,
+      record: nil,
+      old_record: nil
+    }
+
   defp chunk(table, ids, hw, opts \\ []) do
     %{
       qualified: "public.#{table}",
@@ -93,6 +113,47 @@ defmodule Replicant.SnapshotWindowTest do
     {w, discarded} = W.track_capped(w, Enum.map(1..3, &change("orders", &1)))
     assert discarded == ["public.orders"]
     assert :none = W.pop_ready(W.set_frontier(w, 1, 10))
+  end
+
+  test "track_capped drop-tracks a DELETE via old_record (record is nil) — no crash, ghost row dropped" do
+    # A DELETE carries its PK in old_record; record is nil. RED before the fix: put_pk →
+    # pk_tuple(nil, ["id"]) → Map.get(nil, "id") → BadMapError crashes the caller (OTP dumps row
+    # values, Rule 1). After: the deleted PK enters the drop-set so a colliding pending chunk row is
+    # dropped — the stale pre-delete row never resurrects (§2 no-ghosts).
+    w = W.new(epoch: 1, drop_cap: 100, max_pending: 4) |> W.open_window("public.orders")
+    {w, :ok} = W.add_chunk(w, chunk("orders", [1, 2], 1_000))
+    {w, discarded} = W.track_capped(w, [delete_change("orders", 2)])
+
+    assert discarded == []
+    assert W.tracked?(w, "public.orders", [2])
+    assert {:apply, kept, _meta, _w} = W.pop_ready(W.set_frontier(w, 1, 1_000))
+    assert Enum.map(kept, & &1.record["id"]) == [1]
+  end
+
+  test "track_capped TAINTS a table on TRUNCATE (no per-row PK) — no crash, re-read" do
+    # A TRUNCATE has no row image (record and old_record nil). RED before the fix:
+    # pk_tuple(nil, ["id"]) → BadMapError. After: the table is tainted (all rows gone → the pending
+    # chunk is stale) so the reader re-reads.
+    w = W.new(epoch: 1, drop_cap: 100, max_pending: 4) |> W.open_window("public.orders")
+    {w, :ok} = W.add_chunk(w, chunk("orders", [1, 2], 1_000))
+    {w, discarded} = W.track_capped(w, [truncate_change("orders")])
+
+    assert discarded == ["public.orders"]
+    assert W.discarded?(w, "public.orders")
+    assert w.pending == []
+  end
+
+  test "track_capped drop-tracks a PRE-CHUNK DELETE, then rebind_pk_raw normalizes it without crashing" do
+    # A DELETE tracked BEFORE the first chunk stores {:record, old_record}; add_chunk's rebind must
+    # normalize it to a PK tuple. RED before the fix: the pre-chunk delete stored {:record, nil}
+    # (record nil) → rebind → pk_tuple(nil, ["id"]) → BadMapError.
+    {w, []} =
+      W.new(epoch: 1, drop_cap: 100, max_pending: 4)
+      |> W.open_window("public.orders")
+      |> W.track_capped([delete_change("orders", 2)])
+
+    {w, :ok} = W.add_chunk(w, chunk("orders", [1, 2], 1_000))
+    assert W.tracked?(w, "public.orders", [2])
   end
 
   test "TRIPWIRE pre-chunk placeholder cap counts distinct row IMAGES; rebind collapses to one PK" do
