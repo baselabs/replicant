@@ -270,6 +270,38 @@ defmodule Replicant.IncrementalSnapshotTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Test 6 — DELETE during backfill. A concurrent DELETE feeds the drop-set a change whose `record`
+  # is nil (its PK lives in old_record); before the fix that raised BadMapError in track_capped,
+  # OUTSIDE the value-free rescue → the AssemblerServer crashed (OTP dumping row bytes = Rule 1) and
+  # :one_for_all restarted it, storming under a continuous delete writer so the backfill never
+  # completed. Now deletes drop-track via old_record. Gates: the assembler PID is STABLE (no crash/
+  # restart), the backfill completes, and it converges (deleted rows absent from BOTH source and
+  # mirror — a resurrected ghost row would diverge).
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "DELETE during backfill: no AssemblerServer crash (Rule 1) + converges with deletes",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_del", "incdel_pub", 5_000)
+      start_incremental(slot, "incdel_pub", chunk_rows: 200, max_pending_chunks: 4)
+
+      asm_pid = GenServer.whereis(Replicant.AssemblerServer.via(slot))
+      assert is_pid(asm_pid)
+
+      {writer, go} = start_writer(fn w, n -> update_and_delete(w, n, "inc_del", 5_000) end)
+
+      wait_backfill_complete(60_000)
+      stop_writer(writer, go)
+
+      # Same PID ⇒ the assembler never crashed+restarted on a delete (the pre-fix BadMapError).
+      assert GenServer.whereis(Replicant.AssemblerServer.via(slot)) == asm_pid,
+             "AssemblerServer crashed+restarted during backfill (a DELETE hit pk_tuple(nil, …))"
+
+      wait_converged(ctrl, "inc_del")
+    end
+  end
+
   # ===========================================================================
   # convergence gate
   # ===========================================================================
@@ -393,6 +425,16 @@ defmodule Replicant.IncrementalSnapshotTest do
 
   defp update_random_wide(w, n, table, base) do
     Postgrex.query!(w, "UPDATE #{table} SET note=$2 WHERE id=$1", [:rand.uniform(base), "v#{n}"])
+  end
+
+  # UPDATE a random row every iteration; DELETE a random row every 4th. A DELETE carries its PK only
+  # in old_record (record: nil) — the crash trigger the drop-set fix closes.
+  defp update_and_delete(w, n, table, base) do
+    Postgrex.query!(w, "UPDATE #{table} SET note=$2 WHERE id=$1", [:rand.uniform(base), "v#{n}"])
+
+    if rem(n, 4) == 0 do
+      Postgrex.query!(w, "DELETE FROM #{table} WHERE id=$1", [:rand.uniform(base)])
+    end
   end
 
   # ===========================================================================
