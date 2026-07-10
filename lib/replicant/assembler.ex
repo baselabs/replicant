@@ -1354,6 +1354,7 @@ defmodule Replicant.Assembler do
            | batch_count: 0,
              pending_lsn: nil,
              batch_spill_paths: [],
+             last_buffered_changes: [],
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}
 
@@ -1386,7 +1387,15 @@ defmodule Replicant.Assembler do
     # A discarded sink-owned batch re-streams from the durable checkpoint, so any migrated spill
     # file must not survive (spec §5 reset cleanup). Delete the recorded files and clear the list.
     Enum.each(paths, &Spill.rm/1)
-    %{asm | batch_count: 0, pending_lsn: nil, batch_txns: [], batch_spill_paths: []}
+
+    %{
+      asm
+      | batch_count: 0,
+        pending_lsn: nil,
+        batch_txns: [],
+        batch_spill_paths: [],
+        last_buffered_changes: []
+    }
   end
 
   @doc """

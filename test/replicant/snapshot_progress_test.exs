@@ -56,6 +56,20 @@ defmodule Replicant.SnapshotProgressTest do
     assert {:error, :snapshot_progress_invalid} = SP.decode(nil)
   end
 
+  test "decode rejects the COMPRESSED external-term format (decompression-bomb guard)" do
+    # A valid-shaped token re-encoded WITH :compressed. Its inner term is our exact shape, so without
+    # the compressed-format reject it would decode {:ok, _} after inflating — the bomb vector. RED
+    # without the `decode(<<131, 80, …>>)` clause: this returns {:ok, sp}.
+    compressed =
+      :erlang.term_to_binary(
+        {:replicant_snapshot_progress, 1, Map.from_struct(SP.new(tables(), 7))},
+        [:compressed]
+      )
+
+    assert <<131, 80, _::binary>> = compressed
+    assert {:error, :snapshot_progress_invalid} = SP.decode(compressed)
+  end
+
   test "decode rejects a well-versioned token with a malformed inner table_ref (value-free)" do
     forged =
       :erlang.term_to_binary(

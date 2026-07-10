@@ -94,6 +94,13 @@ defmodule Replicant.SnapshotProgress do
   precedent: the exception is discarded).
   """
   @spec decode(term()) :: {:ok, t()} | {:error, :snapshot_progress_invalid}
+  # Reject the COMPRESSED external-term format (version magic 131 + compression tag 80) before
+  # decoding: `encode/1` uses `term_to_binary/1` without `:compressed`, so a legitimate token is
+  # NEVER compressed — but `binary_to_term` INFLATES a compressed term BEFORE the `:safe` checks
+  # bite, so a few-KB tampered token could expand to a multi-GB term and OOM the reader
+  # (a progress-store-write-gated DoS). Value-free reject (spec §6.2/§9).
+  def decode(<<131, 80, _rest::binary>>), do: {:error, :snapshot_progress_invalid}
+
   def decode(bin) when is_binary(bin) do
     case :erlang.binary_to_term(bin, [:safe]) do
       {:replicant_snapshot_progress, @version, %{} = map} -> from_map(map)

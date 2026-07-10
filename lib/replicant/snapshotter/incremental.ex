@@ -332,8 +332,20 @@ defmodule Replicant.Snapshotter.Incremental do
     # A reconnect (:window_reset) OR a keyed drop-cap contention discard (:table_discarded) both
     # re-read from durable progress: the discarded chunks were never applied (removed while pending),
     # so re-fetching them is loss-free convergence, never a halt, never an attempt count (spec §4).
-    :window_reset -> reload_and_continue(db, args, chunk_rows, standby?)
-    :table_discarded -> reload_and_continue(db, args, chunk_rows, standby?)
+    :window_reset ->
+      reload_and_continue(db, args, chunk_rows, standby?)
+
+    :table_discarded ->
+      # Emit `:chunk_retried` on the keyed drop-cap-breach re-read — spec §9 defines the event for
+      # BOTH triggers ("drop-set-cap breach / PK-less redo — no silent re-read loops"); the keyless
+      # redo already emits it (run_keyless_table), the keyed breach must too, or a keyed contention
+      # loop is invisible. NOT on :window_reset (a reconnect is not a contention retry, §6.4).
+      Telemetry.event([:replicant, :snapshot, :chunk_retried], %{}, %{
+        table: table.qualified,
+        reason: :snapshot_table_contended
+      })
+
+      reload_and_continue(db, args, chunk_rows, standby?)
   end
 
   # An in-process reconnect reset the window: re-read DURABLE progress, RE-DISCOVER table
