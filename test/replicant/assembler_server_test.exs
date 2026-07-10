@@ -730,4 +730,389 @@ defmodule Replicant.AssemblerServerTest do
       assert state.asm.current_stream_xid == nil
     end
   end
+
+  defmodule ChunkLedgerSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+
+    def handle_snapshot(changes, ctx) do
+      send(Process.whereis(:asrv_chunk_test), {:snapshot_call, changes, ctx})
+      :ok
+    end
+
+    def snapshot_progress, do: {:ok, nil}
+  end
+
+  defmodule FaultChunkSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+    def handle_snapshot(_changes, _ctx), do: {:error, {:secret_value, "PII-LEAK"}}
+    def snapshot_progress, do: {:ok, nil}
+  end
+
+  # handle_snapshot RAISES with a PII-bearing message — exercises apply_chunk's `rescue _ ->
+  # :halt_sentinel` arm (the classic leak vector: a rescue that echoes the exception would leak
+  # the message). The message MUST NOT reach the halt telemetry.
+  defmodule RaiseChunkSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+    def handle_snapshot(_changes, _ctx), do: raise("PII-RAISE-SECRET-abc123")
+    def snapshot_progress, do: {:ok, nil}
+  end
+
+  # handle_snapshot THROWS a PII-bearing term — exercises apply_chunk's `catch _kind, _reason ->
+  # :halt_sentinel` arm (throw/exit). The thrown term MUST NOT reach the halt telemetry.
+  defmodule ThrowChunkSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+    def handle_snapshot(_changes, _ctx), do: throw({:secret_value, "PII-THROW-xyz789"})
+    def snapshot_progress, do: {:ok, nil}
+  end
+
+  # A sink-owned batch-delivery sink (handle_batch/1, no checkpoint_store) that ALSO backfills via
+  # handle_snapshot/2 — the incremental × batch_delivery composition (spec §6/§7, Task 12). Reports
+  # the flushed batch's LSNs AND every applied chunk's changes to the registered test process.
+  defmodule BatchChunkSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def snapshot_progress, do: {:ok, nil}
+    def handle_transaction(_txn), do: {:ok, 0}
+
+    def handle_batch(txns) do
+      send(Process.whereis(:asrv_chunk_test), {:batch_call, Enum.map(txns, & &1.commit_lsn)})
+      {:ok, List.last(txns).commit_lsn}
+    end
+
+    def handle_snapshot(changes, ctx) do
+      send(Process.whereis(:asrv_chunk_test), {:snapshot_call, changes, ctx})
+      :ok
+    end
+  end
+
+  describe "incremental chunk path" do
+    setup do
+      Process.register(self(), :asrv_chunk_test)
+      on_exit(fn -> nil end)
+      :ok
+    end
+
+    defp start_incremental_server(sink, slot) do
+      start_supervised!(
+        {Replicant.AssemblerServer,
+         slot_name: slot,
+         sink: sink,
+         snapshot_window: [chunk_rows: 10, max_pending_chunks: 2],
+         max_inflight_lag: 1_000_000}
+      )
+    end
+
+    defp chunk_msg(hw, ids, opts \\ []) do
+      %{
+        qualified: "public.orders",
+        schema: "public",
+        table: "orders",
+        pk_raw: ["id"],
+        pk_canon: Enum.map(ids, &[&1]),
+        changes:
+          Enum.map(ids, fn id ->
+            %Replicant.Change{
+              op: :snapshot,
+              schema: "public",
+              table: "orders",
+              record: %{"id" => id}
+            }
+          end),
+        hw: hw,
+        first?: Keyword.get(opts, :first?, false),
+        complete?: Keyword.get(opts, :complete?, false),
+        progress: Keyword.get(opts, :progress, <<1>>),
+        bound: nil
+      }
+    end
+
+    # Fabricate a decoded Begin/Relation/Insert/Commit flow for `table`/`id` through the normal
+    # message path (mirrors drive_txn/2 + relation/1; commit LSN 400 is below every test chunk HW,
+    # so the explicit {:snapshot_frontier} cast closes the chunk).
+    defp send_committed_txn(pid, table, id) do
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: table,
+        replica_identity: :default,
+        columns: [col("id", "int4", [:key])]
+      }
+
+      cast(pid, %Begin{final_lsn: 400, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 400}, 20)
+      cast(pid, rel, 30)
+      cast(pid, %Insert{relation_id: 1, tuple_data: {"#{id}"}}, 15)
+
+      cast(
+        pid,
+        %Commit{lsn: 400, end_lsn: 400, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+        8
+      )
+    end
+
+    test "open_window -> deliver -> frontier closure applies the chunk with drop-filter + ctx keys" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_1")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
+      # not yet closed: no sink call
+      refute_receive {:snapshot_call, _, _}, 100
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {:snapshot_call, changes, ctx}, 1_000
+      assert Enum.map(changes, & &1.record["id"]) == [1, 2]
+      assert %{first_for_table?: false, backfill_complete?: false, progress: <<1>>} = ctx
+      assert is_integer(ctx.snapshot_lsn)
+    end
+
+    test "TRIPWIRE: a txn applied after open_window drops the colliding chunk row" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_2")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      # a committed txn for orders id=2 flows through the normal message path
+      send_committed_txn(pid, "orders", 2)
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {:snapshot_call, changes, _ctx}, 1_000
+      assert Enum.map(changes, & &1.record["id"]) == [1]
+    end
+
+    test "TRIPWIRE incremental×batch_delivery: a cap-tripping {:flush} txn drops the colliding chunk row" do
+      # Sink-owned batch_delivery (batch:, no checkpoint_store) COMPOSED with an incremental window.
+      # max_transactions: 1 makes the FIRST committed txn trip the count cap → the assembler returns
+      # {:flush, :max_transactions, asm} DIRECTLY, skipping {:buffered}. The bug: dispatch({:flush})
+      # tracked nothing, so the tripping txn's PK never entered the drop-set and a colliding chunk row
+      # survived → stale-overwrite. The fix tracks at RECEIPT (buffered_changes = batch_txns head)
+      # before do_flush resets the batch. RED without the fix: the chunk keeps [1, 2].
+      pid =
+        start_supervised!(
+          {Replicant.AssemblerServer,
+           slot_name: "asrv_inc_batch",
+           sink: BatchChunkSink,
+           batch: [max_transactions: 1, max_delay_ms: 60_000, max_span: 1_000_000],
+           snapshot_window: [chunk_rows: 10, max_pending_chunks: 2],
+           max_inflight_lag: 1_000_000}
+        )
+
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+
+      # A committed txn for orders id=2 flows through the normal message path; at Commit the count cap
+      # (1) trips → {:flush} → dispatch({:flush}). Receiving the flushed batch is a happens-after
+      # barrier for the RECEIPT tracking, which (with the fix) strictly precedes do_flush→handle_batch.
+      send_committed_txn(pid, "orders", 2)
+      assert_receive {:batch_call, [400]}, 1_000
+
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+
+      assert_receive {:snapshot_call, changes, _ctx}, 1_000
+
+      # id=2 DROPPED because the {:flush} txn tracked it at receipt (RED → [1, 2] without the fix).
+      assert Enum.map(changes, & &1.record["id"]) == [1]
+    end
+
+    test "TRIPWIRE value-free: a sink {:error, values} on a chunk halts WITHOUT the value leaking" do
+      pid = start_incremental_server(FaultChunkSink, "asrv_inc_3")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1]))
+
+      # Observe the halt via the telemetry channel (Supervisor.halt/2 discards its reason —
+      # supervisor.ex:48) + the server's own halted flag; assert the event meta is the bare
+      # allowlisted atom and the sink's PII payload appears nowhere in it.
+      ref = make_ref()
+      handler = fn event, _meas, meta, _cfg -> send(:asrv_chunk_test, {ref, event, meta}) end
+      :telemetry.attach({__MODULE__, ref}, [:replicant, :snapshot, :failed], handler, nil)
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {^ref, [:replicant, :snapshot, :failed], meta}, 1_000
+      assert meta == %{reason: :snapshot_failed}
+      refute inspect(meta) =~ "PII-LEAK"
+      assert :sys.get_state(pid).halted
+    end
+
+    test "backpressure: the 3rd deliver call blocks until a chunk applies (max_pending_chunks: 2)" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_4")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(100, [1]))
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(200, [2]))
+
+      caller =
+        Task.async(fn ->
+          Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(300, [3]))
+        end)
+
+      refute Task.yield(caller, 200)
+      GenServer.cast(pid, {:snapshot_frontier, 0, 100})
+      assert :ok = Task.await(caller, 1_000)
+    end
+
+    test "reconnect reset discards pending chunks and adopts the new epoch" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_5")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(100, [1]))
+      GenServer.cast(pid, {:reset_snapshot_window, 1})
+      # a stale epoch-0 frontier cannot close anything; the chunk is gone anyway
+      GenServer.cast(pid, {:snapshot_frontier, 0, 999_999})
+      refute_receive {:snapshot_call, _, _}, 200
+    end
+
+    test "F-PACE: open_snapshot_window is NOT paced when the frontier gap from the floor is within max_inflight_lag/2" do
+      # max_inflight_lag 1_000_000 → the gate is div(_, 2) = 500_000. Seed a large ABSOLUTE floor and
+      # a frontier only 400_000 above it (WITHIN the gate), with last_applied still 0 (no commit yet).
+      # The in-flight base MUST be max(last_applied, floor_lsn) = floor, so the estimate is
+      # 400_000 < 500_000 → NOT paced → :ok. RED with the old `frontier - last_applied` base:
+      # 1e9+400_000 − 0 ≫ 500_000 → paced → the call blocks forever (a fresh slot on an idle/low-write
+      # DB could never open a window → backfill never starts).
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_pace_ok")
+      floor = 1_000_000_000
+      GenServer.cast(pid, {:snapshot_floor, floor})
+      GenServer.cast(pid, {:snapshot_frontier, 0, floor + 400_000})
+      :sys.get_state(pid)
+
+      task =
+        Task.async(fn -> Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders") end)
+
+      # Replies :ok within the window (GREEN). nil (still blocked) is the RED signal of the old base.
+      assert {:ok, :ok} = Task.yield(task, 1_000) || Task.shutdown(task)
+    end
+
+    test "F-PACE: open_snapshot_window IS still deferred when the frontier gap from the floor exceeds max_inflight_lag/2" do
+      # Same absolute floor, but the frontier is 600_000 above it — OVER the 500_000 gate. The gate
+      # still fires (stream drain has genuine priority) → the call is DEFERRED (no reply). This half
+      # proves the fix did not defeat the pacing gate (the estimate is now floor-relative, not 0).
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_pace_defer")
+      floor = 1_000_000_000
+      GenServer.cast(pid, {:snapshot_floor, floor})
+      GenServer.cast(pid, {:snapshot_frontier, 0, floor + 600_000})
+      :sys.get_state(pid)
+
+      task =
+        Task.async(fn -> Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders") end)
+
+      refute Task.yield(task, 300)
+      Task.shutdown(task, :brutal_kill)
+    end
+
+    test "F-TAINT: a hot-table stream write does not taint a cold backfill table (lib+batch taints only affected tables)" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_taint")
+
+      # Swap in a lib+batch assembler (mode: :lib + a batch policy) — start_incremental_server
+      # otherwise builds a sink-owned one. Same inject pattern as the batched-checkpointing block; the
+      # window lives on server STATE (untouched by the asm swap), and the sink stays ChunkLedgerSink so
+      # handle_transaction (per-txn in lib+batch) AND handle_snapshot both resolve.
+      :sys.replace_state(pid, fn st ->
+        asm =
+          Replicant.Assembler.new(ChunkLedgerSink,
+            mode: :lib,
+            checkpoint_writer: fn _lsn -> :ok end,
+            slot_name: "asrv_inc_taint",
+            lib_checkpoint: 0,
+            batch: [max_transactions: 5, max_delay_ms: 60_000, max_span: 1_000_000],
+            max_inflight_lag: 1_000_000
+          )
+
+        %{st | asm: asm}
+      end)
+
+      # Backfill public.cold: open its window + deliver a PENDING chunk (hw 500 > the hot txn's commit
+      # LSN 400, so it stays pending until the explicit frontier advance closes it).
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.cold")
+
+      cold_chunk = %{
+        qualified: "public.cold",
+        schema: "public",
+        table: "cold",
+        pk_raw: ["id"],
+        pk_canon: [[1], [2]],
+        changes:
+          Enum.map([1, 2], fn id ->
+            %Replicant.Change{
+              op: :snapshot,
+              schema: "public",
+              table: "cold",
+              record: %{"id" => id}
+            }
+          end),
+        hw: 500,
+        first?: false,
+        complete?: false,
+        progress: <<1>>,
+        bound: nil
+      }
+
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, cold_chunk)
+
+      # A lib+batch stream txn writing ONLY public.hot (commit LSN 400): delivered per-txn then
+      # DISCARDED (buffered_changes = :unavailable) → track_window's :unavailable path. With the fix it
+      # taints only the AFFECTED table {public.hot}, which has NO open window → a no-op; public.cold's
+      # pending chunk survives. RED (taint-all): public.cold is tainted → its chunk is discarded and
+      # the snapshot_call never arrives.
+      send_committed_txn(pid, "hot", 42)
+      :sys.get_state(pid)
+
+      # Close public.cold's chunk. If it survived, it applies now with BOTH rows.
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {:snapshot_call, changes, ctx}, 1_000
+      assert ctx.table == "public.cold"
+      assert Enum.map(changes, & &1.record["id"]) == [1, 2]
+    end
+
+    test "TRIPWIRE value-free: a sink handle_snapshot that RAISES halts WITHOUT the message leaking (rescue arm)" do
+      pid = start_incremental_server(RaiseChunkSink, "asrv_inc_raise")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1]))
+
+      ref = make_ref()
+      handler = fn event, _meas, meta, _cfg -> send(:asrv_chunk_test, {ref, event, meta}) end
+      :telemetry.attach({__MODULE__, ref}, [:replicant, :snapshot, :failed], handler, nil)
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {^ref, [:replicant, :snapshot, :failed], meta}, 1_000
+      assert meta == %{reason: :snapshot_failed}
+      refute inspect(meta) =~ "PII-RAISE-SECRET"
+      assert :sys.get_state(pid).halted
+    end
+
+    test "TRIPWIRE value-free: a sink handle_snapshot that THROWS halts WITHOUT the term leaking (catch arm)" do
+      pid = start_incremental_server(ThrowChunkSink, "asrv_inc_throw")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1]))
+
+      ref = make_ref()
+      handler = fn event, _meas, meta, _cfg -> send(:asrv_chunk_test, {ref, event, meta}) end
+      :telemetry.attach({__MODULE__, ref}, [:replicant, :snapshot, :failed], handler, nil)
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {^ref, [:replicant, :snapshot, :failed], meta}, 1_000
+      assert meta == %{reason: :snapshot_failed}
+      refute inspect(meta) =~ "PII-THROW"
+      assert :sys.get_state(pid).halted
+    end
+
+    test "ctx carries the non-zero snapshot floor and the first?/complete? chunk flags" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_ctx")
+      floor = 0xABCDEF
+      GenServer.cast(pid, {:snapshot_floor, floor})
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+
+      assert :ok =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(
+                 pid,
+                 chunk_msg(500, [1], first?: true, complete?: true)
+               )
+
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert_receive {:snapshot_call, _changes, ctx}, 1_000
+      assert ctx.snapshot_lsn == floor
+      assert ctx.first_for_table? == true
+      assert ctx.backfill_complete? == true
+    end
+  end
 end

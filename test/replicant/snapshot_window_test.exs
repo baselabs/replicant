@@ -166,6 +166,33 @@ defmodule Replicant.SnapshotWindowTest do
     refute W.tracked?(w, "public.orders", [1])
   end
 
+  test "taint_table/2 discards a tainted table's pending chunk + resets tracking; other tables untouched" do
+    w =
+      W.new(epoch: 1, drop_cap: 100, max_pending: 4)
+      |> W.open_window("public.orders")
+      |> W.open_window("public.items")
+      |> W.track([change("orders", 7)])
+
+    {w, :ok} = W.add_chunk(w, chunk("orders", [1], 10))
+    {w, :ok} = W.add_chunk(w, chunk("items", [2], 20))
+    assert length(w.pending) == 2
+
+    w = W.taint_table(w, "public.orders")
+
+    # the tainted table's tracking is reset (drop-set now unknowable → force re-read)
+    refute W.tracked?(w, "public.orders", [7])
+    # only the tainted table's pending chunk is discarded
+    assert Enum.map(w.pending, & &1.qualified) == ["public.items"]
+
+    # frontier past BOTH HWs: only the untouched items chunk pops; orders is gone
+    w2 = W.set_frontier(w, 1, 100)
+    assert {:apply, _kept, %{qualified: "public.items"}, w3} = W.pop_ready(w2)
+    assert :none = W.pop_ready(w3)
+
+    # a no-op for a table that is not being tracked
+    assert W.taint_table(w, "public.ghost") == w
+  end
+
   test "frontier also advances from applied commit LSNs (max semantics, monotone)" do
     w = W.new(epoch: 1, drop_cap: 100, max_pending: 4)
     w = W.observe_applied(w, 100)

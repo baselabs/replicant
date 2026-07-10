@@ -83,6 +83,7 @@ defmodule Replicant.Assembler do
           batch_count: non_neg_integer(),
           batch_txns: [Transaction.t()],
           batch_spill_paths: [String.t()],
+          last_buffered_tables: [String.t()] | :spilled,
           pending_lsn: lsn() | nil,
           stream_floor: lsn() | nil,
           stream_txns: %{non_neg_integer() => stream_buf()},
@@ -125,6 +126,7 @@ defmodule Replicant.Assembler do
     batch_count: 0,
     batch_txns: [],
     batch_spill_paths: [],
+    last_buffered_tables: [],
     pending_lsn: nil,
     stream_floor: nil,
     stream_txns: %{},
@@ -1154,11 +1156,26 @@ defmodule Replicant.Assembler do
   # frame) makes this robust on a fresh slot where lib_checkpoint is 0 but stream LSNs are
   # large-absolute — without it the first txn would spuriously span-flush. The max_delay_ms timer is
   # the AssemblerServer's third trigger. `lib_checkpoint` is NOT advanced here — only at flush (§9).
-  defp buffer_txn(%__MODULE__{} = asm, %Transaction{commit_lsn: lsn} = _txn, duration) do
+  defp buffer_txn(
+         %__MODULE__{} = asm,
+         %Transaction{commit_lsn: lsn, changes: changes} = _txn,
+         duration
+       ) do
     Telemetry.event([:replicant, :sink, :committed], %{duration: duration}, %{commit_lsn: lsn})
 
     count = asm.batch_count + 1
-    asm = %{reset(asm) | batch_count: count, pending_lsn: lsn}
+
+    # Capture the AFFECTED "schema.table" set of THIS delivered-then-discarded txn (overwritten each
+    # buffer_txn). The AssemblerServer taints exactly these tables' snapshot chunks (its PKs cannot be
+    # added to the drop-set — the txn is gone), NOT every open table: tainting all would livelock a
+    # cold-table backfill under any hot-table stream write (F-TAINT). A lazy/spilled (non-list)
+    # `changes` is unenumerable → `:spilled` (server falls back to tainting every open table).
+    asm = %{
+      reset(asm)
+      | batch_count: count,
+        pending_lsn: lsn,
+        last_buffered_tables: affected_tables(changes)
+    }
 
     cond do
       count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
@@ -1166,6 +1183,25 @@ defmodule Replicant.Assembler do
       true -> {:buffered, asm}
     end
   end
+
+  # The distinct "schema.table" names a buffered txn touched — the AFFECTED set for taint-scoping.
+  # NEVER enumerate a lazy, single-pass spill-backed `changes` (spec §5): a non-list Enumerable
+  # yields the `:spilled` marker so the server taints conservatively (every open table) instead.
+  defp affected_tables(changes) when is_list(changes) do
+    changes
+    |> Enum.map(fn %Change{schema: s, table: t} -> "#{s}.#{t}" end)
+    |> Enum.uniq()
+  end
+
+  defp affected_tables(_lazy), do: :spilled
+
+  @doc """
+  The "schema.table" set the LAST lib+batch `buffer_txn` affected (or `:spilled` when that txn's
+  `changes` was a lazy spill-backed Enumerable and unenumerable). The AssemblerServer taints exactly
+  these tables' snapshot chunks when the discarded txn's PKs cannot enter the drop-set (spec §2/§4).
+  """
+  @spec buffered_tables(t()) :: [String.t()] | :spilled
+  def buffered_tables(%__MODULE__{last_buffered_tables: tables}), do: tables
 
   # Sink-owned batch delivery (spec §6): buffer the committed txn (NO sink call) and signal a
   # flush when the count OR the LSN-span cap trips (span base = max(lib_checkpoint, stream_floor),
