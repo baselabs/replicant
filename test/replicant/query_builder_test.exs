@@ -166,39 +166,87 @@ defmodule Replicant.QueryBuilderTest do
       assert sql =~ "indisprimary"
       assert sql =~ "WITH ORDINALITY"
       assert sql =~ "quote_ident(a.attname)"
-      assert sql =~ "atttypid"
       # joins against pg_publication_tables by the bound publication name
       assert sql =~ "pg_publication_tables"
       assert sql =~ "pubname = $1"
+      # Per-column TYPE oids now come from table_columns/0 (the full column set covers the
+      # PK columns), so pk_columns/0 no longer duplicates a per-PK type array.
+      refute sql =~ "atttypid"
     end
   end
 
-  describe "keyset_chunk/3" do
-    test "first chunk (no bound): ordered LIMIT-parameterized scan" do
+  describe "table_columns/0" do
+    test "discovers ALL non-dropped columns ordered by attnum with server-quoted names + type oids" do
+      sql = QueryBuilder.table_columns()
+      assert sql =~ "pg_attribute"
+      assert sql =~ "attnum > 0"
+      assert sql =~ "NOT a.attisdropped"
+      assert sql =~ "ORDER BY a.attnum"
+      assert sql =~ "quote_ident(a.attname)"
+      assert sql =~ "atttypid"
+      assert sql =~ "pg_publication_tables"
+      assert sql =~ "pubname = $1"
+      # NOT restricted to primary-key columns (that is pk_columns/0's job).
+      refute sql =~ "indisprimary"
+    end
+  end
+
+  describe "keyset_chunk/4" do
+    test "first chunk (no bound): every column cast to ::text + RAW PK bound projections, TABLE-QUALIFIED ORDER BY" do
       {:ok, sql} =
-        QueryBuilder.keyset_chunk(~s(public."Orders"), [~s("id"), ~s("region")], 0)
+        QueryBuilder.keyset_chunk(
+          ~s(public."Orders"),
+          [~s("id"), ~s("region"), ~s("amount")],
+          [~s("id"), ~s("region")],
+          0
+        )
 
       assert sql ==
-               ~s(SELECT *, "id"::text AS __rpk_1, "region"::text AS __rpk_2 ) <>
+               ~s(SELECT "id"::text AS "id", "region"::text AS "region", "amount"::text AS "amount", ) <>
+                 ~s("id" AS __rpk_1, "region" AS __rpk_2 ) <>
                  ~s(FROM public."Orders" ) <>
-                 ~s(ORDER BY "id", "region" LIMIT $1)
+                 ~s(ORDER BY public."Orders"."id", public."Orders"."region" LIMIT $1)
+
+      # ORDER BY is TABLE-QUALIFIED so it binds the typed int/uuid columns, never the
+      # same-named ::text output alias (a bare `ORDER BY "id"` sorts lexicographically and
+      # silently skips keyset pages — the marquee-caught convergence loss).
+      refute sql =~ ~s(ORDER BY "id",)
     end
 
-    test "subsequent chunk: ROW() comparison with BOUND parameters, never literals" do
+    test "subsequent chunk: ROW() comparison with BOUND parameters on the TABLE-QUALIFIED typed PK columns" do
       {:ok, sql} =
-        QueryBuilder.keyset_chunk(~s(public."Orders"), [~s("id"), ~s("region")], 2)
+        QueryBuilder.keyset_chunk(
+          ~s(public."Orders"),
+          [~s("id"), ~s("region"), ~s("amount")],
+          [~s("id"), ~s("region")],
+          2
+        )
 
       assert sql ==
-               ~s(SELECT *, "id"::text AS __rpk_1, "region"::text AS __rpk_2 ) <>
+               ~s(SELECT "id"::text AS "id", "region"::text AS "region", "amount"::text AS "amount", ) <>
+                 ~s("id" AS __rpk_1, "region" AS __rpk_2 ) <>
                  ~s(FROM public."Orders" ) <>
-                 ~s{WHERE ("id", "region") > ($2, $3) } <>
-                 ~s(ORDER BY "id", "region" LIMIT $1)
+                 ~s{WHERE (public."Orders"."id", public."Orders"."region") > ($2, $3) } <>
+                 ~s(ORDER BY public."Orders"."id", public."Orders"."region" LIMIT $1)
 
       refute sql =~ "ROW(1"
+      # The keyset compares/orders the REAL typed PK columns (type-correct ordering), never
+      # the ::text projection alias — a ::text keyset would break numeric/int pagination.
+      refute sql =~ ~s|"id"::text) >|
     end
 
     test "rejects an empty pk list" do
-      assert {:error, :invalid_identifier} = QueryBuilder.keyset_chunk("public.t", [], 0)
+      assert {:error, :invalid_identifier} =
+               QueryBuilder.keyset_chunk("public.t", [~s("c")], [], 0)
+    end
+  end
+
+  describe "keyless_scan/2" do
+    test "casts every column to ::text (no bound, no ORDER BY) for the PK-less fallback" do
+      sql = QueryBuilder.keyless_scan(~s(public."Log"), [~s("id"), ~s("body")])
+
+      assert sql ==
+               ~s(SELECT "id"::text AS "id", "body"::text AS "body" FROM public."Log")
     end
   end
 

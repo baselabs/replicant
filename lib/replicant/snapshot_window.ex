@@ -18,9 +18,10 @@ defmodule Replicant.SnapshotWindow do
           required(:schema) => String.t(),
           required(:table) => String.t(),
           required(:pk_raw) => [String.t()],
-          # pg-canonical PK tuple per change, cast via Casting.Types from the __rpk_* text
-          # projections — the SAME cast the stream side applied (plan review F1). Parallel
-          # to :changes, same order.
+          # pg-canonical PK tuple per change, read from the delivered CAST record's PK
+          # columns — the SAME Casting.Types term the stream side tracks (plan review F1;
+          # every snapshot column is now cast through the stream's path). Parallel to
+          # :changes, same order.
           required(:pk_canon) => [[term()]],
           required(:changes) => [Change.t()],
           required(:hw) => Replicant.lsn(),

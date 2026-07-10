@@ -20,8 +20,8 @@ defmodule Replicant.Snapshotter.Incremental do
   ## Resume is re-discovered, never token-trusted (Critical Rule 2)
 
   On BOTH the initial resume and every reconnect-reload, table metadata (`qualified`,
-  `pk_quoted`, `pk_raw`, `pk_type_names`) is re-discovered from the server
-  (`quote_ident`/`format('%I.%I')` via `QueryBuilder.pk_columns/0`). The persisted
+  `pk_quoted`, `pk_raw`, `col_quoted`, `col_type_names`) is re-discovered from the server
+  (`quote_ident`/`format('%I.%I')` via `QueryBuilder.pk_columns/0` + `table_columns/0`). The persisted
   progress token is attacker-writable (a row in the progress store) and `decode/1`
   validates only that `pk_quoted`/`pk_raw` are LISTS — NOT that their elements are safe
   identifiers. So the token is used ONLY for the resume POSITION (which tables are done,
@@ -48,15 +48,18 @@ defmodule Replicant.Snapshotter.Incremental do
 
   @max_table_attempts 3
 
-  # A table_ref enriched with `pk_type_names` (SnapshotProgress.table_ref/0 does not carry
-  # them — they are re-derived on every discovery and never trusted from the token).
+  # A table_ref enriched with the full column list (`col_quoted`) and each column's
+  # pgoutput type name (`col_type_names`, keyed by raw attname; an integer OID for a type
+  # with no `name_for_type_id` mapping). SnapshotProgress.table_ref/0 does not carry these —
+  # they are re-derived on every discovery and never trusted from the token.
   @type table_ref :: %{
           schema: String.t(),
           table: String.t(),
           qualified: String.t(),
           pk_raw: [String.t()],
           pk_quoted: [String.t()],
-          pk_type_names: [String.t()]
+          col_quoted: [String.t()],
+          col_type_names: %{optional(String.t()) => String.t() | non_neg_integer()}
         }
 
   @type args :: %{
@@ -127,44 +130,73 @@ defmodule Replicant.Snapshotter.Incremental do
   # queued LAST (their whole-table windows are the contention-sensitive ones).
   defp discover(db, args) do
     pk_rows = Postgrex.query!(db, QueryBuilder.pk_columns(), [args.publication]).rows
+    col_rows = Postgrex.query!(db, QueryBuilder.table_columns(), [args.publication]).rows
     {:ok, all_sql} = QueryBuilder.publication_tables(args.publication)
     all_rows = Postgrex.query!(db, all_sql, []).rows
-    SnapshotProgress.new(parse_pk_rows(pk_rows, all_rows), args.floor_lsn)
+    SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
   end
 
   @doc false
-  @spec parse_pk_rows([[term()]], [[term()]]) :: [table_ref()]
-  def parse_pk_rows(pk_rows, all_rows) do
+  @spec parse_pk_rows([[term()]], [[term()]], [[term()]]) :: [table_ref()]
+  def parse_pk_rows(pk_rows, col_rows, all_rows) do
+    cols_by_q = Map.new(col_rows, &col_meta/1)
+
     with_pk =
-      Map.new(pk_rows, fn [schema, table, qualified, pk_raw, pk_quoted, pk_type_oids] ->
-        {qualified,
-         %{
-           schema: schema,
-           table: table,
-           qualified: qualified,
-           pk_raw: pk_raw,
-           pk_quoted: pk_quoted,
-           # OID -> pgoutput type-name via the decoder's own mapping, so chunk-side PK
-           # text casts through EXACTLY the stream side's cast path (plan review F1).
-           pk_type_names: Enum.map(pk_type_oids, &OidDatabase.name_for_type_id/1)
-         }}
+      Map.new(pk_rows, fn [schema, table, qualified, pk_raw, pk_quoted] ->
+        {qualified, keyed_ref(schema, table, qualified, pk_raw, pk_quoted, cols_by_q)}
       end)
 
     {keyed, keyless} =
       all_rows
       |> Enum.map(fn [schema, table, qualified] ->
-        Map.get(with_pk, qualified, %{
-          schema: schema,
-          table: table,
-          qualified: qualified,
-          pk_raw: [],
-          pk_quoted: [],
-          pk_type_names: []
-        })
+        Map.get_lazy(with_pk, qualified, fn ->
+          keyless_ref(schema, table, qualified, cols_by_q)
+        end)
       end)
       |> Enum.split_with(&(&1.pk_raw != []))
 
     keyed ++ keyless
+  end
+
+  # {qualified => %{col_quoted, col_type_names}}. The OID -> pgoutput type-name mapping is
+  # the decoder's OWN (`name_for_type_id`), so a `<col>::text` value casts through EXACTLY
+  # the stream side's cast path; an unmapped OID stays its integer (cast_record's fallback
+  # returns the raw text — the same value-free graceful path the stream takes).
+  defp col_meta([_schema, _table, qualified, col_raw, col_quoted, col_type_oids]) do
+    type_names =
+      col_raw
+      |> Enum.zip(Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1))
+      |> Map.new()
+
+    {qualified, %{col_quoted: col_quoted, col_type_names: type_names}}
+  end
+
+  defp keyed_ref(schema, table, qualified, pk_raw, pk_quoted, cols_by_q) do
+    cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}})
+
+    %{
+      schema: schema,
+      table: table,
+      qualified: qualified,
+      pk_raw: pk_raw,
+      pk_quoted: pk_quoted,
+      col_quoted: cmeta.col_quoted,
+      col_type_names: cmeta.col_type_names
+    }
+  end
+
+  defp keyless_ref(schema, table, qualified, cols_by_q) do
+    cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}})
+
+    %{
+      schema: schema,
+      table: table,
+      qualified: qualified,
+      pk_raw: [],
+      pk_quoted: [],
+      col_quoted: cmeta.col_quoted,
+      col_type_names: cmeta.col_type_names
+    }
   end
 
   @doc false
@@ -249,21 +281,29 @@ defmodule Replicant.Snapshotter.Incremental do
     reset_guard(AssemblerServer.open_snapshot_window(server(args), table.qualified))
 
     _lw = watermark(db, standby?)
-    {:ok, sql} = QueryBuilder.keyset_chunk(table.qualified, table.pk_quoted, length(bound || []))
+
+    {:ok, sql} =
+      QueryBuilder.keyset_chunk(
+        table.qualified,
+        table.col_quoted,
+        table.pk_quoted,
+        length(bound || [])
+      )
+
     params = [chunk_rows | bound || []]
     %Postgrex.Result{columns: cols, rows: rows} = Postgrex.query!(db, sql, params)
     hw = watermark(db, standby?)
 
-    # Split off the trailing __rpk_* text projections: the record keeps only real columns;
-    # the canonical PK tuple casts the pg-rendered text through the stream's OWN cast path
-    # (one representation on both drop-set sides — plan review F1).
-    {changes, pk_canon} = split_changes(table, cols, rows)
+    # Cast every column to its stream-identical term (the delivered record) + derive the
+    # cast pk_canon (drop-set key, matches the window's cast stream PK); the RAW __rpk_*
+    # projections give the bind-compatible keyset bound (last_bound).
+    {changes, pk_canon, last_bound} = split_changes(table, cols, rows)
 
     {sp, done?} =
       if length(rows) < chunk_rows do
         {SnapshotProgress.finish_table(sp), true}
       else
-        {SnapshotProgress.advance(sp, bound_of(changes, table.pk_raw)), false}
+        {SnapshotProgress.advance(sp, last_bound), false}
       end
 
     deliver(args, %{
@@ -414,7 +454,9 @@ defmodule Replicant.Snapshotter.Incremental do
           Postgrex.query!(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
 
           c
-          |> Postgrex.stream("SELECT * FROM #{table.qualified}", [], max_rows: 1000)
+          |> Postgrex.stream(QueryBuilder.keyless_scan(table.qualified, table.col_quoted), [],
+            max_rows: 1000
+          )
           |> Enum.reduce({:ok, true}, fn %Postgrex.Result{columns: cols, rows: rows},
                                          {:ok, first?} ->
             deliver_keyless_batch(args, table, {cols, rows}, watermark_in_txn(c, standby?),
@@ -481,12 +523,17 @@ defmodule Replicant.Snapshotter.Incremental do
   defp server(args), do: AssemblerServer.via(args.slot_name)
 
   @doc false
-  # Separate real columns from the trailing __rpk_* projections; cast each __rpk text
-  # through Casting.Types.cast_record/2 with the discovered pgoutput type names.
-  # `table` is a discovery/enriched table_ref carrying `pk_type_names`; typed `map()`
-  # (not `table_ref()`) because `SnapshotProgress.next/1` returns the declared
-  # `SnapshotProgress.table_ref/0`, which erases the enriched key from dialyzer's view.
-  @spec split_changes(map(), [String.t()], [[term()]]) :: {[Change.t()], [[term()]]}
+  # Split the real (cast) columns from the trailing RAW __rpk_* PK projections. The real
+  # columns arrive as `<col>::text` and are cast through `Casting.Types.cast_record/2` (the
+  # stream's OWN path) into the delivered `%Change{}.record`; `pk_canon` (the drop-set key)
+  # is derived from that CAST record's PK columns — identical to the term the stream tracks;
+  # `last_bound` is the LAST row's RAW native PK tuple (bind-compatible for the keyset
+  # resume — a cast uuid/timestamp value would NOT bind to its typed WHERE column).
+  # `table` is a discovery/enriched table_ref (`col_type_names`/`pk_raw`); typed `map()` (not
+  # `table_ref()`) because `SnapshotProgress.next/1` returns the declared
+  # `SnapshotProgress.table_ref/0`, which erases the enriched keys from dialyzer's view.
+  @spec split_changes(map(), [String.t()], [[term()]]) ::
+          {[Change.t()], [[term()]], [term()] | nil}
   def split_changes(table, cols, rows) do
     {real_cols, rpk_cols} = Enum.split_with(cols, &(not String.starts_with?(&1, "__rpk_")))
     n_real = length(real_cols)
@@ -498,46 +545,64 @@ defmodule Replicant.Snapshotter.Incremental do
     # shorten n_real, misalign Enum.split, and silently mis-build the drop-set. A bare-shape
     # raise (no row values) is caught by backfill/1's value-free rescue → :snapshot_failed
     # (Critical Rule 1), halting instead of corrupting convergence.
-    unless n_rpk == length(table.pk_type_names) do
+    unless n_rpk == length(table.pk_raw) do
       raise "unexpected rpk column count"
     end
 
-    rows
-    |> Enum.map(fn row ->
-      {real_vals, rpk_texts} = Enum.split(row, n_real)
-      change = hd(build_changes(table, {real_cols, [real_vals]}))
+    triples =
+      Enum.map(rows, fn row ->
+        {real_vals, rpk_raw} = Enum.split(row, n_real)
+        change = hd(build_changes(table, {real_cols, [real_vals]}))
+        # pk_canon: the CAST PK tuple (from the delivered record) — matches the window's
+        # cast stream PK. The record carries every column (PKs included), so its PK values
+        # are already cast through the stream path.
+        canon = Enum.map(table.pk_raw, &Map.fetch!(change.record, &1))
+        # The RAW native PK tuple for the keyset bound (bind-compatible).
+        bound = Enum.take(rpk_raw, n_rpk)
+        {change, canon, bound}
+      end)
 
-      canon =
-        rpk_texts
-        |> Enum.take(n_rpk)
-        |> Enum.zip(table.pk_type_names)
-        |> Enum.map(fn {text, type_name} -> Types.cast_record(text, type_name) end)
+    changes = Enum.map(triples, &elem(&1, 0))
+    canons = Enum.map(triples, &elem(&1, 1))
 
-      {change, canon}
-    end)
-    |> Enum.unzip()
+    last_bound =
+      case List.last(triples) do
+        nil -> nil
+        triple -> elem(triple, 2)
+      end
+
+    {changes, canons, last_bound}
   end
 
   @doc false
   @spec build_changes(map(), {[String.t()], [[term()]]}) :: [Change.t()]
   def build_changes(table, {cols, rows}) do
     Enum.map(rows, fn row ->
+      record =
+        cols
+        |> Enum.zip(row)
+        |> Map.new(fn {col, val} ->
+          {col, cast_value(val, Map.get(table.col_type_names, col))}
+        end)
+
       %Change{
         op: :snapshot,
         schema: table.schema,
         table: table.table,
-        record: cols |> Enum.zip(row) |> Map.new(),
+        record: record,
         commit_lsn: nil
       }
     end)
   end
 
-  @doc false
-  @spec bound_of([Change.t()], [String.t()]) :: [term()]
-  def bound_of(changes, pk_raw) do
-    last = List.last(changes)
-    Enum.map(pk_raw, &Map.get(last.record, &1))
-  end
+  # Cast one `<col>::text` value to its Elixir term, EXACTLY mirroring the stream's
+  # `Assembler.cast_value/2`: a NULL column stays `nil`, and a text value routes through
+  # the shared `Casting.Types.cast_record/2`. `type` is the pgoutput type name (or an
+  # integer OID for an unmapped type — `cast_record/2`'s fallback returns the raw text,
+  # matching the stream). No other input shape reaches here: the `::text` projection yields
+  # only binaries and NULLs.
+  defp cast_value(nil, _type), do: nil
+  defp cast_value(value, type) when is_binary(value), do: Types.cast_record(value, type)
 
   @doc false
   @spec reader_error(term()) :: Error.t()

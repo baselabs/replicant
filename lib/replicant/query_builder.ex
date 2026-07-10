@@ -195,14 +195,16 @@ defmodule Replicant.QueryBuilder do
   via `quote_ident` (the ONLY form ever interpolated into keyset SQL — spec §6.6,
   Critical Rule 2; the `format('%I')` precedent). Publication name is bound `$1`.
   A publication table with NO primary key returns no row here (PK-less fallback,
-  spec §6.4). Row shape: `[schemaname, tablename, qualified, pk_raw, pk_quoted, pk_type_oids]`.
+  spec §6.4). Row shape: `[schemaname, tablename, qualified, pk_raw, pk_quoted]`.
+
+  Per-column TYPE oids come from `table_columns/0` (the full column set already covers
+  the PK columns), so no per-PK type array is duplicated here.
   """
   @spec pk_columns() :: String.t()
   def pk_columns do
     "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
       "array_agg(a.attname ORDER BY k.ord) AS pk_raw, " <>
-      "array_agg(quote_ident(a.attname) ORDER BY k.ord) AS pk_quoted, " <>
-      "array_agg(a.atttypid::int ORDER BY k.ord) AS pk_type_oids " <>
+      "array_agg(quote_ident(a.attname) ORDER BY k.ord) AS pk_quoted " <>
       "FROM pg_publication_tables p " <>
       "JOIN pg_class c ON c.relname = p.tablename " <>
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
@@ -214,41 +216,102 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  Keyset chunk SELECT (spec §6.6). `qualified` and `pk_quoted` come from `pk_columns/0`
-  (server-quoted — never validated client-side, never raw). `bound_arity` is the number
-  of PK columns in the resume bound: `0` emits the first-chunk form (no WHERE);
-  `n > 0` emits a ROW() comparison whose bounds are BIND PARAMETERS `$2..$n+1`
-  (`$1` is the LIMIT) — a literal bound would be simultaneously an injection surface
-  and a Rule-1 leak into logged SQL text. An empty PK list is a caller error.
+  Query returning, per publication table, ALL its non-dropped user columns
+  (`attnum > 0 AND NOT attisdropped`, the `SELECT *` column set) ordered by `attnum` —
+  the raw `attname` (the `%Change{}.record` string key and the result column name), the
+  server-quoted form via `quote_ident` (the ONLY form interpolated into the keyset/keyless
+  `::text` projection — Critical Rule 2, the `format('%I')` precedent), and each column's
+  `atttypid`. The reader maps the OID to a pgoutput type name (`OidDatabase.name_for_type_id/1`)
+  and casts the `<col>::text` value through the SAME `Casting.Types.cast_record/2` path the
+  stream uses, so snapshot and stream deliver byte-identical `%Change{}.record` values for
+  EVERY column (spec §2 convergence — the F1 fix generalized from PK-only to all columns).
+  Publication name is bound `$1`. Row shape:
+  `[schemaname, tablename, qualified, col_raw, col_quoted, col_type_oids]`.
   """
-  @spec keyset_chunk(String.t(), [String.t()], non_neg_integer()) ::
-          {:ok, String.t()} | {:error, :invalid_identifier}
-  def keyset_chunk(_qualified, [], _bound_arity), do: {:error, :invalid_identifier}
-
-  def keyset_chunk(qualified, pk_quoted, 0) do
-    {:ok,
-     "SELECT *#{rpk_select(pk_quoted)} FROM #{qualified} " <>
-       "ORDER BY #{Enum.join(pk_quoted, ", ")} LIMIT $1"}
+  @spec table_columns() :: String.t()
+  def table_columns do
+    "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
+      "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
+      "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
+      "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
+      "FROM pg_publication_tables p " <>
+      "JOIN pg_class c ON c.relname = p.tablename " <>
+      "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
+      "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+      "WHERE p.pubname = $1 " <>
+      "GROUP BY p.schemaname, p.tablename"
   end
 
-  def keyset_chunk(qualified, pk_quoted, bound_arity) when bound_arity == length(pk_quoted) do
+  @doc """
+  Keyset chunk SELECT (spec §6.6). `col_quoted` (all columns) and `pk_quoted` (the PK
+  subset) come from `table_columns/0`/`pk_columns/0` (server-quoted — never validated
+  client-side, never raw). `bound_arity` is the number of PK columns in the resume bound:
+  `0` emits the first-chunk form (no WHERE); `n > 0` emits a ROW() comparison whose bounds
+  are BIND PARAMETERS `$2..$n+1` (`$1` is the LIMIT) — a literal bound would be
+  simultaneously an injection surface and a Rule-1 leak into logged SQL text. An empty PK
+  list is a caller error.
+
+  EVERY column is projected as `<col>::text AS <col>` so each delivered value is the
+  type's text output — byte-identical to pgoutput text, which the stream casts through the
+  SAME `Casting.Types.cast_record/2` path (spec §2 convergence). The WHERE/ORDER BY reference
+  the REAL typed PK columns — TABLE-QUALIFIED (`<qualified>.<pk>`, NOT bare `<pk>`) so they
+  bind to the typed table columns, NEVER the same-named `::text` OUTPUT ALIAS: a bare
+  `ORDER BY <pk>` resolves to the projected alias (SQL lets ORDER BY see output names),
+  which would sort keyset pages LEXICOGRAPHICALLY (`1,10,100,…`) and silently skip rows.
+  """
+  @spec keyset_chunk(String.t(), [String.t()], [String.t()], non_neg_integer()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def keyset_chunk(_qualified, _col_quoted, [], _bound_arity), do: {:error, :invalid_identifier}
+
+  def keyset_chunk(qualified, col_quoted, pk_quoted, 0) do
+    {:ok,
+     "SELECT #{cast_projection(col_quoted)}#{rpk_select(pk_quoted)} FROM #{qualified} " <>
+       "ORDER BY #{pk_ref(qualified, pk_quoted)} LIMIT $1"}
+  end
+
+  def keyset_chunk(qualified, col_quoted, pk_quoted, bound_arity)
+      when bound_arity == length(pk_quoted) do
     params = Enum.map_join(2..(bound_arity + 1), ", ", &"$#{&1}")
 
     {:ok,
-     "SELECT *#{rpk_select(pk_quoted)} FROM #{qualified} " <>
-       "WHERE (#{Enum.join(pk_quoted, ", ")}) > (#{params}) " <>
-       "ORDER BY #{Enum.join(pk_quoted, ", ")} LIMIT $1"}
+     "SELECT #{cast_projection(col_quoted)}#{rpk_select(pk_quoted)} FROM #{qualified} " <>
+       "WHERE (#{pk_ref(qualified, pk_quoted)}) > (#{params}) " <>
+       "ORDER BY #{pk_ref(qualified, pk_quoted)} LIMIT $1"}
   end
 
-  # Trailing pg-canonical TEXT projections of the PK columns ("__rpk_1"…): the reader
-  # strips them from the record and casts them through the SAME Casting.Types path the
-  # stream uses — one canonical PK representation on both drop-set sides (plan review F1;
-  # a native-vs-cast term mismatch would make the drop-filter vacuous for uuid/timestamp
-  # PKs and silently break spec §2 convergence).
+  @doc """
+  Whole-table scan for the PK-less fallback (spec §6.4). Every column is projected as
+  `<col>::text AS <col>` (the SAME cast projection as `keyset_chunk/4`) so a PK-less
+  table's snapshot rows converge with the stream too (the record values are cast; there
+  is no keyset bound). `col_quoted` is server-quoted (`table_columns/0`), never raw.
+  """
+  @spec keyless_scan(String.t(), [String.t()]) :: String.t()
+  def keyless_scan(qualified, col_quoted),
+    do: "SELECT #{cast_projection(col_quoted)} FROM #{qualified}"
+
+  # Cast projection: every column as `<quoted>::text AS <quoted>`. The `::text` output
+  # equals pgoutput text (both use the type's output function), and the reader casts it
+  # through `Casting.Types.cast_record/2` — the exact stream path — so the delivered
+  # `%Change{}.record` is byte-identical to the stream's for every type (spec §2).
+  defp cast_projection(col_quoted), do: Enum.map_join(col_quoted, ", ", &"#{&1}::text AS #{&1}")
+
+  # TABLE-QUALIFIED PK column list (`<qualified>.<pk>, …`) for the keyset WHERE/ORDER BY. The
+  # qualification is what makes these bind to the REAL typed table columns and not the
+  # same-named `::text` output alias in the projection (which ORDER BY would otherwise pick,
+  # sorting lexicographically). `qualified` is server-quoted (`format('%I.%I')`) and
+  # `pk_quoted` is `quote_ident`-quoted — both interpolation-safe (Critical Rule 2).
+  defp pk_ref(qualified, pk_quoted), do: Enum.map_join(pk_quoted, ", ", &"#{qualified}.#{&1}")
+
+  # Trailing RAW (uncast) PK projections ("__rpk_1"…): they carry the keyset RESUME BOUND.
+  # Unlike the cast record columns, the bound MUST ride as the NATIVE Postgrex value so it
+  # binds back into the next chunk's `WHERE (pk) > ($2..)` — a cast uuid/timestamp value is
+  # NOT bind-compatible with its typed column (Postgrex rejects a 36-byte dashed-string uuid
+  # for a `uuid` param). `pk_canon` (the drop-set key) is derived separately from the CAST
+  # record, so these projections carry ONLY the bind-compatible bound.
   defp rpk_select(pk_quoted) do
     pk_quoted
     |> Enum.with_index(1)
-    |> Enum.map_join("", fn {col, i} -> ", #{col}::text AS __rpk_#{i}" end)
+    |> Enum.map_join("", fn {col, i} -> ", #{col} AS __rpk_#{i}" end)
   end
 
   @doc """

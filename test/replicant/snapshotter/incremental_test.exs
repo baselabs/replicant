@@ -5,10 +5,15 @@ defmodule Replicant.Snapshotter.IncrementalTest do
   alias Replicant.SnapshotProgress
   alias Replicant.Snapshotter.Incremental, as: Inc
 
-  test "parse_pk_rows/1 builds table_refs and sorts PK-less tables LAST" do
+  test "parse_pk_rows/3 builds table_refs (full column list + type names) and sorts PK-less tables LAST" do
     pk_rows = [
-      # trailing element = pk_type_oids (int4 = 23)
-      ["public", "orders", "public.orders", ["id"], [~s("id")], [23]]
+      ["public", "orders", "public.orders", ["id"], [~s("id")]]
+    ]
+
+    # table_columns/0 rows: every column, quoted names + atttypid (int4 = 23, text = 25).
+    col_rows = [
+      ["public", "orders", "public.orders", ["id", "note"], [~s("id"), ~s("note")], [23, 25]],
+      ["public", "nopk", "public.nopk", ["x"], [~s("x")], [25]]
     ]
 
     all_rows = [
@@ -16,87 +21,132 @@ defmodule Replicant.Snapshotter.IncrementalTest do
       ["public", "nopk", "public.nopk"]
     ]
 
-    refs = Inc.parse_pk_rows(pk_rows, all_rows)
+    refs = Inc.parse_pk_rows(pk_rows, col_rows, all_rows)
 
     assert [
-             %{qualified: "public.orders", pk_raw: ["id"], pk_type_names: ["int4"]},
-             %{qualified: "public.nopk", pk_raw: [], pk_type_names: []}
+             %{
+               qualified: "public.orders",
+               pk_raw: ["id"],
+               col_quoted: [~s("id"), ~s("note")],
+               col_type_names: %{"id" => "int4", "note" => "text"}
+             },
+             %{
+               qualified: "public.nopk",
+               pk_raw: [],
+               col_quoted: [~s("x")],
+               col_type_names: %{"x" => "text"}
+             }
            ] = refs
   end
 
-  test "build_changes/2 produces op: :snapshot rows with string keys and nil commit_lsn" do
-    [c] = Inc.build_changes(%{schema: "public", table: "orders"}, {["id", "note"], [[7, "x"]]})
+  test "build_changes/2 casts each ::text value via col_type_names → op: :snapshot, string keys, nil commit_lsn" do
+    table = %{
+      schema: "public",
+      table: "orders",
+      col_type_names: %{"id" => "int4", "note" => "text"}
+    }
+
+    # Values arrive as TEXT (the ::text projection); build_changes casts them.
+    [c] = Inc.build_changes(table, {["id", "note"], [["7", "x"]]})
 
     assert %Replicant.Change{op: :snapshot, record: %{"id" => 7, "note" => "x"}, commit_lsn: nil} =
              c
   end
 
-  test "bound_of/2 extracts the last row's PK values in pk_raw order" do
-    changes = Inc.build_changes(%{schema: "s", table: "t"}, {["a", "b"], [[1, "x"], [2, "y"]]})
-    assert Inc.bound_of(changes, ["b", "a"]) == ["y", 2]
+  test "build_changes/2 keeps a NULL column nil (mirrors the stream's cast_value(nil,_))" do
+    table = %{schema: "s", table: "t", col_type_names: %{"id" => "int4", "note" => "text"}}
+    [c] = Inc.build_changes(table, {["id", "note"], [["7", nil]]})
+    assert c.record == %{"id" => 7, "note" => nil}
   end
 
-  test "split_changes/3 strips __rpk_* + casts pk_canon via Casting.Types (F1 stream parity)" do
+  test "split_changes/3 casts ALL columns, derives cast pk_canon, and returns the RAW keyset bound" do
     table = %{
       schema: "public",
       table: "t",
       qualified: "public.t",
       pk_raw: ["id"],
       pk_quoted: [~s("id")],
-      pk_type_names: ["int4"]
+      col_quoted: [~s("id"), ~s("note")],
+      col_type_names: %{"id" => "int4", "note" => "text"}
     }
 
+    # Real columns arrive as ::text ("7","x"); __rpk_1 is the RAW native PK (int stays int).
     cols = ["id", "note", "__rpk_1"]
-    rows = [[7, "x", "7"]]
+    rows = [["7", "x", 7]]
 
-    {[change], [canon]} = Inc.split_changes(table, cols, rows)
+    {[change], [canon], last_bound} = Inc.split_changes(table, cols, rows)
 
-    # The record keeps ONLY real columns; the __rpk_* projection is stripped.
+    # EVERY delivered column is cast to its Elixir type (text "7" → 7).
     assert change.record == %{"id" => 7, "note" => "x"}
-    # pk_canon is the SAME term the stream decode yields for this PK type:
-    # cast_record(pg-rendered text, name_for_type_id(oid)) — one representation on both
-    # drop-set sides (plan review F1).
+    # pk_canon is derived from the CAST record — the SAME term the stream tracks.
     assert canon == [Types.cast_record("7", "int4")]
     assert canon == [7]
+    # The keyset resume bound is the RAW native PK (bind-compatible), from __rpk_*.
+    assert last_bound == [7]
+  end
+
+  test "split_changes/3 delivers a uuid as the stream-IDENTICAL dashed STRING; bound stays raw (convergence fix; RED under old Postgrex-* path)" do
+    uuid_text = "550e8400-e29b-41d4-a716-446655440000"
+
+    raw16 =
+      <<0x55, 0x0E, 0x84, 0x00, 0xE2, 0x9B, 0x41, 0xD4, 0xA7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
+        0x00>>
+
+    table = %{
+      schema: "public",
+      table: "t",
+      qualified: "public.t",
+      pk_raw: ["id"],
+      pk_quoted: [~s("id")],
+      col_quoted: [~s("id")],
+      col_type_names: %{"id" => "uuid"}
+    }
+
+    # id::text AS id → the dashed string; __rpk_1 → the RAW 16-byte uuid (for keyset binding).
+    cols = ["id", "__rpk_1"]
+    rows = [[uuid_text, raw16]]
+
+    {[change], [canon], last_bound} = Inc.split_changes(table, cols, rows)
+
+    # THE FIX: the delivered record's uuid is the dashed STRING — byte-identical to what the
+    # STREAM delivers (assembler cast_value → Types.cast_record(pgoutput_text, "uuid")).
+    assert change.record["id"] == uuid_text
+    assert change.record["id"] == Types.cast_record(uuid_text, "uuid")
+    # RED discriminator: the OLD Postgrex-`*` path delivered THIS raw 16-byte binary here, so
+    # a state-mirror sink keyed by PK would see two different keys → NO convergence (spec §2).
+    refute change.record["id"] == raw16
+    # pk_canon matches the stream's tracked PK (the cast dashed string).
+    assert canon == [uuid_text]
+    # The keyset bound stays the RAW 16-byte binary — the ONLY form that binds to a `uuid`
+    # WHERE column (a dashed string raises Postgrex EncodeError, proven live).
+    assert last_bound == [raw16]
   end
 
   test "split_changes/3 RAISES on an unexpected __rpk_ column count (F1 fail-closed prefix collision)" do
-    # A single-PK table: pk_type_names has ONE entry, so the keyset SQL emits ONE __rpk_N.
+    # A single-PK table: pk_raw has ONE entry, so the keyset SQL emits ONE __rpk_N.
     table = %{
       schema: "public",
       table: "t",
       qualified: "public.t",
       pk_raw: ["id"],
       pk_quoted: [~s("id")],
-      pk_type_names: ["int4"]
+      col_quoted: [~s("id"), ~s("note")],
+      col_type_names: %{"id" => "int4", "note" => "text"}
     }
 
     # A user column literally named `__rpk_9` injects a SECOND __rpk_ column. Without the
-    # guard it is misclassified into rpk_cols, shortens n_real, and silently mis-builds the
-    # drop-set: pre-guard this returns {[change], [[99]]} (the user column's value leaks into
-    # pk_canon instead of the real id 7) — a WRONG result, NO raise. The guard fails closed.
+    # guard it is misclassified into rpk_cols, shortens n_real, misaligns Enum.split, and
+    # silently mis-builds the drop-set — a WRONG result, NO raise. The guard fails closed
+    # (n_rpk = 2 ≠ pk arity 1).
     cols = ["id", "note", "__rpk_9", "__rpk_1"]
-    rows = [[7, "x", "99", "7"]]
+    rows = [["7", "x", "99", "7"]]
 
     assert_raise RuntimeError, ~r/rpk/, fn -> Inc.split_changes(table, cols, rows) end
   end
 
   test "reconcile_resume/2 sources identifiers from FRESH discovery, never the token (pk_quoted injection defense)" do
     # Freshly re-discovered metadata: pk_quoted/qualified come from server quote_ident.
-    fresh =
-      SnapshotProgress.new(
-        [
-          %{
-            schema: "public",
-            table: "orders",
-            qualified: "public.orders",
-            pk_raw: ["id"],
-            pk_quoted: [~s("id")],
-            pk_type_names: ["int4"]
-          }
-        ],
-        0
-      )
+    fresh = SnapshotProgress.new([fresh_ref("orders")], 0)
 
     # An attacker-persisted token: same table by qualified NAME, but its pk_quoted/pk_raw
     # carry a SQL-injection payload and it asks to resume "orders" at bound [5].
@@ -130,20 +180,7 @@ defmodule Replicant.Snapshotter.IncrementalTest do
   end
 
   test "reconcile_resume/2 drops a token bound whose arity mismatches the fresh PK (fail-closed)" do
-    fresh =
-      SnapshotProgress.new(
-        [
-          %{
-            schema: "public",
-            table: "orders",
-            qualified: "public.orders",
-            pk_raw: ["id"],
-            pk_quoted: [~s("id")],
-            pk_type_names: ["int4"]
-          }
-        ],
-        0
-      )
+    fresh = SnapshotProgress.new([fresh_ref("orders")], 0)
 
     tampered = %SnapshotProgress{
       floor_lsn: 0,
@@ -336,8 +373,9 @@ defmodule Replicant.Snapshotter.IncrementalTest do
   end
 
   # A freshly re-discovered keyed table_ref (server-quoted identifiers, single int4 PK), as
-  # `discover/1` builds them — carries `pk_type_names`, which the SnapshotProgress table_ref
-  # shape does not. Used to prove reconcile_resume/2 sources identifiers from FRESH only.
+  # `discover/1` builds them — carries the enriched `col_quoted`/`col_type_names`, which the
+  # SnapshotProgress table_ref shape does not. Used to prove reconcile_resume/2 sources
+  # identifiers from FRESH only (the col enrichment is never token-trusted).
   defp fresh_ref(name) do
     %{
       schema: "public",
@@ -345,7 +383,8 @@ defmodule Replicant.Snapshotter.IncrementalTest do
       qualified: "public.#{name}",
       pk_raw: ["id"],
       pk_quoted: [~s("id")],
-      pk_type_names: ["int4"]
+      col_quoted: [~s("id")],
+      col_type_names: %{"id" => "int4"}
     }
   end
 end
