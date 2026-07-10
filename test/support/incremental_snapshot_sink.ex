@@ -3,10 +3,32 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   A `:state_mirror` sink for the incremental-snapshot crash-injection marquees
   (Tasks 11-12). Persists to THREE named public ETS tables instead of Postgres
   (unlike `snapshot_sink.ex`/`ledger_sink.ex`, which back onto a real `sink_orders`
-  table over a named Postgrex connection): a `mirror` table (current row state,
-  keyed `{table, pk}`, PLUS the two watermark keys `:checkpoint` and `:progress`), an
-  APPEND-ONLY `ledger` table (the effect-once proof substrate), and a `control` table
-  (the `fail_next_chunk` fault-injection flag).
+  table over a named Postgrex connection): a `mirror` table (current row state, keyed
+  `{qualified_table, pk}` with an ORIGIN-TAGGED value — `{:chunk, row}` written by
+  `handle_snapshot/2`, `{:stream, row}` (or `{:stream, :deleted}`) written by
+  `handle_transaction/1` — PLUS the two watermark keys `:checkpoint` and `:progress`),
+  an APPEND-ONLY `ledger` table (the effect-once proof substrate), and a `control`
+  table (the `fail_next_chunk` fault-injection flag).
+
+  ## Qualified table keying + origin-tagged first_for_table? redo-safety
+
+  Both callbacks key the mirror by the QUALIFIED `"schema.table"`. The assembler builds
+  a chunk's `ctx.table` as `"\#{schema}.\#{table}"`, but a stream `Change` carries `schema`
+  and a BARE `table` separately — so `handle_transaction/1` reconstructs the SAME
+  qualified key (`"\#{change.schema}.\#{change.table}"`). Keying the stream side by the bare
+  `table` would land a row that was snapshot-loaded AND stream-updated under TWO mirror
+  keys → row-for-row inflation.
+
+  Each mirror value is tagged with the ORIGIN of its latest write: `:chunk` (snapshot) or
+  `:stream`. A stream write over a snapshot row flips its origin to `:stream`. This makes
+  the `first_for_table?` redo-safety reset surgical: `clear_mirror_table/1` `match_delete`s
+  ONLY the `{table, _}` entries whose origin is `:chunk`, PRESERVING `:stream` rows. Under
+  frontier ordering a concurrent stream UPDATE can land BEFORE the first chunk closes; a
+  blanket clear of all of the table's rows would drop that stream-applied row (the drop-set
+  then drops the chunk's collided version → the row is LOST). The library-side drop-set
+  keeps a stream-superseded PK out of the chunk's kept rows, so re-applying the kept chunk
+  rows as `:chunk` never clobbers a surviving `:stream` row — the stream version wins.
+  `mirror/0` strips the tag, so the marquee's row-for-row compare is unaffected.
 
   ## Ownership (surviving a pipeline crash/restart)
 
@@ -148,10 +170,13 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
     :ok
   end
 
+  # `table` is the QUALIFIED `ctx.table`. Tag the value `:chunk` (snapshot origin) so a
+  # later stream write can flip it to `:stream` and the first_for_table? clear can tell
+  # snapshot-loaded rows apart from stream-applied ones.
   defp chunk_entry(%Change{record: r}, table) do
     case r && r["id"] do
       nil -> nil
-      pk -> {{table, pk}, r, pk}
+      pk -> {{table, pk}, {:chunk, r}, pk}
     end
   end
 
@@ -188,14 +213,20 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   end
 
   @doc """
-  The current mirror rows, keyed `{table, pk}` — deleted rows and the `:checkpoint`/
-  `:progress` watermark entries are excluded, so this reflects live state only.
+  The current mirror rows, keyed `{qualified_table, pk} => row` — the internal origin
+  tag (`:chunk`/`:stream`) is STRIPPED here, and tombstoned rows plus the `:checkpoint`/
+  `:progress` watermark entries are excluded, so this reflects live state only (the
+  marquee's row-for-row compare sees the same `{table, pk} => row` shape as before).
   """
   @spec mirror() :: %{{String.t(), term()} => map()}
   def mirror do
     @mirror_table
     |> :ets.tab2list()
-    |> Enum.reject(fn {key, value} -> key in [:checkpoint, :progress] or value == :deleted end)
+    |> Enum.flat_map(fn
+      {key, _value} when key in [:checkpoint, :progress] -> []
+      {_key, {_origin, :deleted}} -> []
+      {key, {_origin, value}} -> [{key, value}]
+    end)
     |> Map.new()
   end
 
@@ -220,20 +251,29 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   # Upsert (insert/update) an entry; delete tombstones it (kept, not removed, so the
   # whole batch — including deletes — still lands via ONE :ets.insert call alongside
   # the checkpoint). `mirror/0` filters tombstones back out for callers.
-  defp mirror_entry(%Change{op: op, table: table, record: r}) when op in [:insert, :update] do
+  #
+  # Key by the QUALIFIED "schema.table" (a stream Change carries `schema` + a BARE
+  # `table` separately) so a stream write keys IDENTICALLY to handle_snapshot's
+  # `ctx.table`. Tag the value `:stream`: a stream write over a snapshot row flips its
+  # origin so the first_for_table? clear preserves it (see clear_mirror_table/1).
+  defp mirror_entry(%Change{op: op, schema: schema, table: table, record: r})
+       when op in [:insert, :update] do
     pk = r && r["id"]
-    if pk, do: {{table, pk}, r, pk}
+    if pk, do: {{"#{schema}.#{table}", pk}, {:stream, r}, pk}
   end
 
-  defp mirror_entry(%Change{op: :delete, table: table, old_record: old}) do
+  defp mirror_entry(%Change{op: :delete, schema: schema, table: table, old_record: old}) do
     pk = old && old["id"]
-    if pk, do: {{table, pk}, :deleted, pk}
+    if pk, do: {{"#{schema}.#{table}", pk}, {:stream, :deleted}, pk}
   end
 
   defp mirror_entry(_change), do: nil
 
+  # first_for_table? redo-safety reset: clear ONLY this table's snapshot-origin (`:chunk`)
+  # rows, preserving `:stream` rows a concurrent UPDATE applied before the first chunk (a
+  # blanket `{{table, :_}, :_}` clear would drop that stream row → loss).
   defp clear_mirror_table(table) do
-    :ets.match_delete(@mirror_table, {{table, :_}, :_})
+    :ets.match_delete(@mirror_table, {{table, :_}, {:chunk, :_}})
   end
 
   # :ets.take/2 reads-and-removes the flag in one call — check-and-clear with no

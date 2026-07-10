@@ -110,7 +110,7 @@ defmodule Replicant.Sink do
   | Obligation | v1 (`snapshot: true`) | incremental (`snapshot: [mode: :incremental]`) |
   |---|---|---|
   | Non-`:ok` return / raise | aborts + re-runs the WHOLE snapshot | halts fail-closed; resume re-delivers from the last durable chunk |
-  | `first_for_table?` | true on the first batch per table, EVERY attempt — clear the table's prior mirror state | true on a table's first chunk of a FRESH run AND on every PK-less-table redo attempt — same clearing obligation |
+  | `first_for_table?` | true on the first batch per table, EVERY attempt — clear the table's prior SNAPSHOT-ORIGIN mirror rows, and MUST NOT clear rows the live stream (`handle_transaction/1`) applied | true on a table's first chunk of a FRESH run AND on every PK-less-table redo attempt — same snapshot-origin-only clearing obligation |
   | Checkpoint | never advance here | never advance here |
   | `context.progress` | absent | sink-owned mode MUST persist the token atomically with the chunk (effect-once); ignoring it degrades resume to restart-from-zero (safe, dup-only) |
   | `context.backfill_complete?` | absent | true ONLY on the dedicated final call (`changes: []`), delivered at-least-once until durable |
@@ -118,7 +118,11 @@ defmodule Replicant.Sink do
 
   In BOTH modes, the library guarantees at least one call per publication table (even a
   zero-row table), so `first_for_table?` always fires and the redo-safety reset always
-  happens. `context.snapshot_lsn` is the snapshot's consistent point.
+  happens. A `:state_mirror` sink MUST distinguish snapshot-origin rows from stream-origin
+  rows for that reset: `first_for_table?` clears only the SNAPSHOT-loaded rows and must
+  PRESERVE rows the live stream (`c:handle_transaction/1`) applied — under frontier ordering
+  a stream update can land BEFORE the first chunk closes, and a blanket clear would lose it.
+  `context.snapshot_lsn` is the snapshot's consistent point.
   """
   @callback handle_snapshot([Replicant.Change.t()], context) :: :ok | {:error, term()}
             when context: %{
