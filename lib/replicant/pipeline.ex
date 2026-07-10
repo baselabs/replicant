@@ -51,6 +51,7 @@ defmodule Replicant.Pipeline do
          checkpoint_store: store,
          batch: Map.get(config, :batch),
          streaming: Map.get(config, :streaming),
+         snapshot_window: incremental_kw(config),
          max_inflight_lag: Map.get(config, :max_inflight_lag)
        ]
 
@@ -60,6 +61,17 @@ defmodule Replicant.Pipeline do
       sink: sink,
       batch: Map.get(config, :batch_delivery),
       streaming: Map.get(config, :streaming),
+      snapshot_window: incremental_kw(config),
       max_inflight_lag: Map.get(config, :max_inflight_lag)
     ]
+
+  # The AssemblerServer's snapshot-window knobs, drawn from an INCREMENTAL snapshot config
+  # (`snapshot: [mode: :incremental, chunk_rows: n, max_pending_chunks: m]`, normalized by
+  # `Replicant.Config`). A boolean snapshot (`false`/`true` — the v1 EXPORT_SNAPSHOT or no
+  # snapshot) yields nil, so the AssemblerServer keeps its window nil and no incremental
+  # machinery is armed.
+  defp incremental_kw(%{snapshot: snapshot}) when is_list(snapshot),
+    do: Keyword.take(snapshot, [:chunk_rows, :max_pending_chunks])
+
+  defp incremental_kw(_config), do: nil
 end

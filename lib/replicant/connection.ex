@@ -43,6 +43,7 @@ defmodule Replicant.Connection do
   use Postgrex.ReplicationConnection
 
   alias Replicant.{AssemblerServer, Decoder, QueryBuilder, Telemetry}
+  alias Replicant.Snapshotter.Incremental
 
   @pg_epoch DateTime.to_unix(~U[2000-01-01 00:00:00Z], :microsecond)
 
@@ -69,6 +70,7 @@ defmodule Replicant.Connection do
           | :invalidation_check
           | :create_slot
           | :create_export_slot
+          | :create_incremental_slot
           | :snapshotting
           | :streaming
 
@@ -77,7 +79,7 @@ defmodule Replicant.Connection do
           publication: String.t(),
           sink: module(),
           go_forward_only: boolean(),
-          snapshot: boolean(),
+          snapshot: boolean() | keyword(),
           connection: keyword(),
           checkpoint_lsn: Replicant.lsn(),
           checkpoint_state: :present | :empty | :fault | :fault_permanent,
@@ -91,6 +93,10 @@ defmodule Replicant.Connection do
           streaming: keyword() | nil,
           in_stream: boolean(),
           store_retry_count: non_neg_integer(),
+          frontier_epoch: non_neg_integer(),
+          backfill_floor: Replicant.lsn() | nil,
+          last_frontier_cast: non_neg_integer(),
+          reader_pid: pid() | nil,
           step: step()
         }
 
@@ -102,6 +108,7 @@ defmodule Replicant.Connection do
     :snapshot,
     :connection,
     :stream_floor_lsn,
+    :backfill_floor,
     checkpoint_lsn: 0,
     checkpoint_state: :empty,
     received_lsn: 0,
@@ -113,6 +120,9 @@ defmodule Replicant.Connection do
     streaming: nil,
     in_stream: false,
     store_retry_count: 0,
+    frontier_epoch: 0,
+    last_frontier_cast: 0,
+    reader_pid: nil,
     step: :disconnected
   ]
 
@@ -202,6 +212,19 @@ defmodule Replicant.Connection do
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
          spilled_bytes: 0,
+         # `frontier_epoch` is KEPT across (re)connect (monotonic; only `start_streaming`
+         # bumps it) so a fresh window always adopts a strictly-higher epoch than any
+         # in-flight pre-reconnect frontier cast (85672f1 stale-epoch class). The per-stream
+         # rate-limit anchor resets to 0 so the first frame of the new stream can cast.
+         frontier_epoch: state.frontier_epoch,
+         last_frontier_cast: 0,
+         # `reader_pid` is KEPT across (re)connect (LOAD-BEARING): the prior incremental reader
+         # is `spawn_link`ed to THIS Connection, which persists (handle_disconnect stays alive),
+         # so its link never fires and it survives the reconnect. Carrying the pid here lets the
+         # next `start_streaming_with_backfill` RETIRE it before respawning — exactly-one-reader
+         # ([[replicant-otp-async-lifetime-hygiene]]). Explicit (not implicit) so a future merge
+         # cannot silently clobber it back to nil and resurrect the double-reader bug.
+         reader_pid: state.reader_pid,
          step: :recovery_check
      }}
   end
@@ -269,6 +292,22 @@ defmodule Replicant.Connection do
     {:noreply, %{state | step: :snapshotting}}
   end
 
+  # A FRESH incremental slot was created (NOEXPORT_SNAPSHOT): its consistent_point is the
+  # backfill floor (the LSN at/after which the stream carries every change; the reader
+  # snapshots the base rows as-of this point). `snapshot_name` is nil for NOEXPORT. Seed the
+  # floor, spawn the reader, and stream from the checkpoint (0 on a fresh slot). Same 4-col
+  # result-row shape as the EXPORT_SNAPSHOT create (probe §11.1).
+  def handle_result(
+        [%Postgrex.Result{rows: [[_slot, consistent_point, _snap_name, _plugin]]}],
+        %{step: :create_incremental_slot} = state
+      ) do
+    floor = Replicant.lsn_from_string(consistent_point)
+    Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+    Telemetry.event([:replicant, :snapshot, :started], %{}, %{commit_lsn: floor})
+    state = %{state | backfill_floor: floor}
+    start_streaming_with_backfill(state, nil)
+  end
+
   def handle_result(%Postgrex.Error{}, _state) do
     # A replication-command error (value-bearing message never inspected). Disconnect;
     # auto_reconnect re-runs the connect chain.
@@ -300,6 +339,27 @@ defmodule Replicant.Connection do
 
     received_lsn = max(state.received_lsn, wal_end)
     state = %{state | received_lsn: received_lsn, stream_floor_lsn: stream_floor_lsn}
+
+    # Whenever the pipeline is in incremental MODE (incremental?/1 tests is_list(snapshot) and
+    # stays true for the whole pipeline lifetime, not only during an active backfill), forward
+    # the XLogData frontier so a pending chunk window can close on a busy-but-publication-filtered
+    # source (spec §2; plan F4: such a source never applies commits, so keepalive-only forwarding
+    # would stall closure to the ~30 s cadence). Post-completion the cast is a cheap no-op (the
+    # assembler's pop_ready returns :none). Rate-limited to ≥ 1 MiB of advance so the hot path
+    # stays cheap. Epoch-tagged with the CURRENT window epoch so a stale pre-reconnect cast can
+    # never close a fresh window (85672f1 class).
+    state =
+      if incremental?(state) and wal_end - state.last_frontier_cast >= 1_048_576 do
+        GenServer.cast(
+          AssemblerServer.via(state.slot_name),
+          {:snapshot_frontier, state.frontier_epoch, wal_end}
+        )
+
+        %{state | last_frontier_cast: wal_end}
+      else
+        state
+      end
+
     lag = inflight_lag(state)
 
     if lag > effective_lag_bound(state) do
@@ -311,7 +371,20 @@ defmodule Replicant.Connection do
 
   # Primary keepalive: reply with the durable checkpoint ONLY when a reply is
   # requested (reply == 1). Never the received wal_end.
-  def handle_data(<<?k, _wal_end::64, _clock::64, reply::8>>, state) do
+  def handle_data(<<?k, wal_end::64, _clock::64, reply::8>>, state) do
+    # Whenever the pipeline is in incremental MODE (incremental?/1 stays true for the whole
+    # pipeline lifetime, not only during an active backfill), forward the keepalive frontier so
+    # a pending chunk window can close on an idle/trickle source (spec §2 D3). Cheap: one cast
+    # per keepalive (~seconds apart), so unconditional; post-completion it is a no-op in the
+    # assembler (pop_ready returns :none). Epoch-tagged with the CURRENT window epoch so a stale
+    # pre-reconnect cast can never close a fresh window (85672f1 class).
+    if incremental?(state) do
+      GenServer.cast(
+        AssemblerServer.via(state.slot_name),
+        {:snapshot_frontier, state.frontier_epoch, wal_end}
+      )
+    end
+
     if reply == 1 do
       {:noreply, [encode_status_update(state.checkpoint_lsn)], state}
     else
@@ -471,11 +544,66 @@ defmodule Replicant.Connection do
         checkpoint_state: :empty,
         sink: sink,
         go_forward_only: false,
-        snapshot: false
+        snapshot: snapshot
       }),
-      do: Replicant.Sink.sink_kind(sink) == :state_mirror
+      # ANY snapshot intent (`true` or a `[mode: :incremental]` keyword) is a safe seed and
+      # bypasses the empty-checkpoint state-mirror refusal; only a bare `false` (no seed, no
+      # go-forward) trips the violation.
+      do: snapshot == false and Replicant.Sink.sink_kind(sink) == :state_mirror
 
   def lib_go_forward_violation?(_), do: false
+
+  @doc false
+  @spec incremental?(map()) :: boolean()
+  def incremental?(%{snapshot: s}), do: is_list(s)
+  def incremental?(_), do: false
+
+  @doc false
+  # Retire any prior incremental chunk reader before a reconnect respawns a fresh one, so the
+  # slot is served by EXACTLY ONE reader (spec §8). The reader is `spawn_link`ed to this
+  # Connection, but `handle_disconnect` keeps the Connection ALIVE across an `auto_reconnect`
+  # cycle — so the link never fires and the old reader survives the reconnect. A second reader
+  # spawned by `start_streaming_with_backfill` would then concurrently backfill the same slot
+  # and double-deliver chunks ([[replicant-otp-async-lifetime-hygiene]]: an async primitive whose
+  # lifetime is not bound to the state it serves survives reconnect and acts stale).
+  #
+  # UNLINK BEFORE KILL: the `spawn_link` link is bidirectional, so killing a still-linked reader
+  # would deliver its `:kill` EXIT back to this Connection and fault it. Unlink first, then kill.
+  # A dead or nil `reader_pid` is a no-op. Clears `reader_pid` (the caller threads in the fresh one).
+  @spec retire_reader(t()) :: t()
+  def retire_reader(%__MODULE__{reader_pid: pid} = state) when is_pid(pid) do
+    if Process.alive?(pid) do
+      Process.unlink(pid)
+      Process.exit(pid, :kill)
+    end
+
+    %{state | reader_pid: nil}
+  end
+
+  def retire_reader(state), do: state
+
+  @doc false
+  # Classify a progress-token read for the §8 matrix. A decode failure / store fault
+  # classifies as :fault (fail-closed halt :snapshot_progress_invalid) — NEVER :none (which
+  # would silently restart the backfill over a possibly-populated mirror = data corruption).
+  @spec classify_progress({:ok, binary() | nil} | {:error, term()}) ::
+          :none | :complete | {:in_flight, Replicant.SnapshotProgress.t()} | :fault
+  def classify_progress({:ok, nil}), do: :none
+
+  def classify_progress({:ok, token}) when is_binary(token) do
+    case Replicant.SnapshotProgress.decode(token) do
+      {:ok, sp} ->
+        if Replicant.SnapshotProgress.complete?(sp), do: :complete, else: {:in_flight, sp}
+
+      # Fail-closed on ANY decode error. Today decode/1 returns only :snapshot_progress_invalid;
+      # this catch-all hardens against a future decode-contract drift to a different error atom
+      # (which would otherwise FunctionClauseError-crash here instead of halting fail-closed).
+      {:error, _} ->
+        :fault
+    end
+  end
+
+  def classify_progress({:error, _}), do: :fault
 
   # ---- private ----
 
@@ -622,6 +750,14 @@ defmodule Replicant.Connection do
   end
 
   defp start_streaming(state) do
+    # SINGLE WRITER of frontier_epoch: an incremental (re)connect opens a fresh window epoch
+    # (fe + 1) HERE and nowhere else, so the {:reset_snapshot_window, epoch} prime_assembler
+    # casts and every subsequent {:snapshot_frontier, epoch, _} keepalive/XLogData cast all read
+    # this one stored value and therefore always agree (85672f1 stale-epoch class). A
+    # resumed-PLAIN stream (progress :complete / :none+present) flows through here too, so it
+    # also adopts the fresh epoch and its stale-window reset matches. Non-incremental pipelines
+    # are unaffected (fe stays 0, prime_assembler casts nothing, no frontier casts fire).
+    state = %{state | frontier_epoch: next_frontier_epoch(state)}
     prime_assembler(state, state.checkpoint_lsn)
 
     {:ok, sql} =
@@ -631,6 +767,55 @@ defmodule Replicant.Connection do
       )
 
     {:stream, sql, [], %{state | step: :streaming, in_stream: false}}
+  end
+
+  # The window epoch this (re)connect adopts: bumped once per incremental (re)connect so a fresh
+  # window strictly outranks any in-flight pre-reconnect frontier cast; unchanged (0) otherwise.
+  defp next_frontier_epoch(state) do
+    if incremental?(state), do: state.frontier_epoch + 1, else: state.frontier_epoch
+  end
+
+  # Incremental backfill start (spec §8): re-seat the window at a fresh epoch + seed the floor on
+  # the assembler, spawn_link the chunk reader (Snapshotter §17 precedent — dies with this
+  # Connection), then stream. The window reset + floor cast BEFORE the reader spawns so the reader
+  # never opens a chunk window against a stale epoch. `sp` nil = fresh run (the reader discovers
+  # tables + builds the token); non-nil = resume from the durable token.
+  #
+  # frontier_epoch stays SINGLE-WRITER: this reset uses `state.frontier_epoch + 1`, and
+  # start_streaming (called with the same pre-bump state) independently computes the identical
+  # fe + 1 and is the sole writer of the returned struct's frontier_epoch — so the two reset casts
+  # carry the same epoch, matching every later frontier cast.
+  defp start_streaming_with_backfill(state, sp) do
+    # Both callers set backfill_floor to a concrete LSN immediately before dispatching here
+    # (fresh: the NOEXPORT consistent_point; resume: sp.floor_lsn), so it is never nil at this
+    # point — the assembler floor and the reader floor read it directly.
+    floor = state.backfill_floor
+
+    # EXACTLY-ONE-READER: retire any reader from a prior life BEFORE re-seating the window and
+    # spawning the fresh one. On a reconnect the persistent Connection still holds the old
+    # `reader_pid` (it survived because the link never fired), so retire_reader unlink+kills it
+    # here; the window-reset that follows discards any old-epoch chunk it delivered mid-flight,
+    # and the fresh reader resumes from durable progress. Ordering: retire → reset → spawn.
+    state = retire_reader(state)
+    server = AssemblerServer.via(state.slot_name)
+    GenServer.cast(server, {:reset_snapshot_window, state.frontier_epoch + 1})
+    GenServer.cast(server, {:snapshot_floor, floor})
+
+    reader_pid =
+      Incremental.start(%{
+        slot_name: state.slot_name,
+        connection: state.connection,
+        publication: state.publication,
+        sink: state.sink,
+        mode: if(lib_mode?(state), do: :lib, else: :sink_owned),
+        snapshot: state.snapshot,
+        resume: sp,
+        floor_lsn: floor
+      })
+
+    # Thread the fresh reader pid into the state start_streaming returns (it preserves reader_pid),
+    # so the NEXT reconnect can retire THIS reader in turn.
+    start_streaming(%{state | reader_pid: reader_pid})
   end
 
   # On every (re)connect prepare the assembler for the resumed stream: lib mode SEEDS the
@@ -647,6 +832,17 @@ defmodule Replicant.Connection do
     # file a prior abnormal exit left. Per-slot and idempotent — safe here because no stream
     # is active yet. A no-op when spill is not configured.
     if spill_dir(state), do: Replicant.Spill.sweep_slot(spill_dir(state), state.slot_name)
+
+    # Incremental: re-seat the snapshot window at THIS connect's epoch (start_streaming already
+    # bumped frontier_epoch to the single-writer value). For a resumed-PLAIN stream (progress
+    # :complete / :none+present, no reader) this clears any stale window a previous life left; for
+    # a backfill it is an idempotent second reset at the same epoch as start_streaming_with_backfill.
+    if incremental?(state),
+      do:
+        GenServer.cast(
+          AssemblerServer.via(state.slot_name),
+          {:reset_snapshot_window, state.frontier_epoch}
+        )
 
     cond do
       lib_mode?(state) -> seed_assembler(state, seed_lsn)
@@ -693,6 +889,24 @@ defmodule Replicant.Connection do
 
   defp write_snapshot_handoff(_state, _lsn), do: :ok
 
+  @doc false
+  # Read the progress token from its per-mode home (spec §6.2). Lib mode: the checkpoint store
+  # (its returns are already value-free-scrubbed). Sink-owned: the sink's snapshot_progress/0
+  # behind a value-free rescue — a raise/throw becomes {:error, :snapshot_progress_read_fault},
+  # which classify_progress maps to :fault (fail-closed halt), never :none. `@doc false def` (not
+  # `defp`) so the sink-mode value-free boundary is unit-tested directly, like its siblings.
+  @spec read_progress(map()) :: {:ok, binary() | nil} | {:error, term()}
+  def read_progress(%{checkpoint_store: store, slot_name: slot}) when is_list(store),
+    do: Replicant.CheckpointStore.read_progress(Replicant.CheckpointStore.via(slot))
+
+  def read_progress(%{sink: sink}) do
+    sink.snapshot_progress()
+  rescue
+    _ -> {:error, :snapshot_progress_read_fault}
+  catch
+    _kind, _reason -> {:error, :snapshot_progress_read_fault}
+  end
+
   # ---- connect matrix (spec §8): slot presence × checkpoint state × snapshot mode ----
 
   # The unchanged sink-owned slot-classification decision (also the lib-mode path once
@@ -727,6 +941,29 @@ defmodule Replicant.Connection do
     end
   end
 
+  # ---- incremental snapshot (spec §8 of the incremental design) ----
+  # These clauses come FIRST; the `is_list/1` guard keeps them disjoint from the v1
+  # `snapshot: true` clauses and the non-snapshot catch-all below.
+
+  # Slot ABSENT. Progress in flight/complete + an absent slot = the stream gap between the
+  # backfill floor and now is unfillable (deletes lost) → :data_gap (the §14.19 family). No
+  # progress → a genuine fresh run: create the NOEXPORT slot. A decode/read fault → fail-closed.
+  defp begin_absent_slot(%{snapshot: s} = state) when is_list(s) do
+    case classify_progress(read_progress(state)) do
+      :none ->
+        {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
+        {:query, sql, %{state | step: :create_incremental_slot}}
+
+      :fault ->
+        halt_snapshot(state, :snapshot_progress_invalid)
+
+      _in_flight_or_complete ->
+        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: :data_gap})
+        Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_with_progress})
+        {:disconnect, :data_gap}
+    end
+  end
+
   # Slot ABSENT, checkpoint not durable (empty or fault-as-0).
   defp begin_absent_slot(%{snapshot: true, checkpoint_state: :fault} = state),
     do: halt_snapshot(state, :checkpoint_unreadable)
@@ -736,6 +973,34 @@ defmodule Replicant.Connection do
   defp begin_absent_slot(state) do
     {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
     {:query, sql, %{state | step: :create_slot}}
+  end
+
+  # Slot PRESENT (incremental — FIRST; `is_list/1` guard keeps it disjoint from the v1 clauses).
+  # :complete → plain resume; in-flight → resume streaming + respawn the reader from the durable
+  # token; :none + checkpoint present → bootstrapped-elsewhere no-op resume; :none + empty
+  # checkpoint → a foreign/crashed-v1 slot → the v1 :snapshot_incomplete discipline; :fault →
+  # fail-closed.
+  defp begin_present_slot(%{snapshot: s} = state) when is_list(s) do
+    case classify_progress(read_progress(state)) do
+      :complete ->
+        Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+        start_streaming(state)
+
+      {:in_flight, sp} ->
+        Telemetry.event([:replicant, :snapshot, :resumed], %{}, %{slot_name: state.slot_name})
+        state = %{state | backfill_floor: sp.floor_lsn}
+        start_streaming_with_backfill(state, sp)
+
+      :none when state.checkpoint_state == :present ->
+        Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+        start_streaming(state)
+
+      :none ->
+        halt_snapshot(state, :snapshot_incomplete)
+
+      :fault ->
+        halt_snapshot(state, :snapshot_progress_invalid)
+    end
   end
 
   # Slot PRESENT.

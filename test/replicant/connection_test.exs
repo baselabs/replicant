@@ -549,6 +549,48 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
+  # ---- read_progress/1 sink-mode value-free boundary (spec §6.2/§9) ----
+  #
+  # In sink-owned incremental mode, read_progress/1 calls the sink's snapshot_progress/0 behind a
+  # value-free rescue AND catch: a raise OR a throw is scrubbed to the bare
+  # {:error, :snapshot_progress_read_fault}, which classify_progress maps to :fault (fail-closed
+  # halt), never leaking the exception's PII-bearing payload. These stubs carry a PII marker in
+  # the raised/thrown value; the tests prove it is NOT present in the scrubbed result.
+
+  defmodule RaisingProgressSink do
+    @pii "PII_SSN_078051120_from_raise"
+    def pii, do: @pii
+    def snapshot_progress, do: raise("progress read blew up: #{@pii}")
+  end
+
+  defmodule ThrowingProgressSink do
+    @pii "PII_TOKEN_xyz789_from_throw"
+    def pii, do: @pii
+    def snapshot_progress, do: throw({:leaked, @pii})
+  end
+
+  describe "read_progress/1 — sink-mode value-free rescue/catch (spec §6.2/§9)" do
+    test "a sink snapshot_progress/0 that RAISES a PII-bearing error → :fault, value-free" do
+      # RED PROOF: without the `rescue` arm the raise propagates and ERRORS this test (it never
+      # reaches the assert), so a green match proves the value-free boundary caught it.
+      result = Connection.read_progress(%{sink: RaisingProgressSink})
+
+      assert result == {:error, :snapshot_progress_read_fault}
+      assert Connection.classify_progress(result) == :fault
+      refute inspect(result) =~ RaisingProgressSink.pii()
+    end
+
+    test "a sink snapshot_progress/0 that THROWS a PII-bearing term → :fault, value-free" do
+      # RED PROOF: without the `catch` arm the throw propagates as an (uncaught throw) exit and
+      # ERRORS this test, so a green match proves the catch arm scrubbed it.
+      result = Connection.read_progress(%{sink: ThrowingProgressSink})
+
+      assert result == {:error, :snapshot_progress_read_fault}
+      assert Connection.classify_progress(result) == :fault
+      refute inspect(result) =~ ThrowingProgressSink.pii()
+    end
+  end
+
   # ---- connection opts precedence ----
 
   describe "connection_opts/1 — library control opts win over caller :connection" do
@@ -794,6 +836,95 @@ defmodule Replicant.ConnectionTest do
       fwd_state = state(slot_name: "c4", stream_floor_lsn: 500, max_inflight_lag: 100)
       fwd_frame = <<?w, 0::64, 600::64, 0::64, "E">>
       assert {:noreply, _} = Connection.handle_data(fwd_frame, fwd_state)
+    end
+  end
+
+  describe "incremental snapshot helpers" do
+    test "incremental?/1 discriminates the widened snapshot field" do
+      assert Replicant.Connection.incremental?(%{snapshot: [mode: :incremental]})
+      refute Replicant.Connection.incremental?(%{snapshot: true})
+      refute Replicant.Connection.incremental?(%{snapshot: false})
+    end
+
+    test "progress classification: token decodes drive the §8 matrix rows" do
+      complete =
+        Replicant.SnapshotProgress.new([], 1) |> Replicant.SnapshotProgress.mark_complete()
+
+      inflight =
+        Replicant.SnapshotProgress.new(
+          [%{qualified: "q", schema: "s", table: "t", pk_raw: [], pk_quoted: []}],
+          1
+        )
+
+      assert :complete =
+               Replicant.Connection.classify_progress(
+                 {:ok, Replicant.SnapshotProgress.encode(complete)}
+               )
+
+      assert {:in_flight, _} =
+               Replicant.Connection.classify_progress(
+                 {:ok, Replicant.SnapshotProgress.encode(inflight)}
+               )
+
+      assert :none = Replicant.Connection.classify_progress({:ok, nil})
+
+      assert :fault =
+               Replicant.Connection.classify_progress(
+                 {:error, %Replicant.Error{reason: :checkpoint_store_failed}}
+               )
+
+      assert :fault = Replicant.Connection.classify_progress({:ok, <<131, 0, 0>>})
+    end
+  end
+
+  # ---- exactly-one-reader on reconnect ([[replicant-otp-async-lifetime-hygiene]]) ----
+  #
+  # The incremental chunk reader is spawn_link'ed to the Connection, but handle_disconnect keeps
+  # the Connection alive across an auto_reconnect cycle, so the link never fires and the old reader
+  # survives. start_streaming_with_backfill therefore retires the prior reader (via this seam)
+  # BEFORE respawning, so exactly one reader ever backfills a slot. This unit test proves the
+  # retire seam; the full reconnect→respawn→exactly-one-reader chain is Task 11's marquee (see the
+  # requirement noted in the closeout).
+  describe "retire_reader/1 — retire the prior reader before a reconnect respawns a fresh one" do
+    test "unlinks THEN kills a live prior reader (dead after; NO EXIT fault reaches the Connection)" do
+      # Trap exits so a still-linked kill (the bug) would deliver {:EXIT, dummy, :killed} HERE —
+      # this test process stands in for the Connection that spawn_link'ed the reader.
+      Process.flag(:trap_exit, true)
+
+      # A dummy long-lived reader, spawn_LINKED to this process exactly as Incremental.start links
+      # the real reader to the Connection.
+      dummy = spawn_link(fn -> Process.sleep(:infinity) end)
+      assert Process.alive?(dummy)
+
+      ref = Process.monitor(dummy)
+      returned = Connection.retire_reader(state(reader_pid: dummy))
+
+      # Exactly-one-reader: the prior reader is deterministically killed (reason :killed from the
+      # untrappable Process.exit/2 :kill). RED PROOF: a no-op retire_reader (`def r(state), do: state`)
+      # never kills the dummy, so this assert_receive times out AND `refute Process.alive?` fails.
+      assert_receive {:DOWN, ^ref, :process, ^dummy, :killed}
+      refute Process.alive?(dummy)
+
+      # reader_pid cleared so start_streaming_with_backfill can thread the fresh reader in.
+      assert returned.reader_pid == nil
+
+      # UNLINK-before-KILL: no EXIT signal reached this process. A retire that killed while still
+      # linked would deliver {:EXIT, ^dummy, :killed} here and fault the real Connection.
+      refute_receive {:EXIT, ^dummy, _reason}
+    end
+
+    test "a nil or already-dead reader_pid is a no-op (never crashes, state unchanged)" do
+      nil_state = state(reader_pid: nil)
+      assert Connection.retire_reader(nil_state) == nil_state
+
+      dead = spawn(fn -> :ok end)
+      ref = Process.monitor(dead)
+      assert_receive {:DOWN, ^ref, :process, ^dead, _}
+      refute Process.alive?(dead)
+
+      # A dead pid takes the live-pid clause but the Process.alive?/1 guard makes it a no-op; the
+      # struct is returned with reader_pid cleared and no exit/unlink is attempted on the dead pid.
+      assert Connection.retire_reader(state(reader_pid: dead)).reader_pid == nil
     end
   end
 end
