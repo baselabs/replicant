@@ -1266,6 +1266,37 @@ defmodule Replicant.AssemblerServerTest do
       assert {:ok, {:error, :table_discarded}} = Task.yield(task, 1_000) || Task.shutdown(task)
     end
 
+    test "finish_snapshot_table replies {:error, :table_discarded} when a KEYED drop-cap breach discards the table mid-barrier (CV2)" do
+      # The KEYED final-chunk barrier the reader now calls (run_chunk done?-branch): a drop-cap breach
+      # (contention) while the barrier is deferred MUST surface {:error, :table_discarded} so the
+      # reader RE-READS instead of marking the table done with un-applied rows = CV2 data loss.
+      # drop_cap = 10 × chunk_rows = 10, so 11 distinct-PK writes breach it deterministically.
+      pid =
+        start_supervised!(
+          {Replicant.AssemblerServer,
+           slot_name: "asrv_keyed_barrier_disc",
+           sink: ChunkLedgerSink,
+           snapshot_window: [chunk_rows: 1, max_pending_chunks: 4],
+           max_inflight_lag: 1_000_000}
+        )
+
+      assert {:ok, epoch} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+
+      # A keyed chunk (pk_raw ["id"]); commit LSN 400 < hw 500 keeps it PENDING while the barrier waits.
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
+
+      task =
+        Task.async(fn ->
+          Replicant.AssemblerServer.finish_snapshot_table(pid, "public.orders", epoch)
+        end)
+
+      refute Task.yield(task, 150)
+
+      # 11 distinct-PK writes to public.orders breach drop_cap (10) → keyed contention discard.
+      Enum.each(1..11, &send_committed_txn(pid, "orders", &1))
+      assert {:ok, {:error, :table_discarded}} = Task.yield(task, 1_000) || Task.shutdown(task)
+    end
+
     test "finish_snapshot_table replies {:error, :window_reset} when a reconnect reset bumped the epoch since open (stale generation — never a spurious :ok)" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_stale")
       assert {:ok, epoch} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")

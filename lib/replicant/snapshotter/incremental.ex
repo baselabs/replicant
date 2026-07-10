@@ -278,7 +278,9 @@ defmodule Replicant.Snapshotter.Incremental do
   defp run_chunk(db, args, sp, table, bound, chunk_rows, standby?) do
     fresh_table? = is_nil(bound) and args.resume == nil
 
-    reset_guard(AssemblerServer.open_snapshot_window(server(args), table.qualified))
+    # Capture the window GENERATION so the FINAL-chunk barrier below can reject a stale one (a
+    # reconnect reset re-seats the window → its buffered chunks were wiped, spec §4/§6.4).
+    epoch = open_window_epoch(server(args), table.qualified)
 
     _lw = watermark(db, standby?)
 
@@ -321,6 +323,16 @@ defmodule Replicant.Snapshotter.Incremental do
     })
 
     if done? do
+      # FINAL-CHUNK BARRIER (spec §6.4, CV2). The final (short) keyed chunk carries the `finish_table`
+      # (done) token, and the reader is about to move to the NEXT table. `deliver` returned on
+      # ACCEPTANCE, not apply, so this chunk is still buffered (frontier < hw). If a contention taint
+      # (drop-cap breach / TRUNCATE / spill) discards it before it applies, NO later same-table deliver
+      # would catch the discard → the table would persist `done` with un-applied rows = DATA LOSS.
+      # Block until ALL of this table's chunks drain (apply): a discard throws :table_discarded → this
+      # table re-reads, a reconnect throws :window_reset → reload. (Non-final chunks need no barrier —
+      # the NEXT same-table deliver catches a discard; the keyless path has its own barrier at §6.4.)
+      reset_guard(AssemblerServer.finish_snapshot_table(server(args), table.qualified, epoch))
+
       Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
         table: table.qualified,
         change_count: 0
