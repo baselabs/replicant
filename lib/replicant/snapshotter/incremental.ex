@@ -222,7 +222,16 @@ defmodule Replicant.Snapshotter.Incremental do
 
   def reconcile_resume(fresh, %SnapshotProgress{} = token) do
     done_set = MapSet.new(token.done)
-    {done_refs, rest} = Enum.split_with(fresh.pending, &MapSet.member?(done_set, &1.qualified))
+    original_set = original_table_set(token)
+
+    # The table set is captured ONCE per fresh run (spec §3/§18 non-goal): a table ADDED to the
+    # publication mid-run — present in FRESH discovery but ABSENT from the token's original set
+    # (done ∪ pending ∪ current) — is NOT historically backfilled; it streams from its add-point
+    # only. Fresh discovery supplies injection-safe METADATA for the ORIGINAL tables, never NEW
+    # ones. [Closeout 2026-07-10: user-ratified F7 — match the non-goal, not backfill-on-reconnect;
+    # supersedes the plan's F3.3 backfill-added-tables-on-resume choice.]
+    in_scope = Enum.filter(fresh.pending, &MapSet.member?(original_set, &1.qualified))
+    {done_refs, rest} = Enum.split_with(in_scope, &MapSet.member?(done_set, &1.qualified))
     {current_ref, remaining} = select_current(rest, token.current)
     bound = resume_bound(current_ref, token.bound)
 
@@ -235,6 +244,16 @@ defmodule Replicant.Snapshotter.Incremental do
         complete?: false
     }
   end
+
+  # The ORIGINAL fresh-run table set, recovered from the token: tables only ever move
+  # pending → current → done (never added), so their union is EXACTLY the set the fresh run
+  # captured — the baseline a resume must not expand (spec §3/§18 non-goal).
+  defp original_table_set(%SnapshotProgress{done: done, pending: pending, current: current}) do
+    MapSet.new(done ++ Enum.map(pending, & &1.qualified) ++ current_qualified(current))
+  end
+
+  defp current_qualified(%{qualified: q}) when is_binary(q), do: [q]
+  defp current_qualified(_), do: []
 
   # Match the token's in-progress table to a FRESH table_ref by qualified name (a string
   # compare — never interpolated). No current / no match ⇒ resume from the queue head.

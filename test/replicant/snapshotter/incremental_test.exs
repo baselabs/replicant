@@ -210,11 +210,19 @@ defmodule Replicant.Snapshotter.IncrementalTest do
         0
       )
 
-    # a,b done; c in-progress at [5]; d still pending. The token's `current` carries an
-    # injection payload in pk_quoted — it MUST be ignored (identifiers come from fresh).
+    # a,b done; c in-progress at [5]; d still pending (in the ORIGINAL token set). The token's
+    # `current` carries an injection payload in pk_quoted — it MUST be ignored (ids come from fresh).
     token = %SnapshotProgress{
       floor_lsn: 0,
-      pending: [],
+      pending: [
+        %{
+          schema: "public",
+          table: "d",
+          qualified: "public.d",
+          pk_raw: ["id"],
+          pk_quoted: [~s("id")]
+        }
+      ],
       done: ["public.a", "public.b"],
       current: %{
         schema: "public",
@@ -246,10 +254,19 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     fresh = SnapshotProgress.new([fresh_ref("a"), fresh_ref("b")], 0)
 
     # Token references two tables no longer in fresh discovery: x_dropped (in done) and
-    # c_dropped (current). Neither exists in the re-discovered publication.
+    # c_dropped (current). Neither exists in the re-discovered publication. b is an ORIGINAL
+    # pending table (in the token) that resume continues from.
     token = %SnapshotProgress{
       floor_lsn: 0,
-      pending: [],
+      pending: [
+        %{
+          schema: "public",
+          table: "b",
+          qualified: "public.b",
+          pk_raw: ["id"],
+          pk_quoted: [~s("id")]
+        }
+      ],
       done: ["public.a", "public.x_dropped"],
       current: %{
         schema: "public",
@@ -274,10 +291,11 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     assert table.pk_quoted == [~s("id")]
   end
 
-  test "reconcile_resume/2 lands a NEW fresh table (added since the token) in pending so it IS backfilled (F3.3)" do
+  test "reconcile_resume/2 does NOT backfill a table ADDED to the publication since the token (F3.3 — non-goal §3/§18)" do
     fresh = SnapshotProgress.new([fresh_ref("a"), fresh_ref("b"), fresh_ref("c")], 0)
 
-    # Token knows only a (done) and b (current); c was ADDED to the publication since.
+    # Token's ORIGINAL set is {a (done), b (current)}; c was ADDED to the publication since — it is
+    # NOT in the token, so it must NOT be historically backfilled (it streams from its add-point).
     token = %SnapshotProgress{
       floor_lsn: 0,
       pending: [],
@@ -295,14 +313,10 @@ defmodule Replicant.Snapshotter.IncrementalTest do
 
     r = Inc.reconcile_resume(fresh, token)
 
-    # c lands in pending with FRESH metadata (never token-sourced).
-    assert Enum.map(r.pending, & &1.qualified) == ["public.c"]
-    assert hd(r.pending).pk_quoted == [~s("id")]
-    # Prove it is actually backfilled: after b finishes, the loop yields c as the next unit.
-    {:table, next_table, nil, _sp} =
-      r |> SnapshotProgress.finish_table() |> SnapshotProgress.next()
-
-    assert next_table.qualified == "public.c"
+    # c is EXCLUDED (added mid-run). RED before the F7 fix: c landed in pending == ["public.c"].
+    assert r.pending == []
+    # After b finishes, the backfill is complete — c is never a backfill unit.
+    assert :complete = r |> SnapshotProgress.finish_table() |> SnapshotProgress.next()
   end
 
   test "reconcile_resume/2 with a complete? token is terminal + marks ALL fresh tables done (F3.4/F4)" do
