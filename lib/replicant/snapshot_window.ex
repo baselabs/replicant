@@ -108,30 +108,39 @@ defmodule Replicant.SnapshotWindow do
   end
 
   # Fold ONE change into the (tracking, touched, untrackable) accumulator. Only OPEN tables (in
-  # `acc`) are tracked; a change whose PK-record is nil (TRUNCATE / REPLICA-IDENTITY-NOTHING delete)
-  # has no per-row PK → its table joins `untrackable` (the caller taints it: discard + re-read,
-  # NEVER a `pk_tuple(nil, …)` crash). Every other change adds its resolved PK to the drop-set.
+  # `acc`) are tracked; a change with an EMPTY `pk_records` (TRUNCATE / REPLICA-IDENTITY-NOTHING
+  # delete) has no per-row PK → its table joins `untrackable` (the caller taints it: discard +
+  # re-read, NEVER a `pk_tuple(nil, …)` crash). Every other change adds its PK(s) to the drop-set.
   defp track_change(%Change{schema: s, table: t} = c, {acc, seen, untr}) do
     qualified = "#{s}.#{t}"
 
-    case {Map.fetch(acc, qualified), pk_record(c)} do
+    case {Map.fetch(acc, qualified), pk_records(c)} do
       {:error, _} ->
         {acc, seen, untr}
 
-      {{:ok, _entry}, nil} ->
+      {{:ok, _entry}, []} ->
         {acc, seen, [qualified | untr]}
 
-      {{:ok, entry}, rec} ->
-        {Map.put(acc, qualified, put_pk(entry, rec)), MapSet.put(seen, qualified), untr}
+      {{:ok, entry}, recs} ->
+        {Map.put(acc, qualified, Enum.reduce(recs, entry, &put_pk(&2, &1))),
+         MapSet.put(seen, qualified), untr}
     end
   end
 
-  # The record image whose PK identifies the changed row for drop-filtering. A DELETE carries only
-  # its key columns in `old_record` (its `record` is nil — pgoutput delete semantics); every other
-  # op (insert/update/snapshot) carries the new row in `record`. A nil result — a TRUNCATE, or a
-  # delete under REPLICA IDENTITY NOTHING — has no per-row PK, so the caller taints the table.
-  defp pk_record(%Change{op: :delete, old_record: old}), do: old
-  defp pk_record(%Change{record: record}), do: record
+  # The record image(s) whose PK(s) identify the changed row(s) for drop-filtering:
+  #   * INSERT / SNAPSHOT → the new row in `record`;
+  #   * DELETE → its key columns in `old_record` (`record` is nil — pgoutput delete semantics);
+  #   * UPDATE → BOTH `old_record` and `record`. A PK-CHANGING update's `old_record` holds the OLD
+  #     key, which a snapshot chunk read before the update still carries and MUST drop, else the
+  #     old-key row RESURRECTS (§2 ghost); the new key is tracked too (superset, convergence-safe).
+  # An EMPTY list — a TRUNCATE, or a delete/update whose key image is absent (REPLICA IDENTITY
+  # NOTHING) — has no per-row PK, so the caller taints the table (discard + re-read), never crashes.
+  defp pk_records(%Change{op: :update, old_record: old, record: rec}),
+    do: Enum.reject([old, rec], &is_nil/1)
+
+  defp pk_records(%Change{op: :delete, old_record: old}), do: Enum.reject([old], &is_nil/1)
+  defp pk_records(%Change{op: :truncate}), do: []
+  defp pk_records(%Change{record: rec}), do: Enum.reject([rec], &is_nil/1)
 
   defp apply_contention(w, tracking, []), do: {%{w | tracking: tracking}, []}
 

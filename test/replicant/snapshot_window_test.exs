@@ -143,6 +143,30 @@ defmodule Replicant.SnapshotWindowTest do
     assert w.pending == []
   end
 
+  test "track_capped drop-tracks BOTH keys of a PK-changing UPDATE (no resurrected old key)" do
+    # A PK-changing UPDATE (id 1 → 2) carries the OLD key in old_record. A snapshot chunk read the
+    # row under the OLD key before the update; unless the OLD key is drop-tracked it resurrects (§2
+    # ghost). RED before the fix (cross-vendor Codex catch): only the new record's PK ([2]) is
+    # tracked → the chunk's id=1 row survives (`kept == [1, 3]`).
+    w = W.new(epoch: 1, drop_cap: 100, max_pending: 4) |> W.open_window("public.orders")
+    {w, :ok} = W.add_chunk(w, chunk("orders", [1, 3], 1_000))
+
+    upd = %Replicant.Change{
+      op: :update,
+      schema: "public",
+      table: "orders",
+      old_record: %{"id" => 1},
+      record: %{"id" => 2}
+    }
+
+    {w, _discarded} = W.track_capped(w, [upd])
+
+    assert W.tracked?(w, "public.orders", [1])
+    assert W.tracked?(w, "public.orders", [2])
+    assert {:apply, kept, _meta, _w} = W.pop_ready(W.set_frontier(w, 1, 1_000))
+    assert Enum.map(kept, & &1.record["id"]) == [3]
+  end
+
   test "track_capped drop-tracks a PRE-CHUNK DELETE, then rebind_pk_raw normalizes it without crashing" do
     # A DELETE tracked BEFORE the first chunk stores {:record, old_record}; add_chunk's rebind must
     # normalize it to a PK tuple. RED before the fix: the pre-chunk delete stored {:record, nil}
