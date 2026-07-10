@@ -55,6 +55,18 @@ defmodule Replicant.CheckpointStoreFaultTest do
     assert {:error, %Error{reason: :checkpoint_store_failed}} = CheckpointStore.write(via, 7)
   end
 
+  test "read_progress/write_progress on a NOT-STARTED store return a value-free error, never a :noproc exit" do
+    # Structural twin of the read/write NOT-STARTED case above: the progress token API
+    # (spec §6.2) shares the same GenServer.call + catch :exit scrub, so the same :noproc
+    # exit class must be converted to a value-free error rather than crashing the caller.
+    via = CheckpointStore.via("cp_fault_noproc_progress_#{System.unique_integer([:positive])}")
+
+    assert {:error, %Error{reason: :checkpoint_store_failed}} = CheckpointStore.read_progress(via)
+
+    assert {:error, %Error{reason: :checkpoint_store_failed}} =
+             CheckpointStore.write_progress(via, <<1, 2, 3>>)
+  end
+
   describe "retry policy helpers" do
     alias Replicant.CheckpointStore
 

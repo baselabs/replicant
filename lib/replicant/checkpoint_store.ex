@@ -46,17 +46,43 @@ defmodule Replicant.CheckpointStore do
     :exit, _ -> {:error, %Error{reason: :checkpoint_store_failed}}
   end
 
+  @doc "Read the incremental-snapshot progress token (`nil` = none) or a value-free error."
+  @spec read_progress(GenServer.server()) :: {:ok, binary() | nil} | {:error, Error.t()}
+  def read_progress(server) do
+    GenServer.call(server, :read_progress)
+  catch
+    :exit, _ -> {:error, %Error{reason: :checkpoint_store_failed}}
+  end
+
+  @doc "Durably upsert the progress token (an opaque bytea; spec §6.2) or return a value-free error."
+  @spec write_progress(GenServer.server(), binary()) :: :ok | {:error, Error.t()}
+  def write_progress(server, token) when is_binary(token) do
+    GenServer.call(server, {:write_progress, token})
+  catch
+    :exit, _ -> {:error, %Error{reason: :checkpoint_store_failed}}
+  end
+
   @impl true
   def init(opts) do
     slot_name = Keyword.fetch!(opts, :slot_name)
     store = Keyword.fetch!(opts, :checkpoint_store)
     conn_opts = Keyword.fetch!(store, :connection)
     table = Keyword.get(store, :table, "replicant_checkpoints")
+    progress_table = Keyword.get(store, :progress_table, "replicant_snapshot_progress")
     # Library control opts win (Keyword.merge, second wins): non-sync connect so a
     # boot blip self-heals; a single pooled conn (low volume, serialized here).
     merged = Keyword.merge(conn_opts, sync_connect: false, pool_size: 1)
     {:ok, conn} = Postgrex.start_link(merged)
-    {:ok, %{conn: conn, table: table, slot_name: slot_name, ensured: false}}
+
+    {:ok,
+     %{
+       conn: conn,
+       table: table,
+       slot_name: slot_name,
+       ensured: false,
+       progress_table: progress_table,
+       progress_ensured: false
+     }}
   end
 
   @impl true
@@ -88,6 +114,24 @@ defmodule Replicant.CheckpointStore do
     end
   end
 
+  def handle_call(:read_progress, _from, state) do
+    with {:ok, state} <- ensure_progress(state),
+         {:ok, token} <- guarded(fn -> do_read_progress(state) end) do
+      {:reply, {:ok, token}, state}
+    else
+      {:error, %Error{} = e} -> reply_failed(e, state)
+    end
+  end
+
+  def handle_call({:write_progress, token}, _from, state) do
+    with {:ok, state} <- ensure_progress(state),
+         :ok <- guarded(fn -> do_write_progress(state, token) end) do
+      {:reply, :ok, state}
+    else
+      {:error, %Error{} = e} -> reply_failed(e, state)
+    end
+  end
+
   # Ensure the table exists AND has the expected shape, once. A create/probe fault
   # (incl. a wrong pre-existing column type) is fail-closed.
   defp ensure(%{ensured: true} = state), do: {:ok, state}
@@ -103,6 +147,29 @@ defmodule Replicant.CheckpointStore do
 
     case result do
       :ok -> {:ok, %{state | ensured: true}}
+      {:error, %Error{}} = err -> err
+    end
+  end
+
+  # Lazily create the progress table, once (a SECOND table, independent of the
+  # checkpoint table's ensured/table state above). No shape-probe: the token column
+  # is a bytea the store alone reads/writes, so there is no legacy-schema hazard to
+  # detect the way `probe_shape/2` guards `commit_lsn`.
+  defp ensure_progress(%{progress_ensured: true} = state), do: {:ok, state}
+
+  defp ensure_progress(%{progress_ensured: false, conn: conn} = state) do
+    table = progress_table(state)
+
+    result =
+      guarded(fn ->
+        with {:ok, create} <- table_ok(QueryBuilder.progress_ensure_table(table)),
+             {:ok, _} <- Postgrex.query(conn, create, []) do
+          :ok
+        end
+      end)
+
+    case result do
+      :ok -> {:ok, %{state | progress_ensured: true}}
       {:error, %Error{}} = err -> err
     end
   end
@@ -136,6 +203,27 @@ defmodule Replicant.CheckpointStore do
   defp do_write(%{conn: conn, table: table, slot_name: slot}, lsn) do
     with {:ok, sql} <- table_ok(QueryBuilder.checkpoint_upsert(table)) do
       case Postgrex.query(conn, sql, [slot, lsn]) do
+        {:ok, %Postgrex.Result{}} -> :ok
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp progress_table(state), do: Map.fetch!(state, :progress_table)
+
+  defp do_read_progress(%{conn: conn, slot_name: slot} = state) do
+    with {:ok, sql} <- table_ok(QueryBuilder.progress_read(progress_table(state))) do
+      case Postgrex.query(conn, sql, [slot]) do
+        {:ok, %Postgrex.Result{rows: [[token]]}} when is_binary(token) -> {:ok, token}
+        {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+        {:error, _} = err -> err
+      end
+    end
+  end
+
+  defp do_write_progress(%{conn: conn, slot_name: slot} = state, token) do
+    with {:ok, sql} <- table_ok(QueryBuilder.progress_upsert(progress_table(state))) do
+      case Postgrex.query(conn, sql, [slot, token]) do
         {:ok, %Postgrex.Result{}} -> :ok
         {:error, _} = err -> err
       end
