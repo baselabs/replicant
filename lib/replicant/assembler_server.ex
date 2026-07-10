@@ -31,10 +31,18 @@ defmodule Replicant.AssemblerServer do
   Open the drop-set tracking window for a table BEFORE the reader captures LW
   (spec §2 R1). The reply is DEFERRED while the assembler-local in-flight estimate
   (frontier − last applied LSN) exceeds max_inflight_lag ÷ 2 — the pacing gate
-  (spec §4 R2): stream drain gets priority, chunks fill idle capacity. Replies
-  `{:error, :table_discarded}` if the table was contention-discarded (reader re-reads).
+  (spec §4 R2): stream drain gets priority, chunks fill idle capacity.
+
+  Replies `{:ok, epoch}` — the window GENERATION the reader now operates under. The
+  keyless reader threads this back to `finish_snapshot_table/3` so the barrier can
+  reject a stale generation (a reconnect reset bumped the epoch since the reader
+  opened → its batches were WIPED, not applied — spec §4/§6.4, the 85672f1
+  sender-tags-epoch discipline). Replies `{:error, :table_discarded}` if the table was
+  contention-discarded (reader re-reads); `{:error, :window_reset}` if a reconnect
+  released the deferred open.
   """
-  @spec open_snapshot_window(GenServer.server(), String.t()) :: :ok | {:error, :table_discarded}
+  @spec open_snapshot_window(GenServer.server(), String.t()) ::
+          {:ok, non_neg_integer()} | {:error, :window_reset | :table_discarded}
   def open_snapshot_window(server, qualified),
     do: GenServer.call(server, {:open_snapshot_window, qualified}, :infinity)
 
@@ -52,14 +60,21 @@ defmodule Replicant.AssemblerServer do
   A PK-less table's whole-read BARRIER (spec §6.4): after the reader streams all of a keyless
   table's provisional batches, it calls this to block until those batches have APPLIED (converged
   past any late contention) — replying `:ok` — or the table was contention-discarded — replying
-  `{:error, :table_discarded}` so the reader redoes the whole table. `{:error, :window_reset}` on a
-  reconnect. Without this barrier a single-batch keyless read can complete before a late-arriving
-  concurrent write discards its still-pending batch, silently losing the rows.
+  `{:error, :table_discarded}` so the reader redoes the whole table. Without this barrier a
+  single-batch keyless read can complete before a late-arriving concurrent write discards its
+  still-pending batch, silently losing the rows.
+
+  `epoch` is the window GENERATION the reader captured at `open_snapshot_window/2`. If a reconnect
+  reset re-seated the window (bumped the epoch) since the reader opened this table, its provisional
+  batches were WIPED (not applied): the barrier MUST reply `{:error, :window_reset}` — never a
+  spurious `:ok` (which would mark a never-delivered table done → data loss). The stale-generation
+  check comes FIRST because a reset also clears `discarded`/`pending`, so a wiped table otherwise
+  reads as clean. `{:error, :window_reset}` also fires when a reconnect releases a deferred barrier.
   """
-  @spec finish_snapshot_table(GenServer.server(), String.t()) ::
+  @spec finish_snapshot_table(GenServer.server(), String.t(), non_neg_integer()) ::
           :ok | {:error, :window_reset} | {:error, :table_discarded}
-  def finish_snapshot_table(server, qualified),
-    do: GenServer.call(server, {:finish_snapshot_table, qualified}, :infinity)
+  def finish_snapshot_table(server, qualified, epoch),
+    do: GenServer.call(server, {:finish_snapshot_table, qualified, epoch}, :infinity)
 
   @impl true
   def init(opts) do
@@ -321,7 +336,8 @@ defmodule Replicant.AssemblerServer do
         {:noreply, %{state | deferred_open: {from, qualified}}}
 
       true ->
-        {:reply, :ok, %{state | window: Replicant.SnapshotWindow.open_window(w, qualified)}}
+        {:reply, {:ok, w.epoch},
+         %{state | window: Replicant.SnapshotWindow.open_window(w, qualified)}}
     end
   end
 
@@ -348,14 +364,30 @@ defmodule Replicant.AssemblerServer do
   # (all applied — :ok) or it was contention-discarded ({:error, :table_discarded}); DEFER while
   # chunks are still pending. This closes the single-batch keyless race where a late concurrent
   # write discards a still-pending batch after the reader already streamed it.
-  def handle_call({:finish_snapshot_table, qualified}, from, %{window: %{} = w} = state) do
+  #
+  # STALE-GENERATION CHECK FIRST (spec §4/§6.4): if a reconnect reset re-seated the window (bumped
+  # the epoch) since the reader opened this table under `reader_epoch`, its provisional batches were
+  # WIPED by the reset — reply {:error, :window_reset} so the reader re-reads, NEVER a spurious :ok.
+  # A reset ALSO clears discarded/pending, so a wiped table would otherwise read as clean and pass
+  # the barrier. Epoch is monotone (reset only increases it), so `e != reader_epoch` ⟺ a reset since
+  # open. Capturing the epoch at the reader's OPEN (not at barrier entry) is what makes this catch
+  # the race: the reset lands BEFORE the barrier call is processed, so a barrier-entry capture would
+  # already read the post-reset epoch and miss it.
+  def handle_call(
+        {:finish_snapshot_table, qualified, reader_epoch},
+        from,
+        %{window: %{epoch: e} = w} = state
+      ) do
     cond do
+      e != reader_epoch ->
+        {:reply, {:error, :window_reset}, state}
+
       Replicant.SnapshotWindow.discarded?(w, qualified) ->
         {:reply, {:error, :table_discarded},
          %{state | window: Replicant.SnapshotWindow.clear_discarded(w, qualified)}}
 
       Replicant.SnapshotWindow.table_pending?(w, qualified) ->
-        {:noreply, %{state | deferred_drain: {from, qualified}}}
+        {:noreply, %{state | deferred_drain: {from, qualified, reader_epoch}}}
 
       true ->
         {:reply, :ok, state}
@@ -569,10 +601,20 @@ defmodule Replicant.AssemblerServer do
     end
   end
 
-  # Settle a deferred PK-less drain barrier (finish_snapshot_table): reply {:error, :table_discarded}
-  # if the table was contention-discarded, :ok once its chunks have all drained, else keep waiting.
-  defp settle_drain(%{deferred_drain: {from, qualified}, window: w} = state) do
+  # Settle a deferred PK-less drain barrier (finish_snapshot_table): reply {:error, :window_reset}
+  # if a reconnect reset re-seated the window since the reader opened (stale generation, batches
+  # WIPED), {:error, :table_discarded} if the table was contention-discarded, :ok once its chunks
+  # have all drained, else keep waiting. The epoch check mirrors the barrier-entry guard (a reset
+  # while deferred is normally caught earlier by release_deferred, which nulls deferred_drain — this
+  # is a defense-in-depth re-check on the same monotone-epoch invariant).
+  defp settle_drain(
+         %{deferred_drain: {from, qualified, reader_epoch}, window: %{epoch: e} = w} = state
+       ) do
     cond do
+      e != reader_epoch ->
+        GenServer.reply(from, {:error, :window_reset})
+        %{state | deferred_drain: nil}
+
       Replicant.SnapshotWindow.discarded?(w, qualified) ->
         GenServer.reply(from, {:error, :table_discarded})
 
@@ -691,7 +733,9 @@ defmodule Replicant.AssemblerServer do
     if paced?(state) do
       state
     else
-      GenServer.reply(from, :ok)
+      # Reply {:ok, epoch} — the SAME window-generation contract as the synchronous open reply, so a
+      # reader whose open was paced still captures the epoch it operates under (barrier stale guard).
+      GenServer.reply(from, {:ok, state.window.epoch})
 
       %{
         state
@@ -707,7 +751,7 @@ defmodule Replicant.AssemblerServer do
   # is never left hanging across a reconnect-reset or a halt.
   defp release_deferred(%{deferred_deliver: {from, _}}, reply), do: GenServer.reply(from, reply)
   defp release_deferred(%{deferred_open: {from, _}}, reply), do: GenServer.reply(from, reply)
-  defp release_deferred(%{deferred_drain: {from, _}}, reply), do: GenServer.reply(from, reply)
+  defp release_deferred(%{deferred_drain: {from, _, _}}, reply), do: GenServer.reply(from, reply)
   defp release_deferred(_state, _reply), do: :ok
 
   # The pacing gate (spec §4 R2): assembler-local in-flight estimate vs max_inflight_lag ÷ 2 —

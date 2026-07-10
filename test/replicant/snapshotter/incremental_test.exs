@@ -332,6 +332,9 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     # :ok passes through. A reconnect and a contention discard throw DIFFERENT atoms so the keyless
     # loop counts a contention redo toward the @max_table_attempts halt but NOT a plain reconnect.
     assert Inc.reset_guard(:ok) == :ok
+    # The KEYED open's {:ok, epoch} reply passes through as :ok (that path never barriers, so it
+    # discards the generation; the keyless path captures it via open_window_epoch/2 instead).
+    assert Inc.reset_guard({:ok, 42}) == :ok
     assert catch_throw(Inc.reset_guard({:error, :window_reset})) == :window_reset
 
     # RED without the fix: the :table_discarded clause does not exist → FunctionClauseError, not a throw.

@@ -871,7 +871,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "open_window -> deliver -> frontier closure applies the chunk with drop-filter + ctx keys" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_1")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
       # not yet closed: no sink call
       refute_receive {:snapshot_call, _, _}, 100
@@ -884,7 +884,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "TRIPWIRE: a txn applied after open_window drops the colliding chunk row" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_2")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       # a committed txn for orders id=2 flows through the normal message path
       send_committed_txn(pid, "orders", 2)
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
@@ -910,7 +910,7 @@ defmodule Replicant.AssemblerServerTest do
            max_inflight_lag: 1_000_000}
         )
 
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
 
       # A committed txn for orders id=2 flows through the normal message path; at Commit the count cap
       # (1) trips → {:flush} → dispatch({:flush}). Receiving the flushed batch is a happens-after
@@ -929,7 +929,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "TRIPWIRE value-free: a sink {:error, values} on a chunk halts WITHOUT the value leaking" do
       pid = start_incremental_server(FaultChunkSink, "asrv_inc_3")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1]))
 
       # Observe the halt via the telemetry channel (Supervisor.halt/2 discards its reason —
@@ -949,7 +949,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "backpressure: the 3rd deliver call blocks until a chunk applies (max_pending_chunks: 2)" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_4")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(100, [1]))
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(200, [2]))
 
@@ -965,7 +965,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "reconnect reset discards pending chunks and adopts the new epoch" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_5")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(100, [1]))
       GenServer.cast(pid, {:reset_snapshot_window, 1})
       # a stale epoch-0 frontier cannot close anything; the chunk is gone anyway
@@ -989,8 +989,8 @@ defmodule Replicant.AssemblerServerTest do
       task =
         Task.async(fn -> Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders") end)
 
-      # Replies :ok within the window (GREEN). nil (still blocked) is the RED signal of the old base.
-      assert {:ok, :ok} = Task.yield(task, 1_000) || Task.shutdown(task)
+      # Replies {:ok, epoch} within the window (GREEN). nil (still blocked) is the RED signal of the old base.
+      assert {:ok, {:ok, _epoch}} = Task.yield(task, 1_000) || Task.shutdown(task)
     end
 
     test "F-PACE: open_snapshot_window IS still deferred when the frontier gap from the floor exceeds max_inflight_lag/2" do
@@ -1033,7 +1033,7 @@ defmodule Replicant.AssemblerServerTest do
 
       # Backfill public.cold: open its window + deliver a PENDING chunk (hw 500 > the hot txn's commit
       # LSN 400, so it stays pending until the explicit frontier advance closes it).
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.cold")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.cold")
 
       cold_chunk = %{
         qualified: "public.cold",
@@ -1076,7 +1076,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "TRIPWIRE value-free: a sink handle_snapshot that RAISES halts WITHOUT the message leaking (rescue arm)" do
       pid = start_incremental_server(RaiseChunkSink, "asrv_inc_raise")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1]))
 
       ref = make_ref()
@@ -1093,7 +1093,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "TRIPWIRE value-free: a sink handle_snapshot that THROWS halts WITHOUT the term leaking (catch arm)" do
       pid = start_incremental_server(ThrowChunkSink, "asrv_inc_throw")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1]))
 
       ref = make_ref()
@@ -1112,7 +1112,7 @@ defmodule Replicant.AssemblerServerTest do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_ctx")
       floor = 0xABCDEF
       GenServer.cast(pid, {:snapshot_floor, floor})
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
 
       assert :ok =
                Replicant.AssemblerServer.deliver_snapshot_chunk(
@@ -1129,7 +1129,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "a tracked write to a PK-less table discards it → the reader's next deliver returns {:error, :table_discarded}" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_disc")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
 
       # The first keyless chunk binds pk_raw == [] onto the tracking entry (stays pending, hw 500).
       assert :ok =
@@ -1152,7 +1152,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "a PK-less chunk whose table saw a write is DISCARDED at closure, never applied empty" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_apply")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
 
       # A placeholder write BEFORE the first keyless chunk (tracked as {:record, _}, pk_raw nil —
       # NOT yet a taint). Its txn commits at 400 → the frontier advances to 400.
@@ -1179,13 +1179,13 @@ defmodule Replicant.AssemblerServerTest do
 
     test "finish_snapshot_table replies :ok immediately when the table has no pending chunks" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_ok")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
-      assert :ok = Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk")
+      assert {:ok, epoch} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+      assert :ok = Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk", epoch)
     end
 
     test "finish_snapshot_table DEFERS while a chunk is pending, then replies :ok when it applies (barrier)" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_defer")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+      assert {:ok, epoch} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
 
       assert :ok =
                Replicant.AssemblerServer.deliver_snapshot_chunk(
@@ -1194,7 +1194,9 @@ defmodule Replicant.AssemblerServerTest do
                )
 
       task =
-        Task.async(fn -> Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk") end)
+        Task.async(fn ->
+          Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk", epoch)
+        end)
 
       # Still pending (frontier 0 < hw 500) → the barrier BLOCKS.
       refute Task.yield(task, 200)
@@ -1208,7 +1210,7 @@ defmodule Replicant.AssemblerServerTest do
 
     test "finish_snapshot_table replies {:error, :table_discarded} when a write discards the table mid-barrier" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_disc")
-      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+      assert {:ok, epoch} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
 
       assert :ok =
                Replicant.AssemblerServer.deliver_snapshot_chunk(
@@ -1217,13 +1219,31 @@ defmodule Replicant.AssemblerServerTest do
                )
 
       task =
-        Task.async(fn -> Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk") end)
+        Task.async(fn ->
+          Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk", epoch)
+        end)
 
       refute Task.yield(task, 150)
 
       # A concurrent write taints the still-pending table → the barrier releases {:error, :table_discarded}.
       send_committed_txn(pid, "nopk", 9)
       assert {:ok, {:error, :table_discarded}} = Task.yield(task, 1_000) || Task.shutdown(task)
+    end
+
+    test "finish_snapshot_table replies {:error, :window_reset} when a reconnect reset bumped the epoch since open (stale generation — never a spurious :ok)" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_stale")
+      assert {:ok, epoch} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+
+      # A reconnect re-seats the window under a NEW epoch, clearing tracking/pending/discarded — the
+      # reader's provisional batches are WIPED, not applied. The barrier then sees a table that is
+      # neither pending nor discarded, so WITHOUT the epoch guard it replies a spurious :ok and marks
+      # a never-delivered table done = DATA LOSS. The reader's captured `epoch` is now stale.
+      GenServer.cast(pid, {:reset_snapshot_window, epoch + 1})
+      :sys.get_state(pid)
+
+      # RED without the stale-generation check: the barrier ignores the epoch and replies :ok.
+      assert {:error, :window_reset} =
+               Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk", epoch)
     end
   end
 end
