@@ -328,6 +328,16 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     refute inspect(e) =~ "42"
   end
 
+  test "reset_guard/1 routes window signals to DISTINCT throws (reconnect vs contention, spec §6.4)" do
+    # :ok passes through. A reconnect and a contention discard throw DIFFERENT atoms so the keyless
+    # loop counts a contention redo toward the @max_table_attempts halt but NOT a plain reconnect.
+    assert Inc.reset_guard(:ok) == :ok
+    assert catch_throw(Inc.reset_guard({:error, :window_reset})) == :window_reset
+
+    # RED without the fix: the :table_discarded clause does not exist → FunctionClauseError, not a throw.
+    assert catch_throw(Inc.reset_guard({:error, :table_discarded})) == :table_discarded
+  end
+
   test "keyless_batch_progress/1 carries the IN-PROGRESS token, NOT finish_table (data-gap fix)" do
     # A token with ONE in-progress keyless table: current set, no bound, nothing done.
     table = %{

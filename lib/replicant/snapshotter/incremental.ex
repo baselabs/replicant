@@ -329,7 +329,11 @@ defmodule Replicant.Snapshotter.Incremental do
 
     loop(db, args, sp, chunk_rows, standby?)
   catch
+    # A reconnect (:window_reset) OR a keyed drop-cap contention discard (:table_discarded) both
+    # re-read from durable progress: the discarded chunks were never applied (removed while pending),
+    # so re-fetching them is loss-free convergence, never a halt, never an attempt count (spec §4).
     :window_reset -> reload_and_continue(db, args, chunk_rows, standby?)
+    :table_discarded -> reload_and_continue(db, args, chunk_rows, standby?)
   end
 
   # An in-process reconnect reset the window: re-read DURABLE progress, RE-DISCOVER table
@@ -397,13 +401,16 @@ defmodule Replicant.Snapshotter.Incremental do
     reset_guard(AssemblerServer.deliver_snapshot_chunk(server(args), chunk))
   end
 
-  # Unify the two window calls' reset handling: `open_snapshot_window/2`'s deferred reply
-  # (released `{:error, :window_reset}` on a reconnect) and `deliver_snapshot_chunk/2`'s
-  # `{:error, :window_reset}` both route to the loop's `catch :window_reset`. A single
-  # helper keeps the `{:error, :window_reset}` clause reachable for dialyzer (open's spec
-  # is `:: :ok`; deliver's union makes the error arm live).
-  defp reset_guard(:ok), do: :ok
-  defp reset_guard({:error, :window_reset}), do: throw(:window_reset)
+  # Unify the window calls' reset/discard handling: a reconnect releases `{:error, :window_reset}`;
+  # a contention discard (drop-cap breach / a PK-less table's concurrent write) releases
+  # `{:error, :table_discarded}`. The two throw DISTINCT atoms so the keyless path counts a
+  # contention redo toward the 3-attempt halt but NOT a plain reconnect (spec §6.4). Reachable from
+  # `open_snapshot_window/2`, `deliver_snapshot_chunk/2`, AND `finish_snapshot_table/2`.
+  @doc false
+  @spec reset_guard(:ok | {:error, :window_reset | :table_discarded}) :: :ok | no_return()
+  def reset_guard(:ok), do: :ok
+  def reset_guard({:error, :window_reset}), do: throw(:window_reset)
+  def reset_guard({:error, :table_discarded}), do: throw(:table_discarded)
 
   # ---- PK-less whole-table fallback (spec §6.4) ----
 
@@ -474,13 +481,23 @@ defmodule Replicant.Snapshotter.Incremental do
 
     case result do
       {:ok, {:ok, _first?}} ->
+        # BARRIER (spec §6.4): the provisional batches are all streamed but still PENDING (frontier-
+        # gated). Block until they APPLY (converged) or the table was contention-discarded. Without
+        # this, a single-batch keyless read completes and advances before a late concurrent write
+        # discards its still-pending batch — silently losing the rows. A discard throws
+        # :table_discarded → the catch redoes this table (attempt + 1).
+        reset_guard(AssemblerServer.finish_snapshot_table(server(args), table.qualified))
         loop(db, args, sp_after, Keyword.fetch!(args.snapshot, :chunk_rows), standby?)
 
       {:error, _} ->
         run_keyless_table(db, args, sp, table, standby?, attempt + 1)
     end
   catch
-    :window_reset -> run_keyless_table(db, args, sp, table, standby?, attempt + 1)
+    # A CONTENTION discard redoes the whole table AND counts toward the @max_table_attempts halt;
+    # a plain reconnect (:window_reset) redoes at the SAME attempt (a reconnect is not contention —
+    # spec §6.4). :chunk_retried fires at the top of each attempt > 1.
+    :table_discarded -> run_keyless_table(db, args, sp, table, standby?, attempt + 1)
+    :window_reset -> run_keyless_table(db, args, sp, table, standby?, attempt)
   end
 
   @doc false

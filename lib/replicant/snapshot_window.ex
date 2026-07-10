@@ -37,10 +37,23 @@ defmodule Replicant.SnapshotWindow do
           tracking: %{optional(String.t()) => %{pks: MapSet.t(), pk_raw: [String.t()]}},
           pending: [chunk()],
           drop_cap: pos_integer(),
-          max_pending: pos_integer()
+          max_pending: pos_integer(),
+          discarded: %{optional(String.t()) => true}
         }
 
-  defstruct epoch: 0, frontier: 0, tracking: %{}, pending: [], drop_cap: 1, max_pending: 1
+  defstruct epoch: 0,
+            frontier: 0,
+            tracking: %{},
+            pending: [],
+            drop_cap: 1,
+            max_pending: 1,
+            # Tables whose pending chunks were DISCARDED by a contention event (keyed drop-cap
+            # breach OR any tracked write to a PK-less table) and whose reader has NOT yet learned
+            # of it. A set-semantics map (a plain map avoids the opaque-MapSet contract_with_opaque
+            # dialyzer wart for a directly-constructed struct field). The caller drains it via a
+            # reader-facing {:error, :table_discarded} signal (spec §4/§6.4); cleared once the
+            # reader is told (clear_discarded/2).
+            discarded: %{}
 
   @spec new(keyword()) :: t()
   def new(opts) do
@@ -66,36 +79,72 @@ defmodule Replicant.SnapshotWindow do
   end
 
   @doc """
-  `track/2` + drop-cap enforcement: a table whose tracking set breaches `drop_cap`
-  has its pending chunks DISCARDED and its tracking reset — returned in the
-  discard list so the caller can tell the reader to re-read (spec §4).
+  `track/2` + contention enforcement: a table whose pending chunks must be DISCARDED
+  and re-read is returned in the discard list AND recorded in `w.discarded` so the
+  caller can signal its reader `{:error, :table_discarded}` (spec §4/§6.4). Two triggers:
+
+    * a KEYED table whose tracking set breaches `drop_cap` (superset discard + re-read); and
+    * a PK-LESS table (its tracking entry's `pk_raw == []`) that received ANY tracked write —
+      `drop_cap` can never fire for a keyless table (its PK tuple collapses to `[]`), so any
+      concurrent write potentially staled the whole read ⇒ redo (spec §6.4).
   """
   @spec track_capped(t(), [Change.t()]) :: {t(), [String.t()]}
   def track_capped(%__MODULE__{} = w, changes) do
-    tracking =
-      Enum.reduce(changes, w.tracking, fn %Change{} = c, acc ->
+    {tracking, touched} =
+      Enum.reduce(changes, {w.tracking, MapSet.new()}, fn %Change{} = c, {acc, seen} ->
         qualified = "#{c.schema}.#{c.table}"
 
         case Map.fetch(acc, qualified) do
-          {:ok, entry} -> Map.put(acc, qualified, put_pk(entry, c))
-          :error -> acc
+          {:ok, entry} -> {Map.put(acc, qualified, put_pk(entry, c)), MapSet.put(seen, qualified)}
+          :error -> {acc, seen}
         end
       end)
 
-    breached =
-      for {q, %{pks: pks}} <- tracking, MapSet.size(pks) > w.drop_cap, do: q
+    keyed_breached =
+      for {q, %{pks: pks, pk_raw: pk_raw}} <- tracking,
+          pk_raw != [],
+          MapSet.size(pks) > w.drop_cap,
+          do: q
 
-    if breached == [] do
-      {%{w | tracking: tracking}, []}
-    else
-      pending = Enum.reject(w.pending, &(&1.qualified in breached))
+    keyless_contended =
+      for q <- MapSet.to_list(touched),
+          match?({:ok, %{pk_raw: []}}, Map.fetch(tracking, q)),
+          do: q
 
-      tracking =
-        Enum.reduce(breached, tracking, &Map.put(&2, &1, %{pks: MapSet.new(), pk_raw: nil}))
-
-      {%{w | tracking: tracking, pending: pending}, breached}
-    end
+    apply_contention(w, tracking, keyed_breached ++ keyless_contended)
   end
+
+  defp apply_contention(w, tracking, []), do: {%{w | tracking: tracking}, []}
+
+  defp apply_contention(w, tracking, discarded) do
+    pending = Enum.reject(w.pending, &(&1.qualified in discarded))
+
+    tracking =
+      Enum.reduce(discarded, tracking, fn q, acc ->
+        # A keyless table keeps `pk_raw == []` across the reset so a subsequent write stays
+        # detectable as contention; a keyed table resets to unknown pk_raw (re-bound by the
+        # re-read's first chunk), matching the pre-fix reset.
+        pk_raw = if match?({:ok, %{pk_raw: []}}, Map.fetch(acc, q)), do: [], else: nil
+        Map.put(acc, q, %{pks: MapSet.new(), pk_raw: pk_raw})
+      end)
+
+    new_discarded = Enum.reduce(discarded, w.discarded, &Map.put(&2, &1, true))
+    {%{w | tracking: tracking, pending: pending, discarded: new_discarded}, discarded}
+  end
+
+  @doc "True when `qualified`'s pending chunks were discarded (contention) and its reader not yet told."
+  @spec discarded?(t(), String.t()) :: boolean()
+  def discarded?(%__MODULE__{discarded: d}, qualified), do: Map.has_key?(d, qualified)
+
+  @doc "Any of `qualified`'s chunks still buffered (pending, not yet applied)?"
+  @spec table_pending?(t(), String.t()) :: boolean()
+  def table_pending?(%__MODULE__{pending: pending}, qualified),
+    do: Enum.any?(pending, &(&1.qualified == qualified))
+
+  @doc "Clear a table's discard flag once its reader has been told to re-read."
+  @spec clear_discarded(t(), String.t()) :: t()
+  def clear_discarded(%__MODULE__{discarded: d} = w, qualified),
+    do: %{w | discarded: Map.delete(d, qualified)}
 
   # The pk_raw column list rides in on the first chunk (add_chunk). Before any chunk
   # arrives, PKs are unknown, so the WHOLE record image is the tracking key (superset;
@@ -161,13 +210,37 @@ defmodule Replicant.SnapshotWindow do
   order must be preserved per table) — and since the reader is serial, pending
   chunks are already globally ordered.
   """
-  @spec pop_ready(t()) :: {:apply, [Change.t()], chunk(), t()} | :none
+  @spec pop_ready(t()) :: {:apply, [Change.t()], chunk(), t()} | {:discard, chunk(), t()} | :none
   def pop_ready(%__MODULE__{pending: [chunk | rest]} = w) when chunk.hw <= w.frontier do
-    kept = drop_filter(w, chunk)
-    {:apply, kept, chunk, %{w | pending: rest}}
+    cond do
+      Map.has_key?(w.discarded, chunk.qualified) ->
+        # The table was discarded (contention) after this chunk was buffered: drop it, never
+        # apply a stale chunk (the reader re-reads on its next window call). The discard already
+        # removes the table's pending chunks, so this is a fail-closed backstop, never the norm.
+        {:discard, chunk, %{w | pending: rest}}
+
+      chunk.pk_raw == [] and keyless_has_writes?(w, chunk.qualified) ->
+        # A PK-less chunk whose table saw a tracked write (e.g. a placeholder write BEFORE this
+        # chunk bound pk_raw): the read is stale and CANNOT be drop-filtered (no PK) — dropping it
+        # to empty would silently lose the batch (the confirmed data-loss bug). Discard it whole
+        # and mark the table needs-re-read so the reader redoes it (spec §6.4).
+        {:discard, chunk,
+         %{w | pending: rest, discarded: Map.put(w.discarded, chunk.qualified, true)}}
+
+      true ->
+        kept = drop_filter(w, chunk)
+        {:apply, kept, chunk, %{w | pending: rest}}
+    end
   end
 
   def pop_ready(%__MODULE__{}), do: :none
+
+  defp keyless_has_writes?(w, qualified) do
+    case Map.fetch(w.tracking, qualified) do
+      {:ok, %{pks: pks}} -> MapSet.size(pks) > 0
+      :error -> false
+    end
+  end
 
   defp drop_filter(w, chunk) do
     case Map.fetch(w.tracking, chunk.qualified) do
@@ -237,5 +310,5 @@ defmodule Replicant.SnapshotWindow do
   @doc "Reconnect re-seed (spec §4): discard ALL pending chunks + tracking, adopt the new epoch."
   @spec reset(t(), non_neg_integer()) :: t()
   def reset(%__MODULE__{} = w, new_epoch),
-    do: %{w | epoch: new_epoch, tracking: %{}, pending: [], frontier: 0}
+    do: %{w | epoch: new_epoch, tracking: %{}, pending: [], frontier: 0, discarded: %{}}
 end

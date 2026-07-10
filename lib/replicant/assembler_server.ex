@@ -31,17 +31,35 @@ defmodule Replicant.AssemblerServer do
   Open the drop-set tracking window for a table BEFORE the reader captures LW
   (spec §2 R1). The reply is DEFERRED while the assembler-local in-flight estimate
   (frontier − last applied LSN) exceeds max_inflight_lag ÷ 2 — the pacing gate
-  (spec §4 R2): stream drain gets priority, chunks fill idle capacity.
+  (spec §4 R2): stream drain gets priority, chunks fill idle capacity. Replies
+  `{:error, :table_discarded}` if the table was contention-discarded (reader re-reads).
   """
-  @spec open_snapshot_window(GenServer.server(), String.t()) :: :ok
+  @spec open_snapshot_window(GenServer.server(), String.t()) :: :ok | {:error, :table_discarded}
   def open_snapshot_window(server, qualified),
     do: GenServer.call(server, {:open_snapshot_window, qualified}, :infinity)
 
-  @doc "Hand a read chunk to the applier. The reply is DEFERRED while max_pending_chunks are buffered."
+  @doc """
+  Hand a read chunk to the applier. The reply is DEFERRED while max_pending_chunks are buffered.
+  `{:error, :window_reset}` on a reconnect; `{:error, :table_discarded}` on a contention discard
+  (drop-cap breach / a PK-less table's concurrent write) — the reader re-reads from durable progress.
+  """
   @spec deliver_snapshot_chunk(GenServer.server(), Replicant.SnapshotWindow.chunk()) ::
-          :ok | {:error, :window_reset}
+          :ok | {:error, :window_reset} | {:error, :table_discarded}
   def deliver_snapshot_chunk(server, chunk),
     do: GenServer.call(server, {:deliver_snapshot_chunk, chunk}, :infinity)
+
+  @doc """
+  A PK-less table's whole-read BARRIER (spec §6.4): after the reader streams all of a keyless
+  table's provisional batches, it calls this to block until those batches have APPLIED (converged
+  past any late contention) — replying `:ok` — or the table was contention-discarded — replying
+  `{:error, :table_discarded}` so the reader redoes the whole table. `{:error, :window_reset}` on a
+  reconnect. Without this barrier a single-batch keyless read can complete before a late-arriving
+  concurrent write discards its still-pending batch, silently losing the rows.
+  """
+  @spec finish_snapshot_table(GenServer.server(), String.t()) ::
+          :ok | {:error, :window_reset} | {:error, :table_discarded}
+  def finish_snapshot_table(server, qualified),
+    do: GenServer.call(server, {:finish_snapshot_table, qualified}, :infinity)
 
   @impl true
   def init(opts) do
@@ -82,7 +100,8 @@ defmodule Replicant.AssemblerServer do
        floor_lsn: 0,
        last_applied: 0,
        deferred_deliver: nil,
-       deferred_open: nil
+       deferred_open: nil,
+       deferred_drain: nil
      }}
   end
 
@@ -278,7 +297,8 @@ defmodule Replicant.AssemblerServer do
        state
        | window: Replicant.SnapshotWindow.reset(w, epoch),
          deferred_deliver: nil,
-         deferred_open: nil
+         deferred_open: nil,
+         deferred_drain: nil
      }}
   end
 
@@ -290,22 +310,55 @@ defmodule Replicant.AssemblerServer do
 
   @impl true
   def handle_call({:open_snapshot_window, qualified}, from, %{window: %{} = w} = state) do
-    if paced?(state) do
-      {:noreply, %{state | deferred_open: {from, qualified}}}
-    else
-      {:reply, :ok, %{state | window: Replicant.SnapshotWindow.open_window(w, qualified)}}
+    cond do
+      Replicant.SnapshotWindow.discarded?(w, qualified) ->
+        # The table was contention-discarded before the reader (re)opened it — tell it to re-read
+        # and clear the flag so the re-read's first chunk is admitted.
+        {:reply, {:error, :table_discarded},
+         %{state | window: Replicant.SnapshotWindow.clear_discarded(w, qualified)}}
+
+      paced?(state) ->
+        {:noreply, %{state | deferred_open: {from, qualified}}}
+
+      true ->
+        {:reply, :ok, %{state | window: Replicant.SnapshotWindow.open_window(w, qualified)}}
     end
   end
 
   def handle_call({:deliver_snapshot_chunk, chunk}, from, %{window: %{} = w} = state) do
-    case Replicant.SnapshotWindow.add_chunk(w, chunk) do
-      {w, :ok} ->
-        # Accepted under the cap: drain any newly-closed chunks, then reply :ok.
-        {:noreply, state} = apply_ready_chunks(%{state | window: w})
-        {:reply, :ok, state}
+    if Replicant.SnapshotWindow.discarded?(w, chunk.qualified) do
+      # Contention discarded this table since the reader last delivered for it: re-read from durable
+      # progress. Clear the flag so the re-read's first chunk is admitted.
+      {:reply, {:error, :table_discarded},
+       %{state | window: Replicant.SnapshotWindow.clear_discarded(w, chunk.qualified)}}
+    else
+      case Replicant.SnapshotWindow.add_chunk(w, chunk) do
+        {w, :ok} ->
+          # Accepted under the cap: drain any newly-closed chunks, then reply :ok.
+          {:noreply, state} = apply_ready_chunks(%{state | window: w})
+          {:reply, :ok, state}
 
-      {w, :at_capacity} ->
-        {:noreply, %{state | window: w, deferred_deliver: {from, chunk}}}
+        {w, :at_capacity} ->
+          {:noreply, %{state | window: w, deferred_deliver: {from, chunk}}}
+      end
+    end
+  end
+
+  # PK-less whole-read barrier (spec §6.4): reply once the table's buffered chunks have drained
+  # (all applied — :ok) or it was contention-discarded ({:error, :table_discarded}); DEFER while
+  # chunks are still pending. This closes the single-batch keyless race where a late concurrent
+  # write discards a still-pending batch after the reader already streamed it.
+  def handle_call({:finish_snapshot_table, qualified}, from, %{window: %{} = w} = state) do
+    cond do
+      Replicant.SnapshotWindow.discarded?(w, qualified) ->
+        {:reply, {:error, :table_discarded},
+         %{state | window: Replicant.SnapshotWindow.clear_discarded(w, qualified)}}
+
+      Replicant.SnapshotWindow.table_pending?(w, qualified) ->
+        {:noreply, %{state | deferred_drain: {from, qualified}}}
+
+      true ->
+        {:reply, :ok, state}
     end
   end
 
@@ -503,10 +556,42 @@ defmodule Replicant.AssemblerServer do
   # pair is atomic here (no interleaving point — spec §4). Always returns {:noreply, state}.
   defp apply_ready_chunks(%{window: %{} = w} = state) do
     case Replicant.SnapshotWindow.pop_ready(w) do
-      :none -> {:noreply, release_capacity(state)}
-      {:apply, kept, chunk, w} -> apply_one_chunk(%{state | window: w}, kept, chunk)
+      :none ->
+        {:noreply, state |> release_capacity() |> settle_drain()}
+
+      {:apply, kept, chunk, w} ->
+        apply_one_chunk(%{state | window: w}, kept, chunk)
+
+      {:discard, _chunk, w} ->
+        # A contended chunk was dropped (not applied): the table is now marked needs-re-read (its
+        # reader learns on its next window/barrier call). Keep draining the rest.
+        apply_ready_chunks(%{state | window: w})
     end
   end
+
+  # Settle a deferred PK-less drain barrier (finish_snapshot_table): reply {:error, :table_discarded}
+  # if the table was contention-discarded, :ok once its chunks have all drained, else keep waiting.
+  defp settle_drain(%{deferred_drain: {from, qualified}, window: w} = state) do
+    cond do
+      Replicant.SnapshotWindow.discarded?(w, qualified) ->
+        GenServer.reply(from, {:error, :table_discarded})
+
+        %{
+          state
+          | deferred_drain: nil,
+            window: Replicant.SnapshotWindow.clear_discarded(w, qualified)
+        }
+
+      Replicant.SnapshotWindow.table_pending?(w, qualified) ->
+        state
+
+      true ->
+        GenServer.reply(from, :ok)
+        %{state | deferred_drain: nil}
+    end
+  end
+
+  defp settle_drain(state), do: state
 
   # EVERY sink return shape is handled at the site (flush-path value-free rule, 2 prior incidents):
   # :ok → progress persisted (lib mode) + telemetry, then drain the next closed chunk; ANY other
@@ -528,7 +613,9 @@ defmodule Replicant.AssemblerServer do
         Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: :snapshot_failed})
         Replicant.Supervisor.halt(state.slot_name, {:snapshot, :snapshot_failed})
         release_deferred(state, {:error, :window_reset})
-        {:noreply, %{state | halted: true, deferred_deliver: nil, deferred_open: nil}}
+
+        {:noreply,
+         %{state | halted: true, deferred_deliver: nil, deferred_open: nil, deferred_drain: nil}}
     end
   end
 
@@ -576,15 +663,27 @@ defmodule Replicant.AssemblerServer do
 
   # After an apply freed a pending slot, release a deferred deliver (re-admit its chunk under the cap)
   # or a paced open (re-checked against the pacing gate). No deferred call → state unchanged.
-  defp release_capacity(%{deferred_deliver: {from, chunk}} = state) do
-    case Replicant.SnapshotWindow.add_chunk(state.window, chunk) do
-      {w, :ok} ->
-        GenServer.reply(from, :ok)
-        {:noreply, state} = apply_ready_chunks(%{state | window: w, deferred_deliver: nil})
-        state
+  defp release_capacity(%{deferred_deliver: {from, chunk}, window: w} = state) do
+    if Replicant.SnapshotWindow.discarded?(w, chunk.qualified) do
+      # The table was contention-discarded while this deliver waited at capacity: don't re-admit a
+      # stale chunk — tell the reader to re-read and clear the flag.
+      GenServer.reply(from, {:error, :table_discarded})
 
-      {w, :at_capacity} ->
-        %{state | window: w}
+      %{
+        state
+        | deferred_deliver: nil,
+          window: Replicant.SnapshotWindow.clear_discarded(w, chunk.qualified)
+      }
+    else
+      case Replicant.SnapshotWindow.add_chunk(w, chunk) do
+        {w, :ok} ->
+          GenServer.reply(from, :ok)
+          {:noreply, state} = apply_ready_chunks(%{state | window: w, deferred_deliver: nil})
+          state
+
+        {w, :at_capacity} ->
+          %{state | window: w}
+      end
     end
   end
 
@@ -608,6 +707,7 @@ defmodule Replicant.AssemblerServer do
   # is never left hanging across a reconnect-reset or a halt.
   defp release_deferred(%{deferred_deliver: {from, _}}, reply), do: GenServer.reply(from, reply)
   defp release_deferred(%{deferred_open: {from, _}}, reply), do: GenServer.reply(from, reply)
+  defp release_deferred(%{deferred_drain: {from, _}}, reply), do: GenServer.reply(from, reply)
   defp release_deferred(_state, _reply), do: :ok
 
   # The pacing gate (spec §4 R2): assembler-local in-flight estimate vs max_inflight_lag ÷ 2 —

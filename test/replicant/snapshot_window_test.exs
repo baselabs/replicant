@@ -33,6 +33,11 @@ defmodule Replicant.SnapshotWindowTest do
     }
   end
 
+  # A PK-less chunk: pk_raw == [] (no keyset drop-set — convergence rests on redo, spec §6.4),
+  # so pk_canon is empty too.
+  defp keyless_chunk(table, ids, hw),
+    do: %{chunk(table, ids, hw) | pk_raw: [], pk_canon: []}
+
   test "open_window/2 starts tracking; track/2 records same-table PKs; other tables untouched" do
     w = W.new(epoch: 1, drop_cap: 100, max_pending: 4)
     w = W.open_window(w, "public.orders")
@@ -198,5 +203,97 @@ defmodule Replicant.SnapshotWindowTest do
     w = W.observe_applied(w, 100)
     w = W.set_frontier(w, 1, 50)
     assert w.frontier == 100
+  end
+
+  describe "contention discard signal (spec §4/§6.4)" do
+    test "a PK-less table is DISCARDED on ANY tracked write (drop_cap can never fire for keyless)" do
+      w =
+        W.new(epoch: 1, drop_cap: 100, max_pending: 4)
+        |> W.open_window("public.nopk")
+
+      # The first PK-less chunk binds pk_raw == [] onto the tracking entry.
+      {w, :ok} = W.add_chunk(w, keyless_chunk("nopk", [], 10))
+      refute W.discarded?(w, "public.nopk")
+
+      # ONE tracked write (its PK tuple collapses to []) — never a drop_cap breach — still discards.
+      {w, discarded} = W.track_capped(w, [change("nopk", 7)])
+      # RED without the keyless-contended arm: discarded == [] and discarded?/2 is false.
+      assert discarded == ["public.nopk"]
+      assert W.discarded?(w, "public.nopk")
+      # its pending chunk is gone (discarded), even with the frontier past its HW
+      assert :none = W.pop_ready(W.set_frontier(w, 1, 10))
+    end
+
+    test "a PK-less table keeps pk_raw == [] across the discard reset (stays contention-detectable)" do
+      w =
+        W.new(epoch: 1, drop_cap: 100, max_pending: 4)
+        |> W.open_window("public.nopk")
+
+      {w, :ok} = W.add_chunk(w, keyless_chunk("nopk", [], 10))
+      {w, _} = W.track_capped(w, [change("nopk", 1)])
+      # A SECOND write after the reset is STILL detected as contention (pk_raw stayed []).
+      {_w, discarded} = W.track_capped(w, [change("nopk", 2)])
+      assert discarded == ["public.nopk"]
+    end
+
+    test "a KEYED drop-cap breach is recorded as needs-re-read (discarded?/2), not just returned" do
+      w = W.new(epoch: 1, drop_cap: 2, max_pending: 4) |> W.open_window("public.orders")
+      {w, :ok} = W.add_chunk(w, chunk("orders", [1, 2, 3], 10))
+      {w, discarded} = W.track_capped(w, Enum.map(1..3, &change("orders", &1)))
+      assert discarded == ["public.orders"]
+      # RED if apply_contention does not fold the breach into w.discarded.
+      assert W.discarded?(w, "public.orders")
+    end
+
+    test "pop_ready DISCARDS a PK-less chunk whose table saw a write — never drop-filters it to empty" do
+      # A placeholder write BEFORE the first keyless chunk binds pk_raw (tracked as {:record, _}).
+      w =
+        W.new(epoch: 1, drop_cap: 100, max_pending: 4)
+        |> W.open_window("public.nopk")
+        |> W.track([change("nopk", 1)])
+
+      # add_chunk binds pk_raw == [] and collapses the placeholder → a non-empty tracking set.
+      {w, :ok} = W.add_chunk(w, keyless_chunk("nopk", [1, 2, 3], 10))
+      w = W.set_frontier(w, 1, 10)
+
+      # RED without the keyless arm: pop_ready returns {:apply, [], _, _} (the WHOLE batch
+      # drop-filtered to empty = the confirmed data loss). The fix DISCARDS it whole + flags re-read.
+      assert {:discard, %{qualified: "public.nopk"}, w2} = W.pop_ready(w)
+      assert W.discarded?(w2, "public.nopk")
+    end
+
+    test "pop_ready DISCARDS a chunk whose table is already flagged needs-re-read (fail-closed backstop)" do
+      w = W.new(epoch: 1, drop_cap: 100, max_pending: 4) |> W.open_window("public.orders")
+      {w, :ok} = W.add_chunk(w, chunk("orders", [1, 2], 10))
+      w = %{w | discarded: Map.put(w.discarded, "public.orders", true)}
+      w = W.set_frontier(w, 1, 10)
+      assert {:discard, %{qualified: "public.orders"}, _w} = W.pop_ready(w)
+    end
+
+    test "an UNCONTENDED PK-less chunk (no tracked write) applies WHOLE (drop-set does not empty it)" do
+      w = W.new(epoch: 1, drop_cap: 100, max_pending: 4) |> W.open_window("public.nopk")
+      {w, :ok} = W.add_chunk(w, keyless_chunk("nopk", [1, 2, 3], 10))
+      w = W.set_frontier(w, 1, 10)
+      assert {:apply, kept, %{qualified: "public.nopk"}, _w} = W.pop_ready(w)
+      assert length(kept) == 3
+    end
+
+    test "table_pending?/2 reflects a table's buffered chunks" do
+      w = W.new(epoch: 1, drop_cap: 100, max_pending: 4) |> W.open_window("public.orders")
+      refute W.table_pending?(w, "public.orders")
+      {w, :ok} = W.add_chunk(w, chunk("orders", [1], 10))
+      assert W.table_pending?(w, "public.orders")
+      refute W.table_pending?(w, "public.other")
+    end
+
+    test "clear_discarded/2 removes one table's flag; reset/2 clears ALL (reconnect)" do
+      w = W.new(epoch: 1, drop_cap: 2, max_pending: 4) |> W.open_window("public.orders")
+      {w, :ok} = W.add_chunk(w, chunk("orders", [1, 2, 3], 10))
+      {w, _} = W.track_capped(w, Enum.map(1..3, &change("orders", &1)))
+      assert W.discarded?(w, "public.orders")
+
+      refute W.discarded?(W.clear_discarded(w, "public.orders"), "public.orders")
+      refute W.discarded?(W.reset(w, 2), "public.orders")
+    end
   end
 end

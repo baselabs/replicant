@@ -834,6 +834,18 @@ defmodule Replicant.AssemblerServerTest do
       }
     end
 
+    # A PK-less chunk for "public.nopk": pk_raw == [] (no drop-set — convergence rests on redo).
+    defp keyless_chunk_msg(hw, ids) do
+      %{
+        chunk_msg(hw, ids)
+        | qualified: "public.nopk",
+          schema: "public",
+          table: "nopk",
+          pk_raw: [],
+          pk_canon: []
+      }
+    end
+
     # Fabricate a decoded Begin/Relation/Insert/Commit flow for `table`/`id` through the normal
     # message path (mirrors drive_txn/2 + relation/1; commit LSN 400 is below every test chunk HW,
     # so the explicit {:snapshot_frontier} cast closes the chunk).
@@ -1113,6 +1125,105 @@ defmodule Replicant.AssemblerServerTest do
       assert ctx.snapshot_lsn == floor
       assert ctx.first_for_table? == true
       assert ctx.backfill_complete? == true
+    end
+
+    test "a tracked write to a PK-less table discards it → the reader's next deliver returns {:error, :table_discarded}" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_disc")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+
+      # The first keyless chunk binds pk_raw == [] onto the tracking entry (stays pending, hw 500).
+      assert :ok =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(
+                 pid,
+                 keyless_chunk_msg(500, [1, 2])
+               )
+
+      # A committed txn WRITES public.nopk → track_capped taints it (keyless contention).
+      send_committed_txn(pid, "nopk", 9)
+      :sys.get_state(pid)
+
+      # RED without the fix: track_window ignored the discard, so this deliver buffers and returns :ok.
+      assert {:error, :table_discarded} =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(
+                 pid,
+                 keyless_chunk_msg(600, [3, 4])
+               )
+    end
+
+    test "a PK-less chunk whose table saw a write is DISCARDED at closure, never applied empty" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_apply")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+
+      # A placeholder write BEFORE the first keyless chunk (tracked as {:record, _}, pk_raw nil —
+      # NOT yet a taint). Its txn commits at 400 → the frontier advances to 400.
+      send_committed_txn(pid, "nopk", 1)
+      :sys.get_state(pid)
+
+      # Deliver the keyless chunk: add_chunk binds pk_raw == [] and collapses the placeholder → the
+      # tracking set is non-empty, so the chunk is STALE.
+      assert :ok =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(
+                 pid,
+                 keyless_chunk_msg(500, [1, 2, 3])
+               )
+
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+
+      # RED without the fix: pop_ready drop-filters the keyless chunk to empty and APPLIES it — a
+      # {:snapshot_call, [], _} arrives (the batch silently lost). The fix DISCARDS it: no sink call.
+      refute_receive {:snapshot_call, _, _}, 300
+      # …and the table is now flagged, so the reader re-reads on its next deliver.
+      assert {:error, :table_discarded} =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(pid, keyless_chunk_msg(600, [4]))
+    end
+
+    test "finish_snapshot_table replies :ok immediately when the table has no pending chunks" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_ok")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+      assert :ok = Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk")
+    end
+
+    test "finish_snapshot_table DEFERS while a chunk is pending, then replies :ok when it applies (barrier)" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_defer")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+
+      assert :ok =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(
+                 pid,
+                 keyless_chunk_msg(500, [1, 2])
+               )
+
+      task =
+        Task.async(fn -> Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk") end)
+
+      # Still pending (frontier 0 < hw 500) → the barrier BLOCKS.
+      refute Task.yield(task, 200)
+
+      # Close it → the uncontended chunk applies WHOLE → the barrier releases :ok.
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+      assert {:ok, :ok} = Task.yield(task, 1_000) || Task.shutdown(task)
+      assert_received {:snapshot_call, changes, _ctx}
+      assert length(changes) == 2
+    end
+
+    test "finish_snapshot_table replies {:error, :table_discarded} when a write discards the table mid-barrier" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_kl_barrier_disc")
+      assert :ok = Replicant.AssemblerServer.open_snapshot_window(pid, "public.nopk")
+
+      assert :ok =
+               Replicant.AssemblerServer.deliver_snapshot_chunk(
+                 pid,
+                 keyless_chunk_msg(500, [1, 2])
+               )
+
+      task =
+        Task.async(fn -> Replicant.AssemblerServer.finish_snapshot_table(pid, "public.nopk") end)
+
+      refute Task.yield(task, 150)
+
+      # A concurrent write taints the still-pending table → the barrier releases {:error, :table_discarded}.
+      send_committed_txn(pid, "nopk", 9)
+      assert {:ok, {:error, :table_discarded}} = Task.yield(task, 1_000) || Task.shutdown(task)
     end
   end
 end
