@@ -439,12 +439,11 @@ defmodule Replicant.AssemblerServer do
     # A count/span-cap-tripping batch txn returns {:flush} DIRECTLY, skipping {:buffered} — so it is
     # ALSO a receipt point for drop-set tracking (mode-uniform convergence, spec §2/§4). Track it at
     # RECEIPT here, exactly as dispatch({:buffered}) does, BEFORE do_flush → Assembler.flush_batch
-    # RESETS the batch (clearing batch_txns). Sink-owned batch_delivery: buffered_changes(asm) is the
-    # tripping txn's changes (batch_txns head), buffered_lsn its commit_lsn → tracked (or tainted if
-    # lazy/spilled). lib+batch: the txn was discarded → :unavailable → track_window taints open tables
-    # (fail-closed, convergence-safe). A no-op when incremental is off. The timer-driven flush needs
-    # NO tracking here — every txn in that batch already tracked at its own {:buffered} (do_flush left
-    # unchanged).
+    # RESETS the batch. Sink-owned batch_delivery: buffered_changes(asm) is the tripping txn's changes
+    # (batch_txns head). lib+batch: its retained `last_buffered_changes` (a `%Change{}` list → drop-
+    # filter, or `:spilled` → taint). Either way buffered_lsn is its commit_lsn. A no-op when
+    # incremental is off. The timer-driven flush needs NO tracking here — every txn in that batch
+    # already tracked at its own {:buffered} (do_flush left unchanged).
     state = track_window(%{state | asm: asm}, buffered_changes(asm), buffered_lsn(asm))
     do_flush(state, reason)
   end
@@ -525,33 +524,22 @@ defmodule Replicant.AssemblerServer do
   # frontier, then drain any newly-closed chunk. A no-op when incremental is off (window: nil).
   defp track_window(%{window: nil} = state, _changes, _lsn), do: state
 
+  # A plain `%Change{}` list — feed its PKs into the drop-set (DROP-FILTER colliding chunk rows) and
+  # advance the frontier. EVERY mode with enumerable changes routes here: sink-owned / lib-non-batch
+  # per-txn ({:transaction}), sink-owned batch (batch_txns head), AND lib+batch (the retained
+  # `last_buffered_changes` — per-txn delivery IS the flush, so tracking at receipt is exact, spec §4).
   defp track_window(%{window: w} = state, changes, lsn) when is_list(changes) do
     {w, _discarded} = Replicant.SnapshotWindow.track_capped(w, changes)
     advance_window(state, w, lsn)
   end
 
-  # lib+batch: the just-buffered txn was delivered to the sink then DISCARDED (`buffered_changes`
-  # returns `:unavailable`), so its PKs cannot be added to the drop-set. TAINT only the tables that
-  # txn actually AFFECTED (the assembler's last-buffered capture) — discard their pending chunks +
-  # reset tracking, forcing a re-read from durable progress. NOT every open table: tainting all would
-  # livelock an unrelated cold-table backfill under any hot-table stream write (F-TAINT). A `:spilled`
-  # marker (the buffered txn was itself a lazy spill Reader and unenumerable) falls back to tainting
-  # every open table. Convergence-safe (discard-and-re-read). The frontier still advances on the lsn.
-  defp track_window(%{window: w} = state, :unavailable, lsn) do
-    tainted =
-      case Assembler.buffered_tables(state.asm) do
-        :spilled -> taint_open_tables(w)
-        tables -> taint_tables(w, tables)
-      end
-
-    advance_window(state, tainted, lsn)
-  end
-
-  # A lazy, single-pass spill-backed `changes` (spec §5 streaming-spill delivered per-txn: valid ONLY
-  # during the sink call) MUST NOT be enumerated here — its affected tables are unknown, so
-  # conservatively TAINT every OPEN table. Convergence-safe (discard-and-re-read; a spilled row never
-  # silently escapes the drop-set). The frontier still advances on the commit lsn.
-  defp track_window(%{window: w} = state, _lazy_changes, lsn) do
+  # A non-list `changes` — a lazy, single-pass spill-backed Enumerable (spec §5, valid ONLY during
+  # the sink call: delivered per-txn or in a sink-owned batch) or the `:spilled` marker for a lib+
+  # batch txn whose changes were unenumerable. Its PKs can't be extracted, so conservatively TAINT
+  # every OPEN table (discard-and-re-read → signal re-read; a spilled row never silently escapes the
+  # drop-set). Rare (only >RAM spilled txns) so it converges, never a per-write livelock. Frontier
+  # still advances on the commit lsn.
+  defp track_window(%{window: w} = state, _unenumerable, lsn) do
     advance_window(state, taint_open_tables(w), lsn)
   end
 
@@ -564,23 +552,24 @@ defmodule Replicant.AssemblerServer do
     state
   end
 
-  defp taint_open_tables(w), do: taint_tables(w, Map.keys(w.tracking))
-
-  # Taint (discard pending chunks + reset tracking) exactly the given tables. A table not in the
-  # list is never touched; `taint_table/2` is a no-op for a name with no tracking entry, so an
-  # affected table the window isn't backfilling costs nothing (spec §2/§4 convergence).
-  defp taint_tables(w, tables) do
-    Enum.reduce(tables, w, fn q, acc -> Replicant.SnapshotWindow.taint_table(acc, q) end)
+  # Taint (discard pending chunks + reset tracking → signal re-read) EVERY open table. Used when a
+  # delivered txn's changes are unenumerable (a lazy spill Reader / the `:spilled` marker) so its PKs
+  # can't drop-filter. `taint_table/2` is a no-op for a name with no tracking entry (spec §2/§4).
+  defp taint_open_tables(w) do
+    Enum.reduce(Map.keys(w.tracking), w, fn q, acc ->
+      Replicant.SnapshotWindow.taint_table(acc, q)
+    end)
   end
 
   # The just-committed txn's changes (a list, or a lazy spill Reader); the skipped path passes [].
   defp txn_changes(%Transaction{changes: changes}), do: changes
 
-  # The just-buffered txn (spec §7 batch modes). Sink-owned batch retains it at the head of
-  # batch_txns; lib+batch already delivered + discarded it (only the checkpoint is batched), so its
-  # changes are UNAVAILABLE → track_window taints conservatively.
+  # The just-buffered txn's changes (spec §7 batch modes). Sink-owned batch retains the full txn at
+  # the head of `batch_txns`; lib+batch delivered it per-txn and retains only its `changes` (a
+  # `%Change{}` list → drop-filter, or `:spilled` → taint) on `last_buffered_changes`. Both feed
+  # track_window so a colliding snapshot-chunk row is dropped (or tainted for an unenumerable spill).
   defp buffered_changes(%Assembler{batch_txns: [txn | _]}), do: txn.changes
-  defp buffered_changes(%Assembler{}), do: :unavailable
+  defp buffered_changes(%Assembler{} = asm), do: Assembler.last_buffered_changes(asm)
 
   defp buffered_lsn(%Assembler{pending_lsn: lsn}), do: lsn
 

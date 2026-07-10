@@ -83,7 +83,7 @@ defmodule Replicant.Assembler do
           batch_count: non_neg_integer(),
           batch_txns: [Transaction.t()],
           batch_spill_paths: [String.t()],
-          last_buffered_tables: [String.t()] | :spilled,
+          last_buffered_changes: [Change.t()] | :spilled,
           pending_lsn: lsn() | nil,
           stream_floor: lsn() | nil,
           stream_txns: %{non_neg_integer() => stream_buf()},
@@ -126,7 +126,7 @@ defmodule Replicant.Assembler do
     batch_count: 0,
     batch_txns: [],
     batch_spill_paths: [],
-    last_buffered_tables: [],
+    last_buffered_changes: [],
     pending_lsn: nil,
     stream_floor: nil,
     stream_txns: %{},
@@ -1165,16 +1165,17 @@ defmodule Replicant.Assembler do
 
     count = asm.batch_count + 1
 
-    # Capture the AFFECTED "schema.table" set of THIS delivered-then-discarded txn (overwritten each
-    # buffer_txn). The AssemblerServer taints exactly these tables' snapshot chunks (its PKs cannot be
-    # added to the drop-set — the txn is gone), NOT every open table: tainting all would livelock a
-    # cold-table backfill under any hot-table stream write (F-TAINT). A lazy/spilled (non-list)
-    # `changes` is unenumerable → `:spilled` (server falls back to tainting every open table).
+    # Retain THIS delivered txn's changes (overwritten each buffer_txn) so the AssemblerServer can
+    # feed its PKs into the drop-set — DROP-FILTERING colliding snapshot-chunk rows exactly as
+    # lib-non-batch and sink-owned batch already do (spec §4: the drop-set consults the flush
+    # boundary, and per-txn lib+batch delivery IS the flush). A lazy/spilled (non-list) `changes` is
+    # single-pass and unenumerable → the `:spilled` marker (server taints every open table instead —
+    # the only case still needing re-read, and rare enough it converges, never a per-write livelock).
     asm = %{
       reset(asm)
       | batch_count: count,
         pending_lsn: lsn,
-        last_buffered_tables: affected_tables(changes)
+        last_buffered_changes: changes_for_tracking(changes)
     }
 
     cond do
@@ -1184,24 +1185,20 @@ defmodule Replicant.Assembler do
     end
   end
 
-  # The distinct "schema.table" names a buffered txn touched — the AFFECTED set for taint-scoping.
-  # NEVER enumerate a lazy, single-pass spill-backed `changes` (spec §5): a non-list Enumerable
-  # yields the `:spilled` marker so the server taints conservatively (every open table) instead.
-  defp affected_tables(changes) when is_list(changes) do
-    changes
-    |> Enum.map(fn %Change{schema: s, table: t} -> "#{s}.#{t}" end)
-    |> Enum.uniq()
-  end
-
-  defp affected_tables(_lazy), do: :spilled
+  # Retain a delivered lib+batch txn's `changes` for drop-set tracking: a plain list passes through
+  # (the AssemblerServer feeds its PKs to the drop-set → drop-filter); a lazy, single-pass
+  # spill-backed `changes` (spec §5) MUST NOT be enumerated, so it yields the `:spilled` marker (the
+  # server taints every open table → re-read, the only remaining conservative path).
+  defp changes_for_tracking(changes) when is_list(changes), do: changes
+  defp changes_for_tracking(_lazy), do: :spilled
 
   @doc """
-  The "schema.table" set the LAST lib+batch `buffer_txn` affected (or `:spilled` when that txn's
-  `changes` was a lazy spill-backed Enumerable and unenumerable). The AssemblerServer taints exactly
-  these tables' snapshot chunks when the discarded txn's PKs cannot enter the drop-set (spec §2/§4).
+  The LAST lib+batch `buffer_txn`'s changes (a `%Change{}` list) so the AssemblerServer can DROP-
+  FILTER colliding snapshot-chunk rows, or `:spilled` when that txn's `changes` was a lazy spill-
+  backed Enumerable and unenumerable (server taints every open table → re-read instead, spec §2/§4).
   """
-  @spec buffered_tables(t()) :: [String.t()] | :spilled
-  def buffered_tables(%__MODULE__{last_buffered_tables: tables}), do: tables
+  @spec last_buffered_changes(t()) :: [Change.t()] | :spilled
+  def last_buffered_changes(%__MODULE__{last_buffered_changes: changes}), do: changes
 
   # Sink-owned batch delivery (spec §6): buffer the committed txn (NO sink call) and signal a
   # flush when the count OR the LSN-span cap trips (span base = max(lib_checkpoint, stream_floor),

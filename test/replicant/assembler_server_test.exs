@@ -1010,7 +1010,7 @@ defmodule Replicant.AssemblerServerTest do
       Task.shutdown(task, :brutal_kill)
     end
 
-    test "F-TAINT: a hot-table stream write does not taint a cold backfill table (lib+batch taints only affected tables)" do
+    test "F-TAINT lib+batch: a stream write to an UNTRACKED table leaves a cold backfill table's chunk intact (drop-filter no-op, not taint-all)" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_taint")
 
       # Swap in a lib+batch assembler (mode: :lib + a batch policy) — start_incremental_server
@@ -1059,11 +1059,11 @@ defmodule Replicant.AssemblerServerTest do
 
       assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, cold_chunk)
 
-      # A lib+batch stream txn writing ONLY public.hot (commit LSN 400): delivered per-txn then
-      # DISCARDED (buffered_changes = :unavailable) → track_window's :unavailable path. With the fix it
-      # taints only the AFFECTED table {public.hot}, which has NO open window → a no-op; public.cold's
-      # pending chunk survives. RED (taint-all): public.cold is tainted → its chunk is discarded and
-      # the snapshot_call never arrives.
+      # A lib+batch stream txn writing ONLY public.hot (commit LSN 400): delivered per-txn, its
+      # retained changes drop-filtered via track_capped. public.hot has NO open window → not in
+      # w.tracking → a drop-filter NO-OP (no PK added, nothing tainted); public.cold's pending chunk
+      # is untouched and survives. RED under the old taint-all path: public.cold would be tainted →
+      # its chunk discarded and the snapshot_call never arrives.
       send_committed_txn(pid, "hot", 42)
       :sys.get_state(pid)
 
@@ -1072,6 +1072,42 @@ defmodule Replicant.AssemblerServerTest do
       assert_receive {:snapshot_call, changes, ctx}, 1_000
       assert ctx.table == "public.cold"
       assert Enum.map(changes, & &1.record["id"]) == [1, 2]
+    end
+
+    test "F-DROP lib+batch: a stream write to a BACKFILLING table drop-filters the colliding chunk row (PK-retention, no taint)" do
+      pid = start_incremental_server(ChunkLedgerSink, "asrv_inc_libbatch_drop")
+
+      # Swap in a lib+batch assembler (mode: :lib + a batch policy) — same inject pattern as F-TAINT.
+      :sys.replace_state(pid, fn st ->
+        asm =
+          Replicant.Assembler.new(ChunkLedgerSink,
+            mode: :lib,
+            checkpoint_writer: fn _lsn -> :ok end,
+            slot_name: "asrv_inc_libbatch_drop",
+            lib_checkpoint: 0,
+            batch: [max_transactions: 5, max_delay_ms: 60_000, max_span: 1_000_000],
+            max_inflight_lag: 1_000_000
+          )
+
+        %{st | asm: asm}
+      end)
+
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+
+      # A lib+batch stream txn writes public.orders id=2 (delivered per-txn, checkpoint batched). With
+      # PK-retention the buffered txn's changes are retained → track_window DROP-FILTERS: id=2 enters
+      # the drop-set, exactly as lib-non-batch / sink-owned already do. RED before the refactor
+      # (buffered_changes == :unavailable → track_window taints the affected table): public.orders is
+      # tainted → the chunk deliver below returns {:error, :table_discarded}, never applies [1].
+      send_committed_txn(pid, "orders", 2)
+      :sys.get_state(pid)
+
+      assert :ok = Replicant.AssemblerServer.deliver_snapshot_chunk(pid, chunk_msg(500, [1, 2]))
+      GenServer.cast(pid, {:snapshot_frontier, 0, 500})
+
+      # id=2 DROPPED (drop-filtered), id=1 survives — no taint, no re-read.
+      assert_receive {:snapshot_call, changes, _ctx}, 1_000
+      assert Enum.map(changes, & &1.record["id"]) == [1]
     end
 
     test "TRIPWIRE value-free: a sink handle_snapshot that RAISES halts WITHOUT the message leaking (rescue arm)" do

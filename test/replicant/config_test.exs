@@ -668,7 +668,7 @@ defmodule Replicant.ConfigTest do
       assert {:error, :snapshot_unsupported} = Config.validate(opts)
     end
 
-    test "lib batched checkpointing + incremental snapshot is rejected :config_invalid (no PK-retention → per-write re-read livelock)" do
+    test "lib batched checkpointing + incremental snapshot is ACCEPTED (PK-retention → drop-filter, no livelock)" do
       opts =
         inc_opts(NoProgressSink, mode: :incremental) ++
           [
@@ -678,12 +678,12 @@ defmodule Replicant.ConfigTest do
             ]
           ]
 
-      # RED without validate_lib_batch_snapshot: the combination validates {:ok, _} and would
-      # livelock — lib+batch discards buffered txns (buffered_changes == :unavailable), so the
-      # drop-set can only TAINT (discard + re-read) affected tables, never drop-filter their PKs.
-      # Now that a taint SIGNALS re-read (the data-loss fix), every concurrent write to a
-      # backfilling table re-reads the WHOLE table → no convergence. Fail-closed until PK-retention.
-      assert {:error, :config_invalid} = Config.validate(opts)
+      # lib+batch retains each delivered txn's changes (last_buffered_changes), so the incremental
+      # drop-set learns its PKs and DROP-FILTERS colliding chunk rows — identical to lib-non-batch.
+      # No taint, no per-write re-read, no livelock; the earlier :config_invalid rejection is lifted.
+      assert {:ok, cfg} = Config.validate(opts)
+      assert cfg.snapshot == [mode: :incremental, chunk_rows: 1000, max_pending_chunks: 4]
+      assert Keyword.fetch!(cfg.batch, :max_transactions) == 100
     end
 
     test "incremental + go_forward_only is :conflicting_start_mode" do

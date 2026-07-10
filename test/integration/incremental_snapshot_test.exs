@@ -230,6 +230,46 @@ defmodule Replicant.IncrementalSnapshotTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Test 5 — lib+batch × incremental composition (live). This is the FIRST live exercise of the mode
+  # combination the interim `:config_invalid` guard used to reject: a `checkpoint_store` with a
+  # nested `batch` policy backfilling incrementally under a continuous concurrent writer, end-to-end
+  # through the store (lib-mode progress) + batch flush + real Postgres reader. It proves the
+  # composition BOOTS and CONVERGES effect-once — guarding the store-progress / batch-flush / drop-
+  # set seam the cross-mode-composition blindspot warns about. NOTE: this is a convergence proof, not
+  # the sharp drop-filter gate — the old taint→re-read path also converges (loss-free, just slower);
+  # the mechanism (lib+batch DROP-FILTERS instead of tainting) is red-gated by the F-DROP UNIT test
+  # (assembler_server_test.exs), which returns {:error, :table_discarded} without PK-retention.
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "lib+batch × incremental: converges effect-once under a concurrent writer (live composition)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_libbatch", "inclb_pub", 5_000)
+
+      cp_table = "cp_" <> String.replace(slot, "-", "_")
+
+      start_incremental_lib_batch(slot, "inclb_pub", cp_table,
+        chunk_rows: 200,
+        max_pending_chunks: 4
+      )
+
+      # A CONTINUOUS writer to the SAME table being backfilled (each write is a lib+batch txn routed
+      # through buffer_txn → last_buffered_changes → track_capped drop-filter). The final row-for-row
+      # check RED's if any stale snapshot chunk row survives over a newer streamed update.
+      {writer, go} = start_writer(fn w, n -> update_random_wide(w, n, "inc_libbatch", 5_000) end)
+
+      wait_backfill_complete(60_000)
+      stop_writer(writer, go)
+
+      wait_converged(ctrl, "inc_libbatch")
+
+      # Effect-once through the batched checkpoint path: no chunk-PK delivered twice.
+      assert chunk_pk_duplicates() == [],
+             "lib+batch backfill must deliver each chunk-PK once (no double-apply via re-read)"
+    end
+  end
+
   # ===========================================================================
   # convergence gate
   # ===========================================================================
@@ -434,6 +474,56 @@ defmodule Replicant.IncrementalSnapshotTest do
     after
       15_000 ->
         ExUnit.Assertions.flunk("pipeline never became ready (slot_active/resumed) for #{slot}")
+    end
+
+    :telemetry.detach(active)
+    :telemetry.detach(resumed)
+  end
+
+  # Boot a LIB+BATCH incremental pipeline: a `checkpoint_store` (which makes it lib mode and owns
+  # progress) with a NESTED `batch` policy. The store auto-creates its checkpoint + progress tables
+  # on connect. Same readiness gate as start_incremental/3. This is the ONLY path that exercises
+  # `buffer_txn`'s `last_buffered_changes` retention → track_capped drop-filter — lib-non-batch uses
+  # the {:transaction} path, so `batch:` is essential to test the PK-retention code.
+  defp start_incremental_lib_batch(slot, pub, cp_table, snap_opts) do
+    ref = make_ref()
+    test_pid = self()
+    active = {__MODULE__, :active, ref}
+    resumed = {__MODULE__, :resumed_ready, ref}
+
+    :telemetry.attach(
+      active,
+      [:replicant, :connection, :slot_active],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    :telemetry.attach(
+      resumed,
+      [:replicant, :snapshot, :resumed],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    {:ok, _} =
+      Replicant.start_link(
+        connection: PG16.pg_opts(),
+        slot_name: slot,
+        publication: pub,
+        sink: IncrementalSnapshotSink,
+        checkpoint_store: [
+          connection: PG16.pg_opts(),
+          table: cp_table,
+          batch: [max_transactions: 50, max_delay_ms: 200]
+        ],
+        snapshot: [mode: :incremental] ++ snap_opts
+      )
+
+    receive do
+      {:ready, ^ref} -> :ok
+    after
+      15_000 ->
+        ExUnit.Assertions.flunk("lib+batch pipeline never became ready for #{slot}")
     end
 
     :telemetry.detach(active)
