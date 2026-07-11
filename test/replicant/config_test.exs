@@ -155,6 +155,23 @@ defmodule Replicant.ConfigTest do
         assert {:error, :config_invalid} = Config.validate(opts)
       end
     end
+
+    test "defaults failover to false when omitted" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.failover == false
+    end
+
+    test "accepts an explicit boolean failover" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted, failover: true])
+      assert cfg.failover == true
+    end
+
+    test "rejects a non-boolean failover" do
+      for bad <- [1, "true", nil, :yes] do
+        opts = @base ++ [sink: StateMirrorPersisted, failover: bad]
+        assert {:error, :config_invalid} = Config.validate(opts)
+      end
+    end
   end
 
   describe "guard/1 — go-forward-only start guard (spec §3/§6)" do

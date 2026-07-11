@@ -22,7 +22,8 @@ defmodule Replicant.Config do
           go_forward_only: boolean(),
           snapshot: boolean() | keyword(),
           max_inflight_lag: pos_integer(),
-          checkpoint_store: keyword() | nil
+          checkpoint_store: keyword() | nil,
+          failover: boolean()
         }
 
   @doc """
@@ -59,6 +60,7 @@ defmodule Replicant.Config do
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
          {:ok, streaming} <- fetch_streaming(opts, max_inflight_lag),
+         {:ok, failover} <- fetch_failover(opts),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          {:ok, snapshot} <- fetch_snapshot(opts),
          :ok <- validate_start_mode(go_forward_only, snapshot),
@@ -73,6 +75,7 @@ defmodule Replicant.Config do
          snapshot: snapshot,
          max_inflight_lag: max_inflight_lag,
          checkpoint_store: checkpoint_store,
+         failover: failover,
          batch: batch,
          batch_delivery: batch_delivery,
          streaming: streaming
@@ -183,6 +186,17 @@ defmodule Replicant.Config do
     case Keyword.fetch(opts, :max_inflight_lag) do
       :error -> {:ok, Connection.default_max_inflight_lag()}
       {:ok, n} when is_integer(n) and n > 0 -> {:ok, n}
+      {:ok, _bad} -> {:error, :config_invalid}
+    end
+  end
+
+  # Opt-in HA failover slot (spec §6). A present value must be a boolean; anything else is a
+  # config error (never a silent fallback). Version-compatibility (FAILOVER is PG17+) is a
+  # connect-time check in Connection, not here — Config is pure and never contacts the server.
+  defp fetch_failover(opts) do
+    case Keyword.fetch(opts, :failover) do
+      :error -> {:ok, false}
+      {:ok, bool} when is_boolean(bool) -> {:ok, bool}
       {:ok, _bad} -> {:error, :config_invalid}
     end
   end
