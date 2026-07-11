@@ -867,6 +867,7 @@ defmodule Replicant.ConnectionTest do
       # disconnect would let auto_reconnect re-read the unchangeable version and re-halt in a spin).
       assert {:noreply, new_state} = Connection.handle_result(result, st)
       assert new_state.server_version_num == 160_014
+      assert_received {:failover_unsup, %{reason: :failover_unsupported}}
       :telemetry.detach({__MODULE__, :failover_unsup})
     end
 
