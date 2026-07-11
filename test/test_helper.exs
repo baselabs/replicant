@@ -4,33 +4,32 @@ defmodule Replicant.TestHelper do
   @moduledoc false
   alias Replicant.Test.PG16
 
-  # The numeric server version behind REPLICANT_TEST_URL, or 0 if unset/unreachable/erroring.
-  # Excludes the :pg17 tag on a PG < 17 substrate so those tests are honestly SKIPPED (not
-  # vacuously passed) — the DoD requires an EXECUTED PG17 run, so skip-count != coverage.
+  # The numeric server version behind REPLICANT_TEST_URL. When the URL is UNSET, returns 0 so
+  # :integration and :pg17 are honestly EXCLUDED (skip, never a vacuous pass) — the DoD requires
+  # an EXECUTED PG17 run, so skip-count != coverage. When the URL is SET, the operator EXPECTS
+  # substrate coverage: if the version cannot be determined (connect/query failure) we FAIL
+  # CLOSED and let the error propagate, aborting the suite. Returning 0 on a set-but-unreachable
+  # URL would silently drop ALL :integration + :pg17 and report green — the exact vacuous pass
+  # this mechanism exists to prevent (closeout gate-integrity finding). 0 is reserved for the
+  # genuinely-unset URL alone.
   def server_version_num do
     url = System.get_env("REPLICANT_TEST_URL")
 
     if url in [nil, ""] do
       0
     else
-      case Postgrex.start_link(PG16.pg_opts()) do
-        {:ok, conn} ->
-          # Guard the QUERY too: start_link is async and returns {:ok, _} even for an
-          # unreachable URL — the failure surfaces at query!. A raise must degrade to 0
-          # (exclude everything), never abort the whole suite at boot.
-          try do
-            Postgrex.query!(conn, "SHOW server_version_num", []).rows
-            |> hd()
-            |> hd()
-            |> String.to_integer()
-          rescue
-            _ -> 0
-          after
-            GenServer.stop(conn)
-          end
+      # start_link is async and returns {:ok, _} even for an unreachable URL — the failure
+      # surfaces at query!, which we let PROPAGATE (fail closed) rather than rescue to 0. A
+      # non-{:ok} start_link likewise raises via the match (fail closed).
+      {:ok, conn} = Postgrex.start_link(PG16.pg_opts())
 
-        _ ->
-          0
+      try do
+        Postgrex.query!(conn, "SHOW server_version_num", []).rows
+        |> hd()
+        |> hd()
+        |> String.to_integer()
+      after
+        GenServer.stop(conn)
       end
     end
   end
