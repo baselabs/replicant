@@ -41,18 +41,29 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
-  describe "create_durable_slot/1 + publication_exists/1 + slot_exists/1" do
-    test "validated names produce slot/publication commands" do
-      {:ok, a} = QueryBuilder.create_durable_slot("orders_slot")
+  describe "create_durable_slot/2 + publication_exists/1 + slot_exists/1" do
+    test "failover?: false is the unchanged legacy NOEXPORT command (published default path)" do
+      {:ok, a} = QueryBuilder.create_durable_slot("orders_slot", false)
       assert a =~ "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT"
+      refute a =~ "FAILOVER"
       {:ok, b} = QueryBuilder.publication_exists("orders_pub")
       assert b =~ "pg_publication" and b =~ "orders_pub"
       {:ok, c} = QueryBuilder.slot_exists("orders_slot")
       assert c =~ "pg_replication_slots" and c =~ "orders_slot"
     end
 
+    test "failover?: true emits the PG17 parenthesized FAILOVER + SNAPSHOT 'nothing' grammar" do
+      {:ok, a} = QueryBuilder.create_durable_slot("orders_slot", true)
+
+      assert a =~
+               "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput (FAILOVER, SNAPSHOT 'nothing')"
+
+      refute a =~ "NOEXPORT_SNAPSHOT"
+    end
+
     test "invalid names never build a command" do
-      assert {:error, :invalid_identifier} = QueryBuilder.create_durable_slot("bad name")
+      assert {:error, :invalid_identifier} = QueryBuilder.create_durable_slot("bad name", false)
+      assert {:error, :invalid_identifier} = QueryBuilder.create_durable_slot("bad name", true)
       assert {:error, :invalid_identifier} = QueryBuilder.publication_exists("bad'name")
       assert {:error, :invalid_identifier} = QueryBuilder.slot_exists("x;--")
     end
@@ -98,15 +109,24 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
-  describe "create_export_slot/1" do
-    test "builds the EXPORT_SNAPSHOT variant from a validated slot name" do
-      {:ok, sql} = QueryBuilder.create_export_slot("orders_slot")
+  describe "create_export_slot/2" do
+    test "failover?: false is the unchanged legacy EXPORT command" do
+      {:ok, sql} = QueryBuilder.create_export_slot("orders_slot", false)
       assert sql =~ "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput EXPORT_SNAPSHOT"
-      refute sql =~ "NOEXPORT"
+      refute sql =~ "FAILOVER"
     end
 
-    test "rejects a hostile slot name, builds nothing" do
-      assert {:error, :invalid_identifier} = QueryBuilder.create_export_slot("x; DROP")
+    test "failover?: true emits the PG17 parenthesized FAILOVER + SNAPSHOT 'export' grammar" do
+      {:ok, sql} = QueryBuilder.create_export_slot("orders_slot", true)
+
+      assert sql =~
+               "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput (FAILOVER, SNAPSHOT 'export')"
+
+      refute sql =~ "EXPORT_SNAPSHOT"
+    end
+
+    test "rejects an invalid slot name" do
+      assert {:error, :invalid_identifier} = QueryBuilder.create_export_slot("x; DROP", false)
     end
   end
 

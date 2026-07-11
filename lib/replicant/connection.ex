@@ -1099,7 +1099,7 @@ defmodule Replicant.Connection do
   defp begin_absent_slot(%{snapshot: s} = state) when is_list(s) do
     case classify_progress(read_progress(state)) do
       :none ->
-        {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
+        {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name, state.failover)
         {:query, sql, %{state | step: :create_incremental_slot}}
 
       :fault ->
@@ -1119,7 +1119,7 @@ defmodule Replicant.Connection do
   defp begin_absent_slot(%{snapshot: true} = state), do: create_export_slot(state)
 
   defp begin_absent_slot(state) do
-    {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name)
+    {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name, state.failover)
     {:query, sql, %{state | step: :create_slot}}
   end
 
@@ -1165,7 +1165,7 @@ defmodule Replicant.Connection do
   end
 
   defp create_export_slot(state) do
-    {:ok, sql} = QueryBuilder.create_export_slot(state.slot_name)
+    {:ok, sql} = QueryBuilder.create_export_slot(state.slot_name, state.failover)
     {:query, sql, %{state | step: :create_export_slot}}
   end
 

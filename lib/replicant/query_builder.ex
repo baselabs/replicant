@@ -48,24 +48,33 @@ defmodule Replicant.QueryBuilder do
     end
   end
 
-  @doc "Replication command to create a durable logical slot (NOEXPORT_SNAPSHOT)."
-  @spec create_durable_slot(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
-  def create_durable_slot(slot_name) do
+  @doc """
+  Replication command to create a durable logical slot with NO exported snapshot. `failover?:
+  false` (the published default) emits the legacy `NOEXPORT_SNAPSHOT` keyword byte-for-byte;
+  `failover?: true` emits the PG17 parenthesized `(FAILOVER, SNAPSHOT 'nothing')` grammar (spec
+  §6). The caller has already gated failover-on-PG16 at connect, so `failover? == true` implies PG17.
+  """
+  @spec create_durable_slot(String.t(), boolean()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_durable_slot(slot_name, failover?) do
     with :ok <- Identifier.validate(slot_name) do
-      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} NOEXPORT_SNAPSHOT;"}
+      tail = if failover?, do: "(FAILOVER, SNAPSHOT 'nothing')", else: "NOEXPORT_SNAPSHOT"
+      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} #{tail};"}
     end
   end
 
   @doc """
-  Replication command to create a durable logical slot that EXPORTS a consistent
-  snapshot (spec §4). The result row is `[slot_name, consistent_point, snapshot_name,
-  output_plugin]` — the caller reads `consistent_point` (a `pg_lsn` string) and
-  `snapshot_name` from it.
+  Replication command to create a durable logical slot that EXPORTS a consistent snapshot (spec
+  §4). `failover?: false` emits the legacy `EXPORT_SNAPSHOT` keyword byte-for-byte; `failover?:
+  true` emits `(FAILOVER, SNAPSHOT 'export')` (spec §6). The result row is `[slot_name,
+  consistent_point, snapshot_name, output_plugin]` in both forms.
   """
-  @spec create_export_slot(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
-  def create_export_slot(slot_name) do
+  @spec create_export_slot(String.t(), boolean()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_export_slot(slot_name, failover?) do
     with :ok <- Identifier.validate(slot_name) do
-      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} EXPORT_SNAPSHOT;"}
+      tail = if failover?, do: "(FAILOVER, SNAPSHOT 'export')", else: "EXPORT_SNAPSHOT"
+      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} #{tail};"}
     end
   end
 
