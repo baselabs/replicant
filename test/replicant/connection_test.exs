@@ -103,6 +103,24 @@ defmodule Replicant.ConnectionTest do
       assert new_state.checkpoint_lsn == 0x1000
     end
 
+    test "NOT idle (an open STREAMED txn) + reply-requested: acks checkpoint even though in_txn is false (CV1/CV2)" do
+      # in_txn is false (no non-streamed txn), but a concurrent streamed xid is still open — the
+      # single-boolean bug would idle-ack past its un-durable data. open_streams must block it.
+      st =
+        state(
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000,
+          open_streams: MapSet.new([200])
+        )
+
+      {:noreply, [ack], new_state} = Connection.handle_data(<<?k, 0x9999::64, 0::64, 1::8>>, st)
+      <<?r, _::64, flush::64, _::64, _::64, 0>> = IO.iodata_to_binary(ack)
+      assert flush == 0x1000
+      assert new_state.checkpoint_lsn == 0x1000
+    end
+
     test "NOT idle (unflushed batch: checkpoint < last_commit_lsn) + reply-requested: acks checkpoint" do
       wal_end = 0x9999
 
@@ -1052,9 +1070,9 @@ defmodule Replicant.ConnectionTest do
       assert st.in_txn == true
     end
 
-    test "StreamStart opens a streamed transaction (in_txn true)" do
-      st = Connection.track_txn(state(in_txn: false), %StreamStart{xid: 7, first_segment: 1})
-      assert st.in_txn == true
+    test "StreamStart opens a streamed transaction (adds its xid to open_streams)" do
+      st = Connection.track_txn(state([]), %StreamStart{xid: 7, first_segment: 1})
+      assert MapSet.member?(st.open_streams, 7)
     end
 
     test "Commit closes the transaction and records last_commit_lsn" do
@@ -1063,24 +1081,34 @@ defmodule Replicant.ConnectionTest do
       assert st.last_commit_lsn == 0x500
     end
 
-    test "StreamCommit closes a streamed transaction and records its commit_lsn" do
-      st =
-        Connection.track_txn(state(in_txn: true, last_commit_lsn: 0), %StreamCommit{
-          commit_lsn: 0x900
-        })
-
-      assert st.in_txn == false
+    test "StreamCommit closes its streamed xid and records its commit_lsn" do
+      st0 = state(open_streams: MapSet.new([7]), last_commit_lsn: 0)
+      st = Connection.track_txn(st0, %StreamCommit{xid: 7, commit_lsn: 0x900})
+      refute MapSet.member?(st.open_streams, 7)
       assert st.last_commit_lsn == 0x900
     end
 
-    test "StreamAbort closes the transaction WITHOUT recording a commit lsn" do
+    test "CV1: a StreamCommit for one xid keeps a CONCURRENT open streamed xid open (no premature idle)" do
       st =
-        Connection.track_txn(state(in_txn: true, last_commit_lsn: 0x500), %StreamAbort{
-          xid: 7,
-          subxid: 7
-        })
+        state([])
+        |> Connection.track_txn(%StreamStart{xid: 100, first_segment: 1})
+        |> Connection.track_txn(%StreamStart{xid: 200, first_segment: 1})
+        |> Connection.track_txn(%StreamCommit{xid: 100, commit_lsn: 0x900})
 
-      assert st.in_txn == false
+      # 200 is still open — the old single-boolean `in_txn` would have been cleared by A's commit.
+      assert MapSet.member?(st.open_streams, 200)
+      refute MapSet.member?(st.open_streams, 100)
+    end
+
+    test "CV2: a SUBtransaction StreamAbort (xid != subxid) keeps the parent txn open" do
+      st = Connection.track_txn(state(open_streams: MapSet.new([100])), %StreamAbort{xid: 100, subxid: 105})
+      assert MapSet.member?(st.open_streams, 100)
+    end
+
+    test "a whole-transaction StreamAbort (xid == subxid) closes the streamed xid, records no commit" do
+      st0 = state(open_streams: MapSet.new([100]), last_commit_lsn: 0x500)
+      st = Connection.track_txn(st0, %StreamAbort{xid: 100, subxid: 100})
+      refute MapSet.member?(st.open_streams, 100)
       assert st.last_commit_lsn == 0x500
     end
 

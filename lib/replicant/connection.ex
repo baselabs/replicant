@@ -97,6 +97,7 @@ defmodule Replicant.Connection do
           streaming: keyword() | nil,
           in_stream: boolean(),
           in_txn: boolean(),
+          open_streams: MapSet.t(),
           last_commit_lsn: Replicant.lsn(),
           store_retry_count: non_neg_integer(),
           frontier_epoch: non_neg_integer(),
@@ -126,6 +127,7 @@ defmodule Replicant.Connection do
     streaming: nil,
     in_stream: false,
     in_txn: false,
+    open_streams: MapSet.new(),
     last_commit_lsn: 0,
     store_retry_count: 0,
     frontier_epoch: 0,
@@ -220,6 +222,7 @@ defmodule Replicant.Connection do
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
          in_txn: false,
+         open_streams: MapSet.new(),
          last_commit_lsn: 0,
          spilled_bytes: 0,
          # `frontier_epoch` is KEPT across (re)connect (monotonic; only `start_streaming`
@@ -437,6 +440,7 @@ defmodule Replicant.Connection do
              stream_floor_lsn: nil,
              in_stream: false,
              in_txn: false,
+             open_streams: MapSet.new(),
              last_commit_lsn: 0
          }}
 
@@ -529,8 +533,8 @@ defmodule Replicant.Connection do
   # last commit (in lib/batch mode this waits for the flush; NOT `received_lsn <= checkpoint_lsn`,
   # which is never true after a commit — the end_lsn tail gap, spec §3.1.1).
   @spec idle?(t()) :: boolean()
-  defp idle?(%{in_txn: in_txn, checkpoint_lsn: cp, last_commit_lsn: lc}),
-    do: not in_txn and cp >= lc
+  defp idle?(%{in_txn: in_txn, open_streams: streams, checkpoint_lsn: cp, last_commit_lsn: lc}),
+    do: not in_txn and MapSet.size(streams) == 0 and cp >= lc
 
   @doc """
   Classify a `pg_replication_slots` invalidation-status result (spec §8, PG16
@@ -782,23 +786,41 @@ defmodule Replicant.Connection do
   defp update_in_stream(state, _message), do: state
 
   @doc false
-  # Maintain the transaction-in-flight signal for the idle-ack (spec A1 §3.1). `in_txn` is TRUE
-  # from a transaction's opening boundary (Begin / StreamStart) until its closing boundary
-  # (Commit / StreamCommit / StreamAbort); `last_commit_lsn` records the most recent commit's
-  # commit_lsn so the keepalive path can confirm it durable (`checkpoint_lsn >= last_commit_lsn`)
-  # before advancing the slot. StreamStop is a mid-transaction PAUSE — it does NOT close the txn.
+  # Maintain the transaction-in-flight signal for the idle-ack (spec A1 §3.1). A transaction is
+  # "open" from its opening boundary until its closing boundary; `idle?/1` refuses to advance the
+  # slot while any is open. `last_commit_lsn` records the most recent commit's commit_lsn so the
+  # keepalive path can confirm it durable (`checkpoint_lsn >= last_commit_lsn`) before advancing.
   # `last_commit_lsn` is monotonic (max) to ignore any out-of-order/nil commit lsn.
+  #
+  # NON-STREAMED (proto-v1, and small txns in v2): the `in_txn` boolean — Begin opens, Commit closes;
+  # only one is in flight at a time (they arrive in commit order, non-interleaved).
+  # STREAMED (proto-v2): the assembler holds up to `max_concurrent_txns` CONCURRENT xid-keyed
+  # in-progress buffers (assembler.ex), so a single boolean under-counts them. Track the SET of open
+  # streamed xids: StreamStart opens one, StreamCommit closes it. StreamAbort is a SUBTRANSACTION
+  # (savepoint) abort when `xid != subxid` — the parent stays open (the assembler keeps its buffer),
+  # so it must NOT close the stream; only a whole-txn abort (`xid == subxid`) closes it (the aborted
+  # changes are discarded, never delivered, so advancing past them is safe). StreamStop is a
+  # mid-transaction PAUSE that touches neither. (Correctness/cross-vendor review CV1/CV2.)
   @spec track_txn(t(), struct()) :: t()
   def track_txn(state, %Begin{}), do: %{state | in_txn: true}
-  def track_txn(state, %StreamStart{}), do: %{state | in_txn: true}
 
   def track_txn(state, %Commit{lsn: lsn}),
     do: %{state | in_txn: false, last_commit_lsn: max(state.last_commit_lsn, lsn || 0)}
 
-  def track_txn(state, %StreamCommit{commit_lsn: lsn}),
-    do: %{state | in_txn: false, last_commit_lsn: max(state.last_commit_lsn, lsn || 0)}
+  def track_txn(state, %StreamStart{xid: xid}),
+    do: %{state | open_streams: MapSet.put(state.open_streams, xid)}
 
-  def track_txn(state, %StreamAbort{}), do: %{state | in_txn: false}
+  def track_txn(state, %StreamCommit{xid: xid, commit_lsn: lsn}),
+    do: %{
+      state
+      | open_streams: MapSet.delete(state.open_streams, xid),
+        last_commit_lsn: max(state.last_commit_lsn, lsn || 0)
+    }
+
+  def track_txn(state, %StreamAbort{xid: top, subxid: sub}) when top == sub,
+    do: %{state | open_streams: MapSet.delete(state.open_streams, top)}
+
+  def track_txn(state, %StreamAbort{}), do: state
   def track_txn(state, _msg), do: state
 
   # Fail-closed lag-halt (spec §4): the sink is not draining fast enough — the
