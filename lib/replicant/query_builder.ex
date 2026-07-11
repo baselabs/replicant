@@ -190,6 +190,16 @@ defmodule Replicant.QueryBuilder do
   def is_in_recovery, do: "SELECT pg_is_in_recovery();"
 
   @doc """
+  Connect-time probe: `pg_is_in_recovery()` (standby detection, spec §8) plus the numeric
+  server version (`server_version_num`, e.g. `170010`) in one round trip on the replication
+  connection. The version gates the PG17+ invalidation columns (spec §5) and the `FAILOVER`
+  slot grammar (spec §6). No identifier to validate — a constant query.
+  """
+  @spec recovery_and_version() :: String.t()
+  def recovery_and_version,
+    do: "SELECT pg_is_in_recovery(), current_setting('server_version_num')::int;"
+
+  @doc """
   Query returning, per publication table, its ordered PRIMARY KEY columns — BOTH the
   raw `attname` (to read `%Change{}.record` string keys) and the server-quoted form
   via `quote_ident` (the ONLY form ever interpolated into keyset SQL — spec §6.6,

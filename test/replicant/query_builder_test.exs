@@ -82,6 +82,15 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
+  describe "recovery_and_version/0" do
+    test "reads recovery status and the numeric server version in one round trip" do
+      sql = QueryBuilder.recovery_and_version()
+      assert sql =~ "pg_is_in_recovery()"
+      assert sql =~ "current_setting('server_version_num')"
+      assert sql =~ "::int"
+    end
+  end
+
   describe "create_export_slot/1" do
     test "builds the EXPORT_SNAPSHOT variant from a validated slot name" do
       {:ok, sql} = QueryBuilder.create_export_slot("orders_slot")
