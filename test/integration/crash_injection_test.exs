@@ -239,11 +239,13 @@ defmodule Replicant.CrashInjectionTest do
 
   # ADVERSARIAL CRASH-INJECTION (spec §12.2 line 144: "kill the Connection ... DURING A
   # KEEPALIVE"). When the stream is idle (all committed WAL drained, no txn buffering)
-  # the only Connection↔PG traffic is the primary-keepalive/standby-status exchange, on
-  # which the Connection replies with its DURABLE checkpoint. This test kills the
-  # Connection in that idle/keepalive window and proves the kill on the ack/keepalive
-  # path loses nothing and duplicates nothing (the ack only advances the idempotent
-  # checkpoint — re-running it is a no-op).
+  # the only Connection↔PG traffic is the primary-keepalive/standby-status exchange. Per
+  # spec A1, the idle-window keepalive now ADVANCES the slot to `wal_end` (not just the
+  # durable checkpoint) since a quiet-but-filtered publication carries no unpersisted
+  # data past that point. This test kills the Connection in that idle/keepalive window
+  # and proves the kill on the ack/keepalive path still loses nothing and duplicates
+  # nothing: the assertions hold because a resume clamps over the filtered WAL in the
+  # gap (spec §3.4 — no publication data was skipped, so re-running is still a no-op).
   #
   # DETERMINISTIC idle window (not a bare sleep-and-hope): after the pre-kill txns land,
   # `wait_until_idle/2` confirms the pipeline reached the idle state by THREE signals — the
@@ -453,11 +455,15 @@ defmodule Replicant.CrashInjectionTest do
   # durable `checkpoint_lsn` has advanced past 0 (a commit landed) and (2) its
   # `received_lsn` frontier is STABLE across a sampling interval — no new WAL is arriving,
   # so the stream has drained and the only Connection↔PG traffic is the primary-
-  # keepalive/standby-status exchange (on which the Connection replies with `checkpoint_lsn`)
-  # — and (3) the AssemblerServer's open buffer is nil (no txn mid-assembly). Note the
-  # idle `received_lsn` sits a small CONSTANT gap above `checkpoint_lsn` (the WAL of the
-  # commit record's own tail after the last applied commit), so idleness is stability of
-  # the frontier, NOT `received == checkpoint`.
+  # keepalive/standby-status exchange (on which the Connection replies with `checkpoint_lsn`
+  # while a txn is in flight, or advances to `wal_end` when idle — spec A1) — and (3) the
+  # AssemblerServer's open buffer is nil (no txn mid-assembly). STALE NOTE (pre-A1): idle
+  # `received_lsn` used to sit a small CONSTANT gap above `checkpoint_lsn` (the WAL of the
+  # commit record's own tail after the last applied commit); this `wait_until_idle`
+  # LOGIC is unaffected by A1 — it checks `checkpoint_lsn > 0` plus `received_lsn`
+  # STABILITY, never `received == checkpoint` — but now the first idle keepalive advances
+  # `checkpoint_lsn` itself to `wal_end >= received_lsn` (spec A1), so idleness is still
+  # stability of the frontier, not equality of the two LSNs.
   defp wait_until_idle(conn, asm) do
     PG16.wait_until(fn -> idle_lsn(conn, asm) != nil end, 400)
     idle_lsn(conn, asm) || flunk_idle()

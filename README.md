@@ -68,11 +68,13 @@ check is plain integer comparison: `txn.commit_lsn <= checkpoint`.
 A running pipeline is two processes under a `:one_for_all` supervisor:
 
 - **`Replicant.Connection`** (`Postgrex.ReplicationConnection`) owns the
-  replication slot and the socket. It answers every keepalive with the **last
-  durably-checkpointed LSN** as the flush position (never the received
-  `wal_end`), decodes each WAL message behind the value-free boundary, and
-  forwards the decoded message to the assembler — it never runs the sink, so it
-  is always free to answer keepalives. It advances the ack asynchronously only
+  replication slot and the socket. It answers a keepalive with the **last
+  durably-checkpointed LSN** while a published transaction is in flight (never
+  advancing the slot past un-persisted data); when the pipeline is idle it
+  advances the slot to the server WAL position so a quiet-but-filtered
+  publication does not pin WAL. It decodes each WAL message behind the
+  value-free boundary and forwards it to the assembler — it never runs the sink,
+  so it is always free to answer keepalives. It advances the ack asynchronously
   when the sink signals a durable commit, and halts fail-closed on slot
   invalidation (`wal_status = 'lost'` / `conflicting`), a decode failure, or a
   sustained sink-lag backlog (the bounded in-flight window).
@@ -80,10 +82,11 @@ A running pipeline is two processes under a `:one_for_all` supervisor:
   keepalive path, and halts fail-closed on a destructive schema change or a
   sink write fault.
 
-Because the ack reports only the durable checkpoint, a crash between dispatch
-and persist re-delivers from the older `confirmed_flush` and the idempotent
-sink dedups — the exactly-once seam that `walex`'s fire-and-forget
-`wal_end + 1` ack does not have.
+Because the ack reports the durable checkpoint while a transaction is in flight
+(advancing over filtered WAL only when idle, which carries no publication data),
+a crash between dispatch and persist re-delivers from the durable `confirmed_flush`
+and the idempotent sink dedups — the exactly-once seam that `walex`'s
+fire-and-forget `wal_end + 1` ack does not have.
 
 ## The 5 critical rules (see `AGENTS.md` for the full text)
 
