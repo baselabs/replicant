@@ -33,6 +33,7 @@ jobs:
             docker exec pg pg_isready -U postgres && break
             sleep 1
           done
+          docker exec pg pg_isready -U postgres || { echo "Postgres never became ready"; exit 1; }
 
       - uses: erlef/setup-beam@v1
         with:
