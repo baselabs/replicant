@@ -1,6 +1,12 @@
 defmodule Replicant.StreamingSpillTest do
   use ExUnit.Case, async: false
   @moduletag :integration
+  # Each marquee streams a 20k–40k-row txn through logical decoding + disk spill — genuinely
+  # ~15s isolated, and its `Postgrex.transaction(..., timeout: 120_000)` already budgets the DB
+  # op at 120s. The ExUnit test timeout was left at the 60s default, so under concurrent machine
+  # load a test would hit ExUnit.TimeoutError (killed at 60s) while its own DB op still had budget.
+  # Match the ExUnit ceiling to the 120s the transactions already use — wall-clock margin only.
+  @moduletag timeout: 120_000
 
   alias Replicant.Test.PG16
 
