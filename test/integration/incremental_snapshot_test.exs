@@ -513,6 +513,80 @@ defmodule Replicant.IncrementalSnapshotTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Test 9 (§3.4) — idle-ack DURING an active backfill × RESUME (cross-mode composition).
+  # The idle-advance is an in-memory keepalive-handler action; per spec §3.4 it becomes observable
+  # to DELIVERY only on a RESUME (START_REPLICATION re-clamps to the advanced confirmed_flush; in-
+  # session the assembler skips on the SINK watermark, not checkpoint_lsn). So the marquee CRASHES
+  # mid-backfill and proves effect-once on the resume — a same-session convergence check alone would
+  # not exercise the idle-advance × incremental composition risk.
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "idle-ack during an active backfill advances the slot over filtered WAL; RESUME after the advance stays effect-once",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      # A large source (500 chunks at chunk_rows 100) so the crash lands safely mid-backfill. The
+      # crash point is gated by `wait_chunks(3)` + one idle keepalive (≈130 ms, row-count independent),
+      # while full-backfill completion scales with the chunk count — so a large source maximizes the
+      # margin between the crash and completion (measured: crash at 16–56 chunks of the total).
+      setup_int_table(ctrl, "inc_orders", "inc_pub", 50_000)
+      Postgrex.query!(ctrl, "DROP TABLE IF EXISTS inc_idle_noise", [])
+      Postgrex.query!(ctrl, "CREATE TABLE inc_idle_noise (id bigserial PRIMARY KEY, v text)", [])
+
+      start_incremental(slot, "inc_pub", chunk_rows: 100, max_pending_chunks: 2)
+
+      # Hold the backfill IN FLIGHT with a CONTINUOUS writer to the UNPUBLISHED noise table — the
+      # load-bearing adaptation. `set_txn_delay/1` only paces the derived SlowIncrementalSnapshotSink's
+      # handle_transaction (streamed txns); the base sink's chunk path honors NO delay, and this
+      # source has no published writer to slow. Instead: a chunk's HW is `pg_current_wal_lsn()`
+      # (server-wide) while the snapshot frontier is the LAGGING keepalive `wal_end`, so continuous
+      # filtered WAL keeps every fresh chunk's HW ahead of the frontier → chunks stay pending → the
+      # backfill stays partial. The SAME filtered WAL is what the idle-ack releases the slot over: an
+      # unpublished table decodes NO Begin/Commit, so `idle?/1` holds and the idle branch fires on
+      # each keepalive (spec §2/§3.1 F4 "busy-but-publication-filtered source releases WAL").
+      {noise, noise_go} =
+        start_writer(fn w, n ->
+          Postgrex.query!(w, "INSERT INTO inc_idle_noise (v) VALUES ($1)", ["n#{n}"])
+        end)
+
+      wait_chunks(3, 8_000)
+      cf0 = confirmed_flush(ctrl, slot)
+
+      # Force a segment boundary so the walsender promptly emits a keepalive with the advanced wal_end.
+      Postgrex.query!(ctrl, "SELECT pg_switch_wal()", [])
+
+      # Idle-ack advances confirmed_flush past the backfill floor over filtered WAL (RED pre-A1: with
+      # the idle branch disabled, checkpoint_lsn is pinned — no published commit advances it — so this
+      # flunks).
+      PG16.wait_until(fn -> confirmed_flush(ctrl, slot) > cf0 end, 400)
+      assert confirmed_flush(ctrl, slot) > cf0
+
+      # The advance happened MID-backfill (non-vacuity: a completed backfill would make the resume
+      # re-clamp a no-op). The continuous filtered WAL guarantees a still-pending chunk window
+      # (measured: this fires with the backfill at ~10–56 of the 500 chunks).
+      refute backfill_complete?()
+
+      # CRASH mid-backfill. The pipeline is :one_for_all, so this restarts Connection+AssemblerServer
+      # together; the fresh Connection resumes from the sink's durable progress and its
+      # START_REPLICATION re-clamps to the idle-advanced confirmed_flush (spec §3.4) — the ONLY path
+      # where the in-memory advance becomes observable to delivery. Cross-mode composition risk the
+      # marquee must exercise.
+      [{conn, _}] = Registry.lookup(Replicant.Registry, {slot, :connection})
+      ref = Process.monitor(conn)
+      Process.exit(conn, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^conn, _}, 5000
+
+      # Quiesce the filtered WAL so the resumed backfill's final-chunk barrier can close.
+      stop_writer(noise, noise_go)
+
+      # Let the resumed backfill finish, then prove effect-once: zero chunk-PK duplicates in the
+      # append-only ledger + final mirror == final source row-for-row (the closure tripwire).
+      wait_backfill_complete(60_000)
+      assert chunk_pk_duplicates() == []
+      wait_converged(ctrl, "inc_orders")
+    end
+  end
+
   # ===========================================================================
   # convergence gate
   # ===========================================================================
@@ -578,6 +652,16 @@ defmodule Replicant.IncrementalSnapshotTest do
     end)
     |> Enum.frequencies()
     |> Enum.filter(fn {_pk, n} -> n > 1 end)
+  end
+
+  # confirmed_flush/2 — the slot's server-side flush position. No such helper exists here yet.
+  defp confirmed_flush(c, slot) do
+    sql = "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1"
+
+    case Postgrex.query!(c, sql, [slot]).rows do
+      [[lsn]] when is_binary(lsn) -> Replicant.lsn_from_string(lsn)
+      _ -> 0
+    end
   end
 
   # ===========================================================================
