@@ -67,6 +67,46 @@ defmodule Replicant.IdleAckTest do
     end
   end
 
+  @tag timeout: 120_000
+  test "reconnect during an idle-advanced window: re-idle-acks and a later published txn is exactly-once",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      start_pipeline(slot)
+      insert(ctrl, 1, "a")
+      PG16.wait_until(fn -> count(ctrl, "sink_orders") == 1 end)
+
+      # Idle-advance the slot over filtered WAL.
+      cf0 = confirmed_flush(ctrl, slot)
+
+      for i <- 1..300,
+          do: Postgrex.query!(ctrl, "INSERT INTO idle_noise (v) VALUES ($1)", ["n#{i}"])
+
+      Postgrex.query!(ctrl, "SELECT pg_switch_wal()", [])
+      PG16.wait_until(fn -> confirmed_flush(ctrl, slot) > cf0 end, 400)
+
+      # Force a reconnect (handle_connect reseeds received_lsn := checkpoint, in_txn := false).
+      [{conn, _}] = Registry.lookup(Replicant.Registry, {slot, :connection})
+      ref = Process.monitor(conn)
+      Process.exit(conn, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^conn, _}, 5000
+
+      # After reconnect: more filtered noise still advances the slot (idle-ack recovers),
+      # and a published txn is delivered exactly-once.
+      cf1 = confirmed_flush(ctrl, slot)
+
+      for i <- 301..600,
+          do: Postgrex.query!(ctrl, "INSERT INTO idle_noise (v) VALUES ($1)", ["n#{i}"])
+
+      Postgrex.query!(ctrl, "SELECT pg_switch_wal()", [])
+      PG16.wait_until(fn -> confirmed_flush(ctrl, slot) > cf1 end, 400)
+
+      insert(ctrl, 2, "b")
+      PG16.wait_until(fn -> count(ctrl, "sink_orders") == 2 end, 400)
+      assert rows(ctrl, "SELECT id, note FROM sink_orders ORDER BY id") == [[1, "a"], [2, "b"]]
+      assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
+    end
+  end
+
   defp reset_schema(c) do
     Postgrex.query!(c, "DROP PUBLICATION IF EXISTS orders_pub", [])
 
