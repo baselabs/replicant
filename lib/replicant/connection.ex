@@ -3,10 +3,13 @@ defmodule Replicant.Connection do
   The `Postgrex.ReplicationConnection` that owns the replication slot and closes
   the exactly-once seam (spec §2/§4/§8). It:
 
-    * replies to every reply-requested keepalive with the **last durably-checkpointed
-      LSN** as the flush position — never the received `wal_end` (walex's
-      fire-and-forget `wal_end+1` is the at-most-once bug this fixes), so the slot
-      never advances past un-persisted data;
+    * replies to a reply-requested keepalive with the **last durably-checkpointed LSN**
+      while any published transaction is in flight — never advancing the slot past
+      un-persisted publication data (walex's fire-and-forget `wal_end+1` is the
+      at-most-once bug this fixes). When IDLE (no open transaction and the checkpoint
+      caught up), it advances the slot to the keepalive `wal_end` so a quiet-but-filtered
+      publication stops pinning WAL (spec A1) — the intervening WAL carries nothing for
+      the publication;
     * decodes each XLogData payload behind Plan 1's value-free boundary and forwards
       the decoded message to `Replicant.AssemblerServer` — it never applies the sink,
       so it is always free to answer keepalives;
@@ -376,8 +379,9 @@ defmodule Replicant.Connection do
     end
   end
 
-  # Primary keepalive: reply with the durable checkpoint ONLY when a reply is
-  # requested (reply == 1). Never the received wal_end.
+  # Primary keepalive (spec A1 §3.1): forward the frontier in incremental mode, then dispatch to
+  # keepalive_ack/3 — idle-advance the slot to wal_end, else reply with the durable checkpoint
+  # (never the received wal_end).
   def handle_data(<<?k, wal_end::64, _clock::64, reply::8>>, state) do
     # Whenever the pipeline is in incremental MODE (incremental?/1 stays true for the whole
     # pipeline lifetime, not only during an active backfill), forward the keepalive frontier so
@@ -392,11 +396,7 @@ defmodule Replicant.Connection do
       )
     end
 
-    if reply == 1 do
-      {:noreply, [encode_status_update(state.checkpoint_lsn)], state}
-    else
-      {:noreply, state}
-    end
+    keepalive_ack(wal_end, reply, state)
   end
 
   def handle_data(_other, state), do: {:noreply, state}
@@ -498,6 +498,39 @@ defmodule Replicant.Connection do
     clock = System.os_time(:microsecond) - @pg_epoch
     <<?r, lsn::64, lsn::64, lsn::64, clock::64, 0>>
   end
+
+  # On a keepalive: when IDLE (no open transaction AND every received commit durable) and the
+  # server WAL end is ahead of our durable checkpoint, advance the slot to `wal_end` (spec A1
+  # §3.1). The intervening WAL is provably empty for this publication (idle ⟹ no in-flight
+  # published change), so this releases WAL pinned on a quiet publication WITHOUT ever acking
+  # past un-persisted publication data. Fires regardless of the reply-request flag so a
+  # busy-but-filtered source releases WAL promptly. When NOT idle, behavior is unchanged:
+  # reply==1 acks the durable checkpoint, reply==0 sends nothing.
+  defp keepalive_ack(wal_end, reply, state) do
+    if idle?(state) and wal_end > state.checkpoint_lsn do
+      if reply == 1 do
+        Telemetry.event([:replicant, :checkpoint, :advanced], %{}, %{commit_lsn: wal_end})
+      end
+
+      {:noreply, [encode_status_update(wal_end)], %{state | checkpoint_lsn: wal_end}}
+    else
+      non_advancing_ack(reply, state)
+    end
+  end
+
+  # The unchanged (non-advancing) keepalive reply: used when NOT idle, or idle but wal_end is
+  # not ahead of the checkpoint. reply==1 volunteers the durable checkpoint; reply==0 sends nothing.
+  defp non_advancing_ack(1, state),
+    do: {:noreply, [encode_status_update(state.checkpoint_lsn)], state}
+
+  defp non_advancing_ack(_reply, state), do: {:noreply, state}
+
+  # Idle (spec A1 §3.1): no published transaction is open AND checkpoint has caught up to the
+  # last commit (in lib/batch mode this waits for the flush; NOT `received_lsn <= checkpoint_lsn`,
+  # which is never true after a commit — the end_lsn tail gap, spec §3.1.1).
+  @spec idle?(t()) :: boolean()
+  defp idle?(%{in_txn: in_txn, checkpoint_lsn: cp, last_commit_lsn: lc}),
+    do: not in_txn and cp >= lc
 
   @doc """
   Classify a `pg_replication_slots` invalidation-status result (spec §8, PG16

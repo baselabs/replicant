@@ -50,28 +50,145 @@ defmodule Replicant.ConnectionTest do
       assert reply == 0
     end
 
-    test "a reply-requested keepalive acks the durable CHECKPOINT, never the received wal_end (fixes walex's wal_end+1)" do
-      received_wal_end = 0x9999
-      checkpoint = 0x1000
-      keepalive = <<?k, received_wal_end::64, 0::64, 1::8>>
+    test "IDLE + reply-requested: advances to wal_end and updates checkpoint_lsn (A1)" do
+      wal_end = 0x9999
 
-      {:noreply, [ack], _state} =
-        Connection.handle_data(keepalive, state(checkpoint_lsn: checkpoint))
+      st =
+        state(
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000
+        )
 
+      keepalive = <<?k, wal_end::64, 0::64, 1::8>>
+
+      {:noreply, [ack], new_state} = Connection.handle_data(keepalive, st)
       <<?r, _write::64, flush::64, _apply::64, _clock::64, 0>> = IO.iodata_to_binary(ack)
 
-      assert flush == checkpoint
-      refute flush == received_wal_end
-      refute flush == received_wal_end + 1
+      assert flush == wal_end
+      assert new_state.checkpoint_lsn == wal_end
     end
 
-    test "a keepalive that does NOT request a reply sends no ack" do
+    test "IDLE + no reply requested: VOLUNTEERS a status update acking wal_end (A1)" do
+      wal_end = 0x9999
+
+      st =
+        state(
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000
+        )
+
+      keepalive = <<?k, wal_end::64, 0::64, 0::8>>
+
+      {:noreply, [ack], new_state} = Connection.handle_data(keepalive, st)
+      <<?r, _::64, flush::64, _::64, _::64, 0>> = IO.iodata_to_binary(ack)
+      assert flush == wal_end
+      assert new_state.checkpoint_lsn == wal_end
+    end
+
+    test "NOT idle (open transaction) + reply-requested: acks the durable checkpoint, never wal_end" do
+      wal_end = 0x9999
+
+      st =
+        state(checkpoint_lsn: 0x1000, received_lsn: 0x1000, in_txn: true, last_commit_lsn: 0x1000)
+
+      keepalive = <<?k, wal_end::64, 0::64, 1::8>>
+
+      {:noreply, [ack], new_state} = Connection.handle_data(keepalive, st)
+      <<?r, _::64, flush::64, _::64, _::64, 0>> = IO.iodata_to_binary(ack)
+      assert flush == 0x1000
+      assert new_state.checkpoint_lsn == 0x1000
+    end
+
+    test "NOT idle (unflushed batch: checkpoint < last_commit_lsn) + reply-requested: acks checkpoint" do
+      wal_end = 0x9999
+
+      st =
+        state(
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x2000
+        )
+
+      keepalive = <<?k, wal_end::64, 0::64, 1::8>>
+
+      {:noreply, [ack], new_state} = Connection.handle_data(keepalive, st)
+      <<?r, _::64, flush::64, _::64, _::64, 0>> = IO.iodata_to_binary(ack)
+      assert flush == 0x1000
+      assert new_state.checkpoint_lsn == 0x1000
+    end
+
+    test "NOT idle + no reply requested: sends nothing" do
+      st =
+        state(checkpoint_lsn: 0x1000, received_lsn: 0x1000, in_txn: true, last_commit_lsn: 0x1000)
+
       keepalive = <<?k, 0x9999::64, 0::64, 0::8>>
+      assert {:noreply, ^st} = Connection.handle_data(keepalive, st)
+    end
 
-      assert {:noreply, returned} =
-               Connection.handle_data(keepalive, state(checkpoint_lsn: 0x1000))
+    test "IDLE but wal_end <= checkpoint + no reply: no redundant send" do
+      st =
+        state(
+          checkpoint_lsn: 0x9999,
+          received_lsn: 0x9999,
+          in_txn: false,
+          last_commit_lsn: 0x9999
+        )
 
-      assert returned == state(checkpoint_lsn: 0x1000)
+      keepalive = <<?k, 0x1000::64, 0::64, 0::8>>
+      assert {:noreply, ^st} = Connection.handle_data(keepalive, st)
+    end
+
+    test "ordering invariant (A1 §3.2): a Begin forwarded via forward_message blocks the next keepalive's idle-ack" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_order", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      xlog = <<?w, 0::64, 0x2000::64, 0::64, begin_payload::binary>>
+
+      st =
+        state(
+          slot_name: "conn_order",
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000,
+          max_inflight_lag: 100_000_000
+        )
+
+      {:noreply, after_begin} = Connection.handle_data(xlog, st)
+      assert after_begin.in_txn == true
+
+      {:noreply, [ack], _} = Connection.handle_data(<<?k, 0x9999::64, 0::64, 1::8>>, after_begin)
+      <<?r, _::64, flush::64, _::64, _::64, 0>> = IO.iodata_to_binary(ack)
+      assert flush == 0x1000
+    end
+
+    test "advancing checkpoint on idle-ack keeps the §4 lag honest over a gap > max_inflight_lag (A1 §3.3)" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_lag", :assembler}, nil)
+      bound = 100
+      wal_end = 1_000 + 10 * bound
+
+      st =
+        state(
+          slot_name: "conn_lag",
+          checkpoint_lsn: 1_000,
+          received_lsn: 1_000,
+          in_txn: false,
+          last_commit_lsn: 1_000,
+          stream_floor_lsn: 1_000,
+          max_inflight_lag: bound
+        )
+
+      {:noreply, [_ack], advanced} = Connection.handle_data(<<?k, wal_end::64, 0::64, 1::8>>, st)
+      assert advanced.checkpoint_lsn == wal_end
+
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      frame = <<?w, 0::64, wal_end + 10::64, 0::64, begin_payload::binary>>
+      assert {:noreply, _} = Connection.handle_data(frame, advanced)
+      assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _b, _f}}
     end
   end
 
