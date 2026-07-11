@@ -117,7 +117,7 @@ defmodule Replicant.Snapshotter.Incremental do
   end
 
   defp standby?(db),
-    do: Postgrex.query!(db, "SELECT pg_is_in_recovery();", []).rows == [[true]]
+    do: Postgrex.query!(db, QueryBuilder.is_in_recovery(), []).rows == [[true]]
 
   # ---- discovery + RESUME RECONCILIATION (Critical Rule 2 injection defense) ----
 
