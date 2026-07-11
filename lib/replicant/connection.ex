@@ -1063,31 +1063,56 @@ defmodule Replicant.Connection do
   # cyclomatically small (credo) — every branch here is the pre-lib-mode behavior,
   # verbatim.
   defp classify_and_begin(rows, state) do
-    case classify_slot_status(rows) do
-      :absent when state.checkpoint_lsn > 0 ->
-        # DATA GAP (spec §8): the sink has durable state (checkpoint > 0) but the slot
-        # is gone (dropped/rebuilt/restored-from-backup). A fresh slot would begin
-        # streaming at its creation LSN, silently skipping every transaction between
-        # the sink's checkpoint and now — unrecoverable loss. Halt fail-closed with a
-        # distinct data-gap signal; NEVER silently recreate. (An EMPTY checkpoint —
-        # nil or a §14.15 read-fault, both read as 0 — is a genuine first run / go
-        # forward and DOES create the slot below.)
-        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: :data_gap})
-        Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_with_checkpoint})
-        {:disconnect, :data_gap}
+    if synced_unpromoted?(rows, state) do
+      # A slot SYNCED from a primary, observed on an UNPROMOTED standby (in_recovery). It cannot
+      # be consumed until promotion — halt fail-closed with a distinct reason instead of the
+      # :query_error auto_reconnect livelock a consume attempt would otherwise cause (spec §7).
+      Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
+        reason: :slot_synced_unpromoted
+      })
 
-      :absent ->
-        begin_absent_slot(state)
+      Replicant.Supervisor.halt(state.slot_name, {:slot_synced_unpromoted})
+      {:disconnect, :slot_synced_unpromoted}
+    else
+      case classify_slot_status(rows) do
+        :absent when state.checkpoint_lsn > 0 ->
+          # DATA GAP (spec §8): the sink has durable state (checkpoint > 0) but the slot
+          # is gone (dropped/rebuilt/restored-from-backup). A fresh slot would begin
+          # streaming at its creation LSN, silently skipping every transaction between
+          # the sink's checkpoint and now — unrecoverable loss. Halt fail-closed with a
+          # distinct data-gap signal; NEVER silently recreate. (An EMPTY checkpoint —
+          # nil or a §14.15 read-fault, both read as 0 — is a genuine first run / go
+          # forward and DOES create the slot below.)
+          Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: :data_gap})
+          Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_with_checkpoint})
+          {:disconnect, :data_gap}
 
-      :ok ->
-        begin_present_slot(state)
+        :absent ->
+          begin_absent_slot(state)
 
-      {:invalidated, reason} ->
-        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: reason})
-        Replicant.Supervisor.halt(state.slot_name, {:slot_invalidated, reason})
-        {:disconnect, :slot_invalidated}
+        :ok ->
+          begin_present_slot(state)
+
+        {:invalidated, reason} ->
+          Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{reason: reason})
+          Replicant.Supervisor.halt(state.slot_name, {:slot_invalidated, reason})
+          {:disconnect, :slot_invalidated}
+      end
     end
   end
+
+  # PG17-only guard (spec §7). A 4-col row carries `synced`; a standby's OWN logical slot has
+  # synced=false, so `synced=true AND in_recovery=true` unambiguously marks a synced failover
+  # slot on an unpromoted standby. PG16 rows are 2-col and never match. After promotion
+  # in_recovery is false, so the guard correctly does not fire and consumption resumes.
+  defp synced_unpromoted?([[_wal_status, _conflicting, _reason, synced] | _], %{
+         server_version_num: v,
+         in_recovery: in_recovery
+       })
+       when v >= 170_000,
+       do: synced == true and in_recovery == true
+
+  defp synced_unpromoted?(_rows, _state), do: false
 
   # ---- incremental snapshot (spec §8 of the incremental design) ----
   # These clauses come FIRST; the `is_list/1` guard keeps them disjoint from the v1

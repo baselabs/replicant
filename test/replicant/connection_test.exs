@@ -535,6 +535,54 @@ defmodule Replicant.ConnectionTest do
       assert sql =~ "0/16E3778"
       assert new_state.step == :streaming
     end
+
+    test "PG17 synced slot on an UNPROMOTED standby halts fail-closed (livelock → halt)" do
+      :telemetry.attach(
+        {__MODULE__, :synced},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:synced, meta}) end,
+        self()
+      )
+
+      # 4-col PG17 row: healthy (wal_status reserved, not conflicting, no invalidation_reason),
+      # but synced = true; the connection is on an unpromoted standby (in_recovery = true).
+      result = [%Postgrex.Result{rows: [["reserved", false, nil, true]]}]
+      st = state(step: :invalidation_check, server_version_num: 170_010, in_recovery: true)
+
+      assert {:disconnect, :slot_synced_unpromoted} = Connection.handle_result(result, st)
+      assert_received {:synced, %{reason: :slot_synced_unpromoted}}
+      :telemetry.detach({__MODULE__, :synced})
+    end
+
+    test "PG17 synced slot on a PROMOTED node (in_recovery false) proceeds to stream" do
+      result = [%Postgrex.Result{rows: [["reserved", false, nil, true]]}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          server_version_num: 170_010,
+          in_recovery: false,
+          checkpoint_lsn: 0x100
+        )
+
+      assert {:stream, _sql, [], new_state} = Connection.handle_result(result, st)
+      assert new_state.step == :streaming
+    end
+
+    test "PG16 (2-col row, no synced column) is never treated as synced-unpromoted" do
+      result = [%Postgrex.Result{rows: [["reserved", false]]}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          server_version_num: 160_014,
+          in_recovery: true,
+          checkpoint_lsn: 0x100
+        )
+
+      assert {:stream, _sql, [], new_state} = Connection.handle_result(result, st)
+      assert new_state.step == :streaming
+    end
   end
 
   describe "handle_result(:invalidation_check) — snapshot-mode connect matrix (spec §8)" do
