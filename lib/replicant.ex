@@ -76,6 +76,15 @@ defmodule Replicant do
   (default `false`; must be `true` to start a `:state_mirror` sink from an empty
   checkpoint — see `Replicant.Config`).
 
+  `:snapshot` bootstraps the sink from a populated source: `snapshot: true` is the
+  point-in-time backfill (`EXPORT_SNAPSHOT` → `COPY` → hand off; requires
+  `handle_snapshot/2` + `handle_snapshot_complete/1`). For large tables, the resumable
+  form `snapshot: [mode: :incremental, chunk_rows: 1000, max_pending_chunks: 4]` streams
+  from a durable slot while a linked reader backfills in PK-ordered keyset chunks through
+  `handle_snapshot/2`, resuming from the last applied chunk after a crash/halt/reconnect
+  (sink-owned mode requires `snapshot_progress/0`; lib mode carries progress in the
+  checkpoint store). Both are mutually exclusive with `go_forward_only: true`.
+
   Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` is
   `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`.
   """

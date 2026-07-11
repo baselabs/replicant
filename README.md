@@ -14,7 +14,8 @@ in a future `ash_replicant` sink adapter.
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
 > invalidation, and is proven by a real-PG16 crash-injection suite
-> (loss = 0, effect-dup = 0). Initial snapshot/backfill, a lib-owned checkpoint
+> (loss = 0, effect-dup = 0). Initial snapshot/backfill (incl. a resumable
+> incremental mode), a lib-owned checkpoint
 > store for non-transactional sinks, batched checkpointing, sink-owned atomic
 > batch delivery, in-progress-transaction streaming, and consumer-side disk
 > spill for oversized transactions have all shipped. See "How it streams" below.
@@ -143,6 +144,23 @@ requires the sink to also implement `handle_snapshot/2` (batch upsert; clear the
 checkpoint); a mid-snapshot crash halts fail-closed (`:snapshot_incomplete`) for an
 operator to drop the slot and retry.
 
+**Resumable incremental snapshot.** For large tables where an all-or-nothing `snapshot: true`
+(a crash at 99% of a multi-hour COPY redoes everything) is the adoption blocker, opt into the
+**incremental** mode instead:
+
+```elixir
+snapshot: [mode: :incremental, chunk_rows: 1000, max_pending_chunks: 4]
+```
+
+It creates a **durable** slot and streams immediately, while a linked reader backfills the
+publication's tables in PK-ordered keyset **chunks** on its own connection — each chunk
+consistency-bracketed by read-only LSN watermarks and collision-corrected against the live
+stream (a concurrent write to a backfilling row wins; the stale chunk row is dropped). Progress
+is durable per chunk, so a crash, halt, or reconnect **resumes from the last applied chunk**
+rather than restarting. Chunks arrive through the same `handle_snapshot/2` callback; sink-owned
+mode gives effect-once chunks, lib mode dup ≤ 1 chunk (never loss). PK-less tables fall back to a
+bounded whole-table redo. `snapshot: true` remains the point-in-time option and is untouched.
+
 **Lib-owned checkpoint (non-transactional sinks).** Pass a `:checkpoint_store`
 (`[connection: <postgrex opts>, table: "replicant_checkpoints"]`) to flip the pipeline
 into **lib mode**: the library writes the checkpoint to a durable Postgres table **after**
@@ -250,6 +268,7 @@ against a real-PG16 crash-injection suite:
 - **Offline core** — decode / assemble / validate / redact behind the value-free boundary.
 - **Live streaming + exactly-once** — the `Postgrex.ReplicationConnection` that owns the slot with ack-after-checkpoint, slot-invalidation fail-closed halt, and the bounded in-flight window (loss = 0, effect-dup = 0).
 - **Initial snapshot / backfill** — `EXPORT_SNAPSHOT` → `COPY` → stream-at-snapshot-LSN, gap-free and dup-free.
+- **Resumable incremental snapshot** — `snapshot: [mode: :incremental]`: a durable-slot, PK-ordered keyset-chunk backfill interleaved with the live stream and collision-corrected against it, resuming from the last applied chunk after a crash/halt/reconnect (sink-owned effect-once chunks / lib dup ≤ 1 chunk; PK-less whole-table fallback).
 - **Lib-owned checkpoint store** — a durable Postgres checkpoint written *after* persist for **non-transactional** sinks (at-least-once, dup bounded to one transaction, never loss), with bounded retry-then-halt on store faults.
 - **Batched checkpointing (lib mode)** and **sink-owned atomic batch delivery** — amortize the checkpoint write / the sink's own commit across a batch of transactions.
 - **In-progress-transaction streaming** (`pgoutput` v2) and **consumer-side disk spill** — reassemble and deliver a transaction larger than memory, effect-once, instead of halting.

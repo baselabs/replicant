@@ -55,6 +55,14 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   (`:checkpoint_store` configured) the library owns the checkpoint, so a sink implements
   only `handle_transaction/1` — `checkpoint/0` is optional there; its returned LSN is ignored.
   Batch delivery is mutually exclusive with lib mode.
+- **Incremental snapshot** (`snapshot: [mode: :incremental]`) — a resumable, chunked backfill
+  for large tables, interleaved with the live stream. Chunks arrive through the SAME
+  `handle_snapshot/2` (same `first_for_table?` redo-safety obligation; `handle_snapshot_complete/1`
+  is NOT used — completion rides a dedicated final `handle_snapshot/2` call). A **sink-owned**
+  incremental sink must ALSO implement `snapshot_progress/0` (return the opaque `ctx.progress`
+  token it persisted atomically with each chunk); **lib mode** carries progress in the checkpoint
+  store, so only `handle_snapshot/2` is required. A concurrent write to a backfilling row wins over
+  its stale chunk row (collision-corrected); PK-less tables fall back to a bounded whole-table redo.
 - **`Replicant.Decoder`** — `decode/1` wraps the vendored `pgoutput` byte
   parser; catches and redacts any raise into a value-free `Replicant.Error`.
 - **`Replicant.Assembler`** — groups decoded messages into
