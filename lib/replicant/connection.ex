@@ -513,7 +513,12 @@ defmodule Replicant.Connection do
   defp keepalive_ack(wal_end, reply, state) do
     if idle?(state) and wal_end > state.checkpoint_lsn do
       if reply == 1 do
-        Telemetry.event([:replicant, :checkpoint, :advanced], %{}, %{commit_lsn: wal_end})
+        # `kind: :idle` distinguishes an idle WAL-skip advance (over filtered WAL, `commit_lsn` is
+        # the acked wal_end, not a committed txn) from a durable-commit advance (which omits `kind`).
+        Telemetry.event([:replicant, :checkpoint, :advanced], %{}, %{
+          commit_lsn: wal_end,
+          kind: :idle
+        })
       end
 
       {:noreply, [encode_status_update(wal_end)], %{state | checkpoint_lsn: wal_end}}

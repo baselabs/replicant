@@ -70,6 +70,30 @@ defmodule Replicant.ConnectionTest do
       assert new_state.checkpoint_lsn == wal_end
     end
 
+    test "an idle-advance emits :checkpoint,:advanced tagged kind: :idle (A2 disambiguation)" do
+      ref = make_ref()
+
+      :telemetry.attach(
+        {__MODULE__, ref},
+        [:replicant, :checkpoint, :advanced],
+        fn _e, _m, meta, pid -> send(pid, {:advanced, meta}) end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+      st =
+        state(
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000
+        )
+
+      Connection.handle_data(<<?k, 0x9999::64, 0::64, 1::8>>, st)
+      assert_received {:advanced, %{commit_lsn: 0x9999, kind: :idle}}
+    end
+
     test "IDLE + no reply requested: VOLUNTEERS a status update acking wal_end (A1)" do
       wal_end = 0x9999
 
@@ -1101,7 +1125,12 @@ defmodule Replicant.ConnectionTest do
     end
 
     test "CV2: a SUBtransaction StreamAbort (xid != subxid) keeps the parent txn open" do
-      st = Connection.track_txn(state(open_streams: MapSet.new([100])), %StreamAbort{xid: 100, subxid: 105})
+      st =
+        Connection.track_txn(state(open_streams: MapSet.new([100])), %StreamAbort{
+          xid: 100,
+          subxid: 105
+        })
+
       assert MapSet.member?(st.open_streams, 100)
     end
 
