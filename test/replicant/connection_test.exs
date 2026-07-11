@@ -851,6 +851,39 @@ defmodule Replicant.ConnectionTest do
       assert_received {:connected, %{kind: :standby}}
       :telemetry.detach({__MODULE__, :conn})
     end
+
+    test "failover on PG16 halts fail-closed and STAYS IDLE (never disconnects → no reconnect spin)" do
+      :telemetry.attach(
+        {__MODULE__, :failover_unsup},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:failover_unsup, meta}) end,
+        self()
+      )
+
+      result = [%Postgrex.Result{rows: [[false, 160_014]]}]
+      st = state(step: :recovery_check, failover: true)
+
+      # STAY IDLE: {:noreply, _} — NOT {:disconnect, _} (mirrors halt_store_permanent; a
+      # disconnect would let auto_reconnect re-read the unchangeable version and re-halt in a spin).
+      assert {:noreply, new_state} = Connection.handle_result(result, st)
+      assert new_state.server_version_num == 160_014
+      :telemetry.detach({__MODULE__, :failover_unsup})
+    end
+
+    test "failover on PG17 proceeds to the invalidation check" do
+      result = [%Postgrex.Result{rows: [[false, 170_010]]}]
+      st = state(step: :recovery_check, failover: true)
+      assert {:query, sql, new_state} = Connection.handle_result(result, st)
+      assert sql =~ "pg_replication_slots"
+      assert new_state.step == :invalidation_check
+    end
+
+    test "no failover on PG16 proceeds normally (unchanged)" do
+      result = [%Postgrex.Result{rows: [[false, 160_014]]}]
+      st = state(step: :recovery_check, failover: false)
+      assert {:query, _sql, new_state} = Connection.handle_result(result, st)
+      assert new_state.step == :invalidation_check
+    end
   end
 
   describe "sink-owned batch delivery casts (spec §6/§9)" do

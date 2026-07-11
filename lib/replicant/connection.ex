@@ -265,8 +265,13 @@ defmodule Replicant.Connection do
     })
 
     state = %{state | server_version_num: version, in_recovery: in_recovery}
-    {:ok, sql} = QueryBuilder.slot_invalidation_status(state.slot_name, state.server_version_num)
-    {:query, sql, %{state | step: :invalidation_check}}
+
+    if state.failover and version < 170_000 do
+      halt_failover_unsupported(state)
+    else
+      {:ok, sql} = QueryBuilder.slot_invalidation_status(state.slot_name, version)
+      {:query, sql, %{state | step: :invalidation_check}}
+    end
   end
 
   def handle_result([%Postgrex.Result{rows: rows}], %{step: :invalidation_check} = state) do
@@ -707,6 +712,19 @@ defmodule Replicant.Connection do
     # Stay idle (do NOT disconnect) so `auto_reconnect` cannot re-run the connect chain and
     # re-detect the permanent fault in a spin until the async teardown lands — same terminal
     # discipline as the exhaustion path (spec §9). The async `Supervisor.halt` kills us.
+    {:noreply, state}
+  end
+
+  # `failover: true` against a PG < 17 server (which rejects the FAILOVER slot option). A
+  # PERMANENT config fault — the version never changes across a reconnect — so halt and STAY
+  # IDLE (do NOT disconnect), mirroring halt_store_permanent: a disconnect would let
+  # auto_reconnect re-run the connect chain and re-halt in a spin until the async teardown lands.
+  defp halt_failover_unsupported(state) do
+    Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
+      reason: :failover_unsupported
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:config, :failover_unsupported})
     {:noreply, state}
   end
 
