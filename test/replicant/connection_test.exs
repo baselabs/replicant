@@ -786,7 +786,7 @@ defmodule Replicant.ConnectionTest do
       {:query, sql, new_state} =
         Connection.handle_connect(state(checkpoint_lsn: 0, step: :disconnected))
 
-      assert sql == Replicant.QueryBuilder.is_in_recovery()
+      assert sql == Replicant.QueryBuilder.recovery_and_version()
       assert new_state.checkpoint_lsn == 0x100
       assert new_state.step == :recovery_check
     end
@@ -811,12 +811,14 @@ defmodule Replicant.ConnectionTest do
         self()
       )
 
-      result = [%Postgrex.Result{rows: [[true]]}]
+      result = [%Postgrex.Result{rows: [[true, 170_010]]}]
 
       assert {:query, _sql, new_state} =
                Connection.handle_result(result, state(step: :recovery_check))
 
       assert new_state.step == :invalidation_check
+      assert new_state.server_version_num == 170_010
+      assert new_state.in_recovery == true
       assert_received {:connected, %{kind: :standby}}
       :telemetry.detach({__MODULE__, :conn})
     end

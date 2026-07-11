@@ -94,6 +94,9 @@ defmodule Replicant.Connection do
           max_spill_bytes: non_neg_integer() | nil,
           checkpoint_store: keyword() | nil,
           batch_delivery: keyword() | nil,
+          failover: boolean(),
+          server_version_num: non_neg_integer(),
+          in_recovery: boolean(),
           streaming: keyword() | nil,
           in_stream: boolean(),
           in_txn: boolean(),
@@ -124,6 +127,9 @@ defmodule Replicant.Connection do
     max_spill_bytes: nil,
     checkpoint_store: nil,
     batch_delivery: nil,
+    failover: false,
+    server_version_num: 0,
+    in_recovery: false,
     streaming: nil,
     in_stream: false,
     in_txn: false,
@@ -186,6 +192,7 @@ defmodule Replicant.Connection do
        max_spill_bytes: spill_ceiling(Map.get(config, :streaming)),
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
+       failover: Map.get(config, :failover, false),
        streaming: Map.get(config, :streaming),
        in_stream: false,
        store_retry_count: 0,
@@ -213,7 +220,7 @@ defmodule Replicant.Connection do
     # fresh/empty checkpoint is the slot-creation LSN (a large absolute value), NOT 0.
     # Measuring lag against that per-stream floor (never against absolute 0) is what
     # keeps the very first frame from reading as a ~50 MB false "lag".
-    {:query, QueryBuilder.is_in_recovery(),
+    {:query, QueryBuilder.recovery_and_version(),
      %{
        state
        | checkpoint_lsn: checkpoint_lsn,
@@ -249,11 +256,15 @@ defmodule Replicant.Connection do
   end
 
   @impl true
-  def handle_result([%Postgrex.Result{rows: [[in_recovery]]}], %{step: :recovery_check} = state) do
+  def handle_result(
+        [%Postgrex.Result{rows: [[in_recovery, version]]}],
+        %{step: :recovery_check} = state
+      ) do
     Telemetry.event([:replicant, :connection, :connected], %{}, %{
       kind: recovery_kind(in_recovery)
     })
 
+    state = %{state | server_version_num: version, in_recovery: in_recovery}
     {:ok, sql} = QueryBuilder.slot_invalidation_status(state.slot_name)
     {:query, sql, %{state | step: :invalidation_check}}
   end
