@@ -122,6 +122,13 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   dedup — do not claim effect-once for it.
 - **Batching is opt-in and lib-mode only.** `checkpoint_store: [batch: [max_transactions: N, max_delay_ms: T]]`. It batches the checkpoint write + ack, NOT sink delivery (`handle_transaction/1` is still per-transaction). A crash or graceful stop mid-batch re-delivers up to one batch — size `max_transactions` for your dup tolerance. Do not set `:batch` at the top level (it belongs under `:checkpoint_store`; a misplaced top-level `:batch` is rejected at start).
 - **Sink-owned atomic batch delivery (`handle_batch/1`) preserves effect-once.** The `batch_delivery: [max_transactions: N, max_delay_ms: T]` config (top-level, sink-owned only; mutually exclusive with `:checkpoint_store`) routes delivery through `handle_batch/1` instead of `handle_transaction/1`. The HARD OBLIGATION is that the data + checkpoint write is ATOMIC — the effect-once guarantee (dup=0 across mid-batch teardown) rests on it. Transactions arrive in ascending `commit_lsn` order; the sink must skip any `commit_lsn <= checkpoint` and upsert rows by table PK, exactly as `handle_transaction/1` does. A non-`{:ok, _}` return (or a raise/throw/exit) halts the pipeline fail-closed; the batch is discarded un-acked and re-delivered on resume, deduped to zero net effect by the idempotent sink.
+- **Failover slots are opt-in and PG17+.** `failover: true` creates the replication slot with
+  Postgres's `FAILOVER` option so it syncs to physical standbys, letting a pipeline resume
+  against a promoted standby with zero loss (the slot's `confirmed_flush` position carries
+  over). PG16 does not support `FAILOVER` slots — passing `failover: true` there halts
+  fail-closed (`{:config, :failover_unsupported}`) instead of silently ignoring the option.
+  Never point Replicant at an unpromoted standby's synced slot — it halts fail-closed
+  (`{:slot_synced_unpromoted}`) instead of retry-looping against a slot it cannot yet consume.
 - **Unchanged TOAST is a sentinel, not a value.** It surfaces only as
   `Replicant.Change`'s `unchanged` list of column names, never in `record`.
   Sinks must leave those columns untouched on upsert.

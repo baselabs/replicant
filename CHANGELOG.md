@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PostgreSQL 17+ forward-compatibility: reads the authoritative `invalidation_reason` slot
+  column (plus `wal_status`/`conflicting`) on PG17+ for complete invalidation detection.
+- Opt-in `failover: true` for PG17 failover slots (HA resume on a promoted standby). Halts
+  fail-closed `{:config, :failover_unsupported}` on PG16.
+- Fail-closed halt `{:slot_synced_unpromoted}` when pointed at an unpromoted standby's synced slot.
+- GitHub Actions CI matrix testing PG16 and PG17.
+
 ## [0.1.0] - 2026-07-08
 
 First public release: the complete v1 zero-loss streaming CDC core plus every

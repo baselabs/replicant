@@ -88,6 +88,32 @@ a crash between dispatch and persist re-delivers from the durable `confirmed_flu
 and the idempotent sink dedups — the exactly-once seam that `walex`'s
 fire-and-forget `wal_end + 1` ack does not have.
 
+## PostgreSQL version support
+
+Replicant targets **PostgreSQL 16 as the tested baseline** and is forward-compatible with
+**17+**. On PG17+ it reads the authoritative `invalidation_reason` slot column (a superset of
+the PG16 `wal_status`/`conflicting` signals) and supports **failover slots** for HA.
+
+### Failover slots (PG17+)
+
+Pass `failover: true` to `Replicant.start_link/1` to create the replication slot with the
+`FAILOVER` option, so PostgreSQL syncs it to physical standbys:
+
+    Replicant.start_link(
+      connection: [hostname: "primary.internal", ...],
+      slot_name: "replicant_orders",
+      publication: "orders_pub",
+      sink: MyApp.OrdersSink,
+      failover: true            # PG17+ only; on PG16 the pipeline halts {:config, :failover_unsupported}
+    )
+
+After a failover, repoint the connection at the promoted primary — the slot already exists
+there with its `confirmed_flush` position, so replication resumes with zero loss. Slot sync
+(`sync_replication_slots`), promotion, and DNS/endpoint changes are operator concerns.
+**Do not point Replicant at an unpromoted standby's synced slot** — it cannot be consumed
+until promotion, and Replicant halts fail-closed (`{:slot_synced_unpromoted}`) rather than
+looping.
+
 ## The 5 critical rules (see `AGENTS.md` for the full text)
 
 1. **No row value in an error, log, or telemetry event.**

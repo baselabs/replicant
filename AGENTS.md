@@ -72,6 +72,11 @@ All gates must pass before a commit/PR. Update `CHANGELOG.md` under
   skip when unset. Spin PG16 with
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
   then `export REPLICANT_TEST_URL="postgres://postgres@localhost:5599/postgres"`.
+- **PG17 forward-compat tests** (`test/integration/pg17_failover_test.exs`, tagged `:pg17`):
+  run against a PG17 server. Spin one alongside PG16 and point `REPLICANT_TEST_URL` at it:
+  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5617:5432 postgres:17 -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
+  then `export REPLICANT_TEST_URL="postgres://postgres@localhost:5617/postgres"`. The `:pg17`
+  tests are auto-excluded (skipped, never vacuously passed) when the server is < 17.
 - **TDD:** write the test first.
 
 ## Docs & lifecycle-artifact policy
