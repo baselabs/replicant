@@ -119,18 +119,24 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  Query returning `wal_status` and `conflicting` for the replication slot — the
-  PG16 invalidation signals (spec §8). `wal_status = 'lost'` means WAL the slot
-  needs was removed (`max_slot_wal_keep_size` exceeded); `conflicting = true`
-  means a standby recovery conflict invalidated the slot. Both are unrecoverable
-  data gaps → fail-closed halt. (PG16 has no `invalidation_reason` column — that
-  is PG17+; `wal_status`/`conflicting` are the PG16-correct signals.)
+  Query returning the slot's invalidation signals (spec §5/§8). On **PG < 17** (`version <
+  170000`): `wal_status` + `conflicting` (the PG16 columns; `invalidation_reason` errors there).
+  On **PG ≥ 17**: also `invalidation_reason` (Postgres's authoritative invalidation field) and
+  `synced` (true on a standby holding a slot synced from the primary). `wal_status = 'lost'` =
+  WAL removed; `conflicting = true` = standby recovery conflict; any non-null `invalidation_reason`
+  = invalidated. All are unrecoverable → fail-closed halt.
   """
-  @spec slot_invalidation_status(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
-  def slot_invalidation_status(slot_name) do
+  @spec slot_invalidation_status(String.t(), non_neg_integer()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def slot_invalidation_status(slot_name, version) do
     with :ok <- Identifier.validate(slot_name) do
+      cols =
+        if version >= 170_000,
+          do: "wal_status, conflicting, invalidation_reason, synced",
+          else: "wal_status, conflicting"
+
       {:ok,
-       "SELECT wal_status, conflicting FROM pg_replication_slots " <>
+       "SELECT #{cols} FROM pg_replication_slots " <>
          "WHERE slot_name = '#{slot_name}' LIMIT 1;"}
     end
   end

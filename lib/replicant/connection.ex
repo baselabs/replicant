@@ -265,7 +265,7 @@ defmodule Replicant.Connection do
     })
 
     state = %{state | server_version_num: version, in_recovery: in_recovery}
-    {:ok, sql} = QueryBuilder.slot_invalidation_status(state.slot_name)
+    {:ok, sql} = QueryBuilder.slot_invalidation_status(state.slot_name, state.server_version_num)
     {:query, sql, %{state | step: :invalidation_check}}
   end
 
@@ -557,8 +557,21 @@ defmodule Replicant.Connection do
   columns): `[]` → `:absent`; `wal_status = "lost"` → `{:invalidated, :wal_lost}`;
   `conflicting = true` → `{:invalidated, :conflict}`; otherwise `:ok`.
   """
-  @spec classify_slot_status([[term()]]) :: :absent | :ok | {:invalidated, :wal_lost | :conflict}
+  @spec classify_slot_status([[term()]]) ::
+          :absent
+          | :ok
+          | {:invalidated,
+             :wal_lost | :conflict | :rows_removed | :wal_level_insufficient | :invalidated}
   def classify_slot_status([]), do: :absent
+
+  def classify_slot_status([[wal_status, conflicting, invalidation_reason, _synced] | _rest]) do
+    cond do
+      wal_status == "lost" -> {:invalidated, :wal_lost}
+      conflicting == true -> {:invalidated, :conflict}
+      invalidation_reason in [nil, ""] -> :ok
+      true -> {:invalidated, invalidation_reason_atom(invalidation_reason)}
+    end
+  end
 
   def classify_slot_status([[wal_status, conflicting] | _rest]) do
     cond do
@@ -567,6 +580,14 @@ defmodule Replicant.Connection do
       true -> :ok
     end
   end
+
+  # Map PG's invalidation_reason enum string to a FIXED atom class (spec §5.2). NEVER
+  # String.to_atom (atom-table exhaustion / Critical Rule 1) — an unknown/future reason maps
+  # to the generic :invalidated so a new PG cause still halts fail-closed.
+  defp invalidation_reason_atom("wal_removed"), do: :wal_lost
+  defp invalidation_reason_atom("rows_removed"), do: :rows_removed
+  defp invalidation_reason_atom("wal_level_insufficient"), do: :wal_level_insufficient
+  defp invalidation_reason_atom(_other), do: :invalidated
 
   @doc false
   @spec lib_mode?(map()) :: boolean()

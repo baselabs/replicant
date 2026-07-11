@@ -440,6 +440,35 @@ defmodule Replicant.ConnectionTest do
     test "conflicting = true is an invalidation (standby recovery conflict)" do
       assert Connection.classify_slot_status([["reserved", true]]) == {:invalidated, :conflict}
     end
+
+    test "PG17 invalidation_reason maps to a fixed atom (never String.to_atom)" do
+      assert Connection.classify_slot_status([["reserved", false, "wal_removed", false]]) ==
+               {:invalidated, :wal_lost}
+
+      assert Connection.classify_slot_status([["reserved", false, "rows_removed", false]]) ==
+               {:invalidated, :rows_removed}
+
+      assert Connection.classify_slot_status([
+               ["reserved", false, "wal_level_insufficient", false]
+             ]) ==
+               {:invalidated, :wal_level_insufficient}
+
+      assert Connection.classify_slot_status([["reserved", false, "some_future_reason", false]]) ==
+               {:invalidated, :invalidated}
+    end
+
+    test "PG17 healthy slot (no invalidation_reason) is :ok" do
+      assert Connection.classify_slot_status([["reserved", false, nil, false]]) == :ok
+      assert Connection.classify_slot_status([["reserved", false, "", false]]) == :ok
+    end
+
+    test "PG17 legacy signals still classify first" do
+      assert Connection.classify_slot_status([["lost", false, nil, false]]) ==
+               {:invalidated, :wal_lost}
+
+      assert Connection.classify_slot_status([["reserved", true, nil, false]]) ==
+               {:invalidated, :conflict}
+    end
   end
 
   describe "handle_result(:invalidation_check)" do
