@@ -43,6 +43,7 @@ defmodule Replicant.Connection do
   use Postgrex.ReplicationConnection
 
   alias Replicant.{AssemblerServer, Decoder, QueryBuilder, Telemetry}
+  alias Replicant.Decoder.Messages.{Begin, Commit, StreamAbort, StreamCommit, StreamStart}
   alias Replicant.Snapshotter.Incremental
 
   @pg_epoch DateTime.to_unix(~U[2000-01-01 00:00:00Z], :microsecond)
@@ -92,6 +93,8 @@ defmodule Replicant.Connection do
           batch_delivery: keyword() | nil,
           streaming: keyword() | nil,
           in_stream: boolean(),
+          in_txn: boolean(),
+          last_commit_lsn: Replicant.lsn(),
           store_retry_count: non_neg_integer(),
           frontier_epoch: non_neg_integer(),
           backfill_floor: Replicant.lsn() | nil,
@@ -119,6 +122,8 @@ defmodule Replicant.Connection do
     batch_delivery: nil,
     streaming: nil,
     in_stream: false,
+    in_txn: false,
+    last_commit_lsn: 0,
     store_retry_count: 0,
     frontier_epoch: 0,
     last_frontier_cast: 0,
@@ -211,6 +216,8 @@ defmodule Replicant.Connection do
          store_retry_count: store_retry_count,
          received_lsn: checkpoint_lsn,
          stream_floor_lsn: nil,
+         in_txn: false,
+         last_commit_lsn: 0,
          spilled_bytes: 0,
          # `frontier_epoch` is KEPT across (re)connect (monotonic; only `start_streaming`
          # bumps it) so a fresh window always adopts a strictly-higher epoch than any
@@ -428,7 +435,9 @@ defmodule Replicant.Connection do
              checkpoint_lsn: lsn,
              received_lsn: lsn,
              stream_floor_lsn: nil,
-             in_stream: false
+             in_stream: false,
+             in_txn: false,
+             last_commit_lsn: 0
          }}
 
       {:error, _} ->
@@ -713,7 +722,12 @@ defmodule Replicant.Connection do
           {:message, message, byte_size(payload), self()}
         )
 
-        {:noreply, update_in_stream(state, message)}
+        # ORDERING INVARIANT (spec A1 §3.2): track_txn runs HERE, when the Connection forwards
+        # each message in WAL order, so a Begin sets in_txn BEFORE any following keepalive is
+        # handled — an idle-ack can never fire while an open transaction has been received.
+        # Moving this off the per-message forward path, or dropping a boundary clause, opens a
+        # silent-loss window. update_in_stream tracks the decode frame; track_txn the txn.
+        {:noreply, state |> update_in_stream(message) |> track_txn(message)}
 
       {:error, error} ->
         Replicant.Supervisor.halt(state.slot_name, error)
@@ -733,6 +747,26 @@ defmodule Replicant.Connection do
     do: %{state | in_stream: false}
 
   defp update_in_stream(state, _message), do: state
+
+  @doc false
+  # Maintain the transaction-in-flight signal for the idle-ack (spec A1 §3.1). `in_txn` is TRUE
+  # from a transaction's opening boundary (Begin / StreamStart) until its closing boundary
+  # (Commit / StreamCommit / StreamAbort); `last_commit_lsn` records the most recent commit's
+  # commit_lsn so the keepalive path can confirm it durable (`checkpoint_lsn >= last_commit_lsn`)
+  # before advancing the slot. StreamStop is a mid-transaction PAUSE — it does NOT close the txn.
+  # `last_commit_lsn` is monotonic (max) to ignore any out-of-order/nil commit lsn.
+  @spec track_txn(t(), struct()) :: t()
+  def track_txn(state, %Begin{}), do: %{state | in_txn: true}
+  def track_txn(state, %StreamStart{}), do: %{state | in_txn: true}
+
+  def track_txn(state, %Commit{lsn: lsn}),
+    do: %{state | in_txn: false, last_commit_lsn: max(state.last_commit_lsn, lsn || 0)}
+
+  def track_txn(state, %StreamCommit{commit_lsn: lsn}),
+    do: %{state | in_txn: false, last_commit_lsn: max(state.last_commit_lsn, lsn || 0)}
+
+  def track_txn(state, %StreamAbort{}), do: %{state | in_txn: false}
+  def track_txn(state, _msg), do: state
 
   # Fail-closed lag-halt (spec §4): the sink is not draining fast enough — the
   # in-flight window is exceeded. Surface it with value-free telemetry (the `reason`

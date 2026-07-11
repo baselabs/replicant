@@ -11,6 +11,7 @@ defmodule Replicant.ConnectionTest do
 
   alias Replicant.Connection
   alias Replicant.Decoder.Messages.Begin
+  alias Replicant.Decoder.Messages.{Commit, StreamAbort, StreamCommit, StreamStart}
 
   defmodule StubSink do
     @behaviour Replicant.Sink
@@ -925,6 +926,68 @@ defmodule Replicant.ConnectionTest do
       # A dead pid takes the live-pid clause but the Process.alive?/1 guard makes it a no-op; the
       # struct is returned with reader_pid cleared and no exit/unlink is attempted on the dead pid.
       assert Connection.retire_reader(state(reader_pid: dead)).reader_pid == nil
+    end
+  end
+
+  describe "track_txn/2 — transaction-in-flight boundary maintenance (spec A1 §3.1)" do
+    test "Begin opens the transaction (in_txn true)" do
+      st = Connection.track_txn(state(in_txn: false), %Begin{xid: 7})
+      assert st.in_txn == true
+    end
+
+    test "StreamStart opens a streamed transaction (in_txn true)" do
+      st = Connection.track_txn(state(in_txn: false), %StreamStart{xid: 7, first_segment: 1})
+      assert st.in_txn == true
+    end
+
+    test "Commit closes the transaction and records last_commit_lsn" do
+      st = Connection.track_txn(state(in_txn: true, last_commit_lsn: 0), %Commit{lsn: 0x500})
+      assert st.in_txn == false
+      assert st.last_commit_lsn == 0x500
+    end
+
+    test "StreamCommit closes a streamed transaction and records its commit_lsn" do
+      st =
+        Connection.track_txn(state(in_txn: true, last_commit_lsn: 0), %StreamCommit{
+          commit_lsn: 0x900
+        })
+
+      assert st.in_txn == false
+      assert st.last_commit_lsn == 0x900
+    end
+
+    test "StreamAbort closes the transaction WITHOUT recording a commit lsn" do
+      st =
+        Connection.track_txn(state(in_txn: true, last_commit_lsn: 0x500), %StreamAbort{
+          xid: 7,
+          subxid: 7
+        })
+
+      assert st.in_txn == false
+      assert st.last_commit_lsn == 0x500
+    end
+
+    test "last_commit_lsn never regresses on an out-of-order lower commit" do
+      st = Connection.track_txn(state(in_txn: true, last_commit_lsn: 0x900), %Commit{lsn: 0x500})
+      assert st.last_commit_lsn == 0x900
+    end
+
+    test "StreamStop (a pause) leaves the transaction open" do
+      st = Connection.track_txn(state(in_txn: true), %Replicant.Decoder.Messages.StreamStop{})
+      assert st.in_txn == true
+    end
+
+    test "a data message (Insert) does not change the flags" do
+      before = state(in_txn: true, last_commit_lsn: 0x500)
+
+      after_ =
+        Connection.track_txn(before, %Replicant.Decoder.Messages.Insert{
+          relation_id: 1,
+          tuple_data: []
+        })
+
+      assert after_.in_txn == true
+      assert after_.last_commit_lsn == 0x500
     end
   end
 end
