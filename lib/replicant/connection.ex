@@ -553,9 +553,13 @@ defmodule Replicant.Connection do
     do: not in_txn and MapSet.size(streams) == 0 and cp >= lc
 
   @doc """
-  Classify a `pg_replication_slots` invalidation-status result (spec §8, PG16
-  columns): `[]` → `:absent`; `wal_status = "lost"` → `{:invalidated, :wal_lost}`;
-  `conflicting = true` → `{:invalidated, :conflict}`; otherwise `:ok`.
+  Classify a `pg_replication_slots` invalidation-status result (spec §5/§8). `[]` →
+  `:absent`. On the **PG16 2-col** row `[wal_status, conflicting]`: `wal_status = "lost"` →
+  `{:invalidated, :wal_lost}`; `conflicting = true` → `{:invalidated, :conflict}`; otherwise
+  `:ok`. On the **PG17 4-col** row `[wal_status, conflicting, invalidation_reason, synced]`:
+  the legacy signals classify first (same as above), then any non-empty `invalidation_reason`
+  → `{:invalidated, <fixed atom>}` via `invalidation_reason_atom/1` (never `String.to_atom`);
+  a `nil`/`""` reason is `:ok`.
   """
   @spec classify_slot_status([[term()]]) ::
           :absent
