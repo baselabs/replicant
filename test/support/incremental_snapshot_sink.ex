@@ -143,10 +143,17 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
 
   @impl true
   def handle_snapshot(changes, %{table: table, first_for_table?: first?} = ctx) do
-    if take_fail_next_chunk?() do
-      {:error, :fail_next_chunk}
-    else
-      apply_chunk(changes, table, first?, ctx)
+    cond do
+      take_fail_next_chunk?() ->
+        {:error, :fail_next_chunk}
+
+      Map.get(ctx, :backfill_complete?, false) and take_fail_completion?() ->
+        # Fault the dedicated completion call ONLY (backfill_complete?: true) — check-and-clear, so
+        # the resume's re-delivered completion succeeds (at-least-once, spec §6.3/§12.7).
+        {:error, :fail_completion}
+
+      true ->
+        apply_chunk(changes, table, first?, ctx)
     end
   end
 
@@ -276,6 +283,22 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
     :ets.match_delete(@mirror_table, {{table, :_}, {:chunk, :_}})
   end
 
+  @doc """
+  Arms (`true`) or disarms (`false`) fault injection targeting ONLY the dedicated completion call
+  (`backfill_complete?: true`); data chunks are unaffected. Check-and-cleared on the next completion
+  call, so a resume's re-delivered completion succeeds (at-least-once, spec §6.3/§12.7).
+  """
+  @spec set_fail_completion(boolean()) :: :ok
+  def set_fail_completion(flag) when is_boolean(flag) do
+    if flag do
+      :ets.insert(@control_table, {:fail_completion, true})
+    else
+      :ets.delete(@control_table, :fail_completion)
+    end
+
+    :ok
+  end
+
   # :ets.take/2 reads-and-removes the flag in one call — check-and-clear with no
   # separate lookup/delete race window.
   defp take_fail_next_chunk? do
@@ -285,8 +308,96 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
     end
   end
 
+  defp take_fail_completion? do
+    case :ets.take(@control_table, :fail_completion) do
+      [{:fail_completion, true}] -> true
+      _absent_or_false -> false
+    end
+  end
+
+  @doc """
+  Sets a per-`handle_transaction/1` delay (ms) in the shared control ETS — the §4 `:sink_too_slow`
+  halt-resume marquee (§12.5): a positive delay makes the applier fall behind so the in-flight lag
+  trips the bound; a restart with `set_txn_delay(0)` is normal-speed. Persists across pipeline
+  restarts (the flag lives on the sink-owned Agent, not the pipeline).
+  """
+  @spec set_txn_delay(non_neg_integer()) :: :ok
+  def set_txn_delay(ms) when is_integer(ms) and ms >= 0 do
+    :ets.insert(@control_table, {:txn_delay_ms, ms})
+    :ok
+  end
+
+  @doc false
+  @spec txn_delay_ms() :: non_neg_integer()
+  def txn_delay_ms do
+    case :ets.lookup(@control_table, :txn_delay_ms) do
+      [{:txn_delay_ms, ms}] -> ms
+      [] -> 0
+    end
+  end
+
   defp append_ledger(entry) do
     :ets.insert(@ledger_table, {System.unique_integer([:monotonic]), entry})
     :ok
+  end
+end
+
+defmodule Replicant.Test.BatchIncrementalSnapshotSink do
+  @moduledoc """
+  `IncrementalSnapshotSink` + `handle_batch/1` — the sink-owned `batch_delivery` × incremental
+  composition marquee (§12.6). Snapshot / progress / checkpoint delegate to the base sink (same
+  shared ETS mirror + ledger, so the marquee reads `IncrementalSnapshotSink.mirror/0` / `ledger/0`
+  unchanged). `handle_batch/1` applies the batch's transactions in commit order through the base
+  sink's `handle_transaction/1` and returns the highest LSN — the final mirror is identical to
+  per-txn delivery, which is what the convergence + effect-once gates assert.
+  """
+  @behaviour Replicant.Sink
+
+  alias Replicant.Test.IncrementalSnapshotSink, as: Base
+
+  @impl true
+  defdelegate checkpoint, to: Base
+
+  @impl true
+  defdelegate handle_snapshot(changes, ctx), to: Base
+
+  @impl true
+  defdelegate snapshot_progress, to: Base
+
+  @impl true
+  def handle_batch([_ | _] = transactions) do
+    Enum.reduce(transactions, {:ok, nil}, fn txn, _acc -> Base.handle_transaction(txn) end)
+  end
+end
+
+defmodule Replicant.Test.SlowIncrementalSnapshotSink do
+  @moduledoc """
+  `IncrementalSnapshotSink` with a configurable per-txn delay (`IncrementalSnapshotSink.set_txn_delay/1`)
+  — the §4 `:sink_too_slow` halt-then-resume marquee (§12.5). Snapshot / progress / checkpoint
+  delegate to the base sink (shared ETS); `handle_transaction/1` sleeps the configured delay before
+  applying, so under a tiny `max_inflight_lag` + a heavy writer the in-flight lag trips the §4 bound.
+  A restart with delay 0 is normal-speed and resumes the backfill from durable progress.
+  """
+  @behaviour Replicant.Sink
+
+  alias Replicant.Test.IncrementalSnapshotSink, as: Base
+
+  @impl true
+  defdelegate checkpoint, to: Base
+
+  @impl true
+  defdelegate handle_snapshot(changes, ctx), to: Base
+
+  @impl true
+  defdelegate snapshot_progress, to: Base
+
+  @impl true
+  def handle_transaction(txn) do
+    case Base.txn_delay_ms() do
+      0 -> :ok
+      ms -> Process.sleep(ms)
+    end
+
+    Base.handle_transaction(txn)
   end
 end

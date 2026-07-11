@@ -302,6 +302,208 @@ defmodule Replicant.IncrementalSnapshotTest do
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # Test 4 (§12.4) — PK-less whole-table fallback: contended → bounded-attempt halt; quiescent → done.
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "PK-less contended: bounded attempts → halt :snapshot_table_contended (+ :chunk_retried fired)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_nopk_table(ctrl, "inc_nopk_c", "incnopkc_pub", 1_000)
+
+      failed = attach_snapshot_failed(slot)
+      retried = attach_snapshot_retried(slot)
+
+      start_incremental(slot, "incnopkc_pub", chunk_rows: 500, max_pending_chunks: 4)
+
+      # A CONTINUOUS writer: the keyless path has NO drop-set, so ANY concurrent write taints the
+      # whole read → redo. After @max_table_attempts (3) the reader halts :snapshot_table_contended
+      # (spec §6.4), emitting :chunk_retried on each redo (spec §9 "no silent re-read loops").
+      {writer, go} = start_writer(fn w, n -> update_random_nopk(w, n, "inc_nopk_c") end)
+
+      assert_receive {:snapshot_failed, :snapshot_table_contended}, 60_000
+      assert_receive {:snapshot_retried, "public.inc_nopk_c"}, 5_000
+
+      stop_writer(writer, go)
+      detach(failed)
+      detach(retried)
+    end
+  end
+
+  @tag timeout: 120_000
+  test "PK-less quiescent: no writer → the whole-table read completes + converges (§12.4)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_nopk_table(ctrl, "inc_nopk_q", "incnopkq_pub", 1_000)
+      start_incremental(slot, "incnopkq_pub", chunk_rows: 500, max_pending_chunks: 4)
+      wait_backfill_complete(30_000)
+      wait_converged(ctrl, "inc_nopk_q")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Test 8 (§12.7) — completion is delivered at-least-once until durable.
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "completion at-least-once: a fault on the backfill_complete? call re-delivers on resume, then :complete durable",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_compl", "inccompl_pub", 400)
+
+      failed = attach_snapshot_failed(slot)
+
+      # Fault ONLY the dedicated completion call (backfill_complete?: true); data chunks land fine.
+      IncrementalSnapshotSink.set_fail_completion(true)
+
+      start_incremental(slot, "inccompl_pub", chunk_rows: 200, max_pending_chunks: 4)
+
+      # Data chunks applied, then the completion call faults → halt.
+      assert_receive {:snapshot_failed, _reason}, 15_000
+      detach(failed)
+      PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
+
+      # NOT complete yet — the completion never durably landed.
+      refute backfill_complete?()
+      assert {:ok, token} = IncrementalSnapshotSink.snapshot_progress()
+      assert {:ok, sp} = Replicant.SnapshotProgress.decode(token)
+      refute sp.complete?
+
+      pre = length(IncrementalSnapshotSink.ledger())
+
+      # Restart: the completion is RE-DELIVERED (at-least-once) and now succeeds.
+      start_incremental(slot, "inccompl_pub", chunk_rows: 200, max_pending_chunks: 4)
+      PG16.wait_until(&backfill_complete?/0, 10_000)
+
+      post = Enum.drop(IncrementalSnapshotSink.ledger(), pre)
+      # The completion entry re-delivered post-restart …
+      assert Enum.any?(post, fn
+               {:chunk, _t, _pks, _prog, _first, true} -> true
+               _ -> false
+             end)
+
+      # … as a RESUME, not a restart (no first_for_table?: true after the halt).
+      refute Enum.any?(post, fn
+               {:chunk, _t, _pks, _prog, true, _complete?} -> true
+               _ -> false
+             end)
+
+      # And ONLY NOW is :complete durable.
+      assert {:ok, token2} = IncrementalSnapshotSink.snapshot_progress()
+      assert {:ok, sp2} = Replicant.SnapshotProgress.decode(token2)
+      assert sp2.complete?
+
+      wait_converged(ctrl, "inc_compl")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Test 6 (§12.6) — sink-owned batch_delivery × incremental composition (cross-mode blindspot).
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "batch_delivery × incremental: converges + effect-once under a concurrent writer (§12.6)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_bd", "incbd_pub", 5_000)
+
+      start_incremental_batch_delivery(slot, "incbd_pub", chunk_rows: 200, max_pending_chunks: 4)
+
+      # A concurrent writer whose txns are delivered via handle_batch (batched). A buffered-but-
+      # unflushed same-PK txn that flushes AFTER a colliding chunk must WIN (the drop-set consults the
+      # receipt boundary — a superset of flush); a stale chunk row surviving over it RED's convergence.
+      {writer, go} = start_writer(fn w, n -> write_orders(w, n, "inc_bd", 5_000) end)
+
+      wait_backfill_complete(30_000)
+      stop_writer(writer, go)
+
+      # Effect-once on chunks (sink-owned atomic progress) + final row-for-row convergence.
+      assert chunk_pk_duplicates() == []
+      wait_converged(ctrl, "inc_bd")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Test 7 (§12.5) — §4 backpressure: a slow sink halts :sink_too_slow mid-backfill; resume continues.
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "§4 backpressure: a slow sink trips :sink_too_slow DURING an incremental backfill (§12.5 composition)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_slow", "incslow_pub", 3_000)
+
+      too_slow = attach_sink_too_slow(slot)
+      IncrementalSnapshotSink.set_txn_delay(40)
+
+      # Tiny max_inflight_lag + a slow sink (40 ms/txn) + a heavy writer → the applier falls behind
+      # and the in-flight lag trips the §4 bound → :sink_too_slow halt DURING an in-flight incremental
+      # backfill (the §4 backpressure composes with the snapshot, not just v1 streaming — spec §4/§12.5).
+      start_incremental_slow(slot, "incslow_pub", 8_192, chunk_rows: 200, max_pending_chunks: 2)
+      {writer, go} = start_writer(fn w, n -> write_orders(w, n, "inc_slow", 3_000) end)
+
+      assert_receive {:sink_too_slow, %{lag: lag}}, 30_000
+      assert lag > 8_192
+      detach(too_slow)
+      stop_writer(writer, go)
+      IncrementalSnapshotSink.set_txn_delay(0)
+      PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
+
+      # The halt was genuinely MID-backfill (not after completion). The resume-from-partial-progress
+      # mechanism itself is the proven Test-1 gate (its sink-fault halt exercises the same resume path);
+      # this test's unique coverage is the :sink_too_slow TRIGGER composing with an incremental backfill.
+      refute backfill_complete?()
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Test 5 (§12.5) — LIB mode: a progress-write fault re-delivers the boundary chunk (dup ≤ 1, no loss).
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "lib mode: a checkpoint-store progress-write fault re-delivers the boundary chunk (dup ≤ 1 chunk, never loss)",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_lib", "inclib_pub", 1_000)
+      cp = "cp_" <> String.replace(slot, "-", "_")
+      prog = "prog_" <> String.replace(slot, "-", "_")
+
+      failed = attach_snapshot_failed(slot)
+      start_incremental_lib(slot, "inclib_pub", cp, prog, chunk_rows: 100, max_pending_chunks: 4)
+
+      # Let a few chunks land (the store auto-created + advanced the progress table), then fault the
+      # NEXT progress write with a CHECK every real write violates (NOT VALID skips the existing-row
+      # scan, enforces on the next UPDATE). Lib mode delivers the chunk to the sink FIRST (ledger),
+      # THEN writes progress (checkpoint-after-persist) — so this halts in the persisted-but-not-
+      # checkpointed window, and resume re-delivers exactly that boundary chunk (dup ≤ 1 chunk, §2).
+      wait_chunks(3, 8_000)
+
+      Postgrex.query!(
+        ctrl,
+        "ALTER TABLE #{prog} ADD CONSTRAINT tmp_block CHECK (octet_length(token) < 0) NOT VALID",
+        []
+      )
+
+      assert_receive {:snapshot_failed, _reason}, 15_000
+      detach(failed)
+      PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
+      refute backfill_complete?()
+
+      # Clear the fault + restart → resume re-delivers the boundary chunk, then completes.
+      Postgrex.query!(ctrl, "ALTER TABLE #{prog} DROP CONSTRAINT tmp_block", [])
+      start_incremental_lib(slot, "inclib_pub", cp, prog, chunk_rows: 100, max_pending_chunks: 4)
+      wait_backfill_complete(15_000)
+
+      # DUP ≤ 1 CHUNK: any re-delivered chunk-PKs are bounded by a single chunk (chunk_rows 100).
+      dups = chunk_pk_duplicates()
+
+      refute dups == [],
+             "the forced progress-write fault must re-deliver the boundary chunk (a dup proves the window)"
+
+      assert length(dups) <= 100,
+             "lib-mode dup must be ≤ 1 chunk, saw #{length(dups)} duplicated chunk-PKs"
+
+      # NEVER LOSS: final mirror == source, row-for-row.
+      wait_converged(ctrl, "inc_lib")
+    end
+  end
+
   # ===========================================================================
   # convergence gate
   # ===========================================================================
@@ -415,6 +617,10 @@ defmodule Replicant.IncrementalSnapshotTest do
     end
   end
 
+  defp update_random_nopk(w, n, table) do
+    Postgrex.query!(w, "UPDATE #{table} SET note=$1 WHERE id=$2", ["v#{n}", :rand.uniform(1_000)])
+  end
+
   defp update_random_uuid(w, n, table) do
     Postgrex.query!(
       w,
@@ -482,6 +688,138 @@ defmodule Replicant.IncrementalSnapshotTest do
   # `[:connection, :slot_active]`; a RESUME (present slot + in-flight progress — the restart
   # in Test 1) emits `[:snapshot, :resumed]` and NOT slot_active — so wait for EITHER (the
   # documented readiness gate; never poll `connection_pid != nil`, the racy pattern).
+  # PLAIN LIB-mode incremental (§12.5 dup≤1): a checkpoint_store (NO batch) with a per-test unique
+  # checkpoint + progress table, so progress is written per chunk (dup ≤ 1 chunk on a fault).
+  defp start_incremental_lib(slot, pub, cp_table, prog_table, snap_opts) do
+    ref = make_ref()
+    test_pid = self()
+    active = {__MODULE__, :active, ref}
+    resumed = {__MODULE__, :resumed_ready, ref}
+
+    :telemetry.attach(
+      active,
+      [:replicant, :connection, :slot_active],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    :telemetry.attach(
+      resumed,
+      [:replicant, :snapshot, :resumed],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    {:ok, _} =
+      Replicant.start_link(
+        connection: PG16.pg_opts(),
+        slot_name: slot,
+        publication: pub,
+        sink: IncrementalSnapshotSink,
+        checkpoint_store: [
+          connection: PG16.pg_opts(),
+          table: cp_table,
+          progress_table: prog_table
+        ],
+        snapshot: [mode: :incremental] ++ snap_opts
+      )
+
+    receive do
+      {:ready, ^ref} -> :ok
+    after
+      15_000 -> ExUnit.Assertions.flunk("lib pipeline never became ready for #{slot}")
+    end
+
+    :telemetry.detach(active)
+    :telemetry.detach(resumed)
+  end
+
+  # SLOW-sink incremental (§12.5): the delay-configurable sink + an explicit max_inflight_lag so a
+  # tiny bound trips the §4 :sink_too_slow halt. Same readiness gate as start_incremental/3.
+  defp start_incremental_slow(slot, pub, max_inflight_lag, snap_opts) do
+    ref = make_ref()
+    test_pid = self()
+    active = {__MODULE__, :active, ref}
+    resumed = {__MODULE__, :resumed_ready, ref}
+
+    :telemetry.attach(
+      active,
+      [:replicant, :connection, :slot_active],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    :telemetry.attach(
+      resumed,
+      [:replicant, :snapshot, :resumed],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    {:ok, _} =
+      Replicant.start_link(
+        connection: PG16.pg_opts(),
+        slot_name: slot,
+        publication: pub,
+        sink: Replicant.Test.SlowIncrementalSnapshotSink,
+        max_inflight_lag: max_inflight_lag,
+        snapshot: [mode: :incremental] ++ snap_opts
+      )
+
+    receive do
+      {:ready, ^ref} -> :ok
+    after
+      15_000 ->
+        ExUnit.Assertions.flunk("slow pipeline never became ready for #{slot}")
+    end
+
+    :telemetry.detach(active)
+    :telemetry.detach(resumed)
+  end
+
+  # Sink-owned batch_delivery (handle_batch/1) × incremental (§12.6): a top-level batch_delivery
+  # policy + the batch-capable incremental sink. Same readiness gate as start_incremental/3.
+  defp start_incremental_batch_delivery(slot, pub, snap_opts) do
+    ref = make_ref()
+    test_pid = self()
+    active = {__MODULE__, :active, ref}
+    resumed = {__MODULE__, :resumed_ready, ref}
+
+    :telemetry.attach(
+      active,
+      [:replicant, :connection, :slot_active],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    :telemetry.attach(
+      resumed,
+      [:replicant, :snapshot, :resumed],
+      fn _e, _m, _meta, _ -> send(test_pid, {:ready, ref}) end,
+      nil
+    )
+
+    {:ok, _} =
+      Replicant.start_link(
+        connection: PG16.pg_opts(),
+        slot_name: slot,
+        publication: pub,
+        sink: Replicant.Test.BatchIncrementalSnapshotSink,
+        batch_delivery: [max_transactions: 50, max_delay_ms: 5000],
+        snapshot: [mode: :incremental] ++ snap_opts
+      )
+
+    receive do
+      {:ready, ^ref} -> :ok
+    after
+      15_000 ->
+        ExUnit.Assertions.flunk("batch_delivery pipeline never became ready for #{slot}")
+    end
+
+    :telemetry.detach(active)
+    :telemetry.detach(resumed)
+  end
+
   defp start_incremental(slot, pub, snap_opts) do
     ref = make_ref()
     test_pid = self()
@@ -587,6 +925,38 @@ defmodule Replicant.IncrementalSnapshotTest do
     ref
   end
 
+  defp attach_sink_too_slow(slot) do
+    ref = {__MODULE__, :too_slow, make_ref()}
+    test_pid = self()
+
+    :telemetry.attach(
+      ref,
+      [:replicant, :connection, :disconnected],
+      fn _e, meas, meta, _ ->
+        if meta[:reason] == :sink_too_slow, do: send(test_pid, {:sink_too_slow, meas})
+      end,
+      nil
+    )
+
+    _ = slot
+    ref
+  end
+
+  defp attach_snapshot_retried(slot) do
+    ref = {__MODULE__, :retried, make_ref()}
+    test_pid = self()
+
+    :telemetry.attach(
+      ref,
+      [:replicant, :snapshot, :chunk_retried],
+      fn _e, _m, meta, _ -> send(test_pid, {:snapshot_retried, meta[:table]}) end,
+      nil
+    )
+
+    _ = slot
+    ref
+  end
+
   defp attach_snapshot_resumed(slot) do
     ref = {__MODULE__, :resumed, make_ref()}
     test_pid = self()
@@ -632,6 +1002,21 @@ defmodule Replicant.IncrementalSnapshotTest do
 
   defp setup_int_table(c, table, pub, rows) do
     reset_pub_table(c, table, pub, "#{table} (id int PRIMARY KEY, note text)")
+
+    Postgrex.query!(
+      c,
+      "INSERT INTO #{table} (id, note) SELECT g, 'seed'||g FROM generate_series(1,#{rows}) g",
+      []
+    )
+  end
+
+  # A PK-LESS table (no PRIMARY KEY) → the reader's PK discovery yields pk_raw [] → keyless whole-
+  # table fallback (spec §6.4). REPLICA IDENTITY FULL is required for pgoutput to stream its
+  # UPDATE/DELETE (a keyless table has no default identity). `id` is an ordinary (non-key) column
+  # the mirror keys by; seed values are distinct so the row-for-row compare is well-defined.
+  defp setup_nopk_table(c, table, pub, rows) do
+    reset_pub_table(c, table, pub, "#{table} (id int, note text)")
+    Postgrex.query!(c, "ALTER TABLE #{table} REPLICA IDENTITY FULL", [])
 
     Postgrex.query!(
       c,
