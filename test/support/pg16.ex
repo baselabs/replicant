@@ -28,7 +28,15 @@ defmodule Replicant.Test.PG16 do
     end
   end
 
-  @doc "Poll `fun` until it returns true, or flunk after ~ `tries * 25`ms."
+  @doc """
+  Poll `fun` every 25 ms until it returns true; flunk after `tries` polls (≈ `tries * 25` ms).
+
+  NOTE — `tries` is a POLL COUNT, not milliseconds. Call sites pass ms-looking values
+  (`wait_until(fun, 8_000)`), so the real ceiling is 25× that (≈200 s), bounded in practice by each
+  test's `@tag timeout`. This never manufactures a pass (it returns on the FIRST successful poll) —
+  the generous ceiling only absorbs shared-PG16 load jitter; any wall-clock SLA is asserted separately
+  (e.g. the idle-closure monotonic-time bound). Prefer a modest count for a fast-failing condition.
+  """
   def wait_until(fun, tries \\ 400) do
     cond do
       fun.() ->
