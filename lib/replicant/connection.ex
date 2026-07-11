@@ -260,6 +260,13 @@ defmodule Replicant.Connection do
         [%Postgrex.Result{rows: [[in_recovery, version]]}],
         %{step: :recovery_check} = state
       ) do
+    # Replication simple-query results arrive as TEXT (bool → "t"/"f", int → "160014"), so
+    # coerce at this boundary: a binary version compares > any integer in Elixir term ordering,
+    # which would force the PG17 4-col invalidation query on PG16 (undefined_column → reconnect
+    # storm). repl_int/repl_bool also accept already-typed values (unit-test inputs).
+    version = repl_int(version)
+    in_recovery = repl_bool(in_recovery)
+
     Telemetry.event([:replicant, :connection, :connected], %{}, %{
       kind: recovery_kind(in_recovery)
     })
@@ -287,7 +294,7 @@ defmodule Replicant.Connection do
         {:disconnect, :go_forward_required}
 
       true ->
-        classify_and_begin(rows, state)
+        classify_and_begin(Enum.map(rows, &coerce_status_row/1), state)
     end
   end
 
@@ -1113,6 +1120,26 @@ defmodule Replicant.Connection do
        do: synced == true and in_recovery == true
 
   defp synced_unpromoted?(_rows, _state), do: false
+
+  # Replication simple-query results arrive as TEXT; coerce the invalidation-status boolean
+  # columns (conflicting, synced) so classify_slot_status / synced_unpromoted? see real booleans.
+  # 2-col PG16 row: [wal_status, conflicting]; 4-col PG17: [wal_status, conflicting, reason, synced].
+  defp coerce_status_row([wal_status, conflicting]), do: [wal_status, repl_bool(conflicting)]
+
+  defp coerce_status_row([wal_status, conflicting, reason, synced]),
+    do: [wal_status, repl_bool(conflicting), reason, repl_bool(synced)]
+
+  defp coerce_status_row(other), do: other
+
+  # Postgres text-protocol scalar coercion (a replication simple-query returns all columns as
+  # text). Accept already-typed values too so unit tests can feed native ints/bools.
+  defp repl_int(v) when is_integer(v), do: v
+  defp repl_int(v) when is_binary(v), do: String.to_integer(v)
+
+  defp repl_bool(v) when is_boolean(v), do: v
+  defp repl_bool("t"), do: true
+  defp repl_bool("f"), do: false
+  defp repl_bool(nil), do: nil
 
   # ---- incremental snapshot (spec §8 of the incremental design) ----
   # These clauses come FIRST; the `is_list/1` guard keeps them disjoint from the v1

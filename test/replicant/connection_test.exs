@@ -583,6 +583,27 @@ defmodule Replicant.ConnectionTest do
       assert {:stream, _sql, [], new_state} = Connection.handle_result(result, st)
       assert new_state.step == :streaming
     end
+
+    test "invalidation_check coerces text synced=\"t\" on an unpromoted PG17 standby → halt" do
+      result = [%Postgrex.Result{rows: [["reserved", "f", nil, "t"]]}]
+      st = state(step: :invalidation_check, server_version_num: 170_010, in_recovery: true)
+      assert {:disconnect, :slot_synced_unpromoted} = Connection.handle_result(result, st)
+    end
+
+    test "invalidation_check coerces text conflicting=\"t\" → invalidated :conflict" do
+      :telemetry.attach(
+        {__MODULE__, :confl},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:confl, meta}) end,
+        self()
+      )
+
+      result = [%Postgrex.Result{rows: [["reserved", "t"]]}]
+      st = state(step: :invalidation_check, server_version_num: 160_014)
+      assert {:disconnect, :slot_invalidated} = Connection.handle_result(result, st)
+      assert_received {:confl, %{reason: :conflict}}
+      :telemetry.detach({__MODULE__, :confl})
+    end
   end
 
   describe "handle_result(:invalidation_check) — snapshot-mode connect matrix (spec §8)" do
@@ -932,6 +953,30 @@ defmodule Replicant.ConnectionTest do
       st = state(step: :recovery_check, failover: false)
       assert {:query, _sql, new_state} = Connection.handle_result(result, st)
       assert new_state.step == :invalidation_check
+    end
+
+    test "recovery_check coerces text replication results (PG16 text version → 2-col query, not 4-col)" do
+      result = [%Postgrex.Result{rows: [["f", "160014"]]}]
+
+      assert {:query, sql, new_state} =
+               Connection.handle_result(result, state(step: :recovery_check))
+
+      assert new_state.server_version_num == 160_014
+      assert new_state.in_recovery == false
+      # THE regression: a text "160014" must gate to the PG16 2-col query, never the PG17 4-col.
+      refute sql =~ "invalidation_reason"
+      assert sql =~ "wal_status"
+    end
+
+    test "recovery_check coerces a PG17 standby text row (t / 170010) → 4-col query" do
+      result = [%Postgrex.Result{rows: [["t", "170010"]]}]
+
+      assert {:query, sql, new_state} =
+               Connection.handle_result(result, state(step: :recovery_check))
+
+      assert new_state.server_version_num == 170_010
+      assert new_state.in_recovery == true
+      assert sql =~ "invalidation_reason"
     end
   end
 
