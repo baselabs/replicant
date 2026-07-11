@@ -102,6 +102,9 @@ defmodule Replicant.Snapshotter.Incremental do
 
   defp do_backfill(args) do
     {:ok, db} = Postgrex.start_link(args.connection ++ [pool_size: 1])
+    # Stamp this run's start on the threaded `args` map so deliver_completion can report a real
+    # `:completed` duration (spec §9) without threading a timestamp through the recursive chunk loop.
+    args = Map.put(args, :started_mono, System.monotonic_time(:millisecond))
 
     try do
       standby? = standby?(db)
@@ -430,7 +433,12 @@ defmodule Replicant.Snapshotter.Incremental do
       bound: nil
     })
 
-    Telemetry.event([:replicant, :snapshot, :completed], %{duration: 0}, %{
+    # This RUN's backfill duration (ms). A resumed backfill spans multiple runs, so this measures the
+    # run that reached completion, not the whole historical backfill — the honest per-run analogue of
+    # the v1 snapshotter's single-session COPY duration. `started_mono` is stamped in do_backfill.
+    duration = System.monotonic_time(:millisecond) - args.started_mono
+
+    Telemetry.event([:replicant, :snapshot, :completed], %{duration: duration}, %{
       commit_lsn: sp.floor_lsn,
       change_count: 0
     })

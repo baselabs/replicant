@@ -246,16 +246,6 @@ defmodule Replicant.SnapshotWindowTest do
     assert w.epoch == 2
   end
 
-  test "close_table/2 stops tracking once a table's chunks are done (memory hygiene)" do
-    w =
-      W.new(epoch: 1, drop_cap: 100, max_pending: 4)
-      |> W.open_window("public.orders")
-      |> W.track([change("orders", 1)])
-      |> W.close_table("public.orders")
-
-    refute W.tracked?(w, "public.orders", [1])
-  end
-
   test "taint_table/2 discards a tainted table's pending chunk + resets tracking; other tables untouched" do
     w =
       W.new(epoch: 1, drop_cap: 100, max_pending: 4)

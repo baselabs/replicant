@@ -302,18 +302,6 @@ defmodule Replicant.SnapshotWindow do
   end
 
   @doc """
-  A table's chunks are all applied: stop tracking it (memory hygiene).
-
-  CALLER CONTRACT: call ONLY after ALL of the table's chunks have been popped and
-  applied. This is a pure helper with no code guard — calling it while a chunk for
-  that table is still pending would make `drop_filter` hit the untracked (`:error`)
-  arm and KEEP every row, re-applying rows the drop-set should have removed.
-  """
-  @spec close_table(t(), String.t()) :: t()
-  def close_table(%__MODULE__{} = w, qualified),
-    do: %{w | tracking: Map.delete(w.tracking, qualified)}
-
-  @doc """
   Conservatively DISCARD a table's pending chunks, RESET its tracking entry, AND
   SIGNAL RE-READ (spec §2/§4/§5/§6.4). Used by the applier when a delivered
   transaction's `changes` is a lazy, single-pass spill-backed `Enumerable` (or is

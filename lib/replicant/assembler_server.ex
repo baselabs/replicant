@@ -635,7 +635,16 @@ defmodule Replicant.AssemblerServer do
           change_count: length(kept)
         })
 
-        apply_ready_chunks(state)
+        if chunk.complete? do
+          # The dedicated completion chunk applied DURABLY (sink-owned atomic, or lib progress written
+          # — apply_chunk only returns :ok after persist_progress). The backfill is done and no pending
+          # chunks remain, so DROP the window: post-completion streaming must not keep tracking a
+          # drop-set for completed tables (bounded, but perpetual per-txn churn otherwise). A resumed
+          # completion re-delivery lands here again idempotently; a reconnect re-seeds a fresh window.
+          {:noreply, %{state | window: nil}}
+        else
+          apply_ready_chunks(state)
+        end
 
       :halt ->
         # Value-free surfaced halt: Supervisor.halt/2 DISCARDS its reason (supervisor.ex:48), so this
