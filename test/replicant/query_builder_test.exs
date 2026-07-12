@@ -4,23 +4,32 @@ defmodule Replicant.QueryBuilderTest do
   alias Replicant.QueryBuilder
 
   describe "start_replication/3" do
-    test "builds the proto-v1 START_REPLICATION command from validated names" do
+    test "builds the v1 command for a single-element publication list (byte-unchanged from 0.1.0)" do
       {:ok, sql} =
-        QueryBuilder.start_replication("orders_slot", "orders_pub", start_lsn: 0x16E3778)
+        QueryBuilder.start_replication("orders_slot", ["orders_pub"], start_lsn: 0x16E3778)
 
-      assert sql =~ "START_REPLICATION SLOT orders_slot LOGICAL 0/16E3778"
-      assert sql =~ "proto_version '1'"
-      assert sql =~ "publication_names 'orders_pub'"
+      assert sql ==
+               "START_REPLICATION SLOT orders_slot LOGICAL 0/16E3778 " <>
+                 "(proto_version '1', publication_names 'orders_pub')"
     end
 
-    test "rejects a hostile slot name with a value-free error, builds nothing" do
-      assert {:error, :invalid_identifier} =
-               QueryBuilder.start_replication("x; DROP", "ok_pub", [])
+    test "comma-joins a multi-element publication list into publication_names" do
+      {:ok, sql} = QueryBuilder.start_replication("orders_slot", ["p1", "p2"], start_lsn: 0)
+
+      assert sql =~ "publication_names 'p1,p2'"
     end
 
-    test "rejects a hostile publication name" do
+    test "validates every publication name in the list" do
       assert {:error, :invalid_identifier} =
-               QueryBuilder.start_replication("ok_slot", "p '--", [])
+               QueryBuilder.start_replication("ok_slot", ["ok", "bad'name"], [])
+
+      assert {:error, :invalid_identifier} =
+               QueryBuilder.start_replication("ok_slot", [], [])
+    end
+
+    test "rejects a hostile slot name" do
+      assert {:error, :invalid_identifier} =
+               QueryBuilder.start_replication("x; DROP", ["ok_pub"], [])
     end
   end
 
@@ -28,13 +37,15 @@ defmodule Replicant.QueryBuilderTest do
     alias Replicant.QueryBuilder
 
     test "defaults to proto_version 1 with no streaming clause" do
-      assert {:ok, sql} = QueryBuilder.start_replication("s", "p", start_lsn: 0)
+      assert {:ok, sql} = QueryBuilder.start_replication("s", ["p"], start_lsn: 0)
       assert sql =~ "proto_version '1'"
       refute sql =~ "streaming"
     end
 
     test "streaming: true selects proto_version 2 and streaming 'on'" do
-      assert {:ok, sql} = QueryBuilder.start_replication("s", "p", start_lsn: 0, streaming: true)
+      assert {:ok, sql} =
+               QueryBuilder.start_replication("s", ["p"], start_lsn: 0, streaming: true)
+
       assert sql =~ "proto_version '2'"
       assert sql =~ "streaming 'on'"
       assert sql =~ "publication_names 'p'"
@@ -46,8 +57,9 @@ defmodule Replicant.QueryBuilderTest do
       {:ok, a} = QueryBuilder.create_durable_slot("orders_slot", false)
       assert a =~ "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT"
       refute a =~ "FAILOVER"
-      {:ok, b} = QueryBuilder.publication_exists("orders_pub")
-      assert b =~ "pg_publication" and b =~ "orders_pub"
+      {:ok, b} = QueryBuilder.publication_exists(["orders_pub"])
+      assert b =~ "SELECT pubname FROM pg_publication WHERE pubname = ANY($1)"
+      refute b =~ "orders_pub"
       {:ok, c} = QueryBuilder.slot_exists("orders_slot")
       assert c =~ "pg_replication_slots" and c =~ "orders_slot"
     end
@@ -64,7 +76,7 @@ defmodule Replicant.QueryBuilderTest do
     test "invalid names never build a command" do
       assert {:error, :invalid_identifier} = QueryBuilder.create_durable_slot("bad name", false)
       assert {:error, :invalid_identifier} = QueryBuilder.create_durable_slot("bad name", true)
-      assert {:error, :invalid_identifier} = QueryBuilder.publication_exists("bad'name")
+      assert {:error, :invalid_identifier} = QueryBuilder.publication_exists(["bad'name"])
       assert {:error, :invalid_identifier} = QueryBuilder.slot_exists("x;--")
     end
   end
@@ -148,15 +160,27 @@ defmodule Replicant.QueryBuilderTest do
   end
 
   describe "publication_tables/1" do
-    test "selects schema, table, and PG-quoted qualified name for the validated publication" do
-      {:ok, sql} = QueryBuilder.publication_tables("orders_pub")
+    test "selects DISTINCT schema/table/qualified bound by ANY($1) for the validated publication list" do
+      {:ok, sql} = QueryBuilder.publication_tables(["orders_pub"])
 
-      assert sql ==
-               "SELECT schemaname, tablename, format('%I.%I', schemaname, tablename) AS qualified FROM pg_publication_tables WHERE pubname = 'orders_pub'"
+      assert sql =~ "pg_publication_tables"
+      assert sql =~ "pubname = ANY($1)"
+      assert sql =~ "SELECT DISTINCT"
+      assert sql =~ "format('%I.%I', schemaname, tablename) AS qualified"
+      refute sql =~ "orders_pub"
     end
 
-    test "rejects a hostile publication name" do
-      assert {:error, :invalid_identifier} = QueryBuilder.publication_tables("p'; DROP")
+    test "rejects a list with a hostile publication name" do
+      assert {:error, :invalid_identifier} = QueryBuilder.publication_tables(["ok", "p'; DROP"])
+    end
+  end
+
+  describe "publication_exists/1 (multi-publication existence, spec §5.3)" do
+    test "returns the pubnames that exist, bound by ANY($1)" do
+      {:ok, sql} = QueryBuilder.publication_exists(["p1", "p2"])
+      assert sql =~ "SELECT pubname FROM pg_publication WHERE pubname = ANY($1)"
+      refute sql =~ "p1"
+      refute sql =~ "p2"
     end
   end
 
@@ -204,10 +228,13 @@ defmodule Replicant.QueryBuilderTest do
       assert sql =~ "quote_ident(a.attname)"
       # joins against pg_publication_tables by the bound publication name
       assert sql =~ "pg_publication_tables"
-      assert sql =~ "pubname = $1"
+      assert sql =~ "pubname = ANY($1)"
       # Per-column TYPE oids now come from table_columns/0 (the full column set covers the
       # PK columns), so pk_columns/0 no longer duplicates a per-PK type array.
       refute sql =~ "atttypid"
+      # multi-publication dedup: a table in two publications must NOT duplicate its array_agg
+      # entries (decision #19): drive from a (SELECT DISTINCT schemaname, tablename ...) set.
+      assert sql =~ "SELECT DISTINCT"
     end
   end
 
@@ -221,9 +248,12 @@ defmodule Replicant.QueryBuilderTest do
       assert sql =~ "quote_ident(a.attname)"
       assert sql =~ "atttypid"
       assert sql =~ "pg_publication_tables"
-      assert sql =~ "pubname = $1"
+      assert sql =~ "pubname = ANY($1)"
       # NOT restricted to primary-key columns (that is pk_columns/0's job).
       refute sql =~ "indisprimary"
+      # multi-publication dedup: a table in two publications must NOT duplicate its array_agg
+      # entries (decision #19): drive from a (SELECT DISTINCT schemaname, tablename ...) set.
+      assert sql =~ "SELECT DISTINCT"
     end
   end
 

@@ -19,21 +19,23 @@ defmodule Replicant.QueryBuilder do
   @snapshot_name ~r/\A[0-9A-Fa-f]{1,16}-[0-9A-Fa-f]{1,16}-\d{1,10}\z/
 
   @doc """
-  Replication command that starts streaming WAL from `start_lsn` for the publication.
+  Replication command that starts streaming WAL from `start_lsn` for the publication set.
 
-  `opts[:start_lsn]` is a `t:Replicant.lsn/0` (`non_neg_integer`, default `0`). A
-  non-integer or negative value raises (caller contract, not attacker input) —
-  pass the uint64 WAL position from `checkpoint/0`.
+  `publication` is a non-empty list of validated identifiers (Critical Rule 2): a single-element
+  list reproduces the published-0.1.0 command byte-for-byte; a multi-element list is comma-joined
+  into `publication_names 'p1,p2'` (each name is an allowlisted bare identifier, so the bare
+  comma-list is injection-safe — probe-verified). `opts[:start_lsn]` is a `t:Replicant.lsn/0`
+  (`non_neg_integer`, default `0`).
 
-  `opts[:streaming]`, when truthy, selects `proto_version '2', streaming 'on'`
-  (in-progress transaction streaming, spec §5). Absent or falsy (the default)
-  emits the byte-for-byte v1 command (`proto_version '1'`, no streaming clause).
+  `opts[:streaming]`, when truthy, selects `proto_version '2', streaming 'on'` (spec §5).
+  `opts[:messages]`, when truthy, adds `messages 'true'` (spec §6, A2). Absent or falsy (the
+  default) emits the byte-for-byte v1 command.
   """
-  @spec start_replication(String.t(), String.t(), keyword()) ::
+  @spec start_replication(String.t(), [String.t()], keyword()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
-  def start_replication(slot_name, publication, opts \\ []) do
+  def start_replication(slot_name, publications, opts \\ []) when is_list(publications) do
     with :ok <- Identifier.validate(slot_name),
-         :ok <- Identifier.validate(publication) do
+         :ok <- validate_all(publications) do
       start_lsn = Keyword.get(opts, :start_lsn, 0)
       lsn_literal = Replicant.lsn_to_string(start_lsn)
 
@@ -42,10 +44,28 @@ defmodule Replicant.QueryBuilder do
           do: "proto_version '2', streaming 'on'",
           else: "proto_version '1'"
 
-      {:ok,
-       "START_REPLICATION SLOT #{slot_name} LOGICAL #{lsn_literal} " <>
-         "(#{proto}, publication_names '#{publication}')"}
+      pub_list = Enum.join(publications, ",")
+
+      options =
+        if Keyword.get(opts, :messages),
+          do: "#{proto}, publication_names '#{pub_list}', messages 'true'",
+          else: "#{proto}, publication_names '#{pub_list}'"
+
+      {:ok, "START_REPLICATION SLOT #{slot_name} LOGICAL #{lsn_literal} (#{options})"}
     end
+  end
+
+  # Validate every name in a publication list (Critical Rule 2). Short-circuits on the first
+  # invalid name; an empty list is invalid (the caller must supply at least one publication).
+  defp validate_all([]), do: {:error, :invalid_identifier}
+
+  defp validate_all(names) when is_list(names) do
+    Enum.reduce_while(names, :ok, fn name, :ok ->
+      case Identifier.validate(name) do
+        :ok -> {:cont, :ok}
+        {:error, :invalid_identifier} = err -> {:halt, err}
+      end
+    end)
   end
 
   @doc """
@@ -96,26 +116,30 @@ defmodule Replicant.QueryBuilder do
   def set_transaction_snapshot(_name), do: {:error, :invalid_snapshot_name}
 
   @doc """
-  Query returning each publication table's `schemaname`, `tablename`, and PG-quoted
-  fully-qualified name (`format('%I.%I', …)`, spec §9). The quoted `qualified` column is
-  interpolation-safe for any valid identifier (mixed-case/quoted tables the streaming
-  path also supports); the raw `schemaname`/`tablename` fill the `%Change{}` fields. The
-  publication name is validated (already an allowlisted identifier) then interpolated.
+  Query returning each DISTINCT publication table's `schemaname`, `tablename`, and PG-quoted
+  fully-qualified name across the publication LIST (spec §5.3 / decision #19). The `DISTINCT`
+  collapses the pubname dimension BEFORE it fans the join, so a table in two publications yields
+  ONE row (not two). The publication names are bound `$1` (an array), so no interpolation.
   """
-  @spec publication_tables(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
-  def publication_tables(publication) do
-    with :ok <- Identifier.validate(publication) do
+  @spec publication_tables([String.t()]) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def publication_tables(publications) when is_list(publications) do
+    with :ok <- validate_all(publications) do
       {:ok,
-       "SELECT schemaname, tablename, format('%I.%I', schemaname, tablename) AS qualified " <>
-         "FROM pg_publication_tables WHERE pubname = '#{publication}'"}
+       "SELECT DISTINCT schemaname, tablename, format('%I.%I', schemaname, tablename) AS qualified " <>
+         "FROM pg_publication_tables WHERE pubname = ANY($1)"}
     end
   end
 
-  @doc "Query returning `1` if the publication exists."
-  @spec publication_exists(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
-  def publication_exists(publication) do
-    with :ok <- Identifier.validate(publication) do
-      {:ok, "SELECT 1 FROM pg_publication WHERE pubname = '#{publication}' LIMIT 1;"}
+  @doc """
+  Query returning the `pubname`s that exist for any name in the bound list (spec §5.3). The
+  caller binds the requested list as `$1` and halts fail-closed if the returned set ≠ the
+  requested set — `START_REPLICATION` with a missing publication silently streams the existing
+  subset, so it CANNOT be the fail-closed gate (probe-verified, decision #18).
+  """
+  @spec publication_exists([String.t()]) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def publication_exists(publications) when is_list(publications) do
+    with :ok <- validate_all(publications) do
+      {:ok, "SELECT pubname FROM pg_publication WHERE pubname = ANY($1)"}
     end
   end
 
@@ -230,13 +254,12 @@ defmodule Replicant.QueryBuilder do
     "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
       "array_agg(a.attname ORDER BY k.ord) AS pk_raw, " <>
       "array_agg(quote_ident(a.attname) ORDER BY k.ord) AS pk_quoted " <>
-      "FROM pg_publication_tables p " <>
+      "FROM (SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)) p " <>
       "JOIN pg_class c ON c.relname = p.tablename " <>
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
       "JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary " <>
       "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true " <>
       "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum " <>
-      "WHERE p.pubname = $1 " <>
       "GROUP BY p.schemaname, p.tablename"
   end
 
@@ -259,11 +282,10 @@ defmodule Replicant.QueryBuilder do
       "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
       "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
       "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
-      "FROM pg_publication_tables p " <>
+      "FROM (SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)) p " <>
       "JOIN pg_class c ON c.relname = p.tablename " <>
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
       "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-      "WHERE p.pubname = $1 " <>
       "GROUP BY p.schemaname, p.tablename"
   end
 
