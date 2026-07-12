@@ -65,7 +65,7 @@ defmodule Replicant.Snapshotter.Incremental do
   @type args :: %{
           required(:slot_name) => String.t(),
           required(:connection) => keyword(),
-          required(:publication) => String.t(),
+          required(:publication) => [String.t()],
           required(:sink) => module(),
           required(:mode) => :sink_owned | :lib,
           required(:snapshot) => keyword(),
@@ -135,7 +135,7 @@ defmodule Replicant.Snapshotter.Incremental do
     pk_rows = Postgrex.query!(db, QueryBuilder.pk_columns(), [args.publication]).rows
     col_rows = Postgrex.query!(db, QueryBuilder.table_columns(), [args.publication]).rows
     {:ok, all_sql} = QueryBuilder.publication_tables(args.publication)
-    all_rows = Postgrex.query!(db, all_sql, []).rows
+    all_rows = Postgrex.query!(db, all_sql, [args.publication]).rows
     SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
   end
 

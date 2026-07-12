@@ -34,7 +34,7 @@ defmodule Replicant.Snapshotter do
           required(:snapshot_name) => String.t(),
           required(:consistent_point) => Replicant.lsn(),
           required(:connection) => keyword(),
-          required(:publication) => String.t(),
+          required(:publication) => [String.t()],
           required(:sink) => module(),
           required(:reply_to) => pid(),
           optional(:mode) => :sink_owned | :lib
@@ -87,13 +87,31 @@ defmodule Replicant.Snapshotter do
     # connection is opened.
     with {:ok, set_snapshot_sql} <- QueryBuilder.set_transaction_snapshot(name),
          {:ok, pub_tables_sql} <- QueryBuilder.publication_tables(publication) do
-      run_snapshot_txn(conn_opts, sink, cp, set_snapshot_sql, pub_tables_sql, start_mono, mode)
+      run_snapshot_txn(
+        conn_opts,
+        sink,
+        cp,
+        set_snapshot_sql,
+        pub_tables_sql,
+        publication,
+        start_mono,
+        mode
+      )
     else
       {:error, reason} -> {:error, snapshot_error(reason)}
     end
   end
 
-  defp run_snapshot_txn(conn_opts, sink, cp, set_snapshot_sql, pub_tables_sql, start_mono, mode) do
+  defp run_snapshot_txn(
+         conn_opts,
+         sink,
+         cp,
+         set_snapshot_sql,
+         pub_tables_sql,
+         publication,
+         start_mono,
+         mode
+       ) do
     {:ok, db} = Postgrex.start_link(conn_opts ++ [pool_size: 1])
 
     try do
@@ -103,7 +121,7 @@ defmodule Replicant.Snapshotter do
           fn c ->
             Postgrex.query!(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
             Postgrex.query!(c, set_snapshot_sql, [])
-            tables = Postgrex.query!(c, pub_tables_sql, []).rows
+            tables = Postgrex.query!(c, pub_tables_sql, [publication]).rows
 
             Enum.reduce(tables, 0, fn [schema, table, qualified], acc ->
               acc + copy_table(c, sink, cp, schema, table, qualified)
