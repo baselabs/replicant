@@ -131,15 +131,25 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  Query returning the `pubname`s that exist for any name in the bound list (spec §5.3). The
-  caller binds the requested list as `$1` and halts fail-closed if the returned set ≠ the
-  requested set — `START_REPLICATION` with a missing publication silently streams the existing
-  subset, so it CANNOT be the fail-closed gate (probe-verified, decision #18).
+  Query returning the `pubname`s that exist for any name in the validated list (spec §5.3 /
+  decision #18). The caller halts fail-closed if the returned set ≠ the requested set —
+  `START_REPLICATION` with a missing publication silently streams the existing subset, so it
+  CANNOT be the fail-closed gate (probe-verified).
+
+  Unlike `publication_tables/1` / `pk_columns/0` / `table_columns/0` (which run via
+  `Postgrex.query!/3` and bind `$1`), this query runs in the `Postgrex.ReplicationConnection`
+  connect chain, whose `{:query, sql, state}` dispatch uses the SIMPLE query protocol — which
+  cannot bind `$1`. So the validated names are interpolated into a single-quoted `IN (...)` list,
+  the exact precedent `slot_invalidation_status/2` sets with `slot_name`. Injection-safe per
+  Critical Rule 2: every name passed `Identifier.validate/1` (`[a-z_][a-z0-9_]{0,62}`) BEFORE
+  reaching here — the allowlist excludes `'`, `)`, `;`, and every other breakout character, so
+  the interpolated literal cannot escape the `IN (...)` position.
   """
   @spec publication_exists([String.t()]) :: {:ok, String.t()} | {:error, :invalid_identifier}
   def publication_exists(publications) when is_list(publications) do
     with :ok <- validate_all(publications) do
-      {:ok, "SELECT pubname FROM pg_publication WHERE pubname = ANY($1)"}
+      names = Enum.map_join(publications, ",", &"'#{&1}'")
+      {:ok, "SELECT pubname FROM pg_publication WHERE pubname IN (#{names})"}
     end
   end
 

@@ -58,8 +58,9 @@ defmodule Replicant.QueryBuilderTest do
       assert a =~ "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT"
       refute a =~ "FAILOVER"
       {:ok, b} = QueryBuilder.publication_exists(["orders_pub"])
-      assert b =~ "SELECT pubname FROM pg_publication WHERE pubname = ANY($1)"
-      refute b =~ "orders_pub"
+      # interpolated single-quoted IN list (the connect-chain simple-query protocol cannot bind
+      # $1; Identifier-validated names are interpolated, the slot_invalidation_status precedent).
+      assert b =~ "SELECT pubname FROM pg_publication WHERE pubname IN ('orders_pub')"
       {:ok, c} = QueryBuilder.slot_exists("orders_slot")
       assert c =~ "pg_replication_slots" and c =~ "orders_slot"
     end
@@ -176,11 +177,12 @@ defmodule Replicant.QueryBuilderTest do
   end
 
   describe "publication_exists/1 (multi-publication existence, spec §5.3)" do
-    test "returns the pubnames that exist, bound by ANY($1)" do
+    test "interpolates the validated names into a single-quoted IN list" do
       {:ok, sql} = QueryBuilder.publication_exists(["p1", "p2"])
-      assert sql =~ "SELECT pubname FROM pg_publication WHERE pubname = ANY($1)"
-      refute sql =~ "p1"
-      refute sql =~ "p2"
+      # connect-chain simple-query protocol can't bind $1; the Identifier-validated names are
+      # interpolated into IN ('p1','p2') — the slot_invalidation_status precedent. Injection-safe
+      # because every name passed the [a-z_][a-z0-9_]* allowlist (no quote/paren/semicolon).
+      assert sql =~ "SELECT pubname FROM pg_publication WHERE pubname IN ('p1','p2')"
     end
   end
 
