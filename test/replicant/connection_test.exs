@@ -24,7 +24,7 @@ defmodule Replicant.ConnectionTest do
   defp state(overrides) do
     base = %Connection{
       slot_name: "conn_test",
-      publication: "orders_pub",
+      publication: ["orders_pub"],
       sink: StubSink,
       go_forward_only: false,
       snapshot: false,
@@ -471,6 +471,92 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
+  describe "handle_result(:publication_check)" do
+    # The A3 fail-closed existence gate (decision #18). START_REPLICATION with a missing
+    # publication silently streams the EXISTING subset (whole-publication data loss — probe-
+    # verified), so the gate MUST halt when the found set ≠ the requested set.
+
+    test "all publications present (found == requested) proceeds to the slot-invalidation check" do
+      # state/1 defaults publication: ["orders_pub"] — a single found row matches the single-element set.
+      result = [%Postgrex.Result{rows: [["orders_pub"]]}]
+
+      assert {:query, sql, new_state} =
+               Connection.handle_result(result, state(step: :publication_check))
+
+      assert new_state.step == :invalidation_check
+
+      # The slot-invalidation query is version-gated; the default state has server_version_num: 0 → PG16 form.
+      assert sql =~ "pg_replication_slots"
+    end
+
+    test "a missing publication halts fail-closed and STAYS IDLE (never disconnects → no spin)" do
+      :telemetry.attach(
+        {__MODULE__, :pub_missing},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:pub_missing, meta}) end,
+        self()
+      )
+
+      # state/1 defaults publication: ["orders_pub"] — an empty result set (publication absent).
+      result = [%Postgrex.Result{rows: []}]
+
+      # CRITICAL safety property (A3): {:noreply, state} — STAY IDLE, NOT {:disconnect, _}.
+      # A disconnect would let auto_reconnect re-run the connect chain and spin on the permanent
+      # config fault until the async teardown lands (mirrors halt_failover_unsupported).
+      assert {:noreply, _new_state} =
+               Connection.handle_result(result, state(step: :publication_check))
+
+      # Telemetry is VALUE-FREE (Rule 1): %{reason: :publication_missing} carries NO pub name.
+      assert_received {:pub_missing, %{reason: :publication_missing}}
+      :telemetry.detach({__MODULE__, :pub_missing})
+    end
+
+    test "a missing publication among many (found ⊂ requested) halts fail-closed" do
+      :telemetry.attach(
+        {__MODULE__, :pub_missing2},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:pub_missing2, meta}) end,
+        self()
+      )
+
+      # Requested {a, b, c}; only {a, b} exist on the server → c is missing → halt.
+      rows = [["a"], ["b"]]
+      result = [%Postgrex.Result{rows: rows}]
+
+      assert {:noreply, _new_state} =
+               Connection.handle_result(
+                 result,
+                 state(step: :publication_check, publication: ["a", "b", "c"])
+               )
+
+      assert_received {:pub_missing2, %{reason: :publication_missing}}
+      :telemetry.detach({__MODULE__, :pub_missing2})
+    end
+
+    test "an unexpected extra publication (found ⊋ requested) also halts (sets not equal)" do
+      :telemetry.attach(
+        {__MODULE__, :pub_extra},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:pub_extra, meta}) end,
+        self()
+      )
+
+      # Requested {a}; server reports {a, b}. Shouldn't happen in practice, but the set-diff
+      # MUST catch the inequality (defensive: never proceed on a non-equal set).
+      rows = [["a"], ["b"]]
+      result = [%Postgrex.Result{rows: rows}]
+
+      assert {:noreply, _new_state} =
+               Connection.handle_result(
+                 result,
+                 state(step: :publication_check, publication: ["a"])
+               )
+
+      assert_received {:pub_extra, %{reason: :publication_missing}}
+      :telemetry.detach({__MODULE__, :pub_extra})
+    end
+  end
+
   describe "handle_result(:invalidation_check)" do
     test "an invalidated slot halts fail-closed and never recreates the slot" do
       :telemetry.attach(
@@ -914,7 +1000,9 @@ defmodule Replicant.ConnectionTest do
       assert {:query, _sql, new_state} =
                Connection.handle_result(result, state(step: :recovery_check))
 
-      assert new_state.step == :invalidation_check
+      # The chain now inserts :publication_check BETWEEN :recovery_check and :invalidation_check
+      # (the A3 existence gate — a missing pub is caught BEFORE the slot-keyed query).
+      assert new_state.step == :publication_check
       assert new_state.server_version_num == 170_010
       assert new_state.in_recovery == true
       assert_received {:connected, %{kind: :standby}}
@@ -940,22 +1028,22 @@ defmodule Replicant.ConnectionTest do
       :telemetry.detach({__MODULE__, :failover_unsup})
     end
 
-    test "failover on PG17 proceeds to the invalidation check" do
+    test "failover on PG17 proceeds to the publication-existence check (before invalidation)" do
       result = [%Postgrex.Result{rows: [[false, 170_010]]}]
       st = state(step: :recovery_check, failover: true)
       assert {:query, sql, new_state} = Connection.handle_result(result, st)
-      assert sql =~ "pg_replication_slots"
-      assert new_state.step == :invalidation_check
+      assert sql =~ "pg_publication"
+      assert new_state.step == :publication_check
     end
 
     test "no failover on PG16 proceeds normally (unchanged)" do
       result = [%Postgrex.Result{rows: [[false, 160_014]]}]
       st = state(step: :recovery_check, failover: false)
       assert {:query, _sql, new_state} = Connection.handle_result(result, st)
-      assert new_state.step == :invalidation_check
+      assert new_state.step == :publication_check
     end
 
-    test "recovery_check coerces text replication results (PG16 text version → 2-col query, not 4-col)" do
+    test "recovery_check coerces text replication results and dispatches the publication check" do
       result = [%Postgrex.Result{rows: [["f", "160014"]]}]
 
       assert {:query, sql, new_state} =
@@ -963,12 +1051,15 @@ defmodule Replicant.ConnectionTest do
 
       assert new_state.server_version_num == 160_014
       assert new_state.in_recovery == false
-      # THE regression: a text "160014" must gate to the PG16 2-col query, never the PG17 4-col.
-      refute sql =~ "invalidation_reason"
-      assert sql =~ "wal_status"
+      # The chain now dispatches the A3 existence-gate query from :recovery_check (version-
+      # independent — the version-gated 2-col/4-col slot query is now selected in
+      # :publication_check, after the existence gate passes). The text-coercion regression
+      # (binary "160014" forcing the wrong path) is still covered by server_version_num above.
+      assert sql =~ "pg_publication"
+      assert new_state.step == :publication_check
     end
 
-    test "recovery_check coerces a PG17 standby text row (t / 170010) → 4-col query" do
+    test "recovery_check coerces a PG17 standby text row (t / 170010) → publication check" do
       result = [%Postgrex.Result{rows: [["t", "170010"]]}]
 
       assert {:query, sql, new_state} =
@@ -976,7 +1067,8 @@ defmodule Replicant.ConnectionTest do
 
       assert new_state.server_version_num == 170_010
       assert new_state.in_recovery == true
-      assert sql =~ "invalidation_reason"
+      assert sql =~ "pg_publication"
+      assert new_state.step == :publication_check
     end
   end
 
@@ -987,7 +1079,7 @@ defmodule Replicant.ConnectionTest do
     defp bd_state(slot, step) do
       %Replicant.Connection{
         slot_name: slot,
-        publication: "p",
+        publication: ["p"],
         sink: Replicant.Test.RecordingSink,
         connection: [hostname: "h"],
         checkpoint_store: nil,
@@ -1034,7 +1126,7 @@ defmodule Replicant.ConnectionTest do
     defp st_state(slot, step, in_stream \\ false) do
       %Replicant.Connection{
         slot_name: slot,
-        publication: "p",
+        publication: ["p"],
         sink: Replicant.Test.RecordingSink,
         connection: [hostname: "h"],
         checkpoint_store: nil,
@@ -1099,7 +1191,7 @@ defmodule Replicant.ConnectionTest do
       Map.merge(
         %Replicant.Connection{
           slot_name: slot,
-          publication: "p",
+          publication: ["p"],
           sink: Replicant.Test.RecordingSink,
           connection: [hostname: "h"],
           checkpoint_store: nil,

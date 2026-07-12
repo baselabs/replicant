@@ -71,6 +71,7 @@ defmodule Replicant.Connection do
   @type step ::
           :disconnected
           | :recovery_check
+          | :publication_check
           | :invalidation_check
           | :create_slot
           | :create_export_slot
@@ -80,7 +81,7 @@ defmodule Replicant.Connection do
 
   @type t :: %__MODULE__{
           slot_name: String.t(),
-          publication: String.t(),
+          publication: [String.t()],
           sink: module(),
           go_forward_only: boolean(),
           snapshot: boolean() | keyword(),
@@ -276,8 +277,33 @@ defmodule Replicant.Connection do
     if state.failover and version < 170_000 do
       halt_failover_unsupported(state)
     else
-      {:ok, sql} = QueryBuilder.slot_invalidation_status(state.slot_name, version)
+      # A3 existence gate (decision #18): START_REPLICATION with a missing publication silently
+      # streams the EXISTING subset (whole-publication data loss), so the existence check MUST
+      # run BEFORE the slot-keyed query. The names are already in the SQL string (simple-query
+      # protocol cannot bind `$1`); a mismatch halts fail-closed in :publication_check.
+      {:ok, sql} = QueryBuilder.publication_exists(state.publication)
+      {:query, sql, %{state | step: :publication_check}}
+    end
+  end
+
+  # The A3 fail-closed gate. `found` is the set of pubnames `pg_publication` reports for the
+  # validated `IN (...)` list; `requested` is the configured publication set. They MUST be equal —
+  # a strict subset means a publication is absent (silent data loss if we proceeded to
+  # START_REPLICATION), and a strict superset (extra rows) is a defensive never-proceed. Either
+  # inequality is a PERMANENT config fault → halt and STAY IDLE (mirrors halt_failover_unsupported:
+  # a disconnect would let auto_reconnect spin the connect chain on the unchangeable fault until
+  # the async teardown lands). Telemetry is VALUE-FREE (Rule 1): the reason carries no pub name.
+  def handle_result([%Postgrex.Result{rows: rows}], %{step: :publication_check} = state) do
+    found = MapSet.new(rows, fn [pubname] -> pubname end)
+    requested = MapSet.new(state.publication)
+
+    if MapSet.equal?(found, requested) do
+      {:ok, sql} =
+        QueryBuilder.slot_invalidation_status(state.slot_name, state.server_version_num)
+
       {:query, sql, %{state | step: :invalidation_check}}
+    else
+      halt_publication_missing(state)
     end
   end
 
@@ -732,6 +758,19 @@ defmodule Replicant.Connection do
     })
 
     Replicant.Supervisor.halt(state.slot_name, {:config, :failover_unsupported})
+    {:noreply, state}
+  end
+
+  # A PERMANENT config fault — a configured publication is absent on the server (or the set is
+  # otherwise non-equal). The publications won't appear across a reconnect, so halt and STAY IDLE
+  # (do NOT disconnect), mirroring halt_failover_unsupported: a disconnect would let auto_reconnect
+  # re-run the connect chain and re-halt in a spin until the async teardown lands.
+  defp halt_publication_missing(state) do
+    Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
+      reason: :publication_missing
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:publication, :missing})
     {:noreply, state}
   end
 
