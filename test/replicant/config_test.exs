@@ -113,7 +113,7 @@ defmodule Replicant.ConfigTest do
     test "accepts a well-formed config and normalises go_forward_only" do
       assert {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
       assert cfg.slot_name == "replicant_orders"
-      assert cfg.publication == "orders_pub"
+      assert cfg.publication == ["orders_pub"]
       assert cfg.sink == StateMirrorPersisted
       assert cfg.go_forward_only == false
     end
@@ -171,6 +171,32 @@ defmodule Replicant.ConfigTest do
         opts = @base ++ [sink: StateMirrorPersisted, failover: bad]
         assert {:error, :config_invalid} = Config.validate(opts)
       end
+    end
+
+    test "publication accepts a single string and normalizes to a one-element list" do
+      assert {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.publication == ["orders_pub"]
+    end
+
+    test "publication accepts a list of validated names" do
+      opts = Keyword.put(@base, :publication, ["p1", "p2"])
+      assert {:ok, cfg} = Config.validate(opts ++ [sink: StateMirrorPersisted])
+      assert cfg.publication == ["p1", "p2"]
+    end
+
+    test "publication rejects a list with an invalid identifier" do
+      opts = Keyword.put(@base, :publication, ["ok", "bad'name"])
+      assert {:error, :invalid_identifier} = Config.validate(opts ++ [sink: StateMirrorPersisted])
+    end
+
+    test "publication rejects an empty list" do
+      opts = Keyword.put(@base, :publication, [])
+      assert {:error, :invalid_identifier} = Config.validate(opts ++ [sink: StateMirrorPersisted])
+    end
+
+    test "publication rejects a non-string non-list value" do
+      opts = Keyword.put(@base, :publication, :not_a_pub)
+      assert {:error, :config_invalid} = Config.validate(opts ++ [sink: StateMirrorPersisted])
     end
   end
 

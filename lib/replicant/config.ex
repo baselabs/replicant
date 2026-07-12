@@ -17,7 +17,7 @@ defmodule Replicant.Config do
           optional(:streaming) => keyword() | nil,
           connection: keyword(),
           slot_name: String.t(),
-          publication: String.t(),
+          publication: [String.t()],
           sink: module(),
           go_forward_only: boolean(),
           snapshot: boolean() | keyword(),
@@ -53,7 +53,7 @@ defmodule Replicant.Config do
   def validate(opts) when is_list(opts) do
     with {:ok, connection} <- fetch_connection(opts),
          {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
-         {:ok, publication} <- fetch_identifier(opts, :publication),
+         {:ok, publication} <- fetch_publications(opts),
          {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
          {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
@@ -346,6 +346,38 @@ defmodule Replicant.Config do
       :ok -> {:ok, value}
       {:error, :invalid_identifier} = err -> err
     end
+  end
+
+  # publication accepts a single validated identifier OR a list of them, normalized to a
+  # non-empty list (Critical Rule 2: every name passes Identifier.validate/1 before it reaches
+  # SQL). A single string is the byte-unchanged default path; a list enables multi-publication
+  # (spec §5.1). An empty list, a bad element, or a non-string/non-list value is a config error
+  # — never a silent fallback.
+  defp fetch_publications(opts) do
+    case Keyword.get(opts, :publication) do
+      pub when is_binary(pub) ->
+        with :ok <- Identifier.validate(pub), do: {:ok, [pub]}
+
+      pubs when is_list(pubs) and pubs != [] ->
+        with :ok <- validate_each_identifier(pubs), do: {:ok, pubs}
+
+      [] ->
+        {:error, :invalid_identifier}
+
+      _other ->
+        {:error, :config_invalid}
+    end
+  end
+
+  # Validates every name in a publication list via Identifier.validate/1, short-circuiting on
+  # the first bad element (the shape-only error is propagated unchanged).
+  defp validate_each_identifier(pubs) do
+    Enum.reduce_while(pubs, :ok, fn name, :ok ->
+      case Identifier.validate(name) do
+        :ok -> {:cont, :ok}
+        {:error, :invalid_identifier} = err -> {:halt, err}
+      end
+    end)
   end
 
   # Callback requirements by mode. Batch-delivery mode requires handle_batch/1 (the delivery
