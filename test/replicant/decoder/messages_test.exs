@@ -61,4 +61,15 @@ defmodule Replicant.Decoder.MessagesTest do
     assert %Messages.Origin{origin_commit_lsn: 0x1, name: "origin_a"}
     assert %Messages.Unsupported{data: "<<raw>>"}
   end
+
+  test "Message carries transactional?, lsn, prefix, content, and optional xid/ordinal" do
+    assert %Messages.Message{
+      transactional?: true,
+      lsn: 0x16E3778,
+      prefix: "outbox",
+      content: "payload",
+      xid: nil,
+      ordinal: nil
+    }
+  end
 end

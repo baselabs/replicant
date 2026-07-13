@@ -24,6 +24,7 @@ defmodule Replicant.Decoder do
     Commit,
     Delete,
     Insert,
+    Message,
     Origin,
     Relation,
     StreamAbort,
@@ -89,15 +90,16 @@ defmodule Replicant.Decoder do
   # tuple/column parsing stays in ONE place. Only the xid-prefixed types delegate here;
   # this clause is guarded on streaming?: true and precedes the v1 change clauses.
   defp decode_message(<<type::integer-8, xid::integer-32, rest::binary>>, true)
-       when type in [?I, ?U, ?D, ?T, ?R, ?Y] do
+       when type in [?I, ?U, ?D, ?T, ?R, ?Y, ?M] do
     put_xid(decode_message_impl(<<type::integer-8, rest::binary>>), xid)
   end
 
   # Non-streamed (v1) and all remaining types delegate to the shipped parser unchanged.
   defp decode_message(binary, _streaming?), do: decode_message_impl(binary)
 
-  defp put_xid(%mod{} = msg, xid) when mod in [Insert, Update, Delete, Truncate, Relation, Type],
-    do: %{msg | xid: xid}
+  defp put_xid(%mod{} = msg, xid)
+       when mod in [Insert, Update, Delete, Truncate, Relation, Type, Message],
+       do: %{msg | xid: xid}
 
   defp put_xid(msg, _xid), do: msg
 
@@ -240,6 +242,21 @@ defmodule Replicant.Decoder do
       id: data_type_id,
       namespace: namespace,
       name: name
+    }
+  end
+
+  # 'M' — a logical-decoding message (spec §6 / A2). flags::8 (1 = transactional, 0 = non-txn),
+  # lsn::64, prefix (null-terminated String), length::32, content::bytes(length). A malformed
+  # frame (truncated content) raises inside split/binary-part → caught by decode/1's boundary.
+  defp decode_message_impl(<<"M", flags::8, lsn::binary-8, rest::binary>>) do
+    [prefix, rest_after_null] = :binary.split(rest, <<0>>)
+    <<length::integer-32, content::binary-size(length)>> = rest_after_null
+
+    %Message{
+      transactional?: flags == 1,
+      lsn: decode_lsn(lsn),
+      prefix: prefix,
+      content: content
     }
   end
 

@@ -59,6 +59,7 @@ defmodule Replicant.Decoder.DecoderTest do
   describe "streaming message structs (spec §5)" do
     alias Replicant.Decoder.Messages.{
       Insert,
+      Message,
       StreamAbort,
       StreamCommit,
       StreamStart,
@@ -163,6 +164,69 @@ defmodule Replicant.Decoder.DecoderTest do
                Decoder.decode(truncated, streaming: true)
 
       assert reason in [:decode_failure, :unsupported_message]
+    end
+
+    test "decodes a non-transactional Message (flags=0) under the v1 path" do
+      # "M" <flags::8=0> <lsn::64> <prefix> <null> <length::32> <content>
+      lsn_bytes = <<0::32, 0x16E3778::32>>
+      bytes = <<"M", 0::8, lsn_bytes::binary, "outbox", 0, 7::32, "payload">>
+
+      assert {:ok,
+              %Message{
+                transactional?: false,
+                lsn: 0x16E3778,
+                prefix: "outbox",
+                content: "payload",
+                xid: nil
+              }} = Decoder.decode(bytes)
+    end
+
+    test "decodes a transactional Message (flags=1) under the v1 path" do
+      lsn_bytes = <<0::32, 0x16E3778::32>>
+      bytes = <<"M", 1::8, lsn_bytes::binary, "outbox", 0, 7::32, "payload">>
+
+      assert {:ok,
+              %Message{
+                transactional?: true,
+                lsn: 0x16E3778,
+                prefix: "outbox",
+                content: "payload",
+                xid: nil
+              }} = Decoder.decode(bytes)
+    end
+
+    test "decodes a STREAMED Message (xid-prefixed) only under streaming?: true" do
+      # streamed: "M" <xid::32> <flags::8> <lsn::64> <prefix> <null> <length::32> <content>
+      lsn_bytes = <<0::32, 0x16E3778::32>>
+      streamed = <<"M", 515_103::32, 1::8, lsn_bytes::binary, "outbox", 0, 7::32, "payload">>
+
+      assert {:ok,
+              %Message{
+                transactional?: true,
+                lsn: 0x16E3778,
+                prefix: "outbox",
+                content: "payload",
+                xid: 515_103
+              }} = Decoder.decode(streamed, streaming: true)
+
+      # Under v1 the same bytes mis-frame: the leading xid is read as flags, and the null-split
+      # + length-prefix body is shape-flexible enough to still match (unlike the rigid "N"/ncols
+      # Insert body, which falls to :unsupported_message). So v1 yields a valid-but-WRONG decode —
+      # garbled prefix/lsn and xid: nil — which is exactly why the streaming flag is load-bearing
+      # for xid attachment. The streamed xid (515_103) is provably absent under v1.
+      assert {:ok, %Message{xid: nil, content: "payload"} = v1_msg} =
+               Decoder.decode(streamed, streaming: false)
+
+      refute v1_msg.prefix == "outbox"
+      refute v1_msg.lsn == 0x16E3778
+    end
+
+    test "a malformed Message (truncated content) is caught value-free (Rule 1)" do
+      # claims 99 bytes of content but provides only "secret-msg"
+      bytes = <<"M", 0::8, 0::64, "p", 0, 99::32, "secret-msg">>
+      {:error, err} = Decoder.decode(bytes)
+      assert err.reason == :decode_failure
+      refute inspect(err) <> Exception.message(err) =~ "secret-msg"
     end
   end
 end

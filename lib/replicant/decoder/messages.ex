@@ -176,4 +176,24 @@ defmodule Replicant.Decoder.Messages do
             subxid: non_neg_integer() | nil
           }
   end
+
+  defmodule Message do
+    @moduledoc """
+    `M` — a logical-decoding message emitted by `pg_logical_emit_message`. A TRANSACTIONAL message
+    (`flags = 1`) arrives bracketed by Begin/Commit (or inside a streamed txn's S/E/c) and rides
+    `%Transaction.messages`; a NON-TRANSACTIONAL message (`flags = 0`) arrives standalone and
+    delivers via `c:Replicant.Sink.handle_message/2`. `xid` is set only for a streamed message.
+    `ordinal` is set by the assembler for a transactional message (spec §7.1).
+    """
+    defstruct [:transactional?, :lsn, :prefix, :content, xid: nil, ordinal: nil]
+
+    @type t :: %__MODULE__{
+            transactional?: boolean() | nil,
+            lsn: Replicant.lsn() | nil,
+            prefix: String.t() | nil,
+            content: binary() | nil,
+            xid: non_neg_integer() | nil,
+            ordinal: non_neg_integer() | nil
+          }
+  end
 end
