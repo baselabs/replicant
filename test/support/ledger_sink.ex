@@ -258,3 +258,56 @@ defmodule Replicant.Test.PausingLedgerSink do
     end
   end
 end
+
+defmodule Replicant.Test.MessagePauseGate do
+  @moduledoc """
+  Test-only coordination gate for `Replicant.Test.PausingMessageSink` (the §8.1 idle-ack
+  marquee harness in test/integration/messages_test.exs). Mirrors `Replicant.Test.PauseGate`:
+  when armed, the FIRST non-txn message's `handle_message/2` blocks (notifying `notify`) until
+  `release/0` is called, constructing the undelivered-message window the §8.1 idle-ack seam
+  must respect (the Connection has bumped `last_commit_lsn` via `track_txn` but the sink has
+  not returned `:ok`, so `{:sink_committed, msg_lsn}` has not fired).
+
+  `handle_message/2` runs in the AssemblerServer's process, so when it blocks it blocks the
+  AssemblerServer. The gate captures `self()` (the blocked caller) at decide-time and
+  `release/0` sends `:release` to THAT pid. An `Agent` registered under this module name,
+  started by the marquee's setup.
+  """
+
+  @doc "Start the gate armed, notifying `notify` when the first non-txn message pauses."
+  @spec start_link(pid()) :: Agent.on_start()
+  def start_link(notify) do
+    Agent.start_link(fn -> %{notify: notify, armed: true, paused_pid: nil} end, name: __MODULE__)
+  end
+
+  @doc "Disarm the gate so subsequent messages apply without pausing."
+  @spec disarm() :: :ok
+  def disarm, do: Agent.update(__MODULE__, &%{&1 | armed: false})
+
+  @doc """
+  Decide whether to pause for the current message. When armed, atomically disarm (so only ONE
+  message is paused), capture the blocked caller (`self()`), and return `{:pause, notify_pid}`;
+  else `:apply`.
+  """
+  @spec decide() :: {:pause, pid()} | :apply
+  def decide do
+    caller = self()
+
+    Agent.get_and_update(__MODULE__, fn state ->
+      if state.armed do
+        {{:pause, state.notify}, %{state | armed: false, paused_pid: caller}}
+      else
+        {:apply, state}
+      end
+    end)
+  end
+
+  @doc "Release the paused message: send :release to the blocked AssemblerServer caller."
+  @spec release() :: :ok
+  def release do
+    case Agent.get(__MODULE__, & &1.paused_pid) do
+      nil -> :ok
+      pid -> send(pid, :release)
+    end
+  end
+end
