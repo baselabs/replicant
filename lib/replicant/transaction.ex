@@ -14,8 +14,9 @@ defmodule Replicant.Transaction do
   @type t :: %__MODULE__{
           commit_lsn: Replicant.lsn() | nil,
           commit_timestamp: DateTime.t() | nil,
-          changes: Enumerable.t()
+          changes: Enumerable.t(),
+          messages: [Replicant.Decoder.Messages.Message.t()]
         }
 
-  defstruct [:commit_lsn, :commit_timestamp, changes: []]
+  defstruct [:commit_lsn, :commit_timestamp, changes: [], messages: []]
 end

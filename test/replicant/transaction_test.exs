@@ -31,4 +31,8 @@ defmodule Replicant.TransactionTest do
     # a lazy Enumerable is iterable exactly like the List form
     assert [%Change{op: :insert}] = Enum.to_list(lazy.changes)
   end
+
+  test "a Transaction carries a messages list (default [])" do
+    assert %Transaction{commit_lsn: nil, commit_timestamp: nil, changes: [], messages: []}
+  end
 end

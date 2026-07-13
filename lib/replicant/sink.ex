@@ -90,6 +90,23 @@ defmodule Replicant.Sink do
               {:ok, Replicant.lsn()} | {:error, term()}
 
   @doc """
+  Optional. Deliver a NON-TRANSACTIONAL logical-decoding message (`pg_logical_emit_message` with
+  `transactional => false`). Such a message arrives STANDALONE (no Begin/Commit bracket) and has
+  no PK or `commit_lsn` dedup key, so the guarantee is **at-least-once, duplicates possible** on a
+  reconnect between the `{:ok}` return and the checkpoint advancing — mirroring the lib-mode
+  `handle_transaction/1` downgrade. A transactional message (`transactional => true`) does NOT
+  route here: it rides `%Transaction.messages` and inherits the txn path's effect-once.
+
+  On `:ok` / `{:ok, _}` the library advances the checkpoint to the message's LSN; a non-`:ok`
+  return (or a raise/throw/exit) halts the pipeline fail-closed. `context` carries `%{lsn: lsn}`.
+  Enabled by the top-level `messages: true` config; a sink missing this callback is rejected at
+  start (`:messages_unsupported`).
+  """
+  @callback handle_message(Replicant.Decoder.Messages.Message.t(), context) ::
+              :ok | {:ok, term()} | {:error, term()}
+            when context: %{required(:lsn) => Replicant.lsn()}
+
+  @doc """
   Optional. When a sink does not implement this, the Assembler (Task 13) applies
   the default: an `:additive` change auto-applies; a `:destructive` change halts
   the pipeline fail-closed. Implement it to accept (`:ok`) or decline (`{:error, _}`)
@@ -155,6 +172,7 @@ defmodule Replicant.Sink do
     checkpoint: 0,
     handle_transaction: 1,
     handle_batch: 1,
+    handle_message: 2,
     handle_schema_change: 2,
     sink_kind: 0,
     handle_snapshot: 2,
@@ -214,5 +232,15 @@ defmodule Replicant.Sink do
   @spec supports_batch?(module()) :: boolean()
   def supports_batch?(module) do
     function_exported?(module, :handle_batch, 1)
+  end
+
+  @doc """
+  True when `module` implements `handle_message/2` — the config gate for `messages: true`
+  (spec §6.3 / A2). A `messages: true` config whose sink is missing this callback is rejected
+  at start (`:messages_unsupported`) rather than silently dropping non-transactional messages.
+  """
+  @spec supports_messages?(module()) :: boolean()
+  def supports_messages?(module) do
+    function_exported?(module, :handle_message, 2)
   end
 end

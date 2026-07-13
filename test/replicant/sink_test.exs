@@ -210,4 +210,27 @@ defmodule Replicant.SinkTest do
       assert Sink.supports_incremental_snapshot?(Replicant.SinkTest.IncrementalCapableSink)
     end
   end
+
+  describe "supports_messages?/1 (A2)" do
+    test "true when the sink implements handle_message/2" do
+      defmodule MessageSink do
+        @behaviour Replicant.Sink
+        def checkpoint, do: {:ok, nil}
+        def handle_transaction(_), do: {:ok, 0}
+        def handle_message(_msg, _ctx), do: :ok
+      end
+
+      assert Replicant.Sink.supports_messages?(MessageSink)
+    end
+
+    test "false when the sink does not implement handle_message/2" do
+      defmodule NoMessageSink do
+        @behaviour Replicant.Sink
+        def checkpoint, do: {:ok, nil}
+        def handle_transaction(_), do: {:ok, 0}
+      end
+
+      refute Replicant.Sink.supports_messages?(NoMessageSink)
+    end
+  end
 end
