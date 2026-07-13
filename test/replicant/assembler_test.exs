@@ -2216,6 +2216,17 @@ defmodule Replicant.AssemblerTest do
       def handle_message(msg, _ctx), do: raise("boom #{msg.content}")
     end
 
+    # Records the delivered %Transaction{} so a streamed transactional message's
+    # arrival in txn.messages is observable (clause (a) regression, A2 Task 8 review).
+    defmodule StreamMessageSink do
+      def checkpoint, do: {:ok, nil}
+
+      def handle_transaction(txn) do
+        send(self(), {:delivered, txn})
+        {:ok, txn.commit_lsn}
+      end
+    end
+
     test "a transactional Message attaches to the open transaction's messages list with an ordinal" do
       # Begin → Message(flags=1) → Commit; the delivered %Transaction{} carries the message.
       asm = Assembler.new(RecordingSink)
@@ -2231,6 +2242,84 @@ defmodule Replicant.AssemblerTest do
 
       assert {:transaction, txn, 100, _asm} = Assembler.handle_message(asm, %Commit{lsn: 100})
       assert [%Message{prefix: "p", content: "c", ordinal: 0}] = txn.messages
+    end
+
+    # Regression for clause (a) — the STREAMED transactional message accumulate clause (assembler.ex:411).
+    # A streamed transactional message carries `xid` and arrives inside an open stream with `txn: nil`;
+    # it MUST match clause (a) BEFORE the `txn: nil` guards, accumulating into `stream_txns[top].messages`.
+    # If clause (a) were removed, the message would miss clause (b) (no `txn` buffer), miss clause (c)
+    # (`xid: nil` guard fails — the streamed message carries an integer xid), miss clause (d)
+    # (`transactional?: false` guard fails) and fall through to `:unsupported_message` →
+    # `{:halt, _}` with NO delivered transaction. This test would then fail on BOTH the
+    # `{:transaction, ...}` match and the message-presence assertion.
+    test "a STREAMED transactional Message accumulates into the stream buffer and rides the StreamCommit's %Transaction{} (clause a)" do
+      alias Replicant.Decoder.Messages.{Insert, StreamCommit, StreamStart, StreamStop}
+
+      asm = %{
+        Assembler.new(StreamMessageSink, max_concurrent_txns: 64)
+        | stream_floor: 0
+      }
+
+      # A relation must be cached before any streamed change can be identified.
+      rel = %Replicant.Decoder.Messages.Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [
+          %Replicant.Decoder.Messages.Relation.Column{
+            name: "v",
+            type: "int4",
+            flags: [:key],
+            type_modifier: nil
+          }
+        ]
+      }
+
+      {:ok, asm} = Assembler.handle_message(asm, rel)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # At least one change keeps the streamed txn NON-empty so StreamCommit delivers (rather than
+      # suppressing an empty txn). The message's ordinal is `length(buf.changes)` at attach, so this
+      # Insert (→ one change) makes the message's ordinal 1.
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      # The streamed transactional message carries `xid` (set by the streamed decode). This is the
+      # message that MUST route to clause (a) — not the `txn: nil` row-before-Begin guard.
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Message{
+          transactional?: true,
+          xid: 100,
+          lsn: 850,
+          prefix: "p",
+          content: "streamed-msg"
+        })
+
+      # The message accumulated into the open stream buffer (clause a), NOT halted.
+      assert [%Message{prefix: "p", content: "streamed-msg", xid: 100}] =
+               asm.stream_txns[100].messages
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:transaction, txn, 900, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # The delivered %Transaction{} carries the message with its `xid` AND the ordinal stamped at
+      # attach (the change-buffer length at the time: 1, after the one Insert above). Both assertions
+      # regress if clause (a) is removed (the message would mis-route to :unsupported_message →
+      # {:halt, _}, no delivered transaction, no txn.messages).
+      assert [%Message{prefix: "p", content: "streamed-msg", xid: 100, ordinal: 1}] =
+               txn.messages
+
+      assert_received {:delivered, ^txn}
+      # buffer cleared
+      refute Map.has_key?(asm.stream_txns, 100)
     end
 
     test "a non-transactional Message delivers via handle_message/2 and returns {:message_delivered, lsn, asm}" do
@@ -2250,6 +2339,40 @@ defmodule Replicant.AssemblerTest do
       # Rule 1 value-free proof: the raised exception embedded content ("boom secret-content"); the
       # scrubbed %Error{} and its inspect/message renderings MUST NOT carry it.
       refute inspect(err) <> Exception.message(err) =~ "secret-content"
+    end
+
+    # Regression for the batch-boundary branch of clause (d) (assembler.ex:583) — when a batch is
+    # open (`batch_pending?/1` true: `pending_lsn` is an integer), a non-transactional message must
+    # NOT deliver+ack immediately (that would advance the slot past un-checkpointed buffered WAL →
+    # loss on a crash-before-flush, spec §8.4). It signals {:flush_before_message, ...} so the
+    # AssemblerServer flushes+acks the batch FIRST, then re-dispatches the message (loss=0).
+    # Constructed at the unit level by driving one committed txn through a sink-owned batch
+    # assembler (the real path that sets `pending_lsn`); no deep machinery required.
+    test "a non-transactional Message arriving with a batch PENDING signals {:flush_before_message, ...} (loss=0, spec §8.4)" do
+      # Sink-owned batch: a committed txn is buffered (not delivered), so `pending_lsn` becomes an
+      # integer → `batch_pending?/1` is true. This is the exact state clause (d) branches on.
+      asm =
+        %{
+          Assembler.new(RecordingSink,
+            batch: [max_transactions: 10, max_delay_ms: 1000, max_span: 1_000_000]
+          )
+          | stream_floor: 0
+        }
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+      assert {:buffered, asm} = Assembler.handle_message(asm, %Commit{lsn: 100})
+      assert Assembler.batch_pending?(asm)
+
+      msg = %Message{transactional?: false, lsn: 200, prefix: "p", content: "c"}
+
+      assert {:flush_before_message, :message_boundary, returned_asm, ^msg} =
+               Assembler.handle_message(asm, msg)
+
+      # The Assembler returns the assembler UNCHANGED on this signal (the flush happens in the
+      # AssemblerServer); the batch is still pending and the message is NOT yet delivered/acked.
+      assert returned_asm.batch_count == 1
+      assert Assembler.batch_pending?(returned_asm)
+      assert RecordingSink.seen_messages() == []
     end
   end
 end
