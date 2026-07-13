@@ -1414,4 +1414,46 @@ defmodule Replicant.ConnectionTest do
       assert after_.last_commit_lsn == 0x500
     end
   end
+
+  # A2 (Task 9) §8.1 idle-ack seam: a NON-transactional pg_logical_emit_message arrives standalone
+  # (no Begin/Commit bracket), so the generic track_txn catch-all would leave last_commit_lsn
+  # unchanged → idle?/1 stays true → the next reply-requested keepalive idle-advances the slot to
+  # wal_end, acking PAST the undelivered message → SILENT LOSS. The fix: a dedicated track_txn
+  # clause for a non-txn %Message{} bumps last_commit_lsn (treated as a pending deliverable) so
+  # idle?/1 returns false until {:sink_committed, msg_lsn} advances the checkpoint past it.
+  describe "A2 idle-ack seam (§8.1)" do
+    alias Replicant.Decoder.Messages.Message
+
+    test "a non-txn message bumps last_commit_lsn so idle? is false until the checkpoint catches up" do
+      state = %Replicant.Connection{
+        slot_name: "s",
+        in_txn: false,
+        open_streams: MapSet.new(),
+        checkpoint_lsn: 0,
+        last_commit_lsn: 0
+      }
+
+      msg = %Message{transactional?: false, lsn: 500}
+      bumped = Replicant.Connection.track_txn(state, msg)
+      assert bumped.last_commit_lsn == 500
+      # idle?/1 is `not in_txn and open_streams empty and checkpoint_lsn >= last_commit_lsn`.
+      # With checkpoint_lsn 0 < last_commit_lsn 500, idle? is FALSE — the keepalive's idle-advance
+      # is BLOCKED, so the slot cannot be acked past the undelivered message.
+      refute bumped.checkpoint_lsn >= bumped.last_commit_lsn
+      acked = %{bumped | checkpoint_lsn: 500}
+      assert acked.checkpoint_lsn >= acked.last_commit_lsn
+    end
+
+    test "the %Message{} track_txn clause precedes the catch-all (a non-txn msg is NOT a no-op)" do
+      state = %Replicant.Connection{last_commit_lsn: 0}
+      msg = %Message{transactional?: false, lsn: 999}
+      assert Replicant.Connection.track_txn(state, msg) != state
+    end
+
+    test "a transactional message is a no-op in track_txn (Begin/Commit owns the idle? signal)" do
+      state = %Replicant.Connection{last_commit_lsn: 0}
+      msg = %Message{transactional?: true, lsn: 999}
+      assert Replicant.Connection.track_txn(state, msg) == state
+    end
+  end
 end

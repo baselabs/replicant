@@ -422,6 +422,35 @@ defmodule Replicant.AssemblerServer do
     {:noreply, state}
   end
 
+  # A2 (Task 9, spec §7.1): a NON-transactional pg_logical_emit_message delivered standalone via
+  # handle_message/2. The sink durably persisted it (no commit boundary, no transaction-watermark
+  # dedup — at-least-once per the handle_message/2 doc); ack `lsn` to the Connection exactly as a
+  # committed txn does. track_window advances the applied frontier (a non-txn message carries no
+  # row PKs for the drop-set, so [] — same as the skipped path); a no-op when incremental is off.
+  defp dispatch({:message_delivered, lsn, asm}, from, state) do
+    state = track_window(%{state | asm: asm}, [], lsn)
+    send(from, {:sink_committed, lsn})
+    {:noreply, state}
+  end
+
+  # A2 (Task 9, spec §8.4 loss=0): a NON-txn message arrived while a lib/sink-owned batch is OPEN.
+  # Delivering+acking the message's LSN now would advance the slot past the batch's un-checkpointed
+  # WAL → loss on a crash-before-flush. So flush+ack the batch FIRST (durability-before-ack), then
+  # re-dispatch the SAME message on the flushed assembler (pending_lsn now nil → the second pass
+  # reaches deliver_message → {:message_delivered}). If the flush halts (a write fault), the message
+  # is NOT delivered — fail-closed, no ack (the message re-streams from the durable checkpoint on
+  # restart; at-least-once).
+  defp dispatch({:flush_before_message, reason, asm, msg}, from, state) do
+    state = %{state | asm: asm}
+    {:noreply, flushed_state} = do_flush(state, reason)
+
+    if flushed_state.halted do
+      {:noreply, flushed_state}
+    else
+      dispatch(Assembler.handle_message(flushed_state.asm, msg), from, flushed_state)
+    end
+  end
+
   defp dispatch({:schema_change, _sc, asm}, _from, state) do
     # Additive schema change auto-applied mid-stream; no commit boundary, no ack.
     {:noreply, %{state | asm: asm}}

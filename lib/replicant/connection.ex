@@ -108,7 +108,8 @@ defmodule Replicant.Connection do
           backfill_floor: Replicant.lsn() | nil,
           last_frontier_cast: non_neg_integer(),
           reader_pid: pid() | nil,
-          step: step()
+          step: step(),
+          messages: boolean()
         }
 
   defstruct [
@@ -140,7 +141,8 @@ defmodule Replicant.Connection do
     frontier_epoch: 0,
     last_frontier_cast: 0,
     reader_pid: nil,
-    step: :disconnected
+    step: :disconnected,
+    messages: false
   ]
 
   @doc "The default in-flight-lag ceiling (WAL bytes) when the config omits it."
@@ -197,7 +199,8 @@ defmodule Replicant.Connection do
        streaming: Map.get(config, :streaming),
        in_stream: false,
        store_retry_count: 0,
-       step: :disconnected
+       step: :disconnected,
+       messages: Map.get(config, :messages, false)
      }}
   end
 
@@ -477,7 +480,8 @@ defmodule Replicant.Connection do
         {:ok, sql} =
           QueryBuilder.start_replication(state.slot_name, state.publication,
             start_lsn: lsn,
-            streaming: streaming?(state)
+            streaming: streaming?(state),
+            messages: state.messages
           )
 
         {:stream, sql, [],
@@ -926,6 +930,19 @@ defmodule Replicant.Connection do
     do: %{state | open_streams: MapSet.delete(state.open_streams, top)}
 
   def track_txn(state, %StreamAbort{}), do: state
+
+  # A2 (Task 9, spec §8.1 idle-ack seam): a NON-transactional pg_logical_emit_message arrives
+  # standalone (no Begin/Commit bracket) and delivers via handle_message/2 — at-least-once, NO
+  # transaction-watermark dedup. Its LSN is a PENDING DELIVERABLE the keepalive path must NOT ack
+  # past. The generic catch-all below would leave last_commit_lsn unchanged → idle?/1 stays true →
+  # the next reply-requested keepalive idle-advances the slot to wal_end, acking PAST the
+  # undelivered message → SILENT LOSS (the probed failure mode of §8.1). Treat the message LSN as a
+  # pending commit: bump last_commit_lsn so idle?/1 returns false until {:sink_committed, msg_lsn}
+  # advances checkpoint_lsn >= last_commit_lsn. A transactional message is intentionally NOT bumped
+  # here — Begin/Commit owns its idle? signal (the next clause is the catch-all no-op).
+  def track_txn(state, %Replicant.Decoder.Messages.Message{transactional?: false, lsn: msg_lsn}),
+    do: %{state | last_commit_lsn: max(state.last_commit_lsn, msg_lsn || 0)}
+
   def track_txn(state, _msg), do: state
 
   # Fail-closed lag-halt (spec §4): the sink is not draining fast enough — the
@@ -957,7 +974,8 @@ defmodule Replicant.Connection do
     {:ok, sql} =
       QueryBuilder.start_replication(state.slot_name, state.publication,
         start_lsn: state.checkpoint_lsn,
-        streaming: streaming?(state)
+        streaming: streaming?(state),
+        messages: state.messages
       )
 
     {:stream, sql, [], %{state | step: :streaming, in_stream: false}}

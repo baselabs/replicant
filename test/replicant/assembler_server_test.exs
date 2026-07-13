@@ -731,6 +731,75 @@ defmodule Replicant.AssemblerServerTest do
     end
   end
 
+  # A2 (Task 9): the AssemblerServer dispatches the assembler's two new result shapes for a
+  # NON-transactional pg_logical_emit_message (spec §7.1/§8.4):
+  #   * {:message_delivered, lsn, asm} — a standalone message with no open batch → ack the LSN.
+  #   * {:flush_before_message, reason, asm, msg} — an open lib/sink-owned batch would be acked past
+  #     by the message's LSN; flush+ack the batch FIRST (loss=0, §8.4), then re-dispatch the message
+  #     on a clean assembler (second pass reaches deliver_message → {:message_delivered}).
+  # The RecordingSink already records handle_message/2 (seen_messages/0), so it stands in for both.
+  describe "A2 message dispatch" do
+    alias Replicant.Decoder.Messages.Message
+
+    test "a non-txn message with no open batch dispatches {:message_delivered} → acks the LSN" do
+      # A fresh sink-owned assembler (no batch) → the non-txn Message routes to deliver_message,
+      # returning {:message_delivered, 200, asm}; dispatch acks 200 to the conn_pid (self()).
+      pid = start("srv_msg_delivered", RecordingSink)
+
+      msg = %Message{transactional?: false, lsn: 200, prefix: "p", content: "hello"}
+      cast(pid, msg, 10)
+
+      assert_receive {:sink_committed, 200}, 1000
+      assert Enum.map(RecordingSink.seen_messages(), & &1.lsn) == [200]
+      refute :sys.get_state(pid).halted
+    end
+
+    test "a non-txn message with an open batch flushes FIRST, then delivers (§8.4 loss=0)" do
+      # Open a lib+batch (buffer a txn at lsn 100 → batch_pending? true), then cast a non-txn
+      # message at lsn 200. handle_message returns {:flush_before_message, :message_boundary, asm,
+      # msg}; dispatch flushes+acks 100 FIRST, then re-dispatches the message on the flushed
+      # assembler (pending_lsn now nil) → {:message_delivered, 200} → acks 200. The two acks arrive
+      # in commit order (100 before 200) — the load-bearing loss=0 invariant.
+      pid = start("srv_msg_flush_first", RecordingSink)
+      test = self()
+
+      :sys.replace_state(pid, fn st ->
+        asm =
+          Replicant.Assembler.new(RecordingSink,
+            mode: :lib,
+            checkpoint_writer: fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+            slot_name: "srv_msg_flush_first",
+            lib_checkpoint: 0,
+            batch: [max_transactions: 100, max_delay_ms: 60_000, max_span: 1_000_000]
+          )
+
+        %{st | asm: asm}
+      end)
+
+      cache_relation(pid)
+      drive_txn(pid, 100)
+      # A batch is now OPEN (pending_lsn = 100, un-checkpointed).
+      assert Replicant.Assembler.batch_pending?(:sys.get_state(pid).asm)
+
+      msg = %Message{transactional?: false, lsn: 200, prefix: "p", content: "hi"}
+      cast(pid, msg, 10)
+
+      # Barrier: get_state flushes the mailbox → the cast's flush-then-deliver ran before we read.
+      # The AssemblerServer is serial, so the two acks landed in the mailbox in SEND order: 100 (the
+      # flushed batch's checkpoint) BEFORE 200 (the re-dispatched message). assert_received pulls
+      # them in that order — the load-bearing loss=0 invariant.
+      refute :sys.get_state(pid).halted
+      assert_received {:sink_committed, 100}
+      assert_received {:sink_committed, 200}
+      refute_received {:sink_committed, _}
+
+      # The batch's writer ran at 100 (the flushed checkpoint), proving the batch was durable first.
+      assert_received {:wrote, 100}
+
+      assert Enum.map(RecordingSink.seen_messages(), & &1.lsn) == [200]
+    end
+  end
+
   defmodule ChunkLedgerSink do
     @behaviour Replicant.Sink
     def checkpoint, do: {:ok, nil}
