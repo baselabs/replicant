@@ -2202,4 +2202,54 @@ defmodule Replicant.AssemblerTest do
       assert asm.batch_spill_paths == []
     end
   end
+
+  describe "A2 messages (spec §6/§7)" do
+    alias Replicant.Decoder.Messages.{Begin, Commit, Message}
+
+    # A sink that RAISES from handle_message/2 embedding the message content in the
+    # exception message — the value-free boundary (Critical Rule 1) must scrub it so
+    # neither the %Error{} nor its inspect/message renderings carry the content.
+    defmodule RaisingMessageSink do
+      @behaviour Replicant.Sink
+      def checkpoint, do: {:ok, nil}
+      def handle_transaction(_), do: {:ok, 0}
+      def handle_message(msg, _ctx), do: raise("boom #{msg.content}")
+    end
+
+    test "a transactional Message attaches to the open transaction's messages list with an ordinal" do
+      # Begin → Message(flags=1) → Commit; the delivered %Transaction{} carries the message.
+      asm = Assembler.new(RecordingSink)
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Message{
+          transactional?: true,
+          lsn: 100,
+          prefix: "p",
+          content: "c"
+        })
+
+      assert {:transaction, txn, 100, _asm} = Assembler.handle_message(asm, %Commit{lsn: 100})
+      assert [%Message{prefix: "p", content: "c", ordinal: 0}] = txn.messages
+    end
+
+    test "a non-transactional Message delivers via handle_message/2 and returns {:message_delivered, lsn, asm}" do
+      asm = Assembler.new(RecordingSink)
+      msg = %Message{transactional?: false, lsn: 200, prefix: "p", content: "c"}
+
+      assert {:message_delivered, 200, _asm} = Assembler.handle_message(asm, msg)
+    end
+
+    test "a non-transactional Message with a raising handle_message/2 halts fail-closed value-free (Rule 1)" do
+      asm = Assembler.new(RaisingMessageSink)
+      msg = %Message{transactional?: false, lsn: 200, prefix: "p", content: "secret-content"}
+
+      {:halt, err, _asm} = Assembler.handle_message(asm, msg)
+      assert err.reason == :sink_failed
+
+      # Rule 1 value-free proof: the raised exception embedded content ("boom secret-content"); the
+      # scrubbed %Error{} and its inspect/message renderings MUST NOT carry it.
+      refute inspect(err) <> Exception.message(err) =~ "secret-content"
+    end
+  end
 end

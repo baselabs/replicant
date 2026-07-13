@@ -56,6 +56,7 @@ defmodule Replicant.Assembler do
     Commit,
     Delete,
     Insert,
+    Message,
     Origin,
     Relation,
     StreamAbort,
@@ -99,11 +100,13 @@ defmodule Replicant.Assembler do
           begin_lsn: lsn() | nil,
           xid: non_neg_integer() | nil,
           changes: [Change.t()],
+          messages: [Message.t()],
           byte_size: non_neg_integer()
         }
 
   @type stream_buf :: %{
           changes: [{non_neg_integer(), Change.t()}],
+          messages: [Message.t()],
           byte_size: non_neg_integer(),
           resident_bytes: non_neg_integer(),
           spilled_bytes: non_neg_integer(),
@@ -224,6 +227,8 @@ defmodule Replicant.Assembler do
           | {:schema_change, SchemaChange.t(), t()}
           | {:buffered, t()}
           | {:flush, atom(), t()}
+          | {:flush_before_message, atom(), t(), Message.t()}
+          | {:message_delivered, lsn(), t()}
           | {:halt, term(), t()}
   def handle_message(asm, message) do
     do_handle_message(asm, message)
@@ -236,7 +241,12 @@ defmodule Replicant.Assembler do
   end
 
   defp do_handle_message(%__MODULE__{} = asm, %Begin{final_lsn: lsn, xid: xid}) do
-    {:ok, %{asm | txn: %{begin_lsn: lsn, xid: xid, changes: [], byte_size: 0}, ordinal: 0}}
+    {:ok,
+     %{
+       asm
+       | txn: %{begin_lsn: lsn, xid: xid, changes: [], messages: [], byte_size: 0},
+         ordinal: 0
+     }}
   end
 
   # --- streaming reassembly (spec §5) ---
@@ -269,6 +279,7 @@ defmodule Replicant.Assembler do
              stream_txns:
                Map.put(asm.stream_txns, xid, %{
                  changes: [],
+                 messages: [],
                  byte_size: 0,
                  resident_bytes: 0,
                  spilled_bytes: 0,
@@ -391,6 +402,36 @@ defmodule Replicant.Assembler do
     stream_accumulate_truncate(asm, rids, sx)
   end
 
+  # (a) A STREAMED transactional message (spec §7.1) carries `xid` and arrives inside an open stream
+  # segment with `txn: nil` (streamed changes live in `stream_txns`, not the v1 buffer). It MUST match
+  # here — BEFORE the `txn: nil` row-before-Begin guard below — so it is not mis-halted as malformed.
+  # The `current_stream_xid: top when is_integer(top)` guard makes this clause disjoint from the v1
+  # transactional clauses (b)/(c): a v1 message has no open stream and `xid: nil`. The ordinal is the
+  # change-buffer length at attach (a message's position in the commit-order replay mirrors a change's).
+  defp do_handle_message(%__MODULE__{current_stream_xid: top} = asm, %Message{
+         transactional?: true,
+         xid: sx,
+         lsn: lsn,
+         prefix: prefix,
+         content: content
+       })
+       when is_integer(top) do
+    buf = Map.fetch!(asm.stream_txns, top)
+    ordinal = length(buf.changes)
+
+    msg = %Message{
+      transactional?: true,
+      lsn: lsn,
+      prefix: prefix,
+      content: content,
+      xid: sx,
+      ordinal: ordinal
+    }
+
+    buf = %{buf | messages: [msg | buf.messages]}
+    {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
+  end
+
   # A row/commit message that arrives before any Begin is malformed → fail-closed
   # (without this guard the nil-buffer crash is caught by the outer rescue and
   # miscategorised as :decode_failure). Relation/Type/Origin may legitimately
@@ -478,7 +519,8 @@ defmodule Replicant.Assembler do
     txn = %Transaction{
       commit_lsn: commit_lsn || buffer.begin_lsn,
       commit_timestamp: ts,
-      changes: Enum.reverse(buffer.changes)
+      changes: Enum.reverse(buffer.changes),
+      messages: Enum.reverse(buffer.messages)
     }
 
     Telemetry.event(
@@ -496,6 +538,52 @@ defmodule Replicant.Assembler do
       {:skipped, txn.commit_lsn, reset(asm)}
     else
       apply_sink(asm, txn)
+    end
+  end
+
+  # (b) A v1 transactional message (spec §7.1) attaches to the open transaction's `messages` list
+  # (newest-first; reversed to commit order at Commit) with the buffer's current ordinal, then
+  # advances it — mirroring a v1 change. Disjoint from (a): a v1 message has no open stream
+  # (`current_stream_xid: nil`) and `xid: nil`. The `txn: buffer when buffer != nil` guard keeps it
+  # disjoint from (c) (a malformed transactional message before Begin).
+  defp do_handle_message(
+         %__MODULE__{txn: buffer, ordinal: ordinal} = asm,
+         %Message{
+           transactional?: true,
+           lsn: lsn,
+           prefix: prefix,
+           content: content
+         }
+       )
+       when buffer != nil do
+    msg = %Message{
+      transactional?: true,
+      lsn: lsn,
+      prefix: prefix,
+      content: content,
+      ordinal: ordinal
+    }
+
+    {:ok, %{asm | txn: %{buffer | messages: [msg | buffer.messages]}, ordinal: ordinal + 1}}
+  end
+
+  # (c) A malformed v1 transactional message arriving before any Begin (txn: nil). The `xid: nil`
+  # guard is LOAD-BEARING: it keeps this clause disjoint from (a), which matches a streamed
+  # transactional message carrying `xid` and `txn: nil`. Halt fail-closed value-free (spec §8).
+  defp do_handle_message(%__MODULE__{txn: nil} = asm, %Message{transactional?: true, xid: nil}),
+    do: {:halt, %Error{reason: :config_invalid, shape: "transactional message before Begin"}, asm}
+
+  # (d) A NON-transactional message (spec §7.1) delivers standalone via handle_message/2. §8.4
+  # batch-boundary: when a batch is open (lib-batch OR sink-owned batch), the buffered txns' WAL is
+  # not yet durable-checkpointed; delivering+acking the message's LSN now would advance the slot past
+  # it → loss on a crash-before-flush. So signal {:flush_before_message, :message_boundary, asm, msg}:
+  # the AssemblerServer (Task 9) flushes+acks the batch FIRST, THEN re-dispatches the message — the
+  # second pass finds no open batch and reaches deliver_message. loss=0 (§8.4).
+  defp do_handle_message(%__MODULE__{} = asm, %Message{transactional?: false} = msg) do
+    if batch_pending?(asm) do
+      {:flush_before_message, :message_boundary, asm, msg}
+    else
+      deliver_message(asm, msg)
     end
   end
 
@@ -537,8 +625,10 @@ defmodule Replicant.Assembler do
 
       buf.spill == nil ->
         # Unspilled, non-empty: the in-memory List replay (stamp commit_lsn + ordinals at replay).
+        # Streamed messages tagged to an aborted subxid are dropped (mirrors the change-reject above).
         {changes, change_count} = replay_resident(resident, lsn)
-        deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count)
+        buf_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+        deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count, buf_messages)
 
       true ->
         # Spilled, non-empty: close the file for reading, deliver a lazy Reader over frames + tail.
@@ -569,7 +659,14 @@ defmodule Replicant.Assembler do
   # deliver via the shared apply_sink path, threading the spill PATH so cleanup happens after durable
   # delivery (per-txn / lib+batch delete the file; sink-owned batch keeps it until flush, Task 8).
   defp deliver_spilled_stream_commit(%__MODULE__{} = asm, lsn, ts, buf, reader) do
-    txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: reader}
+    buf_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+
+    txn = %Transaction{
+      commit_lsn: lsn,
+      commit_timestamp: ts,
+      changes: reader,
+      messages: buf_messages
+    }
 
     Telemetry.event([:replicant, :stream, :committed], %{}, %{
       commit_lsn: lsn,
@@ -589,8 +686,13 @@ defmodule Replicant.Assembler do
   # (effect-once, §2) else deliver via the shared apply_sink/2 — a separate clause to keep the
   # StreamCommit body within credo's nesting depth. An empty streamed txn never reaches here (it is
   # suppressed in the StreamCommit clause, spec §7).
-  defp deliver_stream_commit(asm, lsn, ts, byte_size, changes, change_count) do
-    txn = %Transaction{commit_lsn: lsn, commit_timestamp: ts, changes: changes}
+  defp deliver_stream_commit(asm, lsn, ts, byte_size, changes, change_count, buf_messages) do
+    txn = %Transaction{
+      commit_lsn: lsn,
+      commit_timestamp: ts,
+      changes: changes,
+      messages: buf_messages
+    }
 
     Telemetry.event([:replicant, :transaction, :assembled], %{}, %{
       change_count: change_count,
@@ -1092,6 +1194,39 @@ defmodule Replicant.Assembler do
         # A throw/exit reason may embed row values (a GenServer.call timeout
         # carrying the transaction). Do NOT inspect it — scrub value-free.
         sink_failed(asm, duration)
+    end
+  end
+
+  # Deliver a NON-transactional message standalone via handle_message/2 (spec §7.1, A2 Task 8). This
+  # is the value-free Rule 1 boundary at the sink-call site — symmetric to deliver_now/apply_sink for
+  # handle_transaction: a raise (the exception message can embed the message `content`) is caught as
+  # :sink_raised and the reason is NEVER inspected; a throw/exit likewise as :sink_caught. On :ok /
+  # {:ok, _} emit the value-free [:message, :received] event and return {:message_delivered, lsn, asm}
+  # (the AssemblerServer, Task 9, advances the ack to `lsn` — durability-before-ack). Any other return
+  # halts fail-closed value-free with %Error{reason: :sink_failed} (carries NO value).
+  defp deliver_message(%__MODULE__{} = asm, %Message{lsn: msg_lsn} = msg) do
+    result =
+      try do
+        asm.sink.handle_message(msg, %{lsn: msg_lsn})
+      rescue
+        _ -> :sink_raised
+      catch
+        _kind, _reason -> :sink_caught
+      end
+
+    case result do
+      res when res == :ok or (is_tuple(res) and elem(res, 0) == :ok) ->
+        Telemetry.event([:replicant, :message, :received], %{}, %{
+          commit_lsn: msg_lsn,
+          byte_size: byte_size(msg.content || ""),
+          transactional: false
+        })
+
+        {:message_delivered, msg_lsn, asm}
+
+      _other ->
+        Telemetry.event([:replicant, :sink, :failed], %{}, %{reason: :sink_failed})
+        {:halt, %Error{reason: :sink_failed}, asm}
     end
   end
 
