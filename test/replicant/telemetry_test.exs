@@ -76,6 +76,10 @@ defmodule Replicant.TelemetryTest do
     end
   end
 
+  test "transactional is an allowlisted meta key (A2 messages)" do
+    assert :transactional in Replicant.Telemetry.allowed_meta_keys()
+  end
+
   describe "span/3" do
     test "a stop-side off-allowlist metadata key raises (Critical Rule 1 on the merged meta)" do
       # span/3 merges start + stop meta and re-validates before the stop event —

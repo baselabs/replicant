@@ -31,6 +31,22 @@ defmodule Replicant.QueryBuilderTest do
       assert {:error, :invalid_identifier} =
                QueryBuilder.start_replication("x; DROP", ["ok_pub"], [])
     end
+
+    test "messages: true adds the messages 'true' option (A2, after Task 2 carry-forward)" do
+      {:ok, sql} = QueryBuilder.start_replication("s", ["p"], start_lsn: 0, messages: true)
+      assert sql =~ "messages 'true'"
+      assert sql =~ "publication_names 'p'"
+
+      # composition with streaming (the load-bearing combination)
+      {:ok, sql2} =
+        QueryBuilder.start_replication("s", ["p"], start_lsn: 0, streaming: true, messages: true)
+
+      assert sql2 =~ "proto_version '2', streaming 'on'"
+      assert sql2 =~ "messages 'true'"
+      # option order: messages comes AFTER publication_names
+      [_, after_pub] = String.split(sql2, "publication_names 'p', ", parts: 2)
+      assert String.starts_with?(after_pub, "messages 'true'")
+    end
   end
 
   describe "start_replication streaming (spec §5)" do

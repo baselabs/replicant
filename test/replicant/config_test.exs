@@ -89,6 +89,13 @@ defmodule Replicant.ConfigTest do
     def handle_snapshot_complete(lsn), do: {:ok, lsn}
   end
 
+  defmodule MessageCapableSink do
+    @behaviour Replicant.Sink
+    def checkpoint, do: {:ok, nil}
+    def handle_transaction(_), do: {:ok, 0}
+    def handle_message(_msg, _ctx), do: :ok
+  end
+
   @base [
     connection: [
       hostname: "standby.internal",
@@ -197,6 +204,27 @@ defmodule Replicant.ConfigTest do
     test "publication rejects a non-string non-list value" do
       opts = Keyword.put(@base, :publication, :not_a_pub)
       assert {:error, :config_invalid} = Config.validate(opts ++ [sink: StateMirrorPersisted])
+    end
+
+    test "messages defaults to false when omitted (byte-unchanged)" do
+      assert {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.messages == false
+    end
+
+    test "messages: true is accepted for a sink implementing handle_message/2" do
+      opts = @base ++ [messages: true, sink: MessageCapableSink]
+      assert {:ok, cfg} = Config.validate(opts)
+      assert cfg.messages == true
+    end
+
+    test "messages: true is rejected when the sink lacks handle_message/2" do
+      opts = @base ++ [messages: true, sink: StateMirrorPersisted]
+      assert {:error, :messages_unsupported} = Config.validate(opts)
+    end
+
+    test "messages rejects a non-boolean value" do
+      opts = @base ++ [messages: "yes", sink: MessageCapableSink]
+      assert {:error, :config_invalid} = Config.validate(opts)
     end
   end
 

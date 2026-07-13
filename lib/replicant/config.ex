@@ -15,6 +15,7 @@ defmodule Replicant.Config do
           optional(:batch) => keyword() | nil,
           optional(:batch_delivery) => keyword() | nil,
           optional(:streaming) => keyword() | nil,
+          optional(:messages) => boolean(),
           connection: keyword(),
           slot_name: String.t(),
           publication: [String.t()],
@@ -23,7 +24,8 @@ defmodule Replicant.Config do
           snapshot: boolean() | keyword(),
           max_inflight_lag: pos_integer(),
           checkpoint_store: keyword() | nil,
-          failover: boolean()
+          failover: boolean(),
+          messages: boolean()
         }
 
   @doc """
@@ -37,9 +39,10 @@ defmodule Replicant.Config do
   is missing the required callbacks for that mode: `snapshot: true` needs both v1
   callbacks; sink-owned `snapshot: [mode: :incremental]` needs `handle_snapshot/2`
   + `snapshot_progress/0`), `:batch_unsupported` (`batch_delivery` is set but the
-  sink does not implement `handle_batch/1`). A `snapshot` value that is neither a
-  boolean nor a `[mode: :incremental, ...]` keyword (or has non-positive knobs) is
-  `:config_invalid`.
+  sink does not implement `handle_batch/1`), `:messages_unsupported` (`messages: true`
+  is set but the sink does not implement `handle_message/2`). A `snapshot` value
+  that is neither a boolean nor a `[mode: :incremental, ...]` keyword (or has
+  non-positive knobs) is `:config_invalid`.
   """
   @spec validate(keyword()) ::
           {:ok, t()}
@@ -49,7 +52,8 @@ defmodule Replicant.Config do
              | :invalid_sink
              | :conflicting_start_mode
              | :snapshot_unsupported
-             | :batch_unsupported}
+             | :batch_unsupported
+             | :messages_unsupported}
   def validate(opts) when is_list(opts) do
     with {:ok, connection} <- fetch_connection(opts),
          {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
@@ -58,6 +62,7 @@ defmodule Replicant.Config do
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
          {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
+         {:ok, messages} <- fetch_messages(opts, sink),
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
          {:ok, streaming} <- fetch_streaming(opts, max_inflight_lag),
          {:ok, failover} <- fetch_failover(opts),
@@ -78,7 +83,8 @@ defmodule Replicant.Config do
          failover: failover,
          batch: batch,
          batch_delivery: batch_delivery,
-         streaming: streaming
+         streaming: streaming,
+         messages: messages
        }}
     end
   end
@@ -198,6 +204,26 @@ defmodule Replicant.Config do
       :error -> {:ok, false}
       {:ok, bool} when is_boolean(bool) -> {:ok, bool}
       {:ok, _bad} -> {:error, :config_invalid}
+    end
+  end
+
+  # Non-transactional messages (spec §6.3 / A2) are opt-in via a TOP-LEVEL :messages boolean.
+  # `true` requires the sink to implement handle_message/2 (Sink.supports_messages?/1, Task 6) —
+  # fail-closed at START (`:messages_unsupported`), never silently dropping messages later. This
+  # mirrors :batch_unsupported. Absent OR `false` → byte-unchanged (no `messages 'true'` option).
+  defp fetch_messages(opts, sink) do
+    case Keyword.fetch(opts, :messages) do
+      :error ->
+        {:ok, false}
+
+      {:ok, true} ->
+        if Sink.supports_messages?(sink), do: {:ok, true}, else: {:error, :messages_unsupported}
+
+      {:ok, false} ->
+        {:ok, false}
+
+      {:ok, _bad} ->
+        {:error, :config_invalid}
     end
   end
 

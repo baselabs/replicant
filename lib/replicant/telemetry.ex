@@ -7,7 +7,7 @@ defmodule Replicant.Telemetry do
   `arcadic`'s allowlist pattern.
   """
 
-  @allowed_meta_keys ~w(commit_lsn change_count byte_size lag_ms duration table reason error_class kind slot_name attempt max_retries)a
+  @allowed_meta_keys ~w(commit_lsn change_count byte_size lag_ms duration table reason error_class kind slot_name attempt max_retries transactional)a
 
   @doc "The permitted span metadata keys."
   @spec allowed_meta_keys() :: [atom()]
