@@ -15,6 +15,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed `{:config, :failover_unsupported}` on PG16.
 - Fail-closed halt `{:slot_synced_unpromoted}` when pointed at an unpromoted standby's synced slot.
 - GitHub Actions CI matrix testing PG16 and PG17.
+- **Multi-publication per pipeline.** `publication:` accepts a single validated name **or a list**
+  (`publication: ["p1", "p2"]`) to stream the union of several publications through one slot. Every
+  name is identifier-validated; `start_replication/3` and the four discovery queries bind
+  `DISTINCT ... pubname = ANY($1)`, and `publication_exists/1` interpolates a validated `IN (...)`
+  list (the connect-chain simple-query protocol can't bind `$1`). A new connect-chain
+  `:publication_check` step **halts fail-closed if the found-pubnames set ≠ the requested set** — a
+  `START_REPLICATION` that names a missing publication would otherwise silently stream the subset.
+  pgoutput de-dupes overlapping tables across publications on the wire.
+- **Logical-decoding messages** (`pg_logical_emit_message`). Opt-in via `messages: true` (the sink
+  must implement `handle_message/2`, else the pipeline is rejected at start as `:messages_unsupported`
+  rather than silently dropping messages later). The guarantee is stated honestly per message kind:
+  a **transactional** message (`transactional => true`) rides `%Transaction{messages: [...]}` and is
+  **effect-once** (inherits the txn `commit_lsn` dedup); a **non-transactional** message routes to
+  `handle_message/2` and is **at-least-once — duplicates possible on reconnect** (no dedup key). Two
+  durability seams prevent silent loss: the idle-ack `track_txn` bump (§8.1 — a non-txn message in
+  flight blocks the idle slot advance, so a keepalive cannot advance `confirmed_flush` past an
+  undelivered message) and the batch-boundary `{:flush_before_message}` seam (§8.4 — a non-txn
+  message flushes an open sink-owned batch in delivery order). New `%Message{}` struct
+  (`transactional?`, `lsn`, `prefix`, `content`, `xid`, `ordinal`) decoded by v1 + streamed clauses;
+  the `messages` flag threads through to `start_replication`. A message's `content` and `prefix` are
+  user bytes (Critical Rule 1: never logged or surfaced in telemetry).
 
 ## [0.1.0] - 2026-07-08
 

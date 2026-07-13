@@ -17,8 +17,9 @@ in a future `ash_replicant` sink adapter.
 > (loss = 0, effect-dup = 0). Initial snapshot/backfill (incl. a resumable
 > incremental mode), a lib-owned checkpoint
 > store for non-transactional sinks, batched checkpointing, sink-owned atomic
-> batch delivery, in-progress-transaction streaming, and consumer-side disk
-> spill for oversized transactions have all shipped. See "How it streams" below.
+> batch delivery, in-progress-transaction streaming, consumer-side disk
+> spill for oversized transactions, multi-publication per pipeline, and
+> logical-decoding messages have all shipped. See "How it streams" below.
 
 ## Highlights
 
@@ -277,6 +278,72 @@ deleted on commit/abort/reset/halt and swept per-slot on (re)connect. Replicant 
 them — if the source rows are sensitive, point `dir` at an encrypted/secure volume; a custom persistent
 `dir` is yours to clean on decommission (the default OS temp dir is cleared by the OS).
 
+**Multi-publication per pipeline.** `publication:` accepts a single name (the default) **or a list**.
+Pass a list to stream the union of several publications through one slot — every name is validated
+and deduplicated, and overlapping tables are de-duped by pgoutput on the wire:
+
+```elixir
+Replicant.start_link(
+  connection: [...],
+  slot_name: "replicant_orders",
+  publication: ["orders_pub", "audit_pub"],   # was: publication: "orders_pub"
+  sink: MyApp.OrdersSink,
+  go_forward_only: false
+)
+```
+
+Every requested publication must exist; a missing one **halts fail-closed** at connect time rather
+than silently streaming the subset (a `START_REPLICATION` that names a missing publication would
+otherwise stream only the found subset).
+
+**Logical-decoding messages (`pg_logical_emit_message`).** Opt into Postgres logical-decoding
+**messages** with `messages: true` to receive outbox-pattern / heartbeat rows emitted via
+`pg_logical_emit_message`. The durability guarantee depends on the message's transactional flag
+(stated honestly in the `handle_message/2` docs):
+
+- **Transactional** (`transactional => true` to `pg_logical_emit_message`) — rides
+  `%Transaction.messages` and inherits the transaction path's `commit_lsn` effect-once dedup
+  (effect-once, just like the row changes in the same txn).
+- **Non-transactional** (`transactional => false`) — arrives standalone via the
+  `handle_message/2` sink callback and is **at-least-once** (no dedup key; duplicates are possible
+  on reconnect). This is the honest guarantee — do not claim effect-once for it.
+
+```elixir
+Replicant.start_link(
+  connection: [...],
+  slot_name: "replicant_orders",
+  publication: "orders_pub",
+  sink: MyApp.OrdersSink,
+  messages: true,                            # opt-in; sink MUST implement handle_message/2
+  go_forward_only: false
+)
+
+defmodule MyApp.OrdersSink do
+  @behaviour Replicant.Sink
+
+  @impl true
+  def checkpoint, do: {:ok, MyApp.Repo.last_committed_lsn()}
+
+  @impl true
+  def handle_transaction(%Replicant.Transaction{commit_lsn: lsn, messages: msgs} = txn) do
+    # msgs :: [Replicant.Decoder.Messages.Message.t()] — transactional messages ride the
+    # txn and inherit its commit_lsn effect-once dedup. Persist them with the txn's rows.
+    {:ok, lsn}
+  end
+
+  @impl true
+  # context :: %{lsn: lsn}; non-transactional messages ONLY (transactional ride handle_transaction/1).
+  # At-least-once: a reconnect can re-deliver — your effect must be idempotent. The message's
+  # `content`/`prefix` are USER BYTES (Critical Rule 1: never log or surface them in telemetry).
+  def handle_message(%Replicant.Decoder.Messages.Message{} = msg, %{lsn: lsn}) do
+    :ok
+  end
+end
+```
+
+`messages: true` requires the sink to implement `handle_message/2`; a sink missing it is rejected at
+start (`:messages_unsupported`) rather than silently dropping non-transactional messages later.
+
 ## Development
 
 ```bash
@@ -301,6 +368,8 @@ against a real-PG16 crash-injection suite:
 - **Lib-owned checkpoint store** — a durable Postgres checkpoint written *after* persist for **non-transactional** sinks (at-least-once, dup bounded to one transaction, never loss), with bounded retry-then-halt on store faults.
 - **Batched checkpointing (lib mode)** and **sink-owned atomic batch delivery** — amortize the checkpoint write / the sink's own commit across a batch of transactions.
 - **In-progress-transaction streaming** (`pgoutput` v2) and **consumer-side disk spill** — reassemble and deliver a transaction larger than memory, effect-once, instead of halting.
+- **Multi-publication per pipeline** — `publication: [p1, p2]` streams the union of several publications through one slot, with fail-closed missing-publication detection.
+- **Logical-decoding messages** — opt-in `messages: true` delivers `pg_logical_emit_message` payloads: transactional messages ride `%Transaction.messages` (effect-once); non-transactional via `handle_message/2` (at-least-once).
 
 The sibling consumer library has also shipped, one layer up from this core:
 

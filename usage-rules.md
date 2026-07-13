@@ -23,7 +23,10 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `(file <<< 32) ||| offset`) and `lsn_to_string/1` (uppercase `"file/offset"`
   hex display, matching Postgres `pg_lsn`).
 - **`Replicant.Transaction`** — an assembled, committed transaction: ordered
-  changes plus the transaction's single `commit_lsn`. Ordinarily `changes` is a
+  changes plus the transaction's single `commit_lsn`, and (when `messages: true`
+  is enabled) any **transactional** logical-decoding messages in `messages`
+  (a `[Replicant.Decoder.Messages.Message.t()]` — these ride the txn and inherit
+  its `commit_lsn` effect-once dedup). Ordinarily `changes` is a
   `List`; for an oversized **spilled** streamed transaction (opt-in
   `streaming: [spill: [dir: …, max_spill_bytes: …]]`) it is a lazy, single-pass,
   disk-backed `Enumerable` (`Replicant.Spill.Reader`) valid only *during* the
@@ -55,6 +58,15 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   (`:checkpoint_store` configured) the library owns the checkpoint, so a sink implements
   only `handle_transaction/1` — `checkpoint/0` is optional there; its returned LSN is ignored.
   Batch delivery is mutually exclusive with lib mode.
+- **`handle_message/2`** (opt-in, `messages: true`) — delivers a **non-transactional**
+  logical-decoding message (`pg_logical_emit_message` with `transactional => false`).
+  The guarantee is **at-least-once, NOT effect-once** (see the rule below): a reconnect
+  between the `{:ok}` return and the checkpoint advancing can re-deliver the same message.
+  On `:ok`/`{:ok, _}` the library advances the checkpoint to the message's LSN; a non-`:ok`
+  return (or raise/throw/exit) halts fail-closed. `context` carries `%{lsn: lsn}`. A
+  `messages: true` config whose sink lacks this callback is rejected at start
+  (`:messages_unsupported`). **Transactional** messages do NOT route here — they ride
+  `%Transaction.messages` and inherit the txn path's effect-once.
 - **Incremental snapshot** (`snapshot: [mode: :incremental]`) — a resumable, chunked backfill
   for large tables, interleaved with the live stream. Chunks arrive through the SAME
   `handle_snapshot/2` (same `first_for_table?` redo-safety obligation; `handle_snapshot_complete/1`
@@ -76,7 +88,12 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   Connection with an AssemblerServer; started by `Replicant.start_link/1`.
 - **`Replicant.Config`** — validates pipeline options + the start-mode guard
   (`go_forward_only` / `snapshot` / resume; `go_forward_only` + `snapshot` both
-  set is refused as `:conflicting_start_mode`).
+  set is refused as `:conflicting_start_mode`). `publication:` accepts a single
+  validated name **or a list** (`["p1", "p2"]`) for multi-publication; every name
+  is identifier-validated, the connect chain fails closed if any requested pub is
+  absent (`:publication_check`), and `messages: true` is the opt-in for
+  logical-decoding messages (rejected `:messages_unsupported` if the sink lacks
+  `handle_message/2`).
 - **`Replicant.Snapshotter`** — reads a consistent snapshot of the publication's
   tables at the `EXPORT_SNAPSHOT` LSN (a `REPEATABLE READ` cursor on a separate
   connection) and pushes `%Change{op: :snapshot}` batches to the sink, behind a
@@ -129,6 +146,18 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   fail-closed (`{:config, :failover_unsupported}`) instead of silently ignoring the option.
   Never point Replicant at an unpromoted standby's synced slot — it halts fail-closed
   (`{:slot_synced_unpromoted}`) instead of retry-looping against a slot it cannot yet consume.
+- **Multi-publication is opt-in via a list.** `publication: "p"` stays the byte-unchanged default;
+  `publication: ["p1", "p2"]` streams the union. Every requested publication must exist — a missing
+  one halts fail-closed at connect (`:publication_check`) rather than silently streaming the subset
+  (a `START_REPLICATION` that names a missing pub streams only the found set). pgoutput de-dupes
+  overlapping tables across pubs on the wire.
+- **Logical-decoding messages: state the guarantee honestly.** `messages: true` is opt-in. A
+  **transactional** message (`transactional => true` to `pg_logical_emit_message`) rides
+  `%Transaction.messages` and is **effect-once** (inherits the txn `commit_lsn` dedup). A
+  **non-transactional** message routes to `handle_message/2` and is **at-least-once — duplicates
+  are possible on reconnect** (no dedup key). Never claim effect-once for the non-transactional path.
+  A message's `content` and `prefix` are **user bytes** (Critical Rule 1) — never log them or surface
+  them in telemetry.
 - **Unchanged TOAST is a sentinel, not a value.** It surfaces only as
   `Replicant.Change`'s `unchanged` list of column names, never in `record`.
   Sinks must leave those columns untouched on upsert.

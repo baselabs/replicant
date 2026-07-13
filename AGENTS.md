@@ -11,6 +11,16 @@ slot only AFTER the sink has durably persisted. **Tenant-blind, Ash-agnostic,
 classification-blind.** Multitenancy and classification live in the sibling
 `ash_replicant` sink adapter, never here.
 
+**Capabilities (all shipped):** initial snapshot + resumable incremental backfill,
+a lib-owned checkpoint store for non-transactional sinks (with bounded retry-then-halt),
+batched checkpointing, sink-owned atomic batch delivery, `pgoutput` proto-v2
+in-progress-transaction streaming, consumer-side disk spill for oversized
+transactions, PG17+ forward-compat with failover slots, **multi-publication per
+pipeline** (`publication: [p1, p2]` — fail-closed on a missing pub), and
+**logical-decoding messages** (`messages: true` — `pg_logical_emit_message` payloads).
+A logical-decoding message's `content` and `prefix` are **user bytes**: Critical Rule
+1 binds — never log them, surface them in an error, or emit them in telemetry.
+
 ## Critical rules
 
 **1. No row value in an error, log, or telemetry event.** Assume every value is
@@ -24,15 +34,21 @@ never values.
 
 **2. Validate identifiers.** Slot and publication names reach SQL; they go
 through `Replicant.Identifier.validate/1` (a strict Postgres-identifier
-allowlist) before interpolation. A failure carries the invalid-SHAPE fact only,
-never the offending string. This hardens walex's raw `'#{publication}'`
-interpolation.
+allowlist) before interpolation. A multi-publication list (`publication: [p1, p2]`)
+validates EVERY name and fails closed if any requested pub is absent (a
+`START_REPLICATION` that names a missing pub silently streams the subset). A
+failure carries the invalid-SHAPE fact only, never the offending string. This
+hardens walex's raw `'#{publication}'` interpolation.
 
 **3. Exactly-once is at-least-once + a transaction-watermark-idempotent sink.**
 The watermark is the **commit LSN at transaction granularity** (every row in a
 pgoutput proto-v1 transaction shares one commit LSN). Skip any transaction whose
 `commit_lsn <= checkpoint`; upsert rows by table PK. There is no naked
 exactly-once without two-phase commit or an idempotent sink — do not claim one.
+A **transactional** logical-decoding message rides `%Transaction.messages` and
+inherits this effect-once dedup; a **non-transactional** message routes to
+`handle_message/2` and is **at-least-once** (no dedup key, duplicates possible
+on reconnect) — state each guarantee honestly.
 
 **4. Unchanged TOAST is a sentinel, not a value.** An UPDATE that does not touch
 a TOASTed column sends a sentinel. `%Change{}` surfaces it as a first-class
