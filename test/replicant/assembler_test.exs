@@ -1356,6 +1356,50 @@ defmodule Replicant.AssemblerTest do
       assert asm.current_stream_xid == nil
     end
 
+    test "a streamed txn carrying ONLY a transactional message (zero row-changes) is DELIVERED, not suppressed (spec §7.1; regression — was silently dropped)" do
+      # A large txn streamed because its UNPUBLISHED-table changes exceeded logical_decoding_work_mem
+      # can still carry a transactional message on a PUBLISHED prefix with zero published row-changes.
+      # The v1 path (Begin→Message→Commit) delivers exactly this (effect-once). The streamed
+      # empty-suppression keyed on row-changes alone (`resident == [] and spilled_live == 0`) DROPPED
+      # the message — silent loss. A message-bearing txn is v1-DISTINGUISHABLE: it must ride the txn.
+      asm = deliver_streamed(StreamDeliverSink, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Replicant.Decoder.Messages.Message{
+          transactional?: true,
+          xid: 100,
+          lsn: 850,
+          prefix: "outbox",
+          content: "payload"
+        })
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:transaction, txn, 900, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # The message rides the delivered %Transaction{} (effect-once via commit_lsn); sink called once.
+      assert_received {:delivered, ^txn}
+      assert txn.changes == []
+      assert txn.commit_lsn == 900
+
+      assert [
+               %Replicant.Decoder.Messages.Message{
+                 prefix: "outbox",
+                 content: "payload",
+                 ordinal: 0
+               }
+             ] =
+               txn.messages
+
+      refute Map.has_key?(asm.stream_txns, 100)
+    end
+
     test "an EMPTY StreamCommit does NOT {:skipped}-ack ahead of an OPEN batch — folds into it (CV1 loss guard, spec §7)" do
       # In batch mode a buffered data txn is not yet durable-checkpointed (lib+batch defers the store
       # write to flush; sink-owned defers delivery to flush). An empty streamed txn must NOT

@@ -68,6 +68,44 @@ defmodule Replicant.MultiPubTest do
     end
 
     defp apply_change(_c, _change), do: :ok
+
+    # Snapshot delivery: append each snapshotted row into mp_sink_rows tagged by its source
+    # table (mirrors handle_transaction's plain append — mp_sink_rows is append-only with no PK,
+    # so a shared table discovered twice would show TWO rows, which is exactly what the DISTINCT
+    # discovery marquee asserts against). NO blanket TRUNCATE on first_for_table?: this ledger
+    # holds rows from MULTIPLE source tables, so truncating on one table's first batch would wipe
+    # a sibling table's already-snapshotted rows. This marquee does not exercise mid-snapshot
+    # redo, so per-table reset is unnecessary here.
+    @impl true
+    def handle_snapshot(changes, %{first_for_table?: _first?}) do
+      Postgrex.transaction(@conn, fn c ->
+        Enum.each(changes, fn %Change{table: table, record: r} ->
+          Postgrex.query!(
+            c,
+            "INSERT INTO mp_sink_rows (id, source) VALUES ($1, $2)",
+            [r["id"], table]
+          )
+        end)
+      end)
+
+      :ok
+    rescue
+      e -> {:error, e}
+    end
+
+    # The snapshot handoff commit: durably persist the known consistent point so checkpoint/0
+    # resumes streaming from it.
+    @impl true
+    def handle_snapshot_complete(lsn) do
+      Postgrex.query!(
+        @conn,
+        "INSERT INTO mp_sink_cp (id, lsn) VALUES (1, $1) " <>
+          "ON CONFLICT (id) DO UPDATE SET lsn = EXCLUDED.lsn",
+        [lsn]
+      )
+
+      {:ok, lsn}
+    end
   end
 
   setup do
@@ -141,7 +179,9 @@ defmodule Replicant.MultiPubTest do
       Postgrex.query!(ctrl, "INSERT INTO mp_shared (id, note) VALUES ($1, $2)", [100, "seed_a"])
       Postgrex.query!(ctrl, "INSERT INTO mp_p1_only (id, note) VALUES ($1, $2)", [101, "seed_b"])
 
-      start_pipeline(slot, snapshot: true)
+      # snapshot mode is mutually exclusive with go_forward_only (config :conflicting_start_mode),
+      # so this marquee overrides the helper's go-forward default.
+      start_pipeline(slot, snapshot: true, go_forward_only: false)
 
       # The snapshot MUST union BOTH tables: mp_shared (in both pubs → DISTINCT collapses to ONE
       # discovery) and mp_p1_only (p1-only). Both seeded rows must land.
@@ -215,13 +255,16 @@ defmodule Replicant.MultiPubTest do
 
     {:ok, _} =
       Replicant.start_link(
-        [
-          connection: PG16.pg_opts(),
-          slot_name: slot,
-          publication: ["mp_p1", "mp_p2"],
-          sink: MultiPubSink,
-          go_forward_only: true
-        ] ++ opts
+        Keyword.merge(
+          [
+            connection: PG16.pg_opts(),
+            slot_name: slot,
+            publication: ["mp_p1", "mp_p2"],
+            sink: MultiPubSink,
+            go_forward_only: true
+          ],
+          opts
+        )
       )
 
     receive do

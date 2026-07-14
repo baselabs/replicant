@@ -19,6 +19,7 @@ defmodule Replicant.Decoder.ConformanceTest do
     Commit,
     Delete,
     Insert,
+    Message,
     Origin,
     Relation,
     Relation.Column,
@@ -200,6 +201,48 @@ defmodule Replicant.Decoder.ConformanceTest do
                Decoder.decode(
                  <<68, 0, 0, 96, 0, 79, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53,
                    54, 48>>
+               )
+    end
+  end
+
+  # A2 real-byte corroboration (spec §7.1 / §7.2, decision A2 / plan Task 11). Unlike the
+  # walex-sourced fixtures above, these two 'M' (0x4D = 77) frames were captured fresh from a
+  # live docker-PG16.14 via a Postgrex.ReplicationConnection (START_REPLICATION … messages 'true',
+  # `pg_logical_emit_message/3`) — the independent real-byte second layer for the Message decode
+  # path, which otherwise had only Task 5's hand-crafted bytes. Frame layout: 'M', flags (1 byte:
+  # 0 = non-transactional, 1 = transactional), LSN (uint64), NUL-terminated prefix, content length
+  # (uint32), content bytes.
+  describe "logical-decoding Message (real bytes, fresh PG16 capture)" do
+    test "non-transactional (flags=0) — pg_logical_emit_message(false, …)" do
+      assert {:ok,
+              %Message{
+                transactional?: false,
+                lsn: 14_463_526_072,
+                prefix: "probe_prefix",
+                content: "probe_content",
+                xid: nil,
+                ordinal: nil
+              }} =
+               Decoder.decode(
+                 <<77, 0, 0, 0, 0, 3, 94, 23, 228, 184, 112, 114, 111, 98, 101, 95, 112, 114, 101,
+                   102, 105, 120, 0, 0, 0, 0, 13, 112, 114, 111, 98, 101, 95, 99, 111, 110, 116,
+                   101, 110, 116>>
+               )
+    end
+
+    test "transactional (flags=1) — pg_logical_emit_message(true, …)" do
+      assert {:ok,
+              %Message{
+                transactional?: true,
+                lsn: 14_463_526_368,
+                prefix: "txn_prefix",
+                content: "txn_content",
+                xid: nil,
+                ordinal: nil
+              }} =
+               Decoder.decode(
+                 <<77, 1, 0, 0, 0, 3, 94, 23, 229, 224, 116, 120, 110, 95, 112, 114, 101, 102,
+                   105, 120, 0, 0, 0, 0, 11, 116, 120, 110, 95, 99, 111, 110, 116, 101, 110, 116>>
                )
     end
   end

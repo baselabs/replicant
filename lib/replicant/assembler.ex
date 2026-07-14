@@ -614,8 +614,15 @@ defmodule Replicant.Assembler do
         spilled_total: asm.spilled_total - buf.spilled_bytes
     }
 
+    # Transactional messages tagged to an aborted subxid are dropped (mirrors the change-reject
+    # above); the surviving ones must RIDE the txn even when it carries zero row-changes — the v1
+    # path (Begin→Message→Commit) delivers exactly that (effect-once, spec §7.1). A message-bearing
+    # txn is therefore v1-DISTINGUISHABLE and must NOT be empty-suppressed, or the message is
+    # silently lost (regression: the suppression keyed on row-changes alone).
+    live_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+
     cond do
-      resident == [] and spilled_live == 0 ->
+      resident == [] and spilled_live == 0 and live_messages == [] ->
         # Empty after aborts (spilled or not) → v1-indistinguishable suppression (parent CV1, spec §7).
         # Use Spill.discard (close + delete), NOT Spill.rm (delete only): this branch runs BEFORE the
         # Spill.close below, so buf.spill is a live open device — Spill.rm would unlink the file but
@@ -624,11 +631,10 @@ defmodule Replicant.Assembler do
         suppress_empty_stream_commit(asm, lsn)
 
       buf.spill == nil ->
-        # Unspilled, non-empty: the in-memory List replay (stamp commit_lsn + ordinals at replay).
-        # Streamed messages tagged to an aborted subxid are dropped (mirrors the change-reject above).
+        # Unspilled, non-empty (row-changes and/or a transactional message): the in-memory List
+        # replay (stamp commit_lsn + ordinals at replay).
         {changes, change_count} = replay_resident(resident, lsn)
-        buf_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
-        deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count, buf_messages)
+        deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count, live_messages)
 
       true ->
         # Spilled, non-empty: close the file for reading, deliver a lazy Reader over frames + tail.

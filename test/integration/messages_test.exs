@@ -340,8 +340,11 @@ defmodule Replicant.MessagesTest do
         assert txn_messages(ctrl) == [{"outbox", "payload"}]
         assert non_txn_messages(ctrl) == []
         # dup=0 (load-bearing): exactly ONE delivered txn, carrying 1 change + 1 message.
-        # msg_sink_calls is append-only (no PK) — a re-delivery would push n > 1.
-        assert calls(ctrl) == [{1, 1, 1}]
+        # msg_sink_calls is append-only (no PK) — a re-delivery would push the list length > 1.
+        # The first tuple element is the txn's real commit_lsn (a large WAL position), so it is
+        # matched as _lsn, not asserted to a literal; the count + n_changes + n_messages carry
+        # the dup=0 invariant.
+        assert [{_lsn, 1, 1}] = calls(ctrl)
         assert MapSet.member?(row_ids(ctrl), 1)
 
         cp_before = cp_lsn(ctrl)
@@ -814,13 +817,13 @@ defmodule Replicant.MessagesTest do
       []
     )
 
+    # Drop any stale lib-mode checkpoint table but do NOT re-create it: the CheckpointStore's
+    # own `ensure/1` creates it with the canonical 3-column schema (slot_name, commit_lsn,
+    # updated_at). A hand-rolled 2-column table (missing updated_at NOT NULL) passes the
+    # commit_lsn shape-probe but FAILS the upsert's `INSERT (..., updated_at) VALUES (..., now())`,
+    # halting the pipeline on the first batch flush (mirrors the working batching_test.exs, which
+    # likewise lets the store own the table).
     Postgrex.query!(c, "DROP TABLE IF EXISTS #{@cp_table}", [])
-
-    Postgrex.query!(
-      c,
-      "CREATE TABLE #{@cp_table} (slot_name text PRIMARY KEY, commit_lsn bigint)",
-      []
-    )
 
     Postgrex.query!(c, "CREATE PUBLICATION msg_pub FOR TABLE msg_orders", [])
   end
@@ -830,7 +833,7 @@ defmodule Replicant.MessagesTest do
 
   defp row_ids(c) do
     %Postgrex.Result{rows: rows} = Postgrex.query!(c, "SELECT id FROM msg_sink_rows", [])
-    rows |> Enum.map(fn [_lsn, id] -> id end) |> MapSet.new()
+    rows |> Enum.map(fn [id] -> id end) |> MapSet.new()
   end
 
   defp txn_messages(c) do
