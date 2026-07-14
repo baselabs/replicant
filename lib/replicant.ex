@@ -6,8 +6,8 @@ defmodule Replicant do
   durably persisted the transaction.
 
   `replicant` is **tenant-blind and classification-blind** — the reliable CDC
-  consumer sibling to `arcadic` and `ash_age`. Multitenancy, classification, and
-  Ash resources live one layer up, in a future `ash_replicant` sink adapter.
+  consumer sibling to `arcadic`. Multitenancy, classification, and Ash resources
+  live one layer up, in the `ash_replicant` sink adapter (published on Hex).
 
   ## LSN representation
 

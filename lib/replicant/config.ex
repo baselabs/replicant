@@ -15,7 +15,6 @@ defmodule Replicant.Config do
           optional(:batch) => keyword() | nil,
           optional(:batch_delivery) => keyword() | nil,
           optional(:streaming) => keyword() | nil,
-          optional(:messages) => boolean(),
           connection: keyword(),
           slot_name: String.t(),
           publication: [String.t()],

@@ -6,16 +6,16 @@ A framework-agnostic Elixir CDC consumer for Postgres logical replication
 durably persisted the transaction.
 
 Replicant is **tenant-blind and classification-blind** — the reliable CDC
-consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic) and
-`ash_age`. Multitenancy, classification, and Ash resources live one layer up,
-in a future `ash_replicant` sink adapter.
+consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
+Multitenancy, classification, and Ash resources live one layer up, in the
+[`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** v1 is complete and production-hardened (v0.1.0). Replicant owns
+> **Status:** v1 is complete and production-hardened. Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
 > invalidation, and is proven by a real-PG16 crash-injection suite
-> (loss = 0, effect-dup = 0). Initial snapshot/backfill (incl. a resumable
-> incremental mode), a lib-owned checkpoint
+> (loss = 0, effect-dup = 0). As of **v0.2.0**, initial snapshot/backfill (incl. a
+> resumable incremental mode), a lib-owned checkpoint
 > store for non-transactional sinks, batched checkpointing, sink-owned atomic
 > batch delivery, in-progress-transaction streaming, consumer-side disk
 > spill for oversized transactions, multi-publication per pipeline, and
@@ -130,7 +130,7 @@ looping.
 ```elixir
 def deps do
   [
-    {:replicant, "~> 0.1"}
+    {:replicant, "~> 0.2"}
   ]
 end
 ```
