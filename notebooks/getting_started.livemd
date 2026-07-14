@@ -2,8 +2,6 @@
 
 # Getting started with Replicant
 
-[![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbaselabs%2Freplicant%2Fmain%2Fnotebooks%2Fgetting_started.livemd)
-
 **Replicant** is a framework-agnostic Elixir CDC consumer for Postgres logical
 replication (`pgoutput`). It delivers *committed* row changes to a pluggable
 **sink** with **zero data loss** — the replication slot advances only after your
