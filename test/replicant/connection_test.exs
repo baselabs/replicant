@@ -1015,23 +1015,26 @@ defmodule Replicant.ConnectionTest do
       # max=0 → the first command fault halts (faults=1, retry_decision(0, 0) = :halt).
       s0 = state(max_command_retries: 0)
 
-      # 1. Real ingress: the error struct is DISCARDED — the callback returns a fixed atom and
-      #    carries nothing of the error into mod_state.
-      assert {:disconnect, :query_error} = Connection.handle_result(err, s0)
-
-      # 2. Halt path: one command fault (store_retry_count == 0), then the enforcing connect halts.
+      # Capture logs across BOTH the ingress AND the halt path — the ingress
+      # `handle_result` is the ONE site that touches the value-bearing error, so a log leak
+      # there must be caught too (not only the halt path). [per-task review should-fix 1]
       log =
         ExUnit.CaptureLog.capture_log(fn ->
+          # 1. Real ingress: the error struct is DISCARDED — the callback returns a fixed atom
+          #    and carries nothing of the error into mod_state.
+          assert {:disconnect, :query_error} = Connection.handle_result(err, s0)
+
+          # 2. Halt path: one command fault (store_retry_count == 0), then the enforcing connect halts.
           {:noreply, s1} = Connection.handle_disconnect(s0)
           assert {:noreply, _} = Connection.handle_connect(s1)
         end)
 
       assert_receive {:tel, meas, meta}
 
-      refute Enum.any?(
-               Map.values(meas) ++ Map.values(meta),
-               &(is_binary(&1) and String.contains?(&1, sentinel))
-             )
+      # Deep-inspect BOTH maps — a container-embedded leak (a sentinel nested inside an
+      # allowlisted key's map/tuple value) evades a top-level is_binary filter. [should-fix 2]
+      refute inspect(meas) =~ sentinel
+      refute inspect(meta) =~ sentinel
 
       refute log =~ sentinel
     end
