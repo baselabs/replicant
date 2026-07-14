@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-14
+
 ### Added
 
 - **Getting-started Livebook.** `notebooks/getting_started.livemd` — a runnable, self-verifying
@@ -15,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exactly-once, snapshot/backfill, and logical-decoding messages. Rendered on HexDocs (with a
   "Run in Livebook" badge) and shipped in the Hex package. Its code is executed against a live
   PG16/PG17 on every CI run (`test/integration/livebook_getting_started_test.exs`), so it can
-  never drift from the library.
+  never drift from the library. No library API change.
 
 ## [0.2.1] - 2026-07-14
 
@@ -275,5 +277,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/baselabs/replicant/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/baselabs/replicant/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/baselabs/replicant/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/baselabs/replicant/releases/tag/v0.1.0
