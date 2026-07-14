@@ -39,3 +39,5 @@ priv/plts/
 # Superpowers lifecycle artifacts (specs, plans, handoffs, reviews) — local only, never tracked
 /docs/superpowers/
 
+.forge/
+graphify-out/
