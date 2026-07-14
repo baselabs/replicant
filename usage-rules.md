@@ -81,7 +81,8 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `Replicant.Transaction`s by `commit_lsn`.
 - **`Replicant.Connection`** — the `Postgrex.ReplicationConnection` that owns
   the replication slot: ack-after-checkpoint keepalive replies, async ack,
-  slot-invalidation fail-closed halt, and the bounded in-flight window.
+  slot-invalidation fail-closed halt, the bounded in-flight window, and the
+  replication-command-error watchdog (below).
 - **`Replicant.AssemblerServer`** — the serial process that applies the sink
   synchronously off the keepalive path.
 - **`Replicant.Pipeline`** — the per-slot `:one_for_all` supervisor pairing a
@@ -110,6 +111,19 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   fail-closed** on exhaustion (`Supervisor.halt`, loss = 0). A permanent fault (schema
   mismatch / `:config_invalid`) halts immediately; `max_retries: 0` opts out of retry
   (halt-now). Each retry emits `[:replicant, :checkpoint_store, :retrying]`.
+- **Replication-command-error watchdog** — the top-level `max_command_retries` option
+  (default 5) bounds a persistent PRE-FRAME command error — `CREATE_REPLICATION_SLOT`
+  failing because the server's replication slots are exhausted, a slot already active for
+  another consumer, or a forward-incompatible result shape — which otherwise reconnects
+  forever via `auto_reconnect`. After `max_command_retries` failed connect cycles without
+  the stream establishing, the pipeline **halts fail-closed and stays idle**, emitting
+  value-free `[:replicant, :connection, :command_error_halt]` (`attempt`/`max_retries`/
+  `slot_name`); `max_command_retries: 0` halts on the first fault. The bound is a CYCLE
+  count, not a wall-clock time. Sibling of the store-retry bound above but a separate
+  budget (a store outage never trips it). Only PRE-FRAME errors are bounded: once the
+  stream is flowing the counter resets on the first replication frame, so a later transient
+  outage self-heals, and a server that is simply down (connection refused, never
+  establishes) keeps retrying untouched.
 - **`Replicant.QueryBuilder`** — builds the identifier-validated SQL used to
   create/manage slots and publications.
 - **`Replicant.Identifier`** — allowlist validation for slot, publication, and
