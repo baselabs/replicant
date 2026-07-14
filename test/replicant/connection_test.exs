@@ -993,6 +993,22 @@ defmodule Replicant.ConnectionTest do
       {:noreply, dropped} = Connection.handle_disconnect(st)
       assert dropped.command_error.count == 3
     end
+
+    test "a paced store-retry SETS the store_paced marker (invalidation_check + :fault → pace)" do
+      # Red-capable gate for the SET side of the marker: without it (delta re-review mutation)
+      # a store outage whose store budget > the command budget would be silently mislabeled
+      # {:command_error, :exhausted}. lib mode + checkpoint_state :fault at :invalidation_check
+      # routes to pace_store_retry, whose committed {:noreply} must carry store_paced: true.
+      st =
+        state(
+          checkpoint_state: :fault,
+          checkpoint_store: [connection: [], table: "cp", max_retries: 2, retry_backoff_ms: 60_000],
+          step: :invalidation_check
+        )
+
+      {:noreply, paced} = Connection.handle_result([%Postgrex.Result{rows: []}], st)
+      assert paced.command_error.store_paced
+    end
   end
 
   describe "command-error watchdog — reset on the first replication frame" do
