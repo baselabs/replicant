@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Idle-slot heartbeat / ack-advance.** On a keepalive with zero transactions in flight, the
+  confirmed-flush LSN advances to `wal_end`, so a quiet-but-filtered publication no longer pins
+  WAL indefinitely (the #1 real-world logical-replication incident class). Always on, no knob; the
+  advance is gated on a transaction-boundary predicate (no open transaction, no in-flight streamed
+  txn, checkpoint ≥ last commit) so it can never ack past an undelivered transaction or message.
+- **Incremental (resumable) initial snapshot.** `snapshot: [mode: :incremental]` chunks the
+  backfill and persists a resume token, so a large snapshot survives a restart without re-copying
+  from scratch. The streaming window drops any snapshot chunk row a concurrent change already
+  superseded (convergence-safe, effect-once); PK-update, delete, and truncate all taint the
+  drop-set correctly.
 - PostgreSQL 17+ forward-compatibility: reads the authoritative `invalidation_reason` slot
   column (plus `wal_status`/`conflicting`) on PG17+ for complete invalidation detection.
 - Opt-in `failover: true` for PG17 failover slots (HA resume on a promoted standby). Halts
