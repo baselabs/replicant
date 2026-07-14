@@ -995,6 +995,48 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
+  describe "command-error watchdog — Rule 1 (value-free halt path)" do
+    test "the command-error halt path leaks no error content into telemetry or logs" do
+      sentinel = "SENTINEL-#{System.unique_integer([:positive])}-secret-row-value"
+
+      :telemetry.attach(
+        "a6-rule1",
+        [:replicant, :connection, :command_error_halt],
+        fn _e, meas, meta, _ -> send(self(), {:tel, meas, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach("a6-rule1") end)
+
+      # A forced replication-command error carrying a row-value sentinel in BOTH the message and
+      # the `.postgres` map — the value-bearing surfaces the design must never inspect.
+      err = %Postgrex.Error{postgres: %{message: sentinel, code: :internal_error}}
+
+      # max=0 → the first command fault halts (faults=1, retry_decision(0, 0) = :halt).
+      s0 = state(max_command_retries: 0)
+
+      # 1. Real ingress: the error struct is DISCARDED — the callback returns a fixed atom and
+      #    carries nothing of the error into mod_state.
+      assert {:disconnect, :query_error} = Connection.handle_result(err, s0)
+
+      # 2. Halt path: one command fault (store_retry_count == 0), then the enforcing connect halts.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:noreply, s1} = Connection.handle_disconnect(s0)
+          assert {:noreply, _} = Connection.handle_connect(s1)
+        end)
+
+      assert_receive {:tel, meas, meta}
+
+      refute Enum.any?(
+               Map.values(meas) ++ Map.values(meta),
+               &(is_binary(&1) and String.contains?(&1, sentinel))
+             )
+
+      refute log =~ sentinel
+    end
+  end
+
   # ---- read_progress/1 sink-mode value-free boundary (spec §6.2/§9) ----
   #
   # In sink-owned incremental mode, read_progress/1 calls the sink's snapshot_progress/0 behind a
