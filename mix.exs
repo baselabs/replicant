@@ -1,7 +1,7 @@
 defmodule Replicant.MixProject do
   use Mix.Project
 
-  @version "0.2.0"
+  @version "0.2.1"
   @source_url "https://github.com/baselabs/replicant"
 
   def project do
@@ -68,7 +68,7 @@ defmodule Replicant.MixProject do
     [
       maintainers: ["rjpalermo"],
       files:
-        ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md AGENTS.md),
+        ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
