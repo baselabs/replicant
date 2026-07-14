@@ -27,6 +27,7 @@ defmodule Replicant.ConnectionTest do
     # tests use and fold them onto that field (each independent; a missing one keeps the default).
     {count, overrides} = Keyword.pop(overrides, :command_error_count)
     {max_retries, overrides} = Keyword.pop(overrides, :max_command_retries)
+    {store_paced, overrides} = Keyword.pop(overrides, :store_paced)
 
     base = %Connection{
       slot_name: "conn_test",
@@ -44,6 +45,7 @@ defmodule Replicant.ConnectionTest do
     ce = st.command_error
     ce = if is_nil(count), do: ce, else: %{ce | count: count}
     ce = if is_nil(max_retries), do: ce, else: %{ce | max_retries: max_retries}
+    ce = if is_nil(store_paced), do: ce, else: %{ce | store_paced: store_paced}
     %{st | command_error: ce}
   end
 
@@ -966,10 +968,30 @@ defmodule Replicant.ConnectionTest do
       refute_received {:cmd_halt, _, _}
     end
 
-    test "store-retry disconnects are EXEMPT: with store_retry_count > 0 the command counter does not bump" do
-      st = state(command_error_count: 2, store_retry_count: 1, max_command_retries: 5)
+    test "a store-PACED disconnect is EXEMPT and consumes the one-shot marker" do
+      # The store-retry timer paced this disconnect (store_paced set in pace_store_retry): the
+      # command counter must NOT bump, and the marker is cleared so the NEXT disconnect counts.
+      st = state(command_error_count: 2, store_paced: true, max_command_retries: 5)
       {:noreply, dropped} = Connection.handle_disconnect(st)
       assert dropped.command_error.count == 2
+      refute dropped.command_error.store_paced
+    end
+
+    test "double-fault: a command error while a store episode is active (store_paced false, store_retry_count > 0) STILL counts" do
+      # The escape both closeout lenses caught: keying the exemption on the stale store_retry_count
+      # let a command error during/after a store episode be wrongly exempted → livelock. The marker
+      # (set only when pace_store_retry actually ran) is the correct discriminator: store_retry_count
+      # can be stale-nonzero while THIS disconnect is a command fault (store_paced false) → it counts.
+      st =
+        state(
+          command_error_count: 2,
+          store_paced: false,
+          store_retry_count: 1,
+          max_command_retries: 5
+        )
+
+      {:noreply, dropped} = Connection.handle_disconnect(st)
+      assert dropped.command_error.count == 3
     end
   end
 

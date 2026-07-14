@@ -52,8 +52,9 @@ defmodule Replicant.CommandErrorTest do
 
   # Fill EVERY free replication slot on the shared server so the pipeline's own create_slot
   # step fails persistently with a %Postgrex.Error{} — the exact pre-frame command-error the
-  # watchdog bounds. Fillers are temporary (session-scoped to `ctrl`) AND dropped by name in
-  # teardown.
+  # watchdog bounds. Fillers are PERMANENT (never `active`, so they drop cleanly from any
+  # connection with no session-death race) and cleaned up by name at setup start + on_exit; a
+  # VM-crash leak self-heals on the next run's setup pre-clean.
   defp exhaust_slots!(ctrl) do
     max = int1(ctrl, "SELECT current_setting('max_replication_slots')::int")
     used = int1(ctrl, "SELECT count(*) FROM pg_replication_slots")
@@ -149,7 +150,10 @@ defmodule Replicant.CommandErrorTest do
   defp drop_fillers(conn) do
     Postgrex.query!(
       conn,
-      "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'a6_filler_%'",
+      # Escape the `_` LIKE-wildcards so the pattern matches the literal `a6_filler_` prefix
+      # only — an unescaped `_` matches any char and could drop an unrelated slot on the shared
+      # server (e.g. `a6xfillerx…`).
+      "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'a6\\_filler\\_%' ESCAPE '\\'",
       []
     )
   end

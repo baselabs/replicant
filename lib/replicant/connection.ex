@@ -115,7 +115,11 @@ defmodule Replicant.Connection do
           open_streams: MapSet.t(),
           last_commit_lsn: Replicant.lsn(),
           store_retry_count: non_neg_integer(),
-          command_error: %{count: non_neg_integer(), max_retries: non_neg_integer()},
+          command_error: %{
+            count: non_neg_integer(),
+            max_retries: non_neg_integer(),
+            store_paced: boolean()
+          },
           frontier_epoch: non_neg_integer(),
           backfill_floor: Replicant.lsn() | nil,
           last_frontier_cast: non_neg_integer(),
@@ -150,7 +154,7 @@ defmodule Replicant.Connection do
     open_streams: MapSet.new(),
     last_commit_lsn: 0,
     store_retry_count: 0,
-    command_error: %{count: 0, max_retries: @default_max_command_retries},
+    command_error: %{count: 0, max_retries: @default_max_command_retries, store_paced: false},
     frontier_epoch: 0,
     last_frontier_cast: 0,
     reader_pid: nil,
@@ -214,7 +218,8 @@ defmodule Replicant.Connection do
        store_retry_count: 0,
        command_error: %{
          count: 0,
-         max_retries: Map.get(config, :max_command_retries, @default_max_command_retries)
+         max_retries: Map.get(config, :max_command_retries, @default_max_command_retries),
+         store_paced: false
        },
        step: :disconnected,
        messages: Map.get(config, :messages, false)
@@ -292,14 +297,20 @@ defmodule Replicant.Connection do
     Telemetry.event([:replicant, :connection, :disconnected], %{}, %{})
 
     # A6 watchdog increment: an ESTABLISHED-then-dropped connection is a command-fault candidate.
-    # Count it ONLY when `store_retry_count == 0` — the landed store-retry disconnect
-    # (`:checkpoint_store_retry`) also routes through this callback and keeps its OWN budget, so it
-    # is EXEMPT (a smaller command budget must not truncate/mislabel a store outage). A server-down
-    # connection never establishes → this callback never fires → transient self-heal is preserved.
+    # EXEMPT only the disconnect the store-retry timer itself paced, identified by the one-shot
+    # `store_paced` marker set in `pace_store_retry`'s committed `{:noreply}` (the state postgrex
+    # hands this callback). Consume it here so the NEXT disconnect counts. Keying on
+    # `store_retry_count` instead is WRONG: that counter is stale-nonzero after a store episode
+    # (its reset in `handle_connect` is discarded on a command-error `{:disconnect}` — the same
+    # state-revert that broke the original seam), so a command error during/after a store episode
+    # was wrongly exempted → livelock (both closeout lenses, cross-vendor-corroborated). A
+    # server-down connection never establishes → this callback never fires → self-heal preserved.
+    ce = state.command_error
+
     command_error =
-      if state.store_retry_count == 0,
-        do: %{state.command_error | count: state.command_error.count + 1},
-        else: state.command_error
+      if ce.store_paced,
+        do: %{ce | store_paced: false},
+        else: %{ce | count: ce.count + 1}
 
     {:noreply, %{state | step: :disconnected, command_error: command_error}}
   end
@@ -874,7 +885,11 @@ defmodule Replicant.Connection do
     case store_retry_step(state) do
       {:retry, state} ->
         Process.send_after(self(), :store_retry_reconnect, retry_backoff_ms(state))
-        {:noreply, state}
+        # Mark this idle cycle as store-paced so the A6 watchdog EXEMPTS the disconnect the
+        # timer is about to cause (reaching here proves the command chain succeeded to
+        # :invalidation_check — no command fault this cycle). This committed `{:noreply}` is the
+        # state `handle_disconnect` sees when `:store_retry_reconnect` fires.
+        {:noreply, %{state | command_error: %{state.command_error | store_paced: true}}}
 
       :halt ->
         Telemetry.event([:replicant, :checkpoint_store, :failed], %{}, %{
