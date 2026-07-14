@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-14
+
+### Changed
+
+- **Docs.** Documented the A6 command-error watchdog on every surface it was missing:
+  a "Resilience knobs" reference section in the getting-started Livebook (grouping
+  `max_inflight_lag`, checkpoint-store retry, `max_command_retries`, and `failover`), and
+  the `max_command_retries` option + `[:connection, :command_error_halt]` event in
+  `usage-rules.md`. No library API change (the watchdog itself shipped in 0.3.0).
+
 ## [0.3.0] - 2026-07-14
 
 ### Added

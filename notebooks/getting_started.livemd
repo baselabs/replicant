@@ -725,6 +725,29 @@ For multitenancy, classification, and Ash resources, use the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter, which is
 built on this tenant-blind core.
 
+## Resilience knobs
+
+Every failure mode fails **closed** — Replicant halts and stays idle rather than
+silently dropping data or reconnecting forever. Most fail-closed halts are automatic
+(a slot invalidation, a destructive schema change, a sink that raises); the four knobs
+below tune the *bounded* fault paths. All halt telemetry is value-free (LSNs + counts
+only, never a row value — critical rule 1).
+
+| Knob (default) | Bounds | On exhaustion | Telemetry |
+| --- | --- | --- | --- |
+| `max_inflight_lag: 64 * 1024 * 1024` | how far the received WAL frontier may run ahead of the durable checkpoint before the sink is "too slow" | halt fail-closed (sink can't keep up) | — |
+| `checkpoint_store: [max_retries: 5, retry_backoff_ms: 1000]` (lib mode) | transient checkpoint-store faults (connect-read + mid-stream write) | halt after N retries; a permanent fault (schema/config) halts at once; `max_retries: 0` = halt-now | `[:replicant, :checkpoint_store, :retrying]` per attempt |
+| `max_command_retries: 5` | a persistent **pre-frame** replication-command error — slot exhaustion, a slot already active for another consumer, a forward-incompatible result — that otherwise reconnects forever | halt after N failed connect cycles; `max_command_retries: 0` = halt-now | `[:replicant, :connection, :command_error_halt]` on halt |
+| `failover: true` (PG17+) | enables an HA failover slot that survives a promoted standby | on PG16 halts `{:config, :failover_unsupported}`; an unpromoted synced slot halts fail-closed | — |
+
+Two scope notes for `max_command_retries`: it bounds only **pre-frame** errors — once
+the stream is flowing the counter resets on the first replication frame, so a later
+transient outage self-heals, and a server that never connects (connection refused) keeps
+retrying untouched — and it holds a **separate budget** from the checkpoint-store retry, so
+a store outage never trips the command watchdog. Full contracts:
+[usage rules](https://hexdocs.pm/replicant/usage-rules.html) ·
+[README](https://hexdocs.pm/replicant/readme.html).
+
 ## Verify everything we just saw
 
 These assertions are the same ones the library's CI runs against this notebook (via
