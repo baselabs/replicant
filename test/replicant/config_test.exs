@@ -163,6 +163,28 @@ defmodule Replicant.ConfigTest do
       end
     end
 
+    test "defaults max_command_retries to the CheckpointStore default (5) when omitted (A6)" do
+      {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
+      assert cfg.max_command_retries == Replicant.CheckpointStore.default_max_retries()
+      assert cfg.max_command_retries == 5
+    end
+
+    test "accepts a non-negative-integer max_command_retries (0 = halt-now, parity with the store)" do
+      for good <- [0, 5] do
+        {:ok, cfg} =
+          Config.validate(@base ++ [sink: StateMirrorPersisted, max_command_retries: good])
+
+        assert cfg.max_command_retries == good
+      end
+    end
+
+    test "rejects a negative or non-integer max_command_retries" do
+      for bad <- [-1, "5", 1.5] do
+        opts = @base ++ [sink: StateMirrorPersisted, max_command_retries: bad]
+        assert {:error, :config_invalid} = Config.validate(opts)
+      end
+    end
+
     test "defaults failover to false when omitted" do
       {:ok, cfg} = Config.validate(@base ++ [sink: StateMirrorPersisted])
       assert cfg.failover == false

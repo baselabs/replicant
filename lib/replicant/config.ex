@@ -22,6 +22,7 @@ defmodule Replicant.Config do
           go_forward_only: boolean(),
           snapshot: boolean() | keyword(),
           max_inflight_lag: pos_integer(),
+          max_command_retries: non_neg_integer(),
           checkpoint_store: keyword() | nil,
           failover: boolean(),
           messages: boolean()
@@ -59,6 +60,7 @@ defmodule Replicant.Config do
          {:ok, publication} <- fetch_publications(opts),
          {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
+         {:ok, max_command_retries} <- fetch_max_command_retries(opts),
          {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
          {:ok, messages} <- fetch_messages(opts, sink),
@@ -78,6 +80,7 @@ defmodule Replicant.Config do
          go_forward_only: go_forward_only,
          snapshot: snapshot,
          max_inflight_lag: max_inflight_lag,
+         max_command_retries: max_command_retries,
          checkpoint_store: checkpoint_store,
          failover: failover,
          batch: batch,
@@ -191,6 +194,20 @@ defmodule Replicant.Config do
     case Keyword.fetch(opts, :max_inflight_lag) do
       :error -> {:ok, Connection.default_max_inflight_lag()}
       {:ok, n} when is_integer(n) and n > 0 -> {:ok, n}
+      {:ok, _bad} -> {:error, :config_invalid}
+    end
+  end
+
+  # The command-error watchdog budget (spec A6): the number of failed connect cycles the
+  # pre-frame replication-command livelock tolerates before the pipeline halts fail-closed.
+  # Omitted → the store retry family's default (`CheckpointStore.default_max_retries/0` = 5),
+  # keeping the two budgets in parity. A present value must be a NON-NEGATIVE integer
+  # (`0` = halt-now, valid — unlike `max_inflight_lag`'s `> 0`); anything else is a config
+  # error (never a silent fallback that would mask a mis-set bound).
+  defp fetch_max_command_retries(opts) do
+    case Keyword.fetch(opts, :max_command_retries) do
+      :error -> {:ok, CheckpointStore.default_max_retries()}
+      {:ok, n} when is_integer(n) and n >= 0 -> {:ok, n}
       {:ok, _bad} -> {:error, :config_invalid}
     end
   end
