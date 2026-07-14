@@ -112,7 +112,12 @@ defmodule Replicant.Assembler do
           spilled_bytes: non_neg_integer(),
           spilled_by_subxid: %{non_neg_integer() => non_neg_integer()},
           aborted: MapSet.t(non_neg_integer()),
-          spill: Replicant.Spill.handle() | nil
+          spill: Replicant.Spill.handle() | nil,
+          # Shared per-txn ordinal counter (spec §5, mirrors the v1 `asm.ordinal`): incremented per
+          # accumulated change AND per attached transactional message, so changes and messages carry
+          # ONE ascending numbering space and a consumer can interleave `changes` + `messages` by
+          # `ordinal`. Stamped at accumulation/attach and PRESERVED at replay (never re-numbered).
+          seq: non_neg_integer()
         }
 
   defstruct [
@@ -285,7 +290,8 @@ defmodule Replicant.Assembler do
                  spilled_bytes: 0,
                  spilled_by_subxid: %{},
                  aborted: MapSet.new(),
-                 spill: nil
+                 spill: nil,
+                 seq: 0
                })
          }}
     end
@@ -407,7 +413,8 @@ defmodule Replicant.Assembler do
   # here — BEFORE the `txn: nil` row-before-Begin guard below — so it is not mis-halted as malformed.
   # The `current_stream_xid: top when is_integer(top)` guard makes this clause disjoint from the v1
   # transactional clauses (b)/(c): a v1 message has no open stream and `xid: nil`. The ordinal is the
-  # change-buffer length at attach (a message's position in the commit-order replay mirrors a change's).
+  # shared per-txn ordinal counter at attach (mirrors the v1 counter) so the message interleaves
+  # correctly with the surrounding changes' ordinals (spec §5).
   defp do_handle_message(%__MODULE__{current_stream_xid: top} = asm, %Message{
          transactional?: true,
          xid: sx,
@@ -417,7 +424,6 @@ defmodule Replicant.Assembler do
        })
        when is_integer(top) do
     buf = Map.fetch!(asm.stream_txns, top)
-    ordinal = length(buf.changes)
 
     msg = %Message{
       transactional?: true,
@@ -425,10 +431,10 @@ defmodule Replicant.Assembler do
       prefix: prefix,
       content: content,
       xid: sx,
-      ordinal: ordinal
+      ordinal: buf.seq
     }
 
-    buf = %{buf | messages: [msg | buf.messages]}
+    buf = %{buf | messages: [msg | buf.messages], seq: buf.seq + 1}
     {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
   end
 
@@ -645,15 +651,17 @@ defmodule Replicant.Assembler do
   end
 
   # Replay the newest-first resident tail into commit order in ONE pass (`Enum.reverse` then
-  # `Enum.map_reduce`), stamping the commit-granularity commit_lsn + ascending ordinal (streamed
-  # changes have no LSN before commit, spec §5), yielding the change_count from the same traversal.
+  # `Enum.map_reduce`), stamping the commit-granularity commit_lsn (streamed changes have no LSN
+  # before commit, spec §5) and yielding the change_count from the same traversal. The `ordinal` is
+  # PRESERVED (stamped at accumulation from the shared per-txn counter, so it interleaves with any
+  # transactional message's ordinal) — never re-numbered here; the counter is only a change tally.
   # Extracted VERBATIM from the shipped StreamCommit body to keep `deliver_or_skip_stream` within
   # credo's nesting depth (mirrors the `deliver_stream_commit` extraction).
   defp replay_resident(resident, lsn) do
     resident
     |> Enum.reverse()
-    |> Enum.map_reduce(0, fn {_subxid, change}, ordinal ->
-      {%{change | commit_lsn: lsn, ordinal: ordinal}, ordinal + 1}
+    |> Enum.map_reduce(0, fn {_subxid, change}, count ->
+      {%{change | commit_lsn: lsn}, count + 1}
     end)
   end
 
@@ -845,9 +853,12 @@ defmodule Replicant.Assembler do
 
       %Relation{} = rel ->
         projected = Map.fetch!(asm.projected, rid)
-        change = build_change(op, rel, projected, new_tuple, old_spec, nil, 0)
         buf = Map.fetch!(asm.stream_txns, top)
-        buf = %{buf | changes: [{subxid, change} | buf.changes]}
+
+        # Stamp the shared per-txn ordinal at accumulation (mirrors the v1 counter) and preserve it
+        # at replay, so it interleaves correctly with any transactional message's ordinal.
+        change = build_change(op, rel, projected, new_tuple, old_spec, nil, buf.seq)
+        buf = %{buf | changes: [{subxid, change} | buf.changes], seq: buf.seq + 1}
         {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
     end
   end
@@ -863,22 +874,25 @@ defmodule Replicant.Assembler do
          subxid
        ) do
     if Enum.all?(rids, &Map.has_key?(relations, &1)) do
-      tagged =
-        Enum.map(rids, fn rid ->
+      buf = Map.fetch!(asm.stream_txns, top)
+
+      # Each truncated relation gets its own ascending ordinal from the shared per-txn counter
+      # (preserved at replay), so a truncate never collides with a following change or message.
+      {tagged, next_seq} =
+        Enum.map_reduce(rids, buf.seq, fn rid, ord ->
           rel = Map.fetch!(relations, rid)
 
-          {subxid,
-           %Change{
-             op: :truncate,
-             schema: rel.namespace,
-             table: rel.name,
-             commit_lsn: nil,
-             ordinal: 0
-           }}
+          {{subxid,
+            %Change{
+              op: :truncate,
+              schema: rel.namespace,
+              table: rel.name,
+              commit_lsn: nil,
+              ordinal: ord
+            }}, ord + 1}
         end)
 
-      buf = Map.fetch!(asm.stream_txns, top)
-      buf = %{buf | changes: Enum.reverse(tagged, buf.changes)}
+      buf = %{buf | changes: Enum.reverse(tagged, buf.changes), seq: next_seq}
       {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
     else
       {:halt, %Error{reason: :config_invalid, shape: "streamed truncate for uncached relation"},
@@ -1170,6 +1184,12 @@ defmodule Replicant.Assembler do
 
     case result do
       {:ok, _lsn} ->
+        # The txn (and any transactional messages riding it) is durably delivered — emit the
+        # per-message [:message, :received] telemetry (spec §10), symmetric to deliver_message's
+        # non-txn emit. lib+batch defers only the CHECKPOINT to flush, not delivery, so this is the
+        # correct point for lib/per-txn/lib+batch (sink-owned batch_delivery emits at flush_sink_batch).
+        emit_txn_messages_received(txn)
+
         # lib+batch: buffer the durable txn and defer the store write/ack to the batch
         # flush (spec §7). Per-txn (sink-owned or lib-non-batch): checkpoint-after-persist.
         if batching?(asm),
@@ -1201,6 +1221,22 @@ defmodule Replicant.Assembler do
         # carrying the transaction). Do NOT inspect it — scrub value-free.
         sink_failed(asm, duration)
     end
+  end
+
+  # Emit [:replicant, :message, :received] with `transactional: true` for each transactional message
+  # riding a DURABLY-delivered txn (spec §10) — the transactional-kind complement to deliver_message's
+  # non-txn `transactional: false` emit, so both message kinds are observable on the SAME event tagged
+  # by kind. Value-free (Critical Rule 1): only `commit_lsn` (the txn's) + `byte_size` + the boolean —
+  # never `prefix`/`content`. `txn.messages` is an in-memory list (never the lazy spill Reader), so
+  # iterating it is safe even for a spilled txn.
+  defp emit_txn_messages_received(%Transaction{commit_lsn: lsn, messages: messages}) do
+    Enum.each(messages, fn %Message{content: content} ->
+      Telemetry.event([:replicant, :message, :received], %{}, %{
+        commit_lsn: lsn,
+        byte_size: byte_size(content || ""),
+        transactional: true
+      })
+    end)
   end
 
   # Deliver a NON-transactional message standalone via handle_message/2 (spec §7.1, A2 Task 8). This
@@ -1424,6 +1460,12 @@ defmodule Replicant.Assembler do
 
     case result do
       {:ok, _returned} ->
+        # The batch (and every transactional message riding its txns) is durably delivered — emit
+        # the per-message [:message, :received] telemetry (spec §10), as deliver_now does for the
+        # non-batch modes. Sink-owned batch_delivery defers DELIVERY to handle_batch, so this is the
+        # message's delivery point for this mode.
+        Enum.each(txns, &emit_txn_messages_received/1)
+
         Telemetry.event([:replicant, :sink, :batch_committed], %{duration: duration}, %{
           change_count: asm.batch_count,
           commit_lsn: lsn,

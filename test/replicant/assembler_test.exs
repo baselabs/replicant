@@ -1400,6 +1400,53 @@ defmodule Replicant.AssemblerTest do
       refute Map.has_key?(asm.stream_txns, 100)
     end
 
+    test "streamed change/message/change ordinals share ONE ascending per-txn space (interleave, no collision) — mirrors v1" do
+      # A transactional message emitted BETWEEN two streamed row-changes must sort strictly between
+      # them by `ordinal`. The v1 path (Begin→Insert→Message→Insert→Commit) uses a single per-txn
+      # `asm.ordinal` counter incremented per change AND per message → 0,1,2. The streamed path
+      # historically stamped the message `ordinal = length(buf.changes)` at attach while renumbering
+      # changes 0..N-1 at replay → the message tied with the following change (misorder for a consumer
+      # interleaving `changes` + `messages` by `ordinal`). Ordinals are a consumer interleaving hint.
+      asm = deliver_streamed(StreamDeliverSink, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Replicant.Decoder.Messages.Message{
+          transactional?: true,
+          xid: 100,
+          lsn: 850,
+          prefix: "m",
+          content: "c"
+        })
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"2"}})
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+
+      assert {:transaction, txn, 900, _} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      [c1, c2] = txn.changes
+      [m] = txn.messages
+
+      # Emission order was change("1"), message("m"), change("2").
+      assert c1.ordinal < m.ordinal, "first change must precede the message by ordinal"
+      assert m.ordinal < c2.ordinal, "message must precede the second change by ordinal"
+      # No two of the three share an ordinal (the collision this guards against).
+      ords = [c1.ordinal, m.ordinal, c2.ordinal]
+
+      assert ords == Enum.uniq(ords),
+             "changes and message must not collide on ordinal: #{inspect(ords)}"
+    end
+
     test "an EMPTY StreamCommit does NOT {:skipped}-ack ahead of an OPEN batch — folds into it (CV1 loss guard, spec §7)" do
       # In batch mode a buffered data txn is not yet durable-checkpointed (lib+batch defers the store
       # write to flush; sink-owned defers delivery to flush). An empty streamed txn must NOT
@@ -1702,15 +1749,84 @@ defmodule Replicant.AssemblerTest do
 
       assert txn.commit_lsn == 900
 
-      # delivered effect-once: rows 1,2 (spilled) then 3 (resident); 9 (subxid 101) filtered; ordinals 0,1,2
+      # delivered effect-once: rows 1,2 (spilled) then 3 (resident); 9 (subxid 101) filtered.
+      # Ordinals come from the shared per-txn accumulation counter (preserved at replay), so the
+      # aborted row 9 (seq 2) leaves a GAP — surviving rows are 0,1,3, NOT re-densified to 0,1,2.
+      # This mirrors v1 (a message/aborted slot shifts the counter) and keeps changes+messages on
+      # one ascending ordinal space; sorting the delivered union by ordinal stays commit-order.
       assert_received {:row, 1, 0}
       assert_received {:row, 2, 1}
-      assert_received {:row, 3, 2}
+      assert_received {:row, 3, 3}
       refute_received {:row, 9, _}
       # spill file deleted after delivery; stream buffer cleared; spilled_total decremented
       refute File.exists?(spill_path)
       refute Map.has_key?(asm.stream_txns, 100)
       assert asm.spilled_total == 0
+    end
+
+    test "a transactional message interleaves by ordinal with SPILLED streamed changes (shared per-txn counter, spec §5)",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{Insert, Message, StreamCommit, StreamStart, StreamStop}
+
+      defmodule SpillMsgSink do
+        def checkpoint, do: {:ok, nil}
+
+        def handle_transaction(txn) do
+          Enum.each(txn.changes, fn c -> send(self(), {:row, c.record["v"], c.ordinal}) end)
+          Enum.each(txn.messages, fn m -> send(self(), {:msg, m.prefix, m.ordinal}) end)
+          {:ok, txn.commit_lsn}
+        end
+      end
+
+      asm =
+        %{
+          Replicant.Assembler.new(SpillMsgSink,
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120,
+            slot_name: "spm"
+          )
+          | stream_floor: 0
+        }
+        |> with_rel(1)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # Row 1 + row 2 cross the RAM bound and spill; a message is emitted BETWEEN them.
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"1"}})
+
+      asm = Assembler.observe_bytes(asm, 100)
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Message{
+          transactional?: true,
+          xid: 100,
+          lsn: 850,
+          prefix: "mid",
+          content: "c"
+        })
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{xid: 100, relation_id: 1, tuple_data: {"2"}})
+
+      asm = Assembler.observe_bytes(asm, 100)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      assert asm.stream_txns[100].spill && File.exists?(asm.stream_txns[100].spill.path)
+
+      assert {:transaction, _txn, 900, _} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      # Emission order row1, message, row2 → ordinals 0, 1, 2 across the change/message union, even
+      # though the changes were delivered lazily from the spill file.
+      assert_received {:row, 1, 0}
+      assert_received {:msg, "mid", 1}
+      assert_received {:row, 2, 2}
     end
 
     test "empty-suppression (all spilled subxids aborted) CLOSES the spill device, not just unlinks the file — no FD leak (:emfile guard)",
@@ -2417,6 +2533,83 @@ defmodule Replicant.AssemblerTest do
       assert returned_asm.batch_count == 1
       assert Assembler.batch_pending?(returned_asm)
       assert RecordingSink.seen_messages() == []
+    end
+  end
+
+  describe "transactional message telemetry (spec §10)" do
+    alias Replicant.Decoder.Messages.{Begin, Commit, Message}
+
+    test "a delivered transactional message emits [:replicant, :message, :received] with transactional: true" do
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        {__MODULE__, ref},
+        [:replicant, :message, :received],
+        fn _e, _m, meta, _ -> send(test_pid, {:msg_received, meta}) end,
+        nil
+      )
+
+      asm = Assembler.new(AcceptingSink)
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Message{
+          transactional?: true,
+          lsn: 101,
+          prefix: "outbox",
+          content: "payload"
+        })
+
+      assert {:transaction, _txn, 200, _} =
+               Assembler.handle_message(asm, %Commit{lsn: 200, commit_timestamp: nil})
+
+      # The transactional message rode the txn and is durably delivered → the event fires with
+      # transactional: true, the txn's commit_lsn, and the content byte size (Rule 1: never the
+      # prefix/content bytes themselves).
+      assert_received {:msg_received, meta}
+      assert meta.transactional == true
+      assert meta.commit_lsn == 200
+      assert meta.byte_size == byte_size("payload")
+
+      :telemetry.detach({__MODULE__, ref})
+    end
+
+    defmodule NonTxnMsgSink do
+      @moduledoc false
+      def checkpoint, do: {:ok, nil}
+      def handle_message(_msg, _ctx), do: {:ok, nil}
+    end
+
+    test "a non-transactional message emits [:replicant, :message, :received] with transactional: false" do
+      ref = make_ref()
+      test_pid = self()
+
+      :telemetry.attach(
+        {__MODULE__, ref},
+        [:replicant, :message, :received],
+        fn _e, _m, meta, _ -> send(test_pid, {:msg_received, meta}) end,
+        nil
+      )
+
+      asm = Assembler.new(NonTxnMsgSink)
+
+      assert {:message_delivered, 500, _} =
+               Assembler.handle_message(asm, %Message{
+                 transactional?: false,
+                 lsn: 500,
+                 prefix: "hb",
+                 content: "tick"
+               })
+
+      # The non-txn kind delivers standalone via handle_message/2 and tags the SAME event false —
+      # so a consumer distinguishes the two message kinds on `[:message, :received]` (spec §10).
+      assert_received {:msg_received, meta}
+      assert meta.transactional == false
+      assert meta.commit_lsn == 500
+      assert meta.byte_size == byte_size("tick")
+
+      :telemetry.detach({__MODULE__, ref})
     end
   end
 end

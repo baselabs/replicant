@@ -12,7 +12,11 @@ defmodule Replicant.Spill.ReaderTest do
     %{base: base}
   end
 
-  defp change(v), do: %Change{op: :insert, schema: "public", table: "t", record: %{"v" => v}}
+  # The `ordinal` is stamped at ACCUMULATION (the assembler's shared per-txn counter) and persisted
+  # in the spill frame; the Reader preserves it (only `commit_lsn` is stamped at read). So fixtures
+  # carry their emission-order ordinal, exactly as a spilled change would.
+  defp change(v, ordinal \\ 0),
+    do: %Change{op: :insert, schema: "public", table: "t", record: %{"v" => v}, ordinal: ordinal}
 
   defp spill_file(base, frames) do
     {:ok, h} = Spill.open(base, "s", 100)
@@ -21,22 +25,24 @@ defmodule Replicant.Spill.ReaderTest do
     h.path
   end
 
-  test "streams spilled frames THEN the in-memory tail, filtered by aborted subxids, ordinals + commit_lsn stamped",
+  test "streams spilled frames THEN the in-memory tail, filtered by aborted subxids, preserving the accumulation ordinal + stamping commit_lsn",
        %{base: base} do
-    # spilled (commit order): subxid 100 v=1, subxid 101 v=2 (101 will be aborted)
-    path = spill_file(base, [{100, change(1)}, {101, change(2)}])
+    # Emission order (accumulation ordinal): v=1 seq 0 (subxid 100), v=2 seq 1 (subxid 101, aborted),
+    # v=3 seq 2, v=4 seq 3 (both subxid 100). Spilled = the first two; tail = the last two.
+    path = spill_file(base, [{100, change(1, 0)}, {101, change(2, 1)}])
     # in-memory tail is stored newest-first (as the assembler holds it): [{100, v=4}, {100, v=3}]
-    tail = [{100, change(4)}, {100, change(3)}]
+    tail = [{100, change(4, 3)}, {100, change(3, 2)}]
     aborted = MapSet.new([101])
 
     reader = Reader.new(path, tail, aborted, 900)
     changes = Enum.to_list(reader)
 
-    # 101 filtered out; commit order = spilled(1) then tail-reversed(3,4); ordinals 0,1,2; commit_lsn 900
+    # 101 filtered out → the aborted v=2 (seq 1) leaves a GAP; commit order = spilled(1) then
+    # tail-reversed(3,4); the accumulation ordinals 0,2,3 are PRESERVED; commit_lsn 900 is stamped.
     assert [
              %Change{record: %{"v" => 1}, ordinal: 0, commit_lsn: 900},
-             %Change{record: %{"v" => 3}, ordinal: 1, commit_lsn: 900},
-             %Change{record: %{"v" => 4}, ordinal: 2, commit_lsn: 900}
+             %Change{record: %{"v" => 3}, ordinal: 2, commit_lsn: 900},
+             %Change{record: %{"v" => 4}, ordinal: 3, commit_lsn: 900}
            ] = changes
   end
 

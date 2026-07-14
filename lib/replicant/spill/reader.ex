@@ -2,8 +2,9 @@ defmodule Replicant.Spill.Reader do
   @moduledoc """
   A lazy, SINGLE-PASS `Enumerable` over a spilled transaction's changes (spec §5): it streams the
   on-disk frames (in commit order) followed by the still-resident in-memory tail, rejects any change
-  whose `subxid` is in the aborted set, and stamps `commit_lsn` + an ascending `ordinal` at replay
-  (streamed changes have no LSN before commit). It is value-free BY CONSTRUCTION — a `File` read or
+  whose `subxid` is in the aborted set, and stamps `commit_lsn` at replay (streamed changes have no
+  LSN before commit; the `ordinal` was stamped at accumulation from the shared per-txn counter and is
+  preserved). It is value-free BY CONSTRUCTION — a `File` read or
   `binary_to_term` fault raises `Replicant.Spill.Error` (fixed reason, no bytes), never a raw-byte
   exception, even though the sink forces this enumeration inside its own DB transaction (spec §11).
 
@@ -33,7 +34,8 @@ defmodule Replicant.Spill.Reader do
   end
 
   @doc false
-  # The lazy pipeline: disk frames ++ tail(commit-order) → reject aborted → stamp ordinal+commit_lsn.
+  # The lazy pipeline: disk frames ++ tail(commit-order) → reject aborted → stamp commit_lsn (the
+  # accumulation-time ordinal is preserved).
   # PUBLIC (not defp) because the `Enumerable` impl below is a SEPARATE module and cannot call a
   # private function of this one.
   def raw_stream(%__MODULE__{path: path, tail: tail, aborted: aborted}) do
@@ -96,8 +98,10 @@ defmodule Replicant.Spill.Reader do
     def reduce(%Reader{commit_lsn: lsn} = reader, acc, fun) do
       reader
       |> Reader.raw_stream()
-      |> Stream.with_index()
-      |> Stream.map(fn {change, ordinal} -> %{change | commit_lsn: lsn, ordinal: ordinal} end)
+      # The change's `ordinal` was stamped at accumulation from the assembler's shared per-txn
+      # counter (persisted in the spill frame) and is PRESERVED here — never re-indexed — so a
+      # spilled change interleaves with any transactional message's ordinal (spec §5).
+      |> Stream.map(fn change -> %{change | commit_lsn: lsn} end)
       |> Enumerable.reduce(acc, fun)
     end
 

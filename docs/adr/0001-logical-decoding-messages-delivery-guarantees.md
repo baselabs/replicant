@@ -90,16 +90,25 @@ those compositions.
 - **Revisit if:** a future need for exactly-once non-transactional messages arises — it would
   require a consumer-supplied dedup key, a product change requiring its own ADR/supersession.
 
-### Known limitation — streamed-txn message ordinal (interleaving hint only)
+### Ordinal — the shared per-txn interleaving hint
 
 Within a delivered `%Transaction{}`, `changes` and `messages` are each in commit order, and the
 library never uses `Message.ordinal` for its own delivery ordering — it is a hint for consumers
-who choose to interleave the two lists. For a **proto-v2 streamed** transaction, a transactional
-message's `ordinal` (assigned at attach as the change-buffer length) can collide with a following
-change's replay ordinal, so an interleaving consumer may see a message mis-positioned relative to
-a change emitted after it. The v1 path uses a single shared ordinal counter and is exact. This is
-an order-hint edge for streamed txns only — no loss, no duplication, no mis-delivery by the
-library — tracked as a follow-up (share the streamed ordinal counter with the change scheme).
+who choose to interleave the two lists. Both the v1 and the **proto-v2 streamed** paths assign
+`ordinal` from a **single shared per-transaction counter** incremented per change AND per
+transactional message (stamped at accumulation/attach and preserved through replay/spill), so a
+message emitted between two changes sorts strictly between them. An aborted (rolled-back) streamed
+change and an interleaved message each occupy a slot, so surviving `ordinal`s may have gaps —
+sorting the `changes` ∪ `messages` union by `ordinal` still yields commit-emission order. (Earlier
+the streamed message used the change-buffer length at attach, which could collide with a following
+change's replay ordinal — resolved 2026-07-14.)
+
+### Telemetry (§10)
+
+`[:replicant, :message, :received]` fires for BOTH message kinds — non-transactional at
+`handle_message/2` delivery (`transactional: false`) and each transactional message when its
+transaction is durably delivered (`transactional: true`) — carrying only `commit_lsn` + `byte_size`
++ the `transactional` boolean (never `prefix`/`content`, Rule 1).
 
 ## Verification (closeout 2026-07-14)
 
