@@ -22,6 +22,12 @@ defmodule Replicant.ConnectionTest do
   end
 
   defp state(overrides) do
+    # The A6 watchdog stores its mutable count and its budget together in ONE struct field
+    # (`command_error: %{count, max_retries}`), so accept the two LOGICAL overrides the watchdog
+    # tests use and fold them onto that field (each independent; a missing one keeps the default).
+    {count, overrides} = Keyword.pop(overrides, :command_error_count)
+    {max_retries, overrides} = Keyword.pop(overrides, :max_command_retries)
+
     base = %Connection{
       slot_name: "conn_test",
       publication: ["orders_pub"],
@@ -34,7 +40,11 @@ defmodule Replicant.ConnectionTest do
       step: :streaming
     }
 
-    struct(base, overrides)
+    st = struct(base, overrides)
+    ce = st.command_error
+    ce = if is_nil(count), do: ce, else: %{ce | count: count}
+    ce = if is_nil(max_retries), do: ce, else: %{ce | max_retries: max_retries}
+    %{st | command_error: ce}
   end
 
   # ---- the marquee exact-once seam ----
@@ -890,6 +900,98 @@ defmodule Replicant.ConnectionTest do
       # stream would be a spurious blip (cross-vendor closeout finding).
       stale = %{slot_name: "rep_timer", store_retry_count: 0}
       assert {:noreply, ^stale} = Replicant.Connection.handle_info(:store_retry_reconnect, stale)
+    end
+  end
+
+  # ---- A6 command-error watchdog (chain-progress) ----
+  #
+  # A pre-frame replication-command livelock is bounded by counting established-then-dropped
+  # connect cycles in handle_disconnect and enforcing a budget on the next handle_connect via
+  # the shared CheckpointStore.retry_decision/2, reset on the first replication frame (?w or ?k)
+  # that proves START_REPLICATION was accepted. Halt is stay-idle. Zero error-content inspection
+  # (Rule 1). Counting: max=5 → faults 1..5 proceed, fault 6 halts; max=0 → first fault halts;
+  # the `faults > 0` guard means the INITIAL connect never halts even at max=0.
+
+  describe "command-error watchdog — increment (handle_disconnect) + enforce (handle_connect)" do
+    setup do
+      ref = make_ref()
+
+      :telemetry.attach(
+        {__MODULE__, ref},
+        [:replicant, :connection, :command_error_halt],
+        fn _e, meas, meta, pid -> send(pid, {:cmd_halt, meas, meta}) end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+      :ok
+    end
+
+    test "max=5: five failed connect cycles still proceed; the sixth halts and fires command_error_halt" do
+      base = state(command_error_count: 0, max_command_retries: 5, store_retry_count: 0)
+
+      # Five established-then-dropped connections accumulate the counter to 5.
+      after_five =
+        Enum.reduce(1..5, base, fn _i, acc ->
+          {:noreply, acc2} = Connection.handle_disconnect(acc)
+          acc2
+        end)
+
+      assert after_five.command_error.count == 5
+
+      # faults 1..5 → retry_decision(0..4, 5) = :retry → the connect still issues the recovery query.
+      assert {:query, _sql, _new} = Connection.handle_connect(after_five)
+      refute_received {:cmd_halt, _, _}
+
+      # The sixth drop → count 6 → retry_decision(5, 5) = :halt → the connect stays idle (halt).
+      {:noreply, after_six} = Connection.handle_disconnect(after_five)
+      assert after_six.command_error.count == 6
+
+      assert {:noreply, ^after_six} = Connection.handle_connect(after_six)
+      assert_receive {:cmd_halt, _meas, %{attempt: 6, max_retries: 5, slot_name: "conn_test"}}
+    end
+
+    test "max=0: the first failed connect cycle halts-now" do
+      st = state(command_error_count: 0, max_command_retries: 0, store_retry_count: 0)
+      {:noreply, dropped} = Connection.handle_disconnect(st)
+      assert dropped.command_error.count == 1
+
+      assert {:noreply, _} = Connection.handle_connect(dropped)
+      assert_receive {:cmd_halt, _meas, %{attempt: 1, max_retries: 0}}
+    end
+
+    test "the INITIAL connect never halts even at max=0 (the faults > 0 guard)" do
+      st = state(command_error_count: 0, max_command_retries: 0, step: :disconnected)
+      assert {:query, _sql, _new} = Connection.handle_connect(st)
+      refute_received {:cmd_halt, _, _}
+    end
+
+    test "store-retry disconnects are EXEMPT: with store_retry_count > 0 the command counter does not bump" do
+      st = state(command_error_count: 2, store_retry_count: 1, max_command_retries: 5)
+      {:noreply, dropped} = Connection.handle_disconnect(st)
+      assert dropped.command_error.count == 2
+    end
+  end
+
+  describe "command-error watchdog — reset on the first replication frame" do
+    test "a ?w replication frame resets command_error_count to 0 (START_REPLICATION accepted)" do
+      {:ok, _} = Registry.register(Replicant.Registry, {"conn_reset_w", :assembler}, nil)
+      begin_payload = <<"B", 0::64, 0::64, 7::32>>
+      xlog = <<?w, 0::64, 0::64, 0::64, begin_payload::binary>>
+
+      st = state(slot_name: "conn_reset_w", command_error_count: 3, max_inflight_lag: 100_000_000)
+
+      assert {:noreply, new_state} = Connection.handle_data(xlog, st)
+      assert new_state.command_error.count == 0
+    end
+
+    test "a ?k keepalive frame resets command_error_count to 0" do
+      # in_txn: true → not idle → the non-advancing 2-tuple return carries the reset state.
+      st = state(slot_name: "conn_reset_k", command_error_count: 3, in_txn: true)
+      keepalive = <<?k, 0x2000::64, 0::64, 0::8>>
+
+      assert {:noreply, new_state} = Connection.handle_data(keepalive, st)
+      assert new_state.command_error.count == 0
     end
   end
 

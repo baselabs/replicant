@@ -68,6 +68,17 @@ defmodule Replicant.Connection do
   # bound above the largest expected single transaction.
   @default_max_inflight_lag 67_108_864
 
+  # A6 command-error watchdog default budget — mirrors the store retry family's
+  # `Replicant.CheckpointStore.default_max_retries/0` (=5). `Replicant.Config` is the runtime
+  # source of truth (it validates `max_command_retries`, defaulting to that same store accessor,
+  # and `init/1` reads it); this struct fallback only backs a directly-constructed state (tests).
+  #
+  # The watchdog's mutable count and its budget live together in ONE struct field
+  # (`command_error: %{count, max_retries}`) rather than two flat fields — the mod_state is a
+  # hot-path struct already at the maximum 31 flat fields (`Credo.Check.Warning.StructFieldAmount`;
+  # a 32nd field crosses the BEAM boundary where a struct's internal map representation changes).
+  @default_max_command_retries 5
+
   @type step ::
           :disconnected
           | :recovery_check
@@ -104,6 +115,7 @@ defmodule Replicant.Connection do
           open_streams: MapSet.t(),
           last_commit_lsn: Replicant.lsn(),
           store_retry_count: non_neg_integer(),
+          command_error: %{count: non_neg_integer(), max_retries: non_neg_integer()},
           frontier_epoch: non_neg_integer(),
           backfill_floor: Replicant.lsn() | nil,
           last_frontier_cast: non_neg_integer(),
@@ -138,6 +150,7 @@ defmodule Replicant.Connection do
     open_streams: MapSet.new(),
     last_commit_lsn: 0,
     store_retry_count: 0,
+    command_error: %{count: 0, max_retries: @default_max_command_retries},
     frontier_epoch: 0,
     last_frontier_cast: 0,
     reader_pid: nil,
@@ -199,6 +212,10 @@ defmodule Replicant.Connection do
        streaming: Map.get(config, :streaming),
        in_stream: false,
        store_retry_count: 0,
+       command_error: %{
+         count: 0,
+         max_retries: Map.get(config, :max_command_retries, @default_max_command_retries)
+       },
        step: :disconnected,
        messages: Map.get(config, :messages, false)
      }}
@@ -206,6 +223,23 @@ defmodule Replicant.Connection do
 
   @impl true
   def handle_connect(state) do
+    # A6 chain-progress watchdog — the FIRST action, BEFORE any store read. When the accumulated
+    # command-error count is over budget, halt fail-closed and STAY IDLE (do NOT issue the recovery
+    # query). `faults > 0` means the INITIAL connect never halts (even at `max_command_retries: 0`);
+    # the budget is enforced by the shared `CheckpointStore.retry_decision/2` (faults - 1 = retries
+    # already made), so command and store faults count identically. The halt returns before
+    # `read_checkpoint/1` — no blocking store read on the halt path.
+    %{count: faults, max_retries: max_retries} = state.command_error
+
+    if faults > 0 and
+         Replicant.CheckpointStore.retry_decision(faults - 1, max_retries) == :halt do
+      halt_command_error(state)
+    else
+      handle_connect_proceed(state)
+    end
+  end
+
+  defp handle_connect_proceed(state) do
     # Read the durable checkpoint (off the keepalive path — a blocking read is fine
     # here). In lib mode the store is the connect authority (a read FAULT halts
     # fail-closed in :invalidation_check — never fail-open, since a non-idempotent
@@ -256,7 +290,18 @@ defmodule Replicant.Connection do
   @impl true
   def handle_disconnect(state) do
     Telemetry.event([:replicant, :connection, :disconnected], %{}, %{})
-    {:noreply, %{state | step: :disconnected}}
+
+    # A6 watchdog increment: an ESTABLISHED-then-dropped connection is a command-fault candidate.
+    # Count it ONLY when `store_retry_count == 0` — the landed store-retry disconnect
+    # (`:checkpoint_store_retry`) also routes through this callback and keeps its OWN budget, so it
+    # is EXEMPT (a smaller command budget must not truncate/mislabel a store outage). A server-down
+    # connection never establishes → this callback never fires → transient self-heal is preserved.
+    command_error =
+      if state.store_retry_count == 0,
+        do: %{state.command_error | count: state.command_error.count + 1},
+        else: state.command_error
+
+    {:noreply, %{state | step: :disconnected, command_error: command_error}}
   end
 
   @impl true
@@ -403,7 +448,22 @@ defmodule Replicant.Connection do
     end
 
     received_lsn = max(state.received_lsn, wal_end)
-    state = %{state | received_lsn: received_lsn, stream_floor_lsn: stream_floor_lsn}
+
+    # A6 watchdog reset: this XLogData frame proves START_REPLICATION was accepted, so the
+    # pre-frame command-error budget is spent. Only rebuild the inner map when the counter is
+    # non-zero (keep the steady-state hot path allocation-free); the reset itself rides the
+    # frame's existing state rebuild.
+    command_error =
+      if state.command_error.count > 0,
+        do: %{state.command_error | count: 0},
+        else: state.command_error
+
+    state = %{
+      state
+      | received_lsn: received_lsn,
+        stream_floor_lsn: stream_floor_lsn,
+        command_error: command_error
+    }
 
     # Whenever the pipeline is in incremental MODE (incremental?/1 tests is_list(snapshot) and
     # stays true for the whole pipeline lifetime, not only during an active backfill), forward
@@ -450,6 +510,15 @@ defmodule Replicant.Connection do
         {:snapshot_frontier, state.frontier_epoch, wal_end}
       )
     end
+
+    # A6 watchdog reset: a primary keepalive proves the walsender accepted START_REPLICATION and
+    # is live, so an idle-but-healthy publication that reconnects on a blip still clears its
+    # pre-frame command-error budget. Cheap: only rebuild when the counter is non-zero (the
+    # steady-state keepalive leaves it untouched).
+    state =
+      if state.command_error.count > 0,
+        do: %{state | command_error: %{state.command_error | count: 0}},
+        else: state
 
     keepalive_ack(wal_end, reply, state)
   end
@@ -735,6 +804,23 @@ defmodule Replicant.Connection do
   def classify_progress({:error, _}), do: :fault
 
   # ---- private ----
+
+  # A6 command-error watchdog exhaustion: the pre-frame replication-command livelock has burned its
+  # budget (N failed connect cycles with no replication frame in between). Halt fail-closed and STAY
+  # IDLE (mirror halt_store_permanent) — do NOT issue the recovery query, so auto_reconnect cannot
+  # re-spin the connect chain into the same fault until the async teardown lands. The event is
+  # VALUE-FREE (Rule 1): only the count / budget / slot — never any error content (the
+  # `%Postgrex.Error{}` is discarded at handle_result, never carried here).
+  defp halt_command_error(state) do
+    Telemetry.event([:replicant, :connection, :command_error_halt], %{}, %{
+      attempt: state.command_error.count,
+      max_retries: state.command_error.max_retries,
+      slot_name: state.slot_name
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:command_error, :exhausted})
+    {:noreply, state}
+  end
 
   # A PERMANENT store fault at connect (wrong column type / invalid table id) cannot be
   # fixed by retrying — halt fail-closed immediately (spec §7/§9). This ALSO fixes the
