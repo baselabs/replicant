@@ -68,7 +68,7 @@ defmodule Replicant.MixProject do
     [
       maintainers: ["rjpalermo"],
       files:
-        ~w(lib .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
+        ~w(lib notebooks .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -85,6 +85,7 @@ defmodule Replicant.MixProject do
       source_url: @source_url,
       extras: [
         "README.md",
+        "notebooks/getting_started.livemd",
         "usage-rules.md",
         "CHANGELOG.md",
         "CONTRIBUTING.md",
@@ -93,7 +94,7 @@ defmodule Replicant.MixProject do
         "NOTICE"
       ],
       groups_for_extras: [
-        Guides: ["usage-rules.md"],
+        Guides: ["notebooks/getting_started.livemd", "usage-rules.md"],
         Project: ["CONTRIBUTING.md", "AGENTS.md", "LICENSE", "NOTICE"]
       ],
       groups_for_modules: [

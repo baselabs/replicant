@@ -135,6 +135,21 @@ def deps do
 end
 ```
 
+## Interactive tour (Livebook)
+
+[![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbaselabs%2Freplicant%2Fmain%2Fnotebooks%2Fgetting_started.livemd)
+
+[`notebooks/getting_started.livemd`](notebooks/getting_started.livemd) is a
+runnable, self-verifying tour: it starts a live pipeline against a local Postgres,
+streams `INSERT`/`UPDATE`/`DELETE` through a tiny sink you can watch, then
+demonstrates the unchanged-TOAST sentinel, transaction-granularity exactly-once,
+snapshot/backfill, and logical-decoding messages. Click the badge to open it in
+[Livebook](https://livebook.dev), or read it rendered on
+[HexDocs](https://hexdocs.pm/replicant/getting_started.html). The notebook's code
+is executed against a live PG16/PG17 on every CI run
+(`test/integration/livebook_getting_started_test.exs`), so it never drifts from the
+library.
+
 ## Usage
 
 Start a pipeline against a standby with `Replicant.start_link/1`, pointing it at

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Getting-started Livebook.** `notebooks/getting_started.livemd` — a runnable, self-verifying
+  interactive tour: it starts a live pipeline, streams `INSERT`/`UPDATE`/`DELETE` through a small
+  in-notebook sink, then demonstrates the unchanged-TOAST sentinel, transaction-granularity
+  exactly-once, snapshot/backfill, and logical-decoding messages. Rendered on HexDocs (with a
+  "Run in Livebook" badge) and shipped in the Hex package. Its code is executed against a live
+  PG16/PG17 on every CI run (`test/integration/livebook_getting_started_test.exs`), so it can
+  never drift from the library.
+
 ## [0.2.1] - 2026-07-14
 
 ### Changed

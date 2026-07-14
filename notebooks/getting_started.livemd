@@ -1,0 +1,756 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Getting started with Replicant
+
+[![Run in Livebook](https://livebook.dev/badge/v1/blue.svg)](https://livebook.dev/run?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbaselabs%2Freplicant%2Fmain%2Fnotebooks%2Fgetting_started.livemd)
+
+**Replicant** is a framework-agnostic Elixir CDC consumer for Postgres logical
+replication (`pgoutput`). It delivers *committed* row changes to a pluggable
+**sink** with **zero data loss** — the replication slot advances only after your
+sink has durably persisted the transaction.
+
+This notebook takes you from an empty database to a live pipeline you can watch,
+then tours the signature guarantees and two of the beyond-the-basics features.
+Everything below runs against a real Postgres; nothing is faked.
+
+### The sink contract
+
+A sink is a module implementing `Replicant.Sink`. The two callbacks that matter
+first:
+
+- `checkpoint/0` — the last durably-persisted commit LSN (your resume point **and**
+  the dedup watermark). `nil` means "never persisted anything".
+- `handle_transaction/1` — persist a whole `%Replicant.Transaction{}` **and** its
+  checkpoint atomically, then return `{:ok, commit_lsn}`.
+
+### The five critical rules (from `AGENTS.md`)
+
+1. **No row value in an error, log, or telemetry event** — every value is assumed PII.
+2. **Validate identifiers** (slot / publication names) before they reach SQL.
+3. **Exactly-once = at-least-once + a transaction-watermark-idempotent sink** — never
+   a naked exactly-once claim.
+4. **Unchanged TOAST is a sentinel, not a value** — never overwrite it.
+5. **Stay tenant-blind** — multitenancy / classification live one layer up, in
+   `ash_replicant`.
+
+## Setup
+
+```elixir
+Mix.install([
+  {:replicant, "~> 0.2"},
+  {:kino, "~> 0.14"}
+])
+```
+
+> **Contributors:** to run against your working tree instead of the published
+> package, replace the `:replicant` line with `{:replicant, path: "/path/to/replicant"}`.
+
+## Connect to a logical-replication Postgres
+
+Replicant needs a Postgres started with `wal_level = logical`. The quickest way to
+get one locally:
+
+```
+docker run -d --name replicant_pg16 -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -p 5599:5432 postgres:16 \
+  -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+```
+
+Point the input below at it (it defaults to `REPLICANT_TEST_URL`, then to the local
+container above):
+
+```elixir
+default_url = System.get_env("REPLICANT_TEST_URL") || "postgres://postgres@localhost:5599/postgres"
+url_input = Kino.Input.text("Postgres URL (needs wal_level = logical)", default: default_url)
+```
+
+```elixir
+# Parse the URL into Postgrex connection options.
+db_url = Kino.Input.read(url_input)
+
+pg_opts =
+  (fn url ->
+     uri = URI.parse(url)
+
+     {user, pass} =
+       case uri.userinfo do
+         nil ->
+           {"postgres", nil}
+
+         ui ->
+           case String.split(ui, ":", parts: 2) do
+             [u, p] -> {u, p}
+             [u] -> {u, nil}
+           end
+       end
+
+     base = [
+       hostname: uri.host || "localhost",
+       port: uri.port || 5432,
+       database: String.trim_leading(uri.path || "/postgres", "/"),
+       username: user
+     ]
+
+     if pass, do: base ++ [password: pass], else: base
+   end).(db_url)
+
+# A plain (non-replication) connection for issuing demo DML + reading the mirror.
+# start-or-reuse so re-running this cell in Livebook is harmless.
+sql =
+  case Postgrex.start_link(pg_opts ++ [name: :lb_sql, pool_size: 4]) do
+    {:ok, pid} -> pid
+    {:error, {:already_started, pid}} -> pid
+  end
+
+Postgrex.query!(sql, "SELECT 1", [])
+:connected
+```
+
+## A few small helpers
+
+`LbDemo` wraps the boilerplate every pipeline needs: start-and-wait-until-live,
+stop-and-drop-the-slot, and some tiny query helpers. This is the same shape the
+library's own integration suite uses.
+
+```elixir
+defmodule LbDemo do
+  @moduledoc false
+
+  # Poll `fun` every 25 ms until it returns truthy; raise after `tries` polls. The generous
+  # default (400 polls ≈ 10 s) absorbs shared-Postgres load jitter and never manufactures a
+  # pass — it returns on the FIRST successful poll, so the happy path stays fast.
+  def wait_until(fun, tries \\ 400) do
+    cond do
+      fun.() -> :ok
+      tries == 0 -> raise "timed out waiting for a live-Postgres condition"
+      true -> Process.sleep(25) && wait_until(fun, tries - 1)
+    end
+  end
+
+  # Start a pipeline and block until it owns the slot and is streaming. We attach a
+  # NAMED handler (`&__MODULE__.on_slot_active/4`) with config rather than an anonymous
+  # function — that's the form :telemetry recommends (no per-event performance note).
+  def start_pipeline(config) do
+    slot = Keyword.fetch!(config, :slot_name)
+    ref = make_ref()
+
+    :telemetry.attach(
+      {__MODULE__, :active, ref},
+      [:replicant, :connection, :slot_active],
+      &__MODULE__.on_slot_active/4,
+      %{pid: self(), ref: ref}
+    )
+
+    {:ok, pid} = Replicant.start_link(config)
+
+    receive do
+      {:slot_active, ^ref} -> :ok
+    after
+      15_000 -> raise "pipeline never reached slot_active for #{slot}"
+    end
+
+    :telemetry.detach({__MODULE__, :active, ref})
+
+    wait_until(
+      fn -> match?([{_, _}], Registry.lookup(Replicant.Registry, {slot, :connection})) end,
+      200
+    )
+
+    {:ok, pid}
+  end
+
+  # Telemetry handler for [:replicant, :connection, :slot_active] — notifies the waiting caller.
+  def on_slot_active(_event, _measure, _meta, %{pid: pid, ref: ref}), do: send(pid, {:slot_active, ref})
+
+  # Stop a pipeline and drop its slot (so it stops pinning WAL).
+  def stop(slot) do
+    Replicant.stop(slot)
+    wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 200)
+    drop_slot(:lb_sql, slot)
+    :ok
+  end
+
+  def drop_slot(conn, slot, tries \\ 20)
+
+  def drop_slot(conn, slot, 0), do: do_drop_slot(conn, slot)
+
+  def drop_slot(conn, slot, tries) do
+    do_drop_slot(conn, slot)
+  rescue
+    _ ->
+      Process.sleep(50)
+      drop_slot(conn, slot, tries - 1)
+  end
+
+  defp do_drop_slot(conn, slot) do
+    Postgrex.query!(
+      conn,
+      "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
+      [slot]
+    )
+  end
+
+  def rows(conn, sql, params \\ []), do: Postgrex.query!(conn, sql, params).rows
+  def ids(conn, table), do: rows(conn, "SELECT id FROM #{table} ORDER BY id") |> Enum.map(&hd/1)
+  def count(conn, table), do: rows(conn, "SELECT count(*) FROM #{table}") |> hd() |> hd()
+end
+```
+
+`LbCapture` is a tiny in-memory recorder so we can *look at* the real
+`%Replicant.Change{}` structs the sink receives.
+
+```elixir
+defmodule LbCapture do
+  @moduledoc false
+  use Agent
+
+  def start do
+    case Agent.start_link(fn -> [] end, name: __MODULE__) do
+      {:ok, pid} -> pid
+      {:error, {:already_started, pid}} -> pid
+    end
+  end
+
+  def record(changes), do: Agent.update(__MODULE__, fn acc -> acc ++ [changes] end)
+  def reset, do: Agent.update(__MODULE__, fn _ -> [] end)
+  def all, do: Agent.get(__MODULE__, & &1)
+  def any?, do: Agent.get(__MODULE__, &(&1 != []))
+end
+
+LbCapture.start()
+:ok
+```
+
+## Create a demo schema
+
+We create a source table `lb_orders`, a `PUBLICATION` naming it, and a mirror
+table the sink will keep in sync. The `SET STORAGE EXTERNAL` on `memo` forces a
+large value out-of-line (TOAST) so we can demonstrate the unchanged-TOAST sentinel
+later. This cell is idempotent and self-heals any leftover demo slots from a prior
+run.
+
+```elixir
+# Self-heal: stop any leftover demo pipelines + drop their slots from a prior run.
+for slot <- ~w(replicant_lb_core replicant_lb_snapshot replicant_lb_messages) do
+  Replicant.stop(slot)
+  LbDemo.drop_slot(:lb_sql, slot)
+end
+
+ddl = [
+  "DROP PUBLICATION IF EXISTS lb_pub",
+  "DROP TABLE IF EXISTS lb_orders, lb_sink_orders, lb_sink_cp, lb_sink_calls",
+  "CREATE TABLE lb_orders (id int PRIMARY KEY, item text, qty int, memo text)",
+  "ALTER TABLE lb_orders ALTER COLUMN memo SET STORAGE EXTERNAL",
+  "CREATE TABLE lb_sink_orders (id int PRIMARY KEY, item text, qty int)",
+  "CREATE TABLE lb_sink_cp (id int PRIMARY KEY, lsn bigint)",
+  "CREATE TABLE lb_sink_calls (seq bigserial PRIMARY KEY, lsn bigint, outcome text)",
+  "CREATE PUBLICATION lb_pub FOR TABLE lb_orders"
+]
+
+for stmt <- ddl, do: Postgrex.query!(sql, stmt, [])
+:schema_ready
+```
+
+## Define a sink and start the pipeline
+
+`LbCoreSink` persists each transaction's rows into the mirror **and** the
+checkpoint in one database transaction — that atomicity is what makes replay
+effect-once. It also skips any transaction at or below the checkpoint
+(`commit_lsn <= checkpoint`), the transaction-granularity dedup watermark.
+
+```elixir
+defmodule LbCoreSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  alias Replicant.{Change, Transaction}
+
+  @conn :lb_sql
+
+  @impl true
+  def checkpoint do
+    case Postgrex.query(@conn, "SELECT lsn FROM lb_sink_cp WHERE id = 1", []) do
+      {:ok, %Postgrex.Result{rows: [[lsn]]}} -> {:ok, lsn}
+      {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+      {:error, _} = err -> err
+    end
+  end
+
+  @impl true
+  def handle_transaction(%Transaction{commit_lsn: lsn, changes: changes}) do
+    change_list = Enum.to_list(changes)
+
+    result =
+      Postgrex.transaction(@conn, fn c ->
+        case current_cp(c) do
+          cp when is_integer(cp) and lsn <= cp ->
+            record_call(c, lsn, "skipped")
+
+          _not_yet_applied ->
+            Enum.each(change_list, &apply_change(c, &1))
+            set_cp(c, lsn)
+            record_call(c, lsn, "applied")
+        end
+      end)
+
+    # Record the delivered changes so the notebook can display the real structs.
+    LbCapture.record(change_list)
+
+    case result do
+      {:ok, _} -> {:ok, lsn}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp current_cp(c) do
+    case Postgrex.query!(c, "SELECT lsn FROM lb_sink_cp WHERE id = 1", []).rows do
+      [[lsn]] -> lsn
+      [] -> nil
+    end
+  end
+
+  defp set_cp(c, lsn) do
+    Postgrex.query!(
+      c,
+      "INSERT INTO lb_sink_cp (id, lsn) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET lsn = EXCLUDED.lsn",
+      [lsn]
+    )
+  end
+
+  defp record_call(c, lsn, outcome) do
+    Postgrex.query!(c, "INSERT INTO lb_sink_calls (lsn, outcome) VALUES ($1, $2)", [lsn, outcome])
+  end
+
+  defp apply_change(c, %Change{op: op, record: r}) when op in [:insert, :update] do
+    Postgrex.query!(
+      c,
+      "INSERT INTO lb_sink_orders (id, item, qty) VALUES ($1, $2, $3) " <>
+        "ON CONFLICT (id) DO UPDATE SET " <>
+        "item = COALESCE(EXCLUDED.item, lb_sink_orders.item), " <>
+        "qty = COALESCE(EXCLUDED.qty, lb_sink_orders.qty)",
+      [r["id"], r["item"], r["qty"]]
+    )
+  end
+
+  defp apply_change(c, %Change{op: :delete, old_record: old}) do
+    Postgrex.query!(c, "DELETE FROM lb_sink_orders WHERE id = $1", [old["id"]])
+  end
+
+  defp apply_change(_c, _change), do: :ok
+end
+```
+
+`go_forward_only: true` tells a from-empty state-mirror sink to start streaming
+from *now* (as opposed to bootstrapping with a snapshot — we do that further down).
+
+```elixir
+core_slot = "replicant_lb_core"
+
+{:ok, _pipeline} =
+  LbDemo.start_pipeline(
+    connection: pg_opts,
+    slot_name: core_slot,
+    publication: "lb_pub",
+    sink: LbCoreSink,
+    go_forward_only: true
+  )
+
+:streaming
+```
+
+## Watch changes flow
+
+Insert three rows, update one, delete one — each `Postgrex.query!` below is its own
+committed transaction. The pipeline streams every commit to `LbCoreSink`, which
+mirrors it into `lb_sink_orders`. We poll the mirror after each step (CDC is
+asynchronous — the change lands a few milliseconds later).
+
+```elixir
+# INSERT 3 orders.
+for {id, item, qty} <- [{1, "widget", 9}, {2, "gadget", 4}, {3, "gizmo", 7}] do
+  Postgrex.query!(sql, "INSERT INTO lb_orders (id, item, qty, memo) VALUES ($1, $2, $3, $4)", [
+    id,
+    item,
+    qty,
+    "memo-#{id}"
+  ])
+end
+
+LbDemo.wait_until(fn -> LbDemo.count(:lb_sql, "lb_sink_orders") == 3 end)
+
+# UPDATE order 1.
+Postgrex.query!(sql, "UPDATE lb_orders SET qty = 42 WHERE id = 1", [])
+LbDemo.wait_until(fn -> LbDemo.rows(:lb_sql, "SELECT qty FROM lb_sink_orders WHERE id = 1") == [[42]] end)
+
+# DELETE order 2.
+Postgrex.query!(sql, "DELETE FROM lb_orders WHERE id = 2", [])
+LbDemo.wait_until(fn -> LbDemo.count(:lb_sql, "lb_sink_orders") == 2 end)
+
+Kino.DataTable.new(
+  LbDemo.rows(:lb_sql, "SELECT id, item, qty FROM lb_sink_orders ORDER BY id")
+  |> Enum.map(fn [id, item, qty] -> %{id: id, item: item, qty: qty} end)
+)
+```
+
+Those weren't opaque blobs — the sink received fully-decoded
+`%Replicant.Change{}` structs. Here are the real ones, newest last. Notice that a
+DELETE's `old_record` carries only the key column under the default replica
+identity (set `REPLICA IDENTITY FULL` upstream to receive the whole old row):
+
+```elixir
+LbCapture.all()
+|> List.flatten()
+|> Enum.map(fn ch ->
+  %{
+    op: ch.op,
+    record: inspect(ch.record),
+    old_record: inspect(ch.old_record),
+    unchanged: inspect(ch.unchanged)
+  }
+end)
+|> Kino.DataTable.new()
+```
+
+## Guarantee 1 — the unchanged-TOAST sentinel
+
+When an UPDATE doesn't touch a TOASTed (large, out-of-line) column, Postgres sends
+a *sentinel* instead of the value. Replicant surfaces that as a first-class
+`unchanged: [col]` list so your sink knows to **leave that column alone** rather
+than overwrite it with a placeholder. We insert a row with a big `memo`, then
+update only `qty`:
+
+```elixir
+big_memo = String.duplicate("x", 8_000)
+
+Postgrex.query!(sql, "INSERT INTO lb_orders (id, item, qty, memo) VALUES (10, 'bulky', 1, $1)", [
+  big_memo
+])
+
+LbDemo.wait_until(fn -> LbDemo.count(:lb_sql, "lb_sink_orders") == 3 end)
+
+# Now update a DIFFERENT column and watch `memo` come through as unchanged.
+LbCapture.reset()
+Postgrex.query!(sql, "UPDATE lb_orders SET qty = 99 WHERE id = 10", [])
+LbDemo.wait_until(fn -> LbCapture.any?() end)
+
+toast_change =
+  LbCapture.all()
+  |> List.flatten()
+  |> Enum.find(fn ch -> ch.op == :update and ch.record["id"] == 10 end)
+
+toast_unchanged = toast_change.unchanged
+```
+
+`toast_unchanged` is `["memo"]` — the UPDATE never carried the 8 KB value, and the
+sink knew not to clobber it.
+
+## Guarantee 2 — transaction-granularity exactly-once
+
+Replicant's watermark is the **transaction**, keyed by its single `commit_lsn`.
+The sink skips any `commit_lsn <= checkpoint` and upserts rows by primary key —
+that's at-least-once plus an idempotent sink, the only honest route to exactly-once
+without two-phase commit. Our `lb_sink_calls` ledger is append-only (no PK), so a
+duplicate delivery would be visible as a repeated LSN. It isn't:
+
+```elixir
+calls =
+  LbDemo.rows(:lb_sql, "SELECT lsn, outcome FROM lb_sink_calls ORDER BY seq")
+  |> Enum.map(fn [lsn, outcome] -> {lsn, outcome} end)
+
+applied_lsns = for {lsn, "applied"} <- calls, do: lsn
+core_dup_count = length(applied_lsns) - length(Enum.uniq(applied_lsns))
+
+{:ok, checkpoint_lsn} = LbCoreSink.checkpoint()
+core_final_ids = LbDemo.ids(:lb_sql, "lb_sink_orders")
+
+%{
+  checkpoint: Replicant.lsn_to_string(checkpoint_lsn),
+  applied_transactions: length(applied_lsns),
+  duplicates: core_dup_count,
+  mirror_ids: core_final_ids
+}
+```
+
+A real crash between dispatch and persist re-delivers from the durable
+`confirmed_flush` and the idempotent sink dedups — that end-to-end crash-injection
+proof lives in the library's `test/integration/crash_injection_test.exs`. Let's
+stop this pipeline before moving on.
+
+```elixir
+LbDemo.stop(core_slot)
+:core_stopped
+```
+
+## Beyond the basics 1 — snapshot / backfill
+
+Point a sink at a table that already has data and you need a **backfill** before
+streaming. `snapshot: true` runs `EXPORT_SNAPSHOT` → `COPY` → hand off to streaming
+at the snapshot LSN, gap-free and dup-free. A snapshot-capable sink adds
+`handle_snapshot/2` (upsert a batch; clear the table on `first_for_table?`) and
+`handle_snapshot_complete/1` (persist the handoff checkpoint).
+
+```elixir
+defmodule LbSnapshotSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  alias Replicant.{Change, Transaction}
+
+  @conn :lb_sql
+
+  @impl true
+  def checkpoint do
+    case Postgrex.query(@conn, "SELECT lsn FROM lb_snapshot_cp WHERE id = 1", []) do
+      {:ok, %Postgrex.Result{rows: [[lsn]]}} -> {:ok, lsn}
+      {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+      {:error, _} = err -> err
+    end
+  end
+
+  @impl true
+  def handle_snapshot(changes, %{first_for_table?: first?}) do
+    Postgrex.transaction(@conn, fn c ->
+      # Redo-safety: clear the prior snapshot-origin rows on the first batch per table.
+      if first?, do: Postgrex.query!(c, "TRUNCATE lb_snapshot_sink", [])
+
+      Enum.each(changes, fn %Change{record: r} ->
+        Postgrex.query!(
+          c,
+          "INSERT INTO lb_snapshot_sink (id, name) VALUES ($1, $2) " <>
+            "ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+          [r["id"], r["name"]]
+        )
+      end)
+    end)
+
+    :ok
+  rescue
+    e -> {:error, e}
+  end
+
+  @impl true
+  def handle_snapshot_complete(lsn) do
+    Postgrex.query!(
+      @conn,
+      "INSERT INTO lb_snapshot_cp (id, lsn) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET lsn = EXCLUDED.lsn",
+      [lsn]
+    )
+
+    {:ok, lsn}
+  end
+
+  @impl true
+  def handle_transaction(%Transaction{commit_lsn: lsn, changes: changes}) do
+    Postgrex.transaction(@conn, fn c ->
+      Enum.each(changes, fn
+        %Change{op: op, record: r} when op in [:insert, :update] ->
+          Postgrex.query!(
+            c,
+            "INSERT INTO lb_snapshot_sink (id, name) VALUES ($1, $2) " <>
+              "ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+            [r["id"], r["name"]]
+          )
+
+        %Change{op: :delete, old_record: old} ->
+          Postgrex.query!(c, "DELETE FROM lb_snapshot_sink WHERE id = $1", [old["id"]])
+
+        _other ->
+          :ok
+      end)
+
+      Postgrex.query!(
+        c,
+        "INSERT INTO lb_snapshot_cp (id, lsn) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET lsn = EXCLUDED.lsn",
+        [lsn]
+      )
+    end)
+
+    {:ok, lsn}
+  end
+end
+```
+
+Seed five rows into a fresh source table, then start with `snapshot: true` and
+watch them arrive through `handle_snapshot/2`:
+
+```elixir
+snapshot_ddl = [
+  "DROP PUBLICATION IF EXISTS lb_snapshot_pub",
+  "DROP TABLE IF EXISTS lb_snapshot_orders, lb_snapshot_sink, lb_snapshot_cp",
+  "CREATE TABLE lb_snapshot_orders (id int PRIMARY KEY, name text)",
+  "CREATE TABLE lb_snapshot_sink (id int PRIMARY KEY, name text)",
+  "CREATE TABLE lb_snapshot_cp (id int PRIMARY KEY, lsn bigint)",
+  "CREATE PUBLICATION lb_snapshot_pub FOR TABLE lb_snapshot_orders"
+]
+
+for stmt <- snapshot_ddl, do: Postgrex.query!(sql, stmt, [])
+
+for id <- 1..5 do
+  Postgrex.query!(sql, "INSERT INTO lb_snapshot_orders (id, name) VALUES ($1, $2)", [
+    id,
+    "item-#{id}"
+  ])
+end
+
+snapshot_slot = "replicant_lb_snapshot"
+
+{:ok, _} =
+  LbDemo.start_pipeline(
+    connection: pg_opts,
+    slot_name: snapshot_slot,
+    publication: "lb_snapshot_pub",
+    sink: LbSnapshotSink,
+    snapshot: true
+  )
+
+LbDemo.wait_until(fn -> LbDemo.count(:lb_sql, "lb_snapshot_sink") == 5 end, 400)
+snapshot_mirror_count = LbDemo.count(:lb_sql, "lb_snapshot_sink")
+```
+
+The five pre-existing rows were backfilled, and the pipeline is now streaming any
+new commits from the snapshot's consistent point onward. Stop it:
+
+```elixir
+LbDemo.stop(snapshot_slot)
+:snapshot_stopped
+```
+
+## Beyond the basics 2 — logical-decoding messages
+
+Postgres can emit out-of-band **messages** into the WAL via
+`pg_logical_emit_message` — perfect for the outbox pattern or heartbeats. Opt in
+with `messages: true`. A **non-transactional** message arrives standalone through
+`handle_message/2` and is **at-least-once** (no dedup key — your effect must be
+idempotent). A transactional one instead rides `%Transaction.messages` and inherits
+the transaction's effect-once (see ADR-0001).
+
+```elixir
+defmodule LbMessageSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  alias Replicant.Transaction
+  alias Replicant.Decoder.Messages.Message
+
+  @conn :lb_sql
+
+  @impl true
+  def checkpoint do
+    case Postgrex.query(@conn, "SELECT lsn FROM lb_msg_cp WHERE id = 1", []) do
+      {:ok, %Postgrex.Result{rows: [[lsn]]}} -> {:ok, lsn}
+      {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+      {:error, _} = err -> err
+    end
+  end
+
+  @impl true
+  def handle_transaction(%Transaction{commit_lsn: lsn}) do
+    Postgrex.query!(
+      @conn,
+      "INSERT INTO lb_msg_cp (id, lsn) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET lsn = EXCLUDED.lsn",
+      [lsn]
+    )
+
+    {:ok, lsn}
+  end
+
+  @impl true
+  def handle_message(%Message{lsn: lsn, prefix: prefix, content: content}, %{lsn: ctx_lsn}) do
+    # `prefix`/`content` are USER BYTES — Critical Rule 1 says never log or surface them
+    # in telemetry. Persisting them into your own store (as here) is fine.
+    Postgrex.query!(@conn, "INSERT INTO lb_msg_messages (lsn, prefix, content) VALUES ($1, $2, $3)", [
+      ctx_lsn || lsn,
+      prefix,
+      content
+    ])
+
+    :ok
+  end
+end
+```
+
+```elixir
+message_ddl = [
+  "DROP PUBLICATION IF EXISTS lb_msg_pub",
+  "DROP TABLE IF EXISTS lb_msg_orders, lb_msg_messages, lb_msg_cp",
+  "CREATE TABLE lb_msg_orders (id int PRIMARY KEY, note text)",
+  "CREATE TABLE lb_msg_messages (lsn bigint, prefix text, content text)",
+  "CREATE TABLE lb_msg_cp (id int PRIMARY KEY, lsn bigint)",
+  "CREATE PUBLICATION lb_msg_pub FOR TABLE lb_msg_orders"
+]
+
+for stmt <- message_ddl, do: Postgrex.query!(sql, stmt, [])
+
+message_slot = "replicant_lb_messages"
+
+{:ok, _} =
+  LbDemo.start_pipeline(
+    connection: pg_opts,
+    slot_name: message_slot,
+    publication: "lb_msg_pub",
+    sink: LbMessageSink,
+    messages: true,
+    go_forward_only: true
+  )
+
+# Emit a non-transactional message straight into the WAL.
+Postgrex.query!(sql, "SELECT pg_logical_emit_message(false, 'lb_heartbeat', 'tick')", [])
+LbDemo.wait_until(fn -> LbDemo.count(:lb_sql, "lb_msg_messages") == 1 end)
+
+nontxn_message =
+  LbDemo.rows(:lb_sql, "SELECT prefix, content FROM lb_msg_messages")
+  |> Enum.map(fn [prefix, content] -> {prefix, content} end)
+  |> List.first()
+```
+
+```elixir
+LbDemo.stop(message_slot)
+:messages_stopped
+```
+
+## The rest of the toolbox
+
+The core flow above is most of what you need day to day. The features below are
+each one config option away — see the linked README section for the full contract:
+
+| Feature | Turn it on with | README |
+| --- | --- | --- |
+| In-progress transaction streaming (proto-v2) | `streaming: [max_concurrent_txns: 64]` | [How it streams](https://hexdocs.pm/replicant/readme.html#how-it-streams) |
+| Consumer-side disk spill (oversized txns) | `streaming: [spill: [dir: ..., max_spill_bytes: ...]]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
+| Resumable incremental snapshot | `snapshot: [mode: :incremental, chunk_rows: 1000]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
+| Lib-owned checkpoint (non-transactional sinks) | `checkpoint_store: [connection: ..., table: ...]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
+| Sink-owned atomic batch delivery | `batch_delivery: [max_transactions: 100]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
+| Multi-publication per pipeline | `publication: ["p1", "p2"]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
+| Failover slots (PG17+, HA) | `failover: true` | [Failover slots](https://hexdocs.pm/replicant/readme.html#failover-slots-pg17) |
+
+For multitenancy, classification, and Ash resources, use the
+[`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter, which is
+built on this tenant-blind core.
+
+## Verify everything we just saw
+
+These assertions are the same ones the library's CI runs against this notebook (via
+`test/integration/livebook_getting_started_test.exs`), so this page can never
+silently drift from the code:
+
+```elixir
+import ExUnit.Assertions
+
+assert core_final_ids == [1, 3, 10]
+assert core_dup_count == 0
+assert toast_unchanged == ["memo"]
+assert snapshot_mirror_count == 5
+assert nontxn_message == {"lb_heartbeat", "tick"}
+
+:all_green
+```
+
+```elixir
+%{
+  core_final_ids: core_final_ids,
+  core_dup_count: core_dup_count,
+  toast_unchanged: toast_unchanged,
+  snapshot_mirror_count: snapshot_mirror_count,
+  nontxn_message: nontxn_message
+}
+```
