@@ -2470,8 +2470,8 @@ defmodule Replicant.AssemblerTest do
                  commit_timestamp: nil
                })
 
-      # The delivered %Transaction{} carries the message with its `xid` AND the ordinal stamped at
-      # attach (the change-buffer length at the time: 1, after the one Insert above). Both assertions
+      # The delivered %Transaction{} carries the message with its `xid` AND the ordinal from the
+      # shared per-txn counter at attach (1, after the one Insert above took seq 0). Both assertions
       # regress if clause (a) is removed (the message would mis-route to :unsupported_message →
       # {:halt, _}, no delivered transaction, no txn.messages).
       assert [%Message{prefix: "p", content: "streamed-msg", xid: 100, ordinal: 1}] =
