@@ -217,6 +217,20 @@ bounded: the pipeline retries `max_retries` times (default 5) `retry_backoff_ms`
 (default 1000 ms — ~5s of outage tolerated) then halts fail-closed; a permanent fault
 (schema mismatch / invalid config) halts immediately.
 
+**Persistent replication-command errors (`max_command_retries`, default 5).** A replication
+command that fails *before the stream starts* — e.g. `CREATE_REPLICATION_SLOT` when the
+server's `max_replication_slots` are exhausted, a second consumer already holding the slot,
+or a forward-incompatible result shape — otherwise reconnects forever (`auto_reconnect`).
+Replicant bounds this: after `max_command_retries` failed connect cycles without the stream
+establishing, the pipeline **halts fail-closed and stays idle** instead of livelocking, and
+emits `[:replicant, :connection, :command_error_halt]` (metadata: `attempt`, `max_retries`,
+`slot_name` — value-free, no error content, Critical Rule 1). Set `max_command_retries: 0`
+to halt on the first such fault. The bound is a *cycle count*, not a wall-clock time (the
+failing reconnect is a hot loop). Only errors *before the first replication frame* are
+bounded — once the stream is flowing, a later transient outage resets the counter and
+still self-heals, and a server that is simply down (connection refused) keeps retrying
+untouched, exactly as before.
+
 **Sink-owned atomic batch delivery (transactional sinks).** For a **transactional sink** that
 can persist multiple rows + checkpoint in one database transaction, pass a top-level
 `batch_delivery: [max_transactions: 100, max_delay_ms: 1000]` to accumulate committed

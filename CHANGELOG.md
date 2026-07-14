@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Replication-command-error watchdog (`max_command_retries`, default 5).** A persistent
+  pre-frame replication-command error (e.g. `CREATE_REPLICATION_SLOT` failing because the
+  server's replication slots are exhausted, or a slot already active for another consumer)
+  previously reconnected forever via `auto_reconnect`. The pipeline now halts fail-closed and
+  stays idle after `max_command_retries` failed connect cycles without the stream establishing,
+  emitting `[:replicant, :connection, :command_error_halt]` (value-free metadata:
+  `attempt`/`max_retries`/`slot_name`). `max_command_retries: 0` halts on the first fault.
+  Transient outages that occur once the stream is flowing still self-heal (the counter resets
+  on the first replication frame), and a down server keeps retrying untouched. The bound is a
+  cycle count, not a wall-clock time. (Behavior change: persistent pre-frame command errors
+  now halt instead of livelocking.)
+
 ## [0.2.2] - 2026-07-14
 
 ### Added
