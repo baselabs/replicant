@@ -68,16 +68,19 @@ defmodule Replicant.Connection do
   # bound above the largest expected single transaction.
   @default_max_inflight_lag 67_108_864
 
-  # A6 command-error watchdog default budget — mirrors the store retry family's
-  # `Replicant.CheckpointStore.default_max_retries/0` (=5). `Replicant.Config` is the runtime
-  # source of truth (it validates `max_command_retries`, defaulting to that same store accessor,
-  # and `init/1` reads it); this struct fallback only backs a directly-constructed state (tests).
+  # A6 command-error watchdog default budget — sourced DIRECTLY from the store retry family's
+  # `Replicant.CheckpointStore.default_max_retries/0` (=5), not a parallel literal, so the two
+  # cannot drift (the codebase centralized that accessor to prevent exactly this; cross-vendor
+  # GLM + per-task review both flagged the earlier hardcoded `5`). `Replicant.Config` is the
+  # runtime source of truth (it validates `max_command_retries`, defaulting to that same store
+  # accessor, and `init/1` reads it); this struct fallback only backs a directly-constructed
+  # state (tests).
   #
   # The watchdog's mutable count and its budget live together in ONE struct field
   # (`command_error: %{count, max_retries}`) rather than two flat fields — the mod_state is a
   # hot-path struct already at the maximum 31 flat fields (`Credo.Check.Warning.StructFieldAmount`;
   # a 32nd field crosses the BEAM boundary where a struct's internal map representation changes).
-  @default_max_command_retries 5
+  @default_max_command_retries Replicant.CheckpointStore.default_max_retries()
 
   @type step ::
           :disconnected
@@ -305,6 +308,15 @@ defmodule Replicant.Connection do
     # state-revert that broke the original seam), so a command error during/after a store episode
     # was wrongly exempted → livelock (both closeout lenses, cross-vendor-corroborated). A
     # server-down connection never establishes → this callback never fires → self-heal preserved.
+    #
+    # Accepted bounded imprecision (GLM lens 2026-07-14, non-defect): the marker is consumed by
+    # ANY disconnect, so a genuine socket drop landing inside a store episode's backoff window is
+    # exempted (under-counted by one) instead of counted. This CANNOT livelock or false-halt — an
+    # active store episode independently halts via `store_retry_step`, and once the store recovers
+    # no pace re-arms the marker so later drops count normally. Distinguishing the two precisely
+    # would need the disconnect reason threaded through state, which postgrex discards on
+    # `{:disconnect}` — the marker is the best available discriminator; the residual is off-by-one
+    # in the conservative direction, in a rare concurrent-outage corner.
     ce = state.command_error
 
     command_error =
