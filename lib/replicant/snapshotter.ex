@@ -163,9 +163,16 @@ defmodule Replicant.Snapshotter do
 
     # array_agg over a table with zero non-dropped columns yields NULL — a degenerate
     # (column-less) table. Emit the per-table reset and skip the scan, matching the prior
-    # `SELECT *` behaviour for a column-less table (no rows can ever be read).
+    # `SELECT *` behaviour for a column-less table (no rows can ever be read). Emit the
+    # :table_completed telemetry (count 0) for parity with the normal branch.
     if col_raw in [nil, []] do
       dispatch_batch!(c, sink, [], cp, qualified_display, true)
+
+      Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
+        table: qualified_display,
+        change_count: 0
+      })
+
       0
     else
       sql = QueryBuilder.keyless_scan(qualified, col_quoted)
