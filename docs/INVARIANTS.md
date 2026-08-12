@@ -70,7 +70,7 @@ that targets the core library; put them one layer up.
 | Transactional message | `messages: true`, rides `%Transaction.messages` | **effect-once** (inherits the txn's `commit_lsn` dedup) |
 | Initial snapshot (`snapshot: true`) | `handle_snapshot/2` | sink-owned effect-once chunks; lib-mode dup ≤ 1 chunk |
 | Incremental snapshot | `snapshot: [mode: :incremental]` | sink-owned effect-once chunks; lib-mode dup ≤ 1 chunk |
-| Spilled oversized transaction | `streaming: [spill: [...]]` | **effect-once**, delivered as a single-pass lazy `changes` |
+| Spilled oversized transaction | `streaming: [spill: [...]]` | **inherits the active checkpoint-mode guarantee** (effect-once sink-owned; at-least-once lib-mode — spill adds no duplicates), delivered as a single-pass lazy `changes` |
 
 See the [README](../README.md) for the full configuration reference and the [ROADMAP](ROADMAP.md)
 for the feature tracker.

@@ -60,6 +60,14 @@ defmodule Replicant.Decoder do
     end
   rescue
     exception -> {:error, Error.decode_failure(exception)}
+  catch
+    # A `throw`/`exit` from the vendored parser would otherwise crash the Connection
+    # process (decode/1 runs THERE — connection.ex forward_message — so the assembler's
+    # own rescue/catch does NOT cover it) with a reason term that can embed raw WAL bytes.
+    # Scrub it value-free (Critical Rule 1), mirroring the assembler's decode boundary.
+    # Defense-in-depth: the vendored parser only `raise`s today, so this fires only on a
+    # future parser change that introduces a throw/exit.
+    _kind, _reason -> {:error, %Error{reason: :decode_failure}}
   end
 
   # Stream-control messages (spec §5) — unambiguous by type byte, decoded regardless

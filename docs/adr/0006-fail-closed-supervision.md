@@ -19,12 +19,14 @@ guarantees are load-bearing for the zero-loss / fail-closed posture:
 
 ## Decision
 
-- **The per-pipeline supervisor is `:one_for_all`** over `[AssemblerServer, Connection]`
-  (AssemblerServer starts first, so the Connection has somewhere to cast to before it streams).
-  Either child crashing tears BOTH down and re-derives from the durable watermark — the
-  AssemblerServer's volatile buffers (in-flight transaction, open batch, snapshot window) are
-  explicitly discarded on reconnect (`{:seed_lib_checkpoint}`, `{:reset_batch}`,
-  `{:reset_streams}`, `{:reset_snapshot_window}`). (`lib/replicant/pipeline.ex`.)
+- **The per-pipeline supervisor is `:one_for_all`** over the pipeline children —
+  `[AssemblerServer, Connection]` in sink-owned mode, `[CheckpointStore, AssemblerServer,
+  Connection]` in lib mode (CheckpointStore + AssemblerServer start before the Connection, so
+  the Connection has somewhere to cast to before it streams). Any child crashing tears the
+  WHOLE set down and re-derives from the durable watermark — the AssemblerServer's volatile
+  buffers (in-flight transaction, open batch, snapshot window) are explicitly discarded on
+  reconnect (`{:seed_lib_checkpoint}`, `{:reset_batch}`, `{:reset_streams}`,
+  `{:reset_snapshot_window}`). (`lib/replicant/pipeline.ex`.)
 - **The DynamicSupervisor pipeline child is `:temporary`** — a halted pipeline is never restarted
   by the supervisor; restart happens only via an explicit operator `Replicant.start_link/1`.
   (`lib/replicant/supervisor.ex`.)
