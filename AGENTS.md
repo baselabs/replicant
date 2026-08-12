@@ -98,10 +98,11 @@ All gates must pass before a commit/PR. Update `CHANGELOG.md` under
 ## Docs & lifecycle-artifact policy
 
 - **Tracked / published:** `AGENTS.md`, `README.md`, `CHANGELOG.md`,
-  `CONTRIBUTING.md`, `usage-rules.md`, `LICENSE`, `NOTICE`.
+  `CONTRIBUTING.md`, `usage-rules.md`, `LICENSE`, `NOTICE`,
+  `docs/ROADMAP.md`, and accepted decisions under `docs/adr/`.
 - **Never tracked:** all brainstorm specs, plans, exec notes, reviews, and
-  handoffs. They live under `/docs/`, which is **gitignored**. Do not move
-  `/docs/` artifacts to the repo root.
+  handoffs under `docs/superpowers/`, which is gitignored. Do not move those
+  lifecycle artifacts into tracked documentation paths.
 - AI-tool state dirs (`.claude/`, `.serena/`, etc.) are gitignored.
 
 ## graphify (code knowledge graph)

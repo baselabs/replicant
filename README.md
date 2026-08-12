@@ -14,7 +14,7 @@ Multitenancy, classification, and Ash resources live one layer up, in the
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
 > invalidation, and is proven by a real-PG16 crash-injection suite
-> (loss = 0, effect-dup = 0). As of **v0.2.0**, initial snapshot/backfill (incl. a
+> (loss = 0, effect-dup = 0). As of **v0.3.1**, initial snapshot/backfill (incl. a
 > resumable incremental mode), a lib-owned checkpoint
 > store for non-transactional sinks, batched checkpointing, sink-owned atomic
 > batch delivery, in-progress-transaction streaming, consumer-side disk
@@ -403,7 +403,7 @@ against a real-PG16 crash-injection suite:
 The sibling consumer library has also shipped, one layer up from this core:
 
 - **[`ash_replicant`](https://github.com/baselabs/ash_replicant)** — the Ash /
-  multitenancy / classification sink adapter (published `v0.2.0`), built on this
+  multitenancy / classification sink adapter (published `v0.3.0`), built on this
   tenant-blind core via `{:replicant, "~> 0.1.0"}`.
 
 ## Credits

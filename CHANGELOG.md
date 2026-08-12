@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reconcile the README, contributor guide, and durable roadmap with the current
+  `replicant` 0.3.1 and `ash_replicant` 0.3.0 releases while retaining older
+  lifecycle rows as explicitly historical evidence. Remove public-roadmap links
+  into ignored lifecycle artifacts and repair release comparison references
+  through 0.3.1.
+
 ## [0.3.1] - 2026-07-14
 
 ### Changed
@@ -303,7 +311,9 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/baselabs/replicant/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/baselabs/replicant/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/baselabs/replicant/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/baselabs/replicant/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/baselabs/replicant/compare/v0.1.0...v0.2.0
