@@ -70,6 +70,7 @@ defmodule Replicant.Casting.Types do
 
   Returns the original value if casting fails.
   """
+  @spec cast_record(binary(), term()) :: term()
   def cast_record("t", "bool"), do: true
   def cast_record("f", "bool"), do: false
 

@@ -19,6 +19,7 @@ defmodule Replicant.Decoder.OidDatabase do
       "jsonb"
 
   """
+  @spec name_for_type_id(non_neg_integer()) :: String.t() | non_neg_integer()
   # credo:disable-for-next-line Credo.Check.Refactor.CyclomaticComplexity
   def name_for_type_id(type_id) do
     case type_id do

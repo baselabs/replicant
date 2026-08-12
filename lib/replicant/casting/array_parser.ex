@@ -42,6 +42,7 @@ defmodule Replicant.Casting.ArrayParser do
       Replicant.Casting.ArrayParser.parse("{1,NULL,3}")
       {:ok, ["1", nil, "3"]}
   """
+  @spec parse(binary()) :: {:ok, [term()]} | {:error, String.t()}
   def parse(array_string) when is_binary(array_string) do
     case array_string do
       "{}" -> {:ok, []}
