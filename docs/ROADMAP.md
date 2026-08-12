@@ -129,3 +129,39 @@ Value-ranking rationale, retained now that it has shipped as 0.3.0:
 - **Sequencing note.** Despite the #1 value ranking, the user directive built the
   §3 slices *first* (one in-build project at a time) and gated `ash_replicant` on
   the `replicant` publish — which is how it actually shipped.
+
+## 1.0.0 Release hardening — readiness assessment (2026-08-12)
+
+A four-lens assessment (architecture, security, coverage, API-stability) of the
+0.3.1 core against a 1.0.0 bar. The core is release-ready — no P0 in library
+behavior. The rows below are the gaps to close at/around the 1.0 tag. Status
+here is authored narrative (this section pre-dates forge-roadmap schema
+migration); the slug is the slice join key.
+
+| ID | What | Acceptance | Depends | Why |
+|---|---|---|---|---|
+| D1 | **Stale install constraint** — README + getting-started Livebook ship `{:replicant, "~> 0.2"}`, which resolves `< 0.3.0` and locks users out of every 0.3 feature (and 1.0). slug:`d1-install-constraint` | `README.md` + `notebooks/getting_started.livemd` show `~> 0.3` now (and `~> 1.0` at the 1.0 tag); grep finds no `~> 0.2` / `~> 0.1.0` install reference | — | Currency — the most-copied snippet |
+| D2 | **`ash_replicant` coordinated release** — published `ash_replicant` pins `{:replicant, "~> 0.3"}` = `< 1.0.0`, so it cannot resolve a replicant 1.0; the sibling ships a widening (`["~> 0.3", "~> 1.0"]`) in the same release window. slug:`d2-ash-replicant-coord` | (cross-repo) `ash_replicant` `mix.exs` widens its `replicant` dep and the two packages release together; replicant's README ash_replicant claim (`~> 0.1.0`) corrected | D1 | Release coordination — a 1.0 that orphans its consumer |
+| D3 | **Release hygiene** — (a) no `.tool-versions` (CI pins otp-27/elixir-1.17; dev PLTs on otp-28/1.19.5 → format/dialyzer skew); (b) `mix format --check-formatted` RED on `connection_test.exs` under the dev toolchain; (c) `mix audit` declared but not enforced in CI; (d) postgrex 0.22.2 carries CVE-2026-66838 (MEDIUM, `Postgrex.stream/4` `:comment`) + CVE-2026-58225 (LOW, `Notifications` dollar-quote) — fixed in 0.22.4, no `ReplicationConnection` API break. slug:`d3-release-hygiene` | `.tool-versions` pins 1.19.5-otp-28/erlang 28.5; CI `setup-beam` matches it; `mix format --check-formatted` green; `mix hex.audit` green (postgrex ≥ 0.22.4); `mix audit` runs in CI; gate-change discipline proves the changed gates still go red; `.zcode/` gitignored | — | A red gate and an unpatched dep cannot ship 1.0 |
+| D4 | **`:batch` type trapdoor** — `Replicant.Config.t` lists `optional(:batch)` but `fetch_batch/3` rejects a top-level `:batch` with `:config_invalid` (it is derived). slug:`d4-batch-type-trapdoor` | The public type no longer advertises a key the user cannot set; dialyzer + compile clean | — | Freeze the type honestly |
+| D5 | **v1 snapshot casting divergence** — `snapshot: true` runs `SELECT *` and zips raw Postgrex-decoded values (no cast), so a `timestamp` arrives as `NaiveDateTime` from the snapshot and `DateTime` from the stream; the incremental path was fixed (`::text` + `cast_record`) but v1 was never back-ported. slug:`d5-snapshot-casting` | A red-first convergence test proves a typed column delivers the SAME runtime type from v1 snapshot and the stream; v1 routes values through the shared `Casting.Types.cast_record/2` (or v1 is explicitly deprecated); value-free boundary intact | — | Convergence correctness (Critical Rule 1 boundary preserved) |
+| D6 | **`%Transaction.changes` spill hazard** — typed `Enumerable.t()`, but a spilled txn is single-pass / call-lifetime; a sink authored against List breaks on its first oversized spilled txn. slug:`d6-changes-spill-type` | The type names both forms (`[Change.t()] | Spill.Reader.t()`) and a `@typedoc` states the single-pass contract; dialyzer clean | — | The biggest latent data-contract hazard |
+| D7 | **Hex description overclaims exactly-once** — `mix.exs` description ends "…exactly-once delivery" unqualified; the lib has three at-least-once paths. slug:`d7-hex-description` | The Hex blurb qualifies exactly-once to the sink-owned/transactional path (Critical Rule 3) | — | Honesty on the most-visible surface |
+| D8 | **Foundational ADRs + published Critical Rules** — `docs/adr/` has only 0001/0002; the load-bearing posture decisions (value-free boundary, commit-LSN transaction watermark, spill-as-ephemeral-scratch, `:one_for_all`+`:temporary` supervision) are unrecoverable from code alone; the 5 Critical Rules live only in the un-tarballed `AGENTS.md`. slug:`d8-foundation-adrs` | Four ADRs land under `docs/adr/`; a tarball-shipped invariants doc (in `mix.exs` `extras`) carries the 5 Critical Rules for a Hex consumer | — | A 1.0 is the moment a bare-clone maintainer must recover the WHY |
+| D9 | **Three vendored public functions unspecced** — `Casting.Types.cast_record/2` (the central casting contract), `Casting.ArrayParser.parse/1`, `Decoder.OidDatabase.name_for_type_id/1`. slug:`d9-vendored-specs` | All three carry `@spec`; the frozen public surface is fully specced; dialyzer clean | — | Freeze the contract |
+
+### P2 backlog (post-1.0 hardening)
+
+Not blocking the freeze; tracked here so nothing is lost.
+
+- **Reader "exactly-one" invariant is comment-defended, not structure-defended** — a future reconnect path that forgets `retire_reader/1` resurrects a double-reader (`connection.ex:293,795-804,1124`). Add a structural guard.
+- **`assembler.ex` is a 1630-LOC god module** — extract `Assembler.Streaming` and `Assembler.Batch` (mechanical; it is a pure state machine).
+- **B8 checkpoint-read cache** — `Assembler.skip?/2` does a live `sink.checkpoint()/0` read per Commit (`assembler.ex:1137-1142`); the throughput floor in sink-owned mode. Profiling-gated.
+- **Duplicated batch flush-trigger `cond`** across lib-batch and sink-owned-batch (`assembler.ex:1358-1362` vs `:1403-1407`) — a drift silently changes the dup bound in one mode.
+- **Spill cleartext-at-rest threat model** undocumented (`spill.ex:13-14`) — document for PII-sensitive deployments.
+- **`Replicant.Config.t()` is a map, not a struct** — decide and freeze (a later defstruct breaks pattern-matchers).
+- **`handle_batch/1` arity** — no context arg unlike `handle_snapshot/2`/`handle_message/2`; adding one later is a breaking rename.
+- **Conformance tamper-evidence is structural, not machine-checked** — add a parametric bit-flip test proving each fixture goes red on mutation.
+- **Effect-once / loss=0 / §4 backpressure have zero unit-level proof** — all live behind `@moduletag :integration`; the local `mix test` loop is blind. Add ≥1 no-server test for the watermark-skip predicate and batch rollback.
+- **`Replicant.SnapshotProgress` ungrouped in HexDocs**; three public fns have `@spec` but no `@doc` (`Supervisor.start_link/1`, `Telemetry.span/3`, `Telemetry.event/3`).
+- **Telemetry test-noise** — `AssemblerTest` attaches anonymous-fn handlers (a `:info` warning); cosmetic, use module-qualified refs.
