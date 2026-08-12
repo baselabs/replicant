@@ -7,9 +7,9 @@ defmodule Replicant.SnapshotTest do
   setup do
     unless PG16.enabled?(), do: :ok
 
-    # Reuse the named pool across tests in this module (ExUnit runs async:false modules
-    # in one long-lived process, so a prior test's named pool is still registered — without
-    # reuse, test 2+ fail with {:error, {:already_started, _}} and the suite masks coverage).
+    # PG16.named_conn starts the named pool UNLINKED and registers its own on_exit to stop
+    # it — per-test isolation (a fresh pool each test), so async:false's one-process model
+    # cannot {:already_started, _} cascade. See test/support/pg16.ex.
     {:ok, ctrl} = PG16.named_conn(Replicant.Test.LedgerConn, pool_size: 5)
 
     slot = "rep_snap_#{System.unique_integer([:positive])}"
