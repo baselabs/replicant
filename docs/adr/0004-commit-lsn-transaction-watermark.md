@@ -65,7 +65,10 @@ and states the at-least-once bound plainly rather than overclaiming.
 ## Consequences
 
 - **Easier:** The watermark is one integer per transaction; comparison is trivial; the sink
-  contract is "skip `commit_lsn <= checkpoint`, upsert by PK, persist the new checkpoint."
+  contract is "skip `commit_lsn <= checkpoint`, upsert by PK, persist the new checkpoint." For an
+  Ash/Postgres sink the idempotency half is best delegated to [`ash_onetime`](https://hex.pm/packages/ash_onetime)
+  (`strategy :idempotency` keyed on `commit_lsn`) — authoritative DB-constraint admission rather
+  than a hand-rolled pre-check; replicant supplies the key, ash_onetime decides the replay.
 - **Harder:** The ack-after-checkpoint seam is load-bearing — an edit that acks `wal_end` instead
   reintroduces at-most-once loss. The idle-ack advance is gated on a transaction-boundary
   predicate precisely so it can never ack past an undelivered transaction or message.

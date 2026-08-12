@@ -400,11 +400,16 @@ against a real-PG16 crash-injection suite:
 - **Multi-publication per pipeline** — `publication: [p1, p2]` streams the union of several publications through one slot, with fail-closed missing-publication detection.
 - **Logical-decoding messages** — opt-in `messages: true` delivers `pg_logical_emit_message` payloads: transactional messages ride `%Transaction.messages` (effect-once); non-transactional via `handle_message/2` (at-least-once).
 
-The sibling consumer library has also shipped, one layer up from this core:
+The sibling libraries live one layer up from this tenant-blind core:
 
 - **[`ash_replicant`](https://github.com/baselabs/ash_replicant)** — the Ash /
-  multitenancy / classification sink adapter (published `v0.4.0`), built on this
-  tenant-blind core via `{:replicant, "~> 0.3"}`.
+  multitenancy / classification sink adapter (published `v0.4.0`), built on this core
+  via `{:replicant, "~> 0.3"}`.
+- **[`ash_onetime`](https://hex.pm/packages/ash_onetime)** — the authoritative
+  idempotency-key / one-time-nonce admission layer for Ash/Postgres sinks. This is the
+  sink's half of Critical Rule 3: `protect` the apply action with `strategy :idempotency`
+  keyed on the transaction's `commit_lsn`, and the DB unique constraint decides the replay.
+  See [`docs/INVARIANTS.md`](docs/INVARIANTS.md) § 3 for the delivery/admission split.
 
 ## Credits
 

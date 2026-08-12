@@ -42,6 +42,18 @@ guarantee is stated **per mode**, never as a naked exactly-once:
 The slot ack advances only after the sink durably commits (ack-after-checkpoint). (Governing ADR:
 [0004](adr/0004-commit-lsn-transaction-watermark.md).)
 
+**Sink-side admission for an Ash sink — `ash_onetime`.** The idempotency obligation above is the
+sink's half of Rule 3; replicant owns at-least-once *delivery* and the `commit_lsn` dedup key, it
+does NOT own the sink's effect-once admission. For an Ash/Postgres sink,
+[`ash_onetime`](https://hex.pm/packages/ash_onetime) is the authoritative admission layer: `protect`
+the apply action with `strategy :idempotency` keyed on the transaction's `commit_lsn`, and the
+Postgres unique constraint (not a hand-rolled "did this run?" pre-check) decides the replay within
+the retention boundary — the clean split `ash_onetime` itself draws between local admission and
+end-to-end delivery. The same mechanism upgrades the at-least-once `handle_message/2` *delivery*
+path to effect-once *at the sink*: `strategy :one_time_nonce` keyed on the message's
+`{lsn, ordinal}` makes the *effect* once while replicant still states that path's *delivery* honestly
+as at-least-once.
+
 ## 4. Unchanged TOAST is a sentinel, not a value
 
 An UPDATE that does not touch a TOASTed column sends a sentinel, not the value. The library
