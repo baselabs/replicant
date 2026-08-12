@@ -72,7 +72,7 @@ defmodule Replicant.MixProject do
     [
       maintainers: ["rjpalermo"],
       files:
-        ~w(lib notebooks .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
+        ~w(lib notebooks docs .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -89,6 +89,13 @@ defmodule Replicant.MixProject do
       source_url: @source_url,
       extras: [
         "README.md",
+        "docs/INVARIANTS.md",
+        "docs/ROADMAP.md",
+        "docs/adr/README.md",
+        "docs/adr/0003-value-free-error-boundary.md",
+        "docs/adr/0004-commit-lsn-transaction-watermark.md",
+        "docs/adr/0005-spill-is-ephemeral-scratch.md",
+        "docs/adr/0006-fail-closed-supervision.md",
         "notebooks/getting_started.livemd",
         "usage-rules.md",
         "CHANGELOG.md",
@@ -98,8 +105,16 @@ defmodule Replicant.MixProject do
         "NOTICE"
       ],
       groups_for_extras: [
+        "Invariants & ADRs": [
+          "docs/INVARIANTS.md",
+          "docs/adr/README.md",
+          "docs/adr/0003-value-free-error-boundary.md",
+          "docs/adr/0004-commit-lsn-transaction-watermark.md",
+          "docs/adr/0005-spill-is-ephemeral-scratch.md",
+          "docs/adr/0006-fail-closed-supervision.md"
+        ],
         Guides: ["notebooks/getting_started.livemd", "usage-rules.md"],
-        Project: ["CONTRIBUTING.md", "AGENTS.md", "LICENSE", "NOTICE"]
+        Project: ["CONTRIBUTING.md", "AGENTS.md", "LICENSE", "NOTICE", "docs/ROADMAP.md"]
       ],
       groups_for_modules: [
         "Core API": [Replicant, Replicant.Sink, Replicant.Config],
