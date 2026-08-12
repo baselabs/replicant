@@ -8,13 +8,15 @@ defmodule Replicant.Transaction do
   A completed transaction's `changes` is ordinarily a `List`; for a SPILLED
   streamed transaction it is a lazy, single-pass, disk-backed
   `Enumerable` (`Replicant.Spill.Reader`) valid only during the delivery call.
-  Iterate with `Enum`/`Stream`; do not retain it past `handle_transaction/1`.
+  Iterate with `Enum`/`Stream`; never call `length/1`, `Enum.to_list/1`, or
+  re-iterate (any of which forces the whole transaction back into RAM), and do
+  not retain it past the `handle_transaction/1` / `handle_batch/1` call.
   """
 
   @type t :: %__MODULE__{
           commit_lsn: Replicant.lsn() | nil,
           commit_timestamp: DateTime.t() | nil,
-          changes: Enumerable.t(),
+          changes: [Replicant.Change.t()] | Replicant.Spill.Reader.t(),
           messages: [Replicant.Decoder.Messages.Message.t()]
         }
 
