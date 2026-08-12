@@ -19,7 +19,8 @@ defmodule Replicant.MixProject do
       name: "Replicant",
       description:
         "Framework-agnostic Elixir CDC consumer for Postgres logical replication (pgoutput) " <>
-          "with sink-owned, transaction-granularity exactly-once delivery.",
+          "with zero-loss delivery to a pluggable sink — exactly-once for transactional " <>
+          "sinks, at-least-once (duplicate-bounded) for non-transactional sinks.",
       source_url: @source_url,
       homepage_url: @source_url,
       dialyzer: [
