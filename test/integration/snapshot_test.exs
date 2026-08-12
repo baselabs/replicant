@@ -7,8 +7,10 @@ defmodule Replicant.SnapshotTest do
   setup do
     unless PG16.enabled?(), do: :ok
 
-    {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.LedgerConn, pool_size: 5])
+    # Reuse the named pool across tests in this module (ExUnit runs async:false modules
+    # in one long-lived process, so a prior test's named pool is still registered — without
+    # reuse, test 2+ fail with {:error, {:already_started, _}} and the suite masks coverage).
+    {:ok, ctrl} = PG16.named_conn(Replicant.Test.LedgerConn, pool_size: 5)
 
     slot = "rep_snap_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)

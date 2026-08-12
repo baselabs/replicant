@@ -19,6 +19,57 @@ defmodule Replicant.Test.PG16 do
     if pass, do: base ++ [password: pass], else: base
   end
 
+  @doc """
+  Start a NAMED Postgrex pool for an integration test, with per-test cleanup.
+
+  ExUnit runs an `async: false` module's tests in ONE long-lived process. A bare
+  `Postgrex.start_link(name: X)` therefore returns `{:error, {:already_started, _}}` on the
+  SECOND test's setup (the first test's pool is still registered), cascading every later
+  test to a setup failure — masking the module's real coverage. Two wrong fixes exist:
+  reusing one shared pool across tests (corrupts under crash-injection — a killed sibling
+  connection makes the next checkout `(EXIT) shutdown`), or stopping the pool from the
+  test's own `on_exit` (the pool's `:shutdown` exit propagates and fails the callback).
+
+  The correct fix is **per-test isolation with helper-managed cleanup**: start the pool
+  UNLINKED from the test process (so a test-process crash cannot double-own it, and its
+  `:shutdown` exit cannot reach the test), and register an `on_exit` HERE that stops it
+  after the test. Because the registered `on_exit` runs after each test (LIFO, before the
+  test's own pipeline-stop `on_exit` only if registered later — but either order is safe:
+  the pool is independent of the pipeline), the next test's setup always finds the name
+  free and starts a FRESH pool — no cascade, no shared state. The `whereis` reuse branch is
+  a defensive fallback for the rare case a prior `on_exit` did not run.
+
+  `opts` carries the remaining pool knobs (e.g. `pool_size: 5`).
+  """
+  @spec named_conn(atom(), keyword()) :: {:ok, pid()}
+  def named_conn(name, opts \\ []) do
+    case Process.whereis(name) do
+      nil ->
+        {:ok, pid} = Postgrex.start_link(pg_opts() ++ [name: name] ++ opts)
+        # Unlink so the pool survives a test-process crash (its on_exit below stops it)
+        # and its :shutdown exit never reaches the test process.
+        Process.unlink(pid)
+        ExUnit.Callbacks.on_exit({__MODULE__, :named_conn, name}, fn -> stop_conn(pid) end)
+        {:ok, pid}
+
+      pid ->
+        {:ok, pid}
+    end
+  end
+
+  @doc false
+  # Stop a named pool, swallowing the :shutdown exit a DBConnection pool raises from its
+  # terminate callback (the pool IS stopped; the exit is benign).
+  def stop_conn(pid) do
+    if Process.alive?(pid) do
+      GenServer.stop(pid, :normal)
+    end
+
+    :ok
+  catch
+    :exit, _ -> :ok
+  end
+
   defp userinfo(nil), do: {"postgres", nil}
 
   defp userinfo(ui) do

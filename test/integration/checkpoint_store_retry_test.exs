@@ -20,10 +20,10 @@ defmodule Replicant.CheckpointStoreRetryTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.CpRetryCtrl, pool_size: 3])
+      PG16.named_conn(Replicant.Test.CpRetryCtrl, pool_size: 3)
 
     {:ok, _} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.SinkLedgerConn, pool_size: 2])
+      PG16.named_conn(Replicant.Test.SinkLedgerConn, pool_size: 2)
 
     slot = "rep_cpretry_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)

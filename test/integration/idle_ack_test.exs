@@ -22,7 +22,7 @@ defmodule Replicant.IdleAckTest do
     # ledger through THAT named connection (test/support/ledger_sink.ex `@conn`); the
     # test's own polls share the same pool (pool_size: 5 keeps polls off the sink's calls).
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.LedgerConn, pool_size: 5])
+      PG16.named_conn(Replicant.Test.LedgerConn, pool_size: 5)
 
     slot = "rep_idle_#{System.unique_integer([:positive])}"
 

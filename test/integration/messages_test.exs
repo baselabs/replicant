@@ -300,10 +300,10 @@ defmodule Replicant.MessagesTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.MsgCtrlConn, pool_size: 3])
+      PG16.named_conn(Replicant.Test.MsgCtrlConn, pool_size: 3)
 
     {:ok, _} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.MessagesConn, pool_size: 2])
+      PG16.named_conn(Replicant.Test.MessagesConn, pool_size: 2)
 
     slot = "rep_msg_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)

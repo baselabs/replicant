@@ -23,7 +23,7 @@ defmodule Replicant.PG16ConformanceTest do
   end
 
   test "real PG16 pgoutput for an insert decodes to the same struct Plan 1 asserts" do
-    {:ok, ctrl} = Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.LedgerConn])
+    {:ok, ctrl} = PG16.named_conn(Replicant.Test.LedgerConn)
     {:ok, _} = CaptureSink.start_link()
     slot = "rep_conf_#{System.unique_integer([:positive])}"
 

@@ -12,10 +12,10 @@ defmodule Replicant.StreamingSpillTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.SpCtrlConn, pool_size: 3])
+      PG16.named_conn(Replicant.Test.SpCtrlConn, pool_size: 3)
 
     {:ok, _} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.SpillConn, pool_size: 2])
+      PG16.named_conn(Replicant.Test.SpillConn, pool_size: 2)
 
     slot = "rep_sp_#{System.unique_integer([:positive])}"
 

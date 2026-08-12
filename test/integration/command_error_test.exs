@@ -27,7 +27,7 @@ defmodule Replicant.CommandErrorTest do
   # + the on_exit sweep.
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.A6Ctrl, pool_size: 1])
+      PG16.named_conn(Replicant.Test.A6Ctrl, pool_size: 1)
 
     drop_fillers(ctrl)
     Postgrex.query!(ctrl, "DROP PUBLICATION IF EXISTS a6_pub", [])

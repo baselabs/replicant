@@ -8,11 +8,11 @@ defmodule Replicant.CheckpointStoreCrashTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.CpCtrlConn, pool_size: 3])
+      PG16.named_conn(Replicant.Test.CpCtrlConn, pool_size: 3)
 
     # The sink's own (non-transactional) connection — survives pipeline crashes.
     {:ok, _} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.SinkLedgerConn, pool_size: 2])
+      PG16.named_conn(Replicant.Test.SinkLedgerConn, pool_size: 2)
 
     slot = "rep_cpci_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)

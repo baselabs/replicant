@@ -24,7 +24,7 @@ defmodule Replicant.CrashInjectionTest do
     # queries. `pool_size: 5` (vs the default 1) keeps the slow-sink burst from
     # starving the test's `count`/audit polls of a connection (spike test).
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.LedgerConn, pool_size: 5])
+      PG16.named_conn(Replicant.Test.LedgerConn, pool_size: 5)
 
     slot = "rep_ci_#{System.unique_integer([:positive])}"
 

@@ -110,10 +110,10 @@ defmodule Replicant.MultiPubTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.MPCtrlConn, pool_size: 3])
+      PG16.named_conn(Replicant.Test.MPCtrlConn, pool_size: 3)
 
     {:ok, _} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.MultiPubConn, pool_size: 2])
+      PG16.named_conn(Replicant.Test.MultiPubConn, pool_size: 2)
 
     slot = "rep_mp_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)

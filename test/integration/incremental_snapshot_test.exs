@@ -25,7 +25,7 @@ defmodule Replicant.IncrementalSnapshotTest do
     unless PG16.enabled?(), do: :ok
 
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.IncCtrlConn, pool_size: 5])
+      PG16.named_conn(Replicant.Test.IncCtrlConn, pool_size: 5)
 
     # The sink Agent OWNS the ETS mirror/ledger and must OUTLIVE the pipeline under test
     # (Task 11/12 kill+restart the pipeline mid-backfill and assert state persisted). It is

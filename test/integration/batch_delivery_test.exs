@@ -6,12 +6,9 @@ defmodule Replicant.BatchDeliveryTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.BDCtrlConn, pool_size: 3])
+      PG16.named_conn(Replicant.Test.BDCtrlConn, pool_size: 3)
 
-    {:ok, _} =
-      Postgrex.start_link(
-        PG16.pg_opts() ++ [name: Replicant.Test.BatchDeliveryConn, pool_size: 2]
-      )
+    {:ok, _} = PG16.named_conn(Replicant.Test.BatchDeliveryConn, pool_size: 2)
 
     slot = "rep_bd_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)

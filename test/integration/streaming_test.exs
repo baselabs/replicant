@@ -6,10 +6,10 @@ defmodule Replicant.StreamingTest do
 
   setup do
     {:ok, ctrl} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.StCtrlConn, pool_size: 3])
+      PG16.named_conn(Replicant.Test.StCtrlConn, pool_size: 3)
 
     {:ok, _} =
-      Postgrex.start_link(PG16.pg_opts() ++ [name: Replicant.Test.StreamingConn, pool_size: 2])
+      PG16.named_conn(Replicant.Test.StreamingConn, pool_size: 2)
 
     slot = "rep_st_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)
