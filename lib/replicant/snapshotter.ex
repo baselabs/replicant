@@ -86,21 +86,23 @@ defmodule Replicant.Snapshotter do
     # `snapshot_error/1` (never a raw MatchError that could leak the reason), before any
     # connection is opened. `table_columns/0` has no identifier argument (the publication
     # is bound as `$1`), so it returns a plain SQL string — no validation tuple to unwrap.
-    with {:ok, set_snapshot_sql} <- QueryBuilder.set_transaction_snapshot(name) do
-      table_columns_sql = QueryBuilder.table_columns()
+    table_columns_sql = QueryBuilder.table_columns()
 
-      run_snapshot_txn(
-        conn_opts,
-        sink,
-        cp,
-        set_snapshot_sql,
-        table_columns_sql,
-        publication,
-        start_mono,
-        mode
-      )
-    else
-      {:error, reason} -> {:error, snapshot_error(reason)}
+    case QueryBuilder.set_transaction_snapshot(name) do
+      {:ok, set_snapshot_sql} ->
+        run_snapshot_txn(
+          conn_opts,
+          sink,
+          cp,
+          set_snapshot_sql,
+          table_columns_sql,
+          publication,
+          start_mono,
+          mode
+        )
+
+      {:error, reason} ->
+        {:error, snapshot_error(reason)}
     end
   end
 
@@ -130,7 +132,8 @@ defmodule Replicant.Snapshotter do
             tables = Postgrex.query!(c, table_columns_sql, [publication]).rows
 
             Enum.reduce(tables, 0, fn [schema, table, qualified, col_raw, col_quoted, col_type_oids], acc ->
-              acc + copy_table(c, sink, cp, schema, table, qualified, col_raw, col_quoted, col_type_oids)
+              cols = {col_raw, col_quoted, col_type_oids}
+              acc + copy_table(c, sink, cp, schema, table, qualified, cols)
             end)
           end,
           timeout: :infinity
@@ -148,17 +151,9 @@ defmodule Replicant.Snapshotter do
   # Stream one table's rows via a server-side cursor (bounded memory), delivering each
   # non-empty batch to the sink. Guarantees >= 1 dispatch per table (an empty one with
   # first_for_table? = true when the table has no rows), so the sink's per-table reset
-  # always fires (redo-safety, spec §6.1).
-  #
-  # Every column is projected as `<col>::text AS <col>` (QueryBuilder.keyless_scan/2) and
-  # each value is cast through the SAME `Casting.Types.cast_record/2` path the stream uses,
-  # so the v1 snapshot and the stream deliver byte-identical `%Change{}.record` values for
-  # every type (spec §2 convergence — the F1 fix back-ported from the incremental reader;
-  # previously `SELECT *` shipped Postgrex's native decode, e.g. NaiveDateTime for a
-  # `timestamp` column where the stream casts DateTime). `col_quoted` is server-quoted
-  # (`table_columns/0`'s `quote_ident`), never raw — Critical Rule 2 (the `format('%I')`
-  # precedent), so the projection interpolation is injection-safe.
-  defp copy_table(c, sink, cp, schema, table, qualified, col_raw, col_quoted, col_type_oids) do
+  # always fires (redo-safety, spec §6.1). `cols` is the parallel `{col_raw, col_quoted,
+  # col_type_oids}` triple from `table_columns/0` (same `attnum` order).
+  defp copy_table(c, sink, cp, schema, table, qualified, {col_raw, col_quoted, col_type_oids}) do
     qualified_display = "#{schema}.#{table}"
 
     # array_agg over a table with zero non-dropped columns yields NULL — a degenerate
@@ -175,29 +170,54 @@ defmodule Replicant.Snapshotter do
 
       0
     else
+      tbl = %{
+        schema: schema,
+        table: table,
+        qualified_display: qualified_display,
+        col_raw: col_raw,
+        type_names: Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1)
+      }
+
       sql = QueryBuilder.keyless_scan(qualified, col_quoted)
-      type_names = Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1)
-      stream = Postgrex.stream(c, sql, [], max_rows: @batch)
+      scan_table(c, sink, cp, tbl, sql)
+    end
+  end
 
-      {dispatched?, count} =
-        Enum.reduce(stream, {false, 0}, fn %Postgrex.Result{rows: rows}, {dispatched?, count} ->
-          if rows == [] do
-            {dispatched?, count}
-          else
-            changes = Enum.map(rows, &build_change(schema, table, col_raw, type_names, &1))
-            dispatch_batch!(c, sink, changes, cp, qualified_display, not dispatched?)
-            {true, count + length(rows)}
-          end
-        end)
+  # Every column is projected as `<col>::text AS <col>` (the `sql` from
+  # `QueryBuilder.keyless_scan/2`) and each value is cast through the SAME
+  # `Casting.Types.cast_record/2` path the stream uses, so the v1 snapshot and the stream
+  # deliver byte-identical `%Change{}.record` values for every type (spec §2 convergence —
+  # the F1 fix back-ported from the incremental reader; previously `SELECT *` shipped
+  # Postgrex's native decode, e.g. NaiveDateTime for a `timestamp` where the stream casts
+  # DateTime). `col_quoted` is server-quoted (`table_columns/0`'s `quote_ident`), never raw
+  # — Critical Rule 2 (the `format('%I')` precedent), so the projection is injection-safe.
+  defp scan_table(c, sink, cp, tbl, sql) do
+    stream = Postgrex.stream(c, sql, [], max_rows: @batch)
 
-      unless dispatched?, do: dispatch_batch!(c, sink, [], cp, qualified_display, true)
+    {dispatched?, count} =
+      Enum.reduce(stream, {false, 0}, fn %Postgrex.Result{rows: rows}, acc ->
+        scan_batch(c, sink, cp, tbl, rows, acc)
+      end)
 
-      Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
-        table: qualified_display,
-        change_count: count
-      })
+    unless dispatched?, do: dispatch_batch!(c, sink, [], cp, tbl.qualified_display, true)
 
-      count
+    Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
+      table: tbl.qualified_display,
+      change_count: count
+    })
+
+    count
+  end
+
+  defp scan_batch(c, sink, cp, tbl, rows, {dispatched?, count}) do
+    if rows == [] do
+      {dispatched?, count}
+    else
+      changes =
+        Enum.map(rows, &build_change(tbl.schema, tbl.table, tbl.col_raw, tbl.type_names, &1))
+
+      dispatch_batch!(c, sink, changes, cp, tbl.qualified_display, not dispatched?)
+      {true, count + length(rows)}
     end
   end
 
