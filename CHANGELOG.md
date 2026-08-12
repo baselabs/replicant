@@ -7,13 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **v1 snapshot value-type convergence.** `snapshot: true` shipped Postgrex's native row
+  decode (`SELECT *`), so a typed column delivered a different runtime type from the snapshot
+  than from the stream — e.g. a `timestamp` column arrived as `%NaiveDateTime{}` from the v1
+  snapshot and `%DateTime{}` from the stream (which casts through `Casting.Types.cast_record/2`).
+  The incremental snapshot was fixed; v1 was not. v1 now projects `<col>::text` and casts each
+  value through the SAME path the stream uses, so the v1 snapshot and the stream deliver
+  byte-identical `%Change{}.record` values for every type. Also extends `cast_record` to
+  recognize bool's full-word `::text` form (`"true"`/`"false"`) — PG `bool::text` emits the word
+  form while pgoutput emits `"t"`/`"f"`, so both `::text` snapshot paths (v1 AND incremental)
+  previously delivered the string `"true"` for a bool column where the stream delivers boolean
+  `true`; both now converge to boolean. (Critical Rule 1 boundary preserved; the stream never
+  sends the word form, so the new clauses fire only on snapshot paths.)
+- **postgrex CVE bump (0.22.2 → 0.22.4).** `mix hex.audit` reported two advisories on
+  postgrex 0.22.2: CVE-2026-58225 (LOW, dollar-quote in `Postgrex.Notifications` reconnect
+  replay, fixed 0.22.3) and CVE-2026-66838 (MEDIUM, SQLi via the `:comment` option in
+  `Postgrex.stream/4`, fixed 0.22.4). Replicant's call sites use neither vector (the snapshotter's
+  `Postgrex.stream` passes no `:comment`; there is no `Postgrex.Notifications` usage), but the floor
+  moves to `~> 0.22.4` so the audit is clean and transitive consumers are not exposed. No
+  `ReplicationConnection` API change across 0.22.2 → 0.22.4 (security patches only).
+- **Integration suite was silently masked.** Every integration module started a NAMED Postgres
+  pool in `setup` and never stopped it; ExUnit's `async: false` one-process model then made test 2+
+  fail with `{:error, {:already_started, _}}`, cascading to setup failure. The full integration
+  suite was 66 tests / 31 failures — roughly half the live-PG16 crash-injection marquees (the
+  project's primary correctness evidence) were not running. `PG16.named_conn/2` now centralizes
+  per-test isolation (start the pool unlinked + register an `on_exit` that stops it); all 23
+  named-pool sites route through it. The full suite is now 66/0.
+
+### Added
+
+- **Foundational ADRs + published Critical Rules.** Four ADRs record the load-bearing 1.0
+  posture decisions a bare-clone maintainer cannot recover from code alone: [0003](docs/adr/0003-value-free-error-boundary.md)
+  the value-free error/log/telemetry boundary, [0004](docs/adr/0004-commit-lsn-transaction-watermark.md)
+  the commit-LSN transaction-granularity watermark, [0005](docs/adr/0005-spill-is-ephemeral-scratch.md)
+  spill as ephemeral non-fsync'd scratch, [0006](docs/adr/0006-fail-closed-supervision.md) the
+  `:one_for_all` + `:temporary` fail-closed supervision. The 5 Critical Rules are published as
+  [`docs/INVARIANTS.md`](docs/INVARIANTS.md) (sink-author-facing; `AGENTS.md` was removed from the
+  tarball in 0.2.1 as an agent contract, so this is the published home for the binding invariants).
+  Both ship in the Hex tarball (`docs` added to package `files`) and render on HexDocs.
+
 ### Changed
 
-- Reconcile the README, contributor guide, and durable roadmap with the current
-  `replicant` 0.3.1 and `ash_replicant` 0.3.0 releases while retaining older
-  lifecycle rows as explicitly historical evidence. Remove public-roadmap links
-  into ignored lifecycle artifacts and repair release comparison references
-  through 0.3.1.
+- **Install constraint corrected.** The README and getting-started Livebook shipped
+  `{:replicant, "~> 0.2"}` (= `< 0.3.0`), locking users out of every 0.3 feature; now `~> 0.3`
+  (and the 1.0 tag bumps it to `~> 1.0`). The stale `ash_replicant` reference (`~> 0.1.0` / `v0.3.0`)
+  is corrected to the actual `~> 0.3` / `v0.4.0`.
+- **Release hygiene.** A `.tool-versions` pins Elixir 1.19.5-otp-28 / Erlang 28.5; CI's `setup-beam`
+  is aligned to it (it was otp-27 / elixir-1.17, and the formatter's list-wrap heuristic is
+  version-sensitive — `mix format --check-formatted` was red on the dev toolchain). `mix audit`
+  (the declared-but-unenforced `deps.unlock --check-unused` + `hex.audit` + `deps.audit` alias) is
+  now a CI gate before build, and the cache key binds the pinned toolchain + `mix.lock` + `.tool-versions`.
+- **`Replicant.Config.t` no longer advertises a `:batch` key.** It is derived from
+  `checkpoint_store[:batch]`; a top-level `batch:` option is rejected with `:config_invalid`, so the
+  public type advertising it was a trapdoor.
+- **`%Transaction.changes` typed as the union it is.** Was `Enumerable.t()` (broad enough to hide
+  that a spilled streamed txn delivers a single-pass `Replicant.Spill.Reader`, not a re-iterable
+  List); now `[Change.t()] | Spill.Reader.t()` with a strengthened moduledoc naming the forbidden
+  calls (`length/1`, `Enum.to_list/1`, re-iteration) that force a spilled txn back into RAM.
+- **Hex description states the delivery guarantee honestly.** Was an unqualified "exactly-once
+  delivery"; now "zero-loss delivery — exactly-once for transactional sinks, at-least-once
+  (duplicate-bounded) for non-transactional sinks" (Critical Rule 3).
+- **The three vendored public functions are specced.** `Casting.Types.cast_record/2`,
+  `Casting.ArrayParser.parse/1`, `Decoder.OidDatabase.name_for_type_id/1` now carry `@spec`; the
+  frozen public surface is fully specced.
+- Reconcile the README, contributor guide, and durable roadmap with the current `replicant` 0.3.1
+  and `ash_replicant` 0.3.0 releases while retaining older lifecycle rows as explicitly historical
+  evidence. Remove public-roadmap links into ignored lifecycle artifacts and repair release
+  comparison references through 0.3.1.
 
 ## [0.3.1] - 2026-07-14
 

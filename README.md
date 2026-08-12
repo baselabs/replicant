@@ -403,8 +403,8 @@ against a real-PG16 crash-injection suite:
 The sibling consumer library has also shipped, one layer up from this core:
 
 - **[`ash_replicant`](https://github.com/baselabs/ash_replicant)** — the Ash /
-  multitenancy / classification sink adapter (published `v0.3.0`), built on this
-  tenant-blind core via `{:replicant, "~> 0.1.0"}`.
+  multitenancy / classification sink adapter (published `v0.4.0`), built on this
+  tenant-blind core via `{:replicant, "~> 0.3"}`.
 
 ## Credits
 
