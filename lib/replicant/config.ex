@@ -11,8 +11,10 @@ defmodule Replicant.Config do
 
   alias Replicant.{CheckpointStore, Connection, Identifier, Sink}
 
+  # `:batch` is deliberately NOT in this type: it is a DERIVED key (normalized from
+  # `checkpoint_store[:batch]` by `fetch_batch/3`), and a top-level `batch:` option is
+  # rejected with `:config_invalid`. Advertising it here would invite the trapdoor.
   @type t :: %{
-          optional(:batch) => keyword() | nil,
           optional(:batch_delivery) => keyword() | nil,
           optional(:streaming) => keyword() | nil,
           connection: keyword(),
