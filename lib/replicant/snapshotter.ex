@@ -25,7 +25,7 @@ defmodule Replicant.Snapshotter do
   and defers VACUUM there until the snapshot completes.
   """
 
-  alias Replicant.{Change, Error, QueryBuilder, Telemetry}
+  alias Replicant.{Casting.Types, Change, Decoder.OidDatabase, Error, QueryBuilder, Telemetry}
 
   # Cursor page size — bounds memory (Postgrex.stream FETCHes `max_rows` at a time).
   @batch 1000
@@ -84,15 +84,17 @@ defmodule Replicant.Snapshotter do
 
     # Route a QueryBuilder validation failure (`{:error, reason}`) through the value-free
     # `snapshot_error/1` (never a raw MatchError that could leak the reason), before any
-    # connection is opened.
-    with {:ok, set_snapshot_sql} <- QueryBuilder.set_transaction_snapshot(name),
-         {:ok, pub_tables_sql} <- QueryBuilder.publication_tables(publication) do
+    # connection is opened. `table_columns/0` has no identifier argument (the publication
+    # is bound as `$1`), so it returns a plain SQL string — no validation tuple to unwrap.
+    with {:ok, set_snapshot_sql} <- QueryBuilder.set_transaction_snapshot(name) do
+      table_columns_sql = QueryBuilder.table_columns()
+
       run_snapshot_txn(
         conn_opts,
         sink,
         cp,
         set_snapshot_sql,
-        pub_tables_sql,
+        table_columns_sql,
         publication,
         start_mono,
         mode
@@ -107,7 +109,7 @@ defmodule Replicant.Snapshotter do
          sink,
          cp,
          set_snapshot_sql,
-         pub_tables_sql,
+         table_columns_sql,
          publication,
          start_mono,
          mode
@@ -121,10 +123,14 @@ defmodule Replicant.Snapshotter do
           fn c ->
             Postgrex.query!(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
             Postgrex.query!(c, set_snapshot_sql, [])
-            tables = Postgrex.query!(c, pub_tables_sql, [publication]).rows
 
-            Enum.reduce(tables, 0, fn [schema, table, qualified], acc ->
-              acc + copy_table(c, sink, cp, schema, table, qualified)
+            # One row per publication table: [schema, table, qualified, col_raw,
+            # col_quoted, col_type_oids]. The column metadata (names + OIDs) lets the
+            # v1 scan project <col>::text and cast each value through the stream's path.
+            tables = Postgrex.query!(c, table_columns_sql, [publication]).rows
+
+            Enum.reduce(tables, 0, fn [schema, table, qualified, col_raw, col_quoted, col_type_oids], acc ->
+              acc + copy_table(c, sink, cp, schema, table, qualified, col_raw, col_quoted, col_type_oids)
             end)
           end,
           timeout: :infinity
@@ -143,30 +149,49 @@ defmodule Replicant.Snapshotter do
   # non-empty batch to the sink. Guarantees >= 1 dispatch per table (an empty one with
   # first_for_table? = true when the table has no rows), so the sink's per-table reset
   # always fires (redo-safety, spec §6.1).
-  defp copy_table(c, sink, cp, schema, table, qualified) do
-    stream = Postgrex.stream(c, "SELECT * FROM #{qualified}", [], max_rows: @batch)
+  #
+  # Every column is projected as `<col>::text AS <col>` (QueryBuilder.keyless_scan/2) and
+  # each value is cast through the SAME `Casting.Types.cast_record/2` path the stream uses,
+  # so the v1 snapshot and the stream deliver byte-identical `%Change{}.record` values for
+  # every type (spec §2 convergence — the F1 fix back-ported from the incremental reader;
+  # previously `SELECT *` shipped Postgrex's native decode, e.g. NaiveDateTime for a
+  # `timestamp` column where the stream casts DateTime). `col_quoted` is server-quoted
+  # (`table_columns/0`'s `quote_ident`), never raw — Critical Rule 2 (the `format('%I')`
+  # precedent), so the projection interpolation is injection-safe.
+  defp copy_table(c, sink, cp, schema, table, qualified, col_raw, col_quoted, col_type_oids) do
     qualified_display = "#{schema}.#{table}"
 
-    {dispatched?, count} =
-      Enum.reduce(stream, {false, 0}, fn %Postgrex.Result{columns: cols, rows: rows},
-                                         {dispatched?, count} ->
-        if rows == [] do
-          {dispatched?, count}
-        else
-          changes = Enum.map(rows, &build_change(schema, table, cols, &1))
-          dispatch_batch!(c, sink, changes, cp, qualified_display, not dispatched?)
-          {true, count + length(rows)}
-        end
-      end)
+    # array_agg over a table with zero non-dropped columns yields NULL — a degenerate
+    # (column-less) table. Emit the per-table reset and skip the scan, matching the prior
+    # `SELECT *` behaviour for a column-less table (no rows can ever be read).
+    if col_raw in [nil, []] do
+      dispatch_batch!(c, sink, [], cp, qualified_display, true)
+      0
+    else
+      sql = QueryBuilder.keyless_scan(qualified, col_quoted)
+      type_names = Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1)
+      stream = Postgrex.stream(c, sql, [], max_rows: @batch)
 
-    unless dispatched?, do: dispatch_batch!(c, sink, [], cp, qualified_display, true)
+      {dispatched?, count} =
+        Enum.reduce(stream, {false, 0}, fn %Postgrex.Result{rows: rows}, {dispatched?, count} ->
+          if rows == [] do
+            {dispatched?, count}
+          else
+            changes = Enum.map(rows, &build_change(schema, table, col_raw, type_names, &1))
+            dispatch_batch!(c, sink, changes, cp, qualified_display, not dispatched?)
+            {true, count + length(rows)}
+          end
+        end)
 
-    Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
-      table: qualified_display,
-      change_count: count
-    })
+      unless dispatched?, do: dispatch_batch!(c, sink, [], cp, qualified_display, true)
 
-    count
+      Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
+        table: qualified_display,
+        change_count: count
+      })
+
+      count
+    end
   end
 
   # Deliver one batch. A sink {:error, _} rolls the read transaction back with a
@@ -220,11 +245,25 @@ defmodule Replicant.Snapshotter do
     do: complete(sink, cp, 0, System.monotonic_time(:millisecond), mode)
 
   @doc false
-  @spec build_change(String.t(), String.t(), [String.t()], [term()]) :: Change.t()
-  def build_change(schema, table, columns, values) do
-    record = columns |> Enum.zip(values) |> Map.new()
+  @spec build_change(String.t(), String.t(), [String.t()], [term()], [binary() | nil]) :: Change.t()
+  def build_change(schema, table, col_names, type_names, text_values) do
+    record =
+      Enum.zip_with([col_names, type_names, text_values], fn [name, type, value] ->
+        {name, cast_value(value, type)}
+      end)
+      |> Map.new()
+
     %Change{op: :snapshot, schema: schema, table: table, record: record, commit_lsn: nil}
   end
+
+  # Cast one `<col>::text` value to its Elixir term, mirroring the incremental reader's
+  # `cast_value/2` and the stream's cast path: NULL stays nil; a text value routes through
+  # the shared `Casting.Types.cast_record/2` (`type` is the pgoutput type name, or an
+  # integer OID for an unmapped type — `cast_record/2`'s fallback returns the raw text,
+  # matching the stream). No other input shape reaches here: the `::text` projection yields
+  # only binaries and NULLs.
+  defp cast_value(nil, _type), do: nil
+  defp cast_value(value, type) when is_binary(value), do: Types.cast_record(value, type)
 
   @doc false
   @spec snapshot_error(term()) :: Error.t()

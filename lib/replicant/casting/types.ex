@@ -74,6 +74,14 @@ defmodule Replicant.Casting.Types do
   def cast_record("t", "bool"), do: true
   def cast_record("f", "bool"), do: false
 
+  # The `::text` projection the snapshot readers use emits bool as the full word
+  # ("true"/"false"), NOT pgoutput's typoutput form ("t"/"f") the stream casts above.
+  # Recognize both so a snapshot row and a streamed row deliver the SAME boolean for a
+  # bool column (spec §2 convergence). The stream never sends the full-word form, so these
+  # clauses only fire on the snapshot path — they do not change stream decoding.
+  def cast_record("true", "bool"), do: true
+  def cast_record("false", "bool"), do: false
+
   # Handle interval type before general integer pattern
   def cast_record(record, "interval") when is_binary(record), do: record
 
