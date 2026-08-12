@@ -1002,7 +1002,12 @@ defmodule Replicant.ConnectionTest do
       st =
         state(
           checkpoint_state: :fault,
-          checkpoint_store: [connection: [], table: "cp", max_retries: 2, retry_backoff_ms: 60_000],
+          checkpoint_store: [
+            connection: [],
+            table: "cp",
+            max_retries: 2,
+            retry_backoff_ms: 60_000
+          ],
           step: :invalidation_check
         )
 

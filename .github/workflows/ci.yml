@@ -37,8 +37,11 @@ jobs:
 
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: "27"
-          elixir-version: "1.17"
+          # Pinned to the dev toolchain (.tool-versions) so the format check,
+          # dialyzer PLT, and CI run on the same Elixir/OTP — a version skew here
+          # lets the formatter list-wrap heuristic pass in one and fail in the other.
+          otp-version: "28"
+          elixir-version: "1.19.5"
 
       - name: Cache deps and build
         uses: actions/cache@v4
@@ -47,10 +50,15 @@ jobs:
             deps
             _build
             priv/plts
-          key: ${{ runner.os }}-mix-${{ matrix.postgres }}-${{ hashFiles('mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-${{ matrix.postgres }}-
+          # Key binds the cache to the pinned toolchain + mix.lock + .tool-versions,
+          # so a toolchain or dep bump invalidates a stale PLT/build cache.
+          key: ${{ runner.os }}-pg${{ matrix.postgres }}-otp28-ex1.19.5-${{ hashFiles('mix.lock', '.tool-versions') }}
+          restore-keys: ${{ runner.os }}-pg${{ matrix.postgres }}-otp28-ex1.19.5-
 
       - run: mix deps.get
+      # Supply-chain gate (declared in mix.exs `audit` alias: unused-dep + hex advisory +
+      # deps audit). Runs before build so a vulnerable/unpinned dep reds before compile.
+      - run: mix audit
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix credo --strict
