@@ -130,7 +130,7 @@ looping.
 ```elixir
 def deps do
   [
-    {:replicant, "~> 0.2"}
+    {:replicant, "~> 0.3"}
   ]
 end
 ```

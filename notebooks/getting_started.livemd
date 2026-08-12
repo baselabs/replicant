@@ -35,7 +35,7 @@ first:
 
 ```elixir
 Mix.install([
-  {:replicant, "~> 0.2"},
+  {:replicant, "~> 0.3"},
   {:kino, "~> 0.14"}
 ])
 ```
