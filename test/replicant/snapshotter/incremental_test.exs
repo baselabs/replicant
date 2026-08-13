@@ -399,6 +399,51 @@ defmodule Replicant.Snapshotter.IncrementalTest do
              SnapshotProgress.encode(SnapshotProgress.finish_table(sp))
   end
 
+  test "register_reader/1 guards the exactly-one invariant: a live prior reader is rejected; the key frees on owner death" do
+    # The structural guard for the codebase's most comment-load-bearing hazard: a reconnect path
+    # that forgets retire_reader/1 must NOT silently spawn a second reader (double chunk delivery).
+    # register_reader makes the invariant mechanical — a live prior reader blocks a new one.
+    slot = "inc_guard_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    # Owner registers + holds the key alive.
+    owner =
+      spawn(fn ->
+        send(parent, {:reg, Inc.register_reader(slot)})
+        receive do: (:release -> :ok)
+      end)
+
+    assert_receive {:reg, :ok}, 500
+
+    # A second process (the double-reader hazard) is rejected — the guard fires.
+    spawn(fn -> send(parent, {:reg2, Inc.register_reader(slot)}) end)
+    assert_receive {:reg2, {:error, :already_running}}, 500
+
+    # The same process re-registering is ALSO rejected (Registry :unique is per-key, not per-pid).
+    spawn(fn -> send(parent, {:reg2b, Inc.register_reader(slot)}) end)
+    assert_receive {:reg2b, {:error, :already_running}}, 500
+
+    # Owner dies → Registry auto-removes the key (it monitors owners). A fresh reader re-registers :ok.
+    send(owner, :release)
+    ref = Process.monitor(owner)
+    assert_receive {:DOWN, ^ref, _, _, _}, 500
+
+    assert poll_register(slot, 50), "the key must free after the owner dies (Registry monitor cleanup)"
+  end
+
+  defp poll_register(slot, tries) do
+    parent = self()
+
+    spawn(fn -> send(parent, {:poll, Replicant.Snapshotter.Incremental.register_reader(slot)}) end)
+
+    receive do
+      {:poll, :ok} -> true
+      {:poll, {:error, :already_running}} when tries > 0 -> Process.sleep(10); poll_register(slot, tries - 1)
+    after
+      200 -> false
+    end
+  end
+
   # A freshly re-discovered keyed table_ref (server-quoted identifiers, single int4 PK), as
   # `discover/1` builds them — carries the enriched `col_quoted`/`col_type_names`, which the
   # SnapshotProgress table_ref shape does not. Used to prove reconcile_resume/2 sources

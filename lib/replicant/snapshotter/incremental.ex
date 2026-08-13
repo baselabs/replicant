@@ -80,14 +80,42 @@ defmodule Replicant.Snapshotter.Incremental do
   @doc false
   @spec run(args()) :: :ok
   def run(args) do
-    case backfill(args) do
+    case register_reader(args.slot_name) do
       :ok ->
-        :ok
+        case backfill(args) do
+          :ok ->
+            :ok
 
-      {:error, reason} when is_atom(reason) ->
-        Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: reason})
-        Replicant.Supervisor.halt(args.slot_name, {:snapshot, reason})
+          {:error, reason} when is_atom(reason) ->
+            Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: reason})
+            Replicant.Supervisor.halt(args.slot_name, {:snapshot, reason})
+            :ok
+        end
+
+      {:error, :already_running} ->
+        # Structural exactly-one guard fired (spec §8): a prior reader for this slot is still
+        # alive — a reconnect path forgot retire_reader/1, the comment-only invariant the 1.0
+        # readiness review flagged as the codebase's most comment-load-bearing hazard. Halt
+        # fail-closed (value-free :duplicate_reader) rather than double-deliver snapshot chunks.
+        # Registry auto-frees the key when the prior reader dies, so a correctly-retired restart
+        # (the normal reconnect flow) re-registers cleanly and is unaffected.
+        Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: :duplicate_reader})
+        Replicant.Supervisor.halt(args.slot_name, {:snapshot, :duplicate_reader})
         :ok
+    end
+  end
+
+  @doc false
+  # Structural exactly-one guard: register THIS reader under a per-slot key in
+  # `Replicant.Registry` (`:unique`). A live prior registration means a reconnect path skipped
+  # `retire_reader/1` — return `{:error, :already_running}` so `run/1` halts fail-closed instead
+  # of double-delivering snapshot chunks. Registry removes the key when the owning reader dies,
+  # so a correctly-retired restart re-registers `:ok`. Public (`@doc false`) for direct unit test.
+  @spec register_reader(String.t()) :: :ok | {:error, :already_running}
+  def register_reader(slot_name) do
+    case Registry.register(Replicant.Registry, {:incremental_reader, slot_name}, nil) do
+      {:ok, _owner} -> :ok
+      {:error, {:already_registered, _pid}} -> {:error, :already_running}
     end
   end
 
