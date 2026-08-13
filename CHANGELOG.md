@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound the lib-mode incremental-snapshot concurrency marquee's writer and
+  assert real chunk/stream overlap before quiescing it, so constrained CI
+  runners prove convergence instead of being starved by an unbounded WAL source.
+
 ## [1.0.0] - 2026-08-13
 
 ### Fixed

@@ -479,7 +479,7 @@ defmodule Replicant.IncrementalSnapshotTest do
   test "lib mode × incremental: store-owned progress completes + converges effect-once under a concurrent writer",
        %{ctrl: ctrl, slot: slot} do
     if PG16.enabled?() do
-      setup_int_table(ctrl, "inc_lib", "inclib_pub", 5_000)
+      setup_int_table(ctrl, "inc_lib", "inclib_pub", 10_000)
       cp = "cp_" <> String.replace(slot, "-", "_")
       prog = "prog_" <> String.replace(slot, "-", "_")
       # Drop any store tables from a prior BEAM run: the slot name recurs across `mix test` runs
@@ -488,15 +488,21 @@ defmodule Replicant.IncrementalSnapshotTest do
       Postgrex.query!(ctrl, "DROP TABLE IF EXISTS #{cp}", [])
       Postgrex.query!(ctrl, "DROP TABLE IF EXISTS #{prog}", [])
 
-      start_incremental_lib(slot, "inclib_pub", cp, prog, chunk_rows: 200, max_pending_chunks: 4)
+      start_incremental_lib(slot, "inclib_pub", cp, prog, chunk_rows: 100, max_pending_chunks: 4)
 
       # A concurrent writer during the LIB-mode backfill — the drop-set collision-corrects exactly as
       # in sink-owned mode, and progress rides the checkpoint store (not the sink). A stale chunk row
       # surviving over a newer streamed update RED's the convergence gate.
-      {writer, go} = start_writer(fn w, n -> write_orders(w, n, "inc_lib", 5_000) end)
+      writer =
+        start_bounded_writer(400, fn w, n -> write_orders(w, n, "inc_lib", 10_000) end)
 
-      wait_backfill_complete(30_000)
-      stop_writer(writer, go)
+      # Non-vacuity: prove the writer's stream and the snapshot overlap. Then let the bounded
+      # writer quiesce so a slower CI runner cannot be starved forever by an unbounded WAL source.
+      PG16.wait_until(fn -> chunk_count() > 0 and stream_txn_count() > 0 end, 1_200)
+      refute backfill_complete?()
+      Task.await(writer, 30_000)
+
+      wait_backfill_complete(2_400)
 
       # Progress is durable IN THE STORE and decodes to :complete (lib mode carries no sink progress).
       assert [[token]] =
@@ -681,6 +687,14 @@ defmodule Replicant.IncrementalSnapshotTest do
       end)
 
     {task, go}
+  end
+
+  defp start_bounded_writer(iterations, body) do
+    Task.async(fn ->
+      {:ok, writer} = Postgrex.start_link(PG16.pg_opts())
+      Enum.each(1..iterations, &body.(writer, &1))
+      GenServer.stop(writer)
+    end)
   end
 
   defp stop_writer(task, go) do
@@ -1106,6 +1120,13 @@ defmodule Replicant.IncrementalSnapshotTest do
   defp chunk_count do
     Enum.count(IncrementalSnapshotSink.ledger(), fn
       {:chunk, _t, _pks, _prog, _first?, _complete?} -> true
+      _ -> false
+    end)
+  end
+
+  defp stream_txn_count do
+    Enum.count(IncrementalSnapshotSink.ledger(), fn
+      {:txn, _lsn, _pks} -> true
       _ -> false
     end)
   end
