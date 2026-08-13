@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-13
+
+### Fixed
+
+- **Float-array casting no longer halts the pipeline on valid Postgres output (Critical-Rule-1
+  path, fail-closed).** The `_float4`/`_float8` array clauses called `String.to_float/1`, which
+  raises on the exact text Postgres `float4out`/`float8out` emits for whole numbers (`"1"`),
+  scientific notation (`"1e+20"`), and the special values `NaN`/`Infinity`/`-Infinity`. So a
+  `double precision[]` / `real[]` column holding an ordinary whole-valued element raised inside
+  `Casting.Types.cast_record/2`; the decode boundary caught it and halted the pipeline
+  fail-closed (no data loss, no value leak), but a schema with a whole-number float-array element
+  permanently stalled the consumer. The array clauses now mirror the scalar `float*` clause
+  (`Float.parse` fallback + the `:nan`/`:infinity`/`:neg_infinity` atoms) and never raise. For
+  symmetry the `_int*` array clause is likewise lenient (`Integer.parse` fallback) instead of
+  `String.to_integer/1`. The `Casting.Types` moduledoc's raise-site list is now accurate (the
+  array bangs it omitted are gone). Covered by a new red-first float-array unit test (whole
+  numbers, scientific notation, special values, NULL, multidimensional nesting).
+
+### Changed
+
+- **Post-halt incremental-window calls are rejected with `{:error, :window_reset}`.** After a
+  fail-closed halt, the `{:message, ...}` cast was already dropped, but the three incremental
+  snapshot-window `handle_call` clauses (`open_snapshot_window`, `deliver_snapshot_chunk`,
+  `finish_snapshot_table`) still ran — so `apply_ready_chunks` could call `sink.handle_snapshot`
+  once during the async teardown window. Idempotent sinks bound the impact, but this contradicted
+  the halt contract the module states. All three now carry a `halted: true` guard returning
+  `{:error, :window_reset}` (the reload/stop signal the reader already handles). Covered by a
+  red-first halted-guard unit test.
+- **Snapshotter / incremental-reader connection opts use `Keyword.merge` (library wins).** Both
+  reader call sites used `conn_opts ++ [pool_size: 1]`, so a caller-supplied `pool_size` won over
+  the library's and duplicate keys reached Postgrex. Now `Keyword.merge(conn_opts, pool_size: 1)`
+  — parity with the checkpoint-store and connection merges, which document the library-wins rule
+  as load-bearing.
+
 ## [1.0.0] - 2026-08-13
 
 ### Fixed
@@ -118,10 +152,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The three vendored public functions are specced.** `Casting.Types.cast_record/2`,
   `Casting.ArrayParser.parse/1`, `Decoder.OidDatabase.name_for_type_id/1` now carry `@spec`; the
   frozen public surface is fully specced.
-- Reconcile the README, contributor guide, and durable roadmap with the current `replicant` 0.3.1
-  and `ash_replicant` 0.3.0 releases while retaining older lifecycle rows as explicitly historical
-  evidence. Remove public-roadmap links into ignored lifecycle artifacts and repair release
-  comparison references through 0.3.1.
 
 ## [0.3.1] - 2026-07-14
 
@@ -419,7 +449,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/baselabs/replicant/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/baselabs/replicant/compare/v0.3.1...v1.0.0
 [0.3.1]: https://github.com/baselabs/replicant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/baselabs/replicant/compare/v0.2.2...v0.3.0

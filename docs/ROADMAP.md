@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-13 · **Release:** `v1.0.0` (tagged) · **Branch:** `main`
+**Updated:** 2026-08-13 · **Release:** `v1.1.0` (tagged) · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,7 +15,8 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.0.0 is published and tagged** `v1.0.0`.
+- **`replicant` 1.1.0 is published and tagged** `v1.1.0` (a post-1.0 hardening patch —
+  see CHANGELOG `[1.1.0]`; 1.0.0 shipped at `v1.0.0`).
 - **`ash_replicant` 0.3.0 is published and tagged** at `c5ef154`; a coordinated
   1.0 release requiring Replicant `~> 1.0` is in progress. Its source dependency
   remains `{:replicant, "~> 0.1.0"}` until that coordinated release.
@@ -148,9 +149,17 @@ migration); the slug is the slice join key.
 | D9 | **Three vendored public functions unspecced** — `Casting.Types.cast_record/2` (the central casting contract), `Casting.ArrayParser.parse/1`, `Decoder.OidDatabase.name_for_type_id/1`. slug:d9-vendored-specs | All three carry `@spec`; the frozen public surface is fully specced; dialyzer clean | — | Freeze the contract |
 | D10 | **Named-ctrl-conn cascade masked the integration suite** — every integration module started a NAMED Postgrex pool in `setup` and never stopped it; ExUnit's `async: false` one-process model then made test 2+ fail with `{:already_started, _}`, silently masking ~half the suite (the full run was 66/31). Found while verifying D5. slug:d10-named-conn-cascade | `PG16.named_conn/2` centralizes per-test isolation (start unlink + register on_exit stop); all 23 named-pool sites route through it; the full integration suite is 66/0 (was 66/31) | D5 | A masked integration suite is not 1.0-grade correctness evidence |
 
-### Status (2026-08-12 run)
+### Status (2026-08-13 closeout)
 
-**Shipped before the current release slice:** D1, D4, D5, D6, D7, D8, D9, and D10. **Reopened by the 2026-08-13 major-contract audit:** D3 must carry the common Elixir 1.20.3/OTP 29 release toolchain and immutable CI inputs; D2 requires actual-session identity, an AshReplicant `~> 1.0` dependency, fetched-package proof, and deliberate dependency-ordered publication. Publication remains separately authorized.
+**All ten rows shipped in 1.0.0** (`v1.0.0`): D1 (install constraint), D4–D10 closed in the
+hardening run, and the two 2026-08-13 major-contract rows — D2 (actual-session identity:
+`Replicant.SessionIdentity`, `handle_session_identity/2`, the `IDENTIFY_SYSTEM` connect step,
+ADR-0007) and D3 (release hygiene: `.tool-versions` pins Elixir 1.20.3-otp-29 / Erlang 29.0.3,
+CI matches and uses immutable action/image revisions, `mix audit` is a gate, postgrex floors at
+`~> 0.22.4`) — both verified against the fetched package. The only separately-authorized item is
+the coordinated AshReplicant `~> 1.0` dependency publication. **1.1.0** (`v1.1.0`) is a
+post-1.0 hardening patch: a float-array casting fix, a post-halt window-guard consistency fix,
+and connection-opt merge hardening (see CHANGELOG `[1.1.0]`).
 
 ### P2 backlog (post-1.0 hardening)
 

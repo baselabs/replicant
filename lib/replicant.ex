@@ -86,8 +86,11 @@ defmodule Replicant do
   (sink-owned mode requires `snapshot_progress/0`; lib mode carries progress in the
   checkpoint store). Both are mutually exclusive with `go_forward_only: true`.
 
-  Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` is
-  `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`.
+  Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` includes
+  `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`,
+  plus the start-gate rejections `:conflicting_start_mode`, `:snapshot_unsupported`,
+  `:batch_unsupported`, and `:messages_unsupported` (e.g. `messages: true` without a
+  `handle_message/2` callback in the sink).
   """
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(opts) when is_list(opts) do

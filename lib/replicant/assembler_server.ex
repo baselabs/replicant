@@ -324,6 +324,23 @@ defmodule Replicant.AssemblerServer do
     do: {:noreply, %{state | floor_lsn: lsn}}
 
   @impl true
+  # Post-halt: the teardown (spawned Supervisor.halt) is in flight and will terminate this
+  # process; refuse the window call family so no chunk drains and no sink.handle_snapshot runs
+  # during teardown. :window_reset is the established reload/stop signal the reader already
+  # handles (parity with the {:message, ...} cast drop and the reset_snapshot_window release).
+  def handle_call({:open_snapshot_window, _qualified}, _from, %{halted: true} = state),
+    do: {:reply, {:error, :window_reset}, state}
+
+  def handle_call({:deliver_snapshot_chunk, _chunk}, _from, %{halted: true} = state),
+    do: {:reply, {:error, :window_reset}, state}
+
+  def handle_call(
+        {:finish_snapshot_table, _qualified, _reader_epoch},
+        _from,
+        %{halted: true} = state
+      ),
+      do: {:reply, {:error, :window_reset}, state}
+
   def handle_call({:open_snapshot_window, qualified}, from, %{window: %{} = w} = state) do
     cond do
       Replicant.SnapshotWindow.discarded?(w, qualified) ->

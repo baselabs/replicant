@@ -116,7 +116,9 @@ defmodule Replicant.Snapshotter do
          start_mono,
          mode
        ) do
-    {:ok, db} = Postgrex.start_link(conn_opts ++ [pool_size: 1])
+    # Library control opts win (Keyword.merge, second wins): this reader issues strictly
+    # serial queries on a single pooled conn (parity with the store + connection merges).
+    {:ok, db} = Postgrex.start_link(Keyword.merge(conn_opts, pool_size: 1))
 
     try do
       result =
@@ -273,6 +275,10 @@ defmodule Replicant.Snapshotter do
     {:ok, cp}
   end
 
+  # Test-only seam (connection_test.exs drives the completion path directly). Lives in lib, NOT
+  # test/support, because complete/5 is `defp`: relocation would force either widening the public
+  # API (making complete/5 public) or duplicating the completion + telemetry logic in test code.
+  # `@doc false` keeps it out of HexDocs; it is never called by library code. Do NOT move it.
   @doc false
   @spec complete_for_test(module(), Replicant.lsn(), :sink_owned | :lib) ::
           {:ok, Replicant.lsn()} | {:error, term()}

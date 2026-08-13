@@ -170,6 +170,24 @@ defmodule Replicant.AssemblerServerTest do
     refute_received {:sink_committed, _}
   end
 
+  test "post-halt incremental-window calls are rejected with {:error, :window_reset} (halt contract)" do
+    # Halt is in flight (spawned Supervisor.halt → terminate is async). The message cast is
+    # dropped (test above); the window call family MUST likewise refuse so no chunk drains and
+    # calls sink.handle_snapshot during teardown. The reader treats :window_reset as reload-and-
+    # stop, which is correct once the teardown kills it. Goes RED if any halted guard is removed.
+    pid = start("srv_window_halt", RecordingSink)
+    window = Replicant.SnapshotWindow.new(epoch: 1, drop_cap: 10, max_pending: 4)
+
+    :sys.replace_state(pid, fn st -> %{st | halted: true, window: window} end)
+
+    assert AssemblerServer.open_snapshot_window(pid, "public.t") == {:error, :window_reset}
+
+    chunk = %{qualified: "public.t", first?: true, complete?: true}
+    assert AssemblerServer.deliver_snapshot_chunk(pid, chunk) == {:error, :window_reset}
+
+    assert AssemblerServer.finish_snapshot_table(pid, "public.t", 1) == {:error, :window_reset}
+  end
+
   test "sink-owned init builds a :sink_owned assembler" do
     {:ok, pid} =
       start_supervised({Replicant.AssemblerServer, slot_name: "s_owned", sink: RecordingSink})

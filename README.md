@@ -10,7 +10,7 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.0.0 is published on Hex (tagged `v1.0.0`). Replicant owns
+> **Status:** 1.1.0 is published on Hex (tagged `v1.1.0`). Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
 > invalidation, and is proven by a real-PG16 crash-injection suite
@@ -70,7 +70,8 @@ check is plain integer comparison: `txn.commit_lsn <= checkpoint`.
 
 ## How it streams
 
-A running pipeline is two processes under a `:one_for_all` supervisor:
+A running pipeline is two processes under a `:one_for_all` supervisor (three in
+lib/checkpoint-store mode, which adds `Replicant.CheckpointStore` as the first child):
 
 - **`Replicant.Connection`** (`Postgrex.ReplicationConnection`) owns the
   replication slot and the socket. It answers a keepalive with the **last

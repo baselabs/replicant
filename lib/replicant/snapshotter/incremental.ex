@@ -163,7 +163,9 @@ defmodule Replicant.Snapshotter.Incremental do
   end
 
   defp do_backfill(args) do
-    {:ok, db} = Postgrex.start_link(args.connection ++ [pool_size: 1])
+    # Library control opts win (Keyword.merge, second wins): a single pooled conn — the
+    # reader issues strictly serial queries (parity with the store + snapshotter merges).
+    {:ok, db} = Postgrex.start_link(Keyword.merge(args.connection, pool_size: 1))
     # Stamp this run's start on the threaded `args` map so deliver_completion can report a real
     # `:completed` duration (spec §9) without threading a timestamp through the recursive chunk loop.
     args = Map.put(args, :started_mono, System.monotonic_time(:millisecond))

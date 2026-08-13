@@ -42,3 +42,12 @@ cond do
   version < 170_000 -> ExUnit.configure(exclude: [:pg17])
   true -> :ok
 end
+
+# NOTE on `--include integration` against a PG16 server: ExUnit's `--include TAG` rescues a test
+# carrying that tag from EVERY exclusion, so `mix test --include integration` re-admits the
+# `:pg17` tests (which carry BOTH `:integration` and `:pg17`) on a PG16 substrate and they FAIL
+# (failover slots need PG17+). This is a framework constraint, not a bug: ExUnit setup callbacks
+# cannot return {:skip, reason} (valid returns are :ok / keyword / map only), so there is no
+# runtime-skip-from-setup to harden the gate further. The canonical invocations are correct:
+# `mix test` (no flags) skips :pg17 on PG16 and runs them on PG17; run the failover file against a
+# PG17+ server explicitly. Do NOT pair `--include integration` with a <17 server.

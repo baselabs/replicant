@@ -40,6 +40,26 @@ defmodule Replicant.Casting.TypesTest do
       assert Types.cast_record("{1,2,3}", "_int4") == [1, 2, 3]
       assert Types.cast_record("{a,b}", "_text") == ["a", "b"]
     end
+
+    # Postgres float8out emits the SHORTEST round-tripping text form, which has NO
+    # decimal dot for whole numbers ("1"), uses scientific notation for very
+    # large/small magnitudes ("1e+20"), and emits bare "NaN"/"Infinity"/"-Infinity".
+    # String.to_float/1 raises on all of those, so the array clauses MUST be lenient
+    # exactly like the scalar "float8" clause — otherwise a double precision[]/real[]
+    # column with an ordinary whole-valued element halts the pipeline fail-closed.
+    test "float arrays: whole numbers, scientific notation, special values, NULL, nested" do
+      assert Types.cast_record("{1,2.5}", "_float8") == [1.0, 2.5]
+      assert Types.cast_record("{1e+20}", "_float8") == [1.0e20]
+
+      assert Types.cast_record("{NaN,Infinity,-Infinity}", "_float8") ==
+               [:nan, :infinity, :neg_infinity]
+
+      # NULL token -> nil; float4 shares the clause
+      assert Types.cast_record("{1,NULL}", "_float4") == [1.0, nil]
+
+      # multidimensional nests recursively
+      assert Types.cast_record("{{1,2},{3,4}}", "_float8") == [[1.0, 2.0], [3.0, 4.0]]
+    end
   end
 
   describe "lenient fallback" do

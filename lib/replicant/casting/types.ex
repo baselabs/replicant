@@ -234,22 +234,31 @@ defmodule Replicant.Casting.Types do
   def cast_record(record, "pg_snapshot") when is_binary(record), do: record
   def cast_record(record, "txid_snapshot") when is_binary(record), do: record
 
-  # Array type casting - integer arrays with support for multidimensional arrays
+  # Array type casting - integer arrays with support for multidimensional arrays.
+  # Lenient (Integer.parse fallback) so a non-integer token returns unchanged rather
+  # than raising — matches the scalar "int*" clause. Postgres int output is always
+  # well-formed, so the fallback is defensive, not load-bearing.
   def cast_record(array_string, <<"_int", _::binary>>) when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
       {:ok, elements} ->
-        cast_array_elements(elements, &String.to_integer/1)
+        cast_array_elements(elements, &cast_int_element/1)
 
       {:error, _} ->
         array_string
     end
   end
 
-  # Array type casting - float arrays
+  # Array type casting - float arrays. MUST be lenient: Postgres float4out/float8out
+  # emits the shortest round-tripping text form, which has no decimal dot for whole
+  # numbers ("1"), uses scientific notation for large/small magnitudes ("1e+20"), and
+  # emits bare "NaN"/"Infinity"/"-Infinity". String.to_float/1 raises on ALL of those,
+  # so a double precision[]/real[] column with an ordinary whole-valued element would
+  # halt the pipeline fail-closed — the array clause mirrors the scalar "float*" clause
+  # (Float.parse + the special-value atoms) instead.
   def cast_record(array_string, <<"_float", _::binary>>) when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
       {:ok, elements} ->
-        cast_array_elements(elements, &String.to_float/1)
+        cast_array_elements(elements, &cast_float_element/1)
 
       {:error, _} ->
         array_string
@@ -493,5 +502,28 @@ defmodule Replicant.Casting.Types do
       elem ->
         cast_fn.(elem)
     end)
+  end
+
+  # Lenient int element: Integer.parse falls back to the original string on a
+  # non-integer token rather than raising (parity with the scalar "int*" clause).
+  defp cast_int_element(elem) do
+    case Integer.parse(elem) do
+      {int, _} -> int
+      :error -> elem
+    end
+  end
+
+  # Lenient float element: handles the special-value atoms Postgres emits
+  # ("NaN"/"Infinity"/"-Infinity") and parses with Float.parse, falling back to the
+  # original string. Parity with the scalar "float*" clause — never raises.
+  defp cast_float_element("NaN"), do: :nan
+  defp cast_float_element("Infinity"), do: :infinity
+  defp cast_float_element("-Infinity"), do: :neg_infinity
+
+  defp cast_float_element(elem) do
+    case Float.parse(elem) do
+      {float, _} -> float
+      :error -> elem
+    end
   end
 end

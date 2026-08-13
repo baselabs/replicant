@@ -1,4 +1,4 @@
-# ADR 0007: Actual replication-session identity precedes checkpoint lookup
+# ADR-0007: Actual replication-session identity precedes checkpoint lookup
 
 ## Status
 
