@@ -131,7 +131,15 @@ defmodule Replicant.Snapshotter do
             # v1 scan project <col>::text and cast each value through the stream's path.
             tables = Postgrex.query!(c, table_columns_sql, [publication]).rows
 
-            Enum.reduce(tables, 0, fn [schema, table, qualified, col_raw, col_quoted, col_type_oids], acc ->
+            Enum.reduce(tables, 0, fn [
+                                        schema,
+                                        table,
+                                        qualified,
+                                        col_raw,
+                                        col_quoted,
+                                        col_type_oids
+                                      ],
+                                      acc ->
               cols = {col_raw, col_quoted, col_type_oids}
               acc + copy_table(c, sink, cp, schema, table, qualified, cols)
             end)
@@ -272,7 +280,8 @@ defmodule Replicant.Snapshotter do
     do: complete(sink, cp, 0, System.monotonic_time(:millisecond), mode)
 
   @doc false
-  @spec build_change(String.t(), String.t(), [String.t()], [term()], [binary() | nil]) :: Change.t()
+  @spec build_change(String.t(), String.t(), [String.t()], [term()], [binary() | nil]) ::
+          Change.t()
   def build_change(schema, table, col_names, type_names, text_values) do
     record =
       Enum.zip_with([col_names, type_names, text_values], fn [name, type, value] ->

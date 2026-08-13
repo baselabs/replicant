@@ -428,7 +428,8 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     ref = Process.monitor(owner)
     assert_receive {:DOWN, ^ref, _, _, _}, 500
 
-    assert poll_register(slot, 50), "the key must free after the owner dies (Registry monitor cleanup)"
+    assert poll_register(slot, 50),
+           "the key must free after the owner dies (Registry monitor cleanup)"
   end
 
   test "register_reader/1 recovers a legit retire-in-flight: a colliding register whose prior dies during the await retries :ok" do
@@ -448,22 +449,30 @@ defmodule Replicant.Snapshotter.IncrementalTest do
 
     # Start a colliding register from a fresh process; it enters its await of the prior's death.
     spawn(fn -> send(parent, {:race_collide, Inc.register_reader(slot)}) end)
+
     # Let the collider enter its await, THEN release the owner (retire-in-flight killing the prior).
     Process.sleep(20)
     send(owner, :release)
 
-    assert_receive {:race_collide, :ok}, 500,
-                    "a colliding register whose prior dies during the await must retry to :ok (legit retire-in-flight)"
+    assert_receive {:race_collide, :ok},
+                   500,
+                   "a colliding register whose prior dies during the await must retry to :ok (legit retire-in-flight)"
   end
 
   defp poll_register(slot, tries) do
     parent = self()
 
-    spawn(fn -> send(parent, {:poll, Replicant.Snapshotter.Incremental.register_reader(slot)}) end)
+    spawn(fn ->
+      send(parent, {:poll, Inc.register_reader(slot)})
+    end)
 
     receive do
-      {:poll, :ok} -> true
-      {:poll, {:error, :already_running}} when tries > 0 -> Process.sleep(10); poll_register(slot, tries - 1)
+      {:poll, :ok} ->
+        true
+
+      {:poll, {:error, :already_running}} when tries > 0 ->
+        Process.sleep(10)
+        poll_register(slot, tries - 1)
     after
       200 -> false
     end

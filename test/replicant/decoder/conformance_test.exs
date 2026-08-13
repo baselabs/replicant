@@ -260,9 +260,8 @@ defmodule Replicant.Decoder.ConformanceTest do
       {"Insert",
        <<73, 0, 0, 96, 0, 78, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48>>},
       {"Update",
-       <<85, 0, 0, 96, 0, 79, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48,
-         78, 0, 2, 116, 0, 0, 0, 7, 101, 120, 97, 109, 112, 108, 101, 116, 0, 0, 0, 3, 53, 54,
-         48>>},
+       <<85, 0, 0, 96, 0, 79, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48, 78,
+         0, 2, 116, 0, 0, 0, 7, 101, 120, 97, 109, 112, 108, 101, 116, 0, 0, 0, 3, 53, 54, 48>>},
       {"Delete",
        <<68, 0, 0, 96, 0, 79, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48>>},
       {"Message",
@@ -277,7 +276,8 @@ defmodule Replicant.Decoder.ConformanceTest do
       test "tamper: #{@name} — the type byte + a sampled payload byte each diverge from the known-good decode" do
         original = Decoder.decode(@bytes)
         # Baseline guard: a mistyped fixture byte fails LOUD here, not silently downstream.
-        assert match?({:ok, _}, original), "#{@name} baseline must decode — check the fixture bytes"
+        assert match?({:ok, _}, original),
+               "#{@name} baseline must decode — check the fixture bytes"
 
         # The message-type byte: flipping the discriminator must NOT silently decode to the same
         # message (it routes to a different type or errors).

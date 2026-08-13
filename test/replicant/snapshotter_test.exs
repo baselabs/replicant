@@ -6,7 +6,9 @@ defmodule Replicant.SnapshotterTest do
   describe "build_change/5 (spec §6.2, §2 convergence)" do
     test "casts ::text values through the stream's path to a string-keyed %Change{op: :snapshot}" do
       # Values arrive as TEXT (the ::text projection); build_change casts them.
-      change = Snapshotter.build_change("public", "orders", ["id", "note"], ["int4", "text"], ["1", "hi"])
+      change =
+        Snapshotter.build_change("public", "orders", ["id", "note"], ["int4", "text"], ["1", "hi"])
+
       assert change.op == :snapshot
       assert change.schema == "public"
       assert change.table == "orders"
@@ -17,7 +19,9 @@ defmodule Replicant.SnapshotterTest do
     end
 
     test "carries a nil column value through as a real NULL (not dropped)" do
-      change = Snapshotter.build_change("public", "orders", ["id", "note"], ["int4", "text"], ["1", nil])
+      change =
+        Snapshotter.build_change("public", "orders", ["id", "note"], ["int4", "text"], ["1", nil])
+
       assert change.record == %{"id" => 1, "note" => nil}
     end
   end

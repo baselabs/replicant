@@ -11,4 +11,3 @@ import Config
 # Logger calls (the value-free boundary), so nothing useful is hidden at :warning in the test
 # env; this just suppresses the cosmetic attach-time advisory (P2 #11).
 config :logger, level: :warning
-

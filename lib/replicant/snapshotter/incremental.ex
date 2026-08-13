@@ -144,8 +144,12 @@ defmodule Replicant.Snapshotter.Incremental do
 
   defp retry_register(slot_name, n) do
     case Registry.register(Replicant.Registry, {:incremental_reader, slot_name}, nil) do
-      {:ok, _} -> :ok
-      {:error, _} -> Process.sleep(5); retry_register(slot_name, n - 1)
+      {:ok, _} ->
+        :ok
+
+      {:error, _} ->
+        Process.sleep(5)
+        retry_register(slot_name, n - 1)
     end
   end
 
