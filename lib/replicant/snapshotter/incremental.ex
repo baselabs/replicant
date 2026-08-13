@@ -111,11 +111,41 @@ defmodule Replicant.Snapshotter.Incremental do
   # `retire_reader/1` — return `{:error, :already_running}` so `run/1` halts fail-closed instead
   # of double-delivering snapshot chunks. Registry removes the key when the owning reader dies,
   # so a correctly-retired restart re-registers `:ok`. Public (`@doc false`) for direct unit test.
+  #
+  # On collision, `await_prior_death_or_halt/2` covers the transient startup race where
+  # `retire_reader/1` has killed the prior but the Registry has not yet freed the key (kill is
+  # not awaited): monitor the prior and, if it dies, retry once; a prior that stays alive is a
+  # genuine forgotten-reader double-spawn (the hazard) → halt.
   @spec register_reader(String.t()) :: :ok | {:error, :already_running}
   def register_reader(slot_name) do
     case Registry.register(Replicant.Registry, {:incremental_reader, slot_name}, nil) do
       {:ok, _owner} -> :ok
-      {:error, {:already_registered, _pid}} -> {:error, :already_running}
+      {:error, {:already_registered, pid}} -> await_prior_death_or_halt(slot_name, pid)
+    end
+  end
+
+  defp await_prior_death_or_halt(slot_name, pid) do
+    ref = Process.monitor(pid)
+
+    receive do
+      {:DOWN, ^ref, _, ^pid, _} ->
+        # Prior died (a legit retire in flight). Registry frees the key on its own :DOWN
+        # (microseconds); retry until it does. The bound (~50 ms) dwarfs Registry processing.
+        retry_register(slot_name, 10)
+    after
+      # A prior that does NOT die in this window is a real forgotten-reader double-spawn → halt.
+      100 ->
+        Process.demonitor(ref, [:flush])
+        {:error, :already_running}
+    end
+  end
+
+  defp retry_register(_slot_name, 0), do: {:error, :already_running}
+
+  defp retry_register(slot_name, n) do
+    case Registry.register(Replicant.Registry, {:incremental_reader, slot_name}, nil) do
+      {:ok, _} -> :ok
+      {:error, _} -> Process.sleep(5); retry_register(slot_name, n - 1)
     end
   end
 

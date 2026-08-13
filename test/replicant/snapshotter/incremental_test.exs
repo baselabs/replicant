@@ -419,7 +419,7 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     spawn(fn -> send(parent, {:reg2, Inc.register_reader(slot)}) end)
     assert_receive {:reg2, {:error, :already_running}}, 500
 
-    # The same process re-registering is ALSO rejected (Registry :unique is per-key, not per-pid).
+    # Another distinct process is ALSO rejected (Registry :unique is per-key, not per-pid).
     spawn(fn -> send(parent, {:reg2b, Inc.register_reader(slot)}) end)
     assert_receive {:reg2b, {:error, :already_running}}, 500
 
@@ -429,6 +429,31 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     assert_receive {:DOWN, ^ref, _, _, _}, 500
 
     assert poll_register(slot, 50), "the key must free after the owner dies (Registry monitor cleanup)"
+  end
+
+  test "register_reader/1 recovers a legit retire-in-flight: a colliding register whose prior dies during the await retries :ok" do
+    # The transient startup race (the P2 review NOTE): retire_reader/1 kills the prior without
+    # awaiting :DOWN, so a new reader's register can collide with a prior that is ALREADY dying.
+    # The await-then-retry recovers the legit case; a prior that STAYS alive (the hazard) still halts.
+    slot = "inc_race_#{System.unique_integer([:positive])}"
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        send(parent, {:race_reg, Inc.register_reader(slot)})
+        receive do: (:release -> :ok)
+      end)
+
+    assert_receive {:race_reg, :ok}, 500
+
+    # Start a colliding register from a fresh process; it enters its await of the prior's death.
+    spawn(fn -> send(parent, {:race_collide, Inc.register_reader(slot)}) end)
+    # Let the collider enter its await, THEN release the owner (retire-in-flight killing the prior).
+    Process.sleep(20)
+    send(owner, :release)
+
+    assert_receive {:race_collide, :ok}, 500,
+                    "a colliding register whose prior dies during the await must retry to :ok (legit retire-in-flight)"
   end
 
   defp poll_register(slot, tries) do
