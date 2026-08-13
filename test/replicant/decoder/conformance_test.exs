@@ -246,4 +246,57 @@ defmodule Replicant.Decoder.ConformanceTest do
                )
     end
   end
+
+  # Tamper-evidence (machine-checked): a meaningful byte flip is caught. The strict per-fixture
+  # assertions above make the suite tamper-red BY CONSTRUCTION; this makes it tamper-red BY TEST.
+  # For each message class, flipping the type byte or a sampled payload byte MUST diverge from the
+  # known-good decode (error or a different decoded term), never silently the same. The fixtures
+  # are the same REAL captured bytes used above (re-transcribed here so this describe is
+  # self-contained; the baseline-decode guard fails LOUD if a byte is mistyped).
+  describe "tamper-evidence (machine-checked: a meaningful byte flip is caught)" do
+    @tamper_fixtures [
+      {"Begin",
+       <<66, 0, 0, 0, 2, 167, 244, 168, 128, 0, 2, 48, 246, 88, 88, 213, 242, 0, 0, 2, 107>>},
+      {"Insert",
+       <<73, 0, 0, 96, 0, 78, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48>>},
+      {"Update",
+       <<85, 0, 0, 96, 0, 79, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48,
+         78, 0, 2, 116, 0, 0, 0, 7, 101, 120, 97, 109, 112, 108, 101, 116, 0, 0, 0, 3, 53, 54,
+         48>>},
+      {"Delete",
+       <<68, 0, 0, 96, 0, 79, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48>>},
+      {"Message",
+       <<77, 1, 0, 0, 0, 3, 94, 23, 229, 224, 116, 120, 110, 95, 112, 114, 101, 102, 105, 120, 0,
+         0, 0, 0, 11, 116, 120, 110, 95, 99, 111, 110, 116, 101, 110, 116>>}
+    ]
+
+    for {name, bytes} <- @tamper_fixtures do
+      @name name
+      @bytes bytes
+
+      test "tamper: #{@name} — the type byte + a sampled payload byte each diverge from the known-good decode" do
+        original = Decoder.decode(@bytes)
+        # Baseline guard: a mistyped fixture byte fails LOUD here, not silently downstream.
+        assert match?({:ok, _}, original), "#{@name} baseline must decode — check the fixture bytes"
+
+        # The message-type byte: flipping the discriminator must NOT silently decode to the same
+        # message (it routes to a different type or errors).
+        refute Decoder.decode(flip_byte(@bytes, 0)) == original,
+               "#{@name}: a type-byte flip must diverge from the known-good decode"
+
+        # At least one payload byte is load-bearing: a sampled payload flip diverges (catches a
+        # value-field tamper, not just the discriminator). ~6 evenly-spaced samples.
+        last = byte_size(@bytes) - 1
+        samples = Enum.take_every(1..last, max(1, div(last, 6)))
+
+        assert Enum.any?(samples, fn p -> Decoder.decode(flip_byte(@bytes, p)) != original end),
+               "#{@name}: at least one sampled payload-byte flip must diverge"
+      end
+    end
+  end
+
+  defp flip_byte(bytes, i) do
+    <<head::binary-size(i), b, rest::binary>> = bytes
+    <<head::binary, bxor(b, 0xFF), rest::binary>>
+  end
 end
