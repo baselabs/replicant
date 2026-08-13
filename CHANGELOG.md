@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`Replicant.Assembler` split into three modules.** The assembler was a 1633-LOC god module;
+  it is now `Replicant.Assembler` (Core: v1 router + sink-dispatch/scrub cluster + change-building +
+  watermark, 1072 LOC), `Replicant.Assembler.Streaming` (proto-v2 streaming reassembly + spill,
+  398 LOC), and `Replicant.Assembler.Batch` (batched-checkpoint buffering + flush, 230 LOC). The
+  `%Assembler{}` struct is UNCHANGED; every moved function is a pure function on that struct, and
+  the 545-unit + 613-integration suites are the preservation net (green at every commit, no
+  behavior change). The cross-cutting Rule-1 scrub cluster stays intact (every sink-call site keeps
+  its value-free `rescue`/`catch`); the moved batch-flush scrub travels as one tamper-tested unit.
+  The Core↔Streaming/Core↔Batch call cycles are runtime-resolved in Elixir; the 8 widened `defp`→`def`
+  internal seams carry `@doc false`. Closeout: fresh-context diff-review CLEAN; cross-vendor
+  codex+claude CLEAN; crash-injection marquees loss=0 / effect-dup=0 green against live PG16.
 - **Batch flush-trigger deduplicated.** The lib-batch and sink-owned-batch flush triggers were
   two identical `cond` blocks (count cap OR LSN-span cap OR buffer); extracted to a shared
   `Assembler.maybe_trip_batch/3` so the two modes cannot drift (a drift would silently change the
