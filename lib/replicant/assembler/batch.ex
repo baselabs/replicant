@@ -161,11 +161,18 @@ defmodule Replicant.Assembler.Batch do
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}
 
+      {:sink_raised, %Spill.Error{}} ->
+        # The lazy Reader raised a value-free Spill.Error while handle_batch forced its enumeration
+        # (a disk/decode fault mid-read, spec §5) — the batch-flush parity of deliver_now's per-txn
+        # Reader-fault path. Distinguish it from a sink fault: :spill_io_failed (NOT :sink_failed),
+        # value-free (no shape — Spill.Error carries no row byte; Critical Rule 1).
+        sink_batch_failed(asm, duration, :spill_io_failed)
+
       {:error, _reason} ->
         sink_batch_failed(asm, duration)
 
       {:sink_raised, e} ->
-        sink_batch_failed(asm, duration, Assembler.safe_shape(e))
+        sink_batch_failed(asm, duration, :sink_failed, Assembler.safe_shape(e))
 
       {:sink_caught, _kind, _reason} ->
         sink_batch_failed(asm, duration)
@@ -179,15 +186,18 @@ defmodule Replicant.Assembler.Batch do
     end
   end
 
-  def sink_batch_failed(asm, duration, shape \\ nil) do
-    Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{reason: :sink_failed})
+  # `reason` distinguishes the fault class for triage (:sink_failed default; :spill_io_failed for a
+  # Reader fault). Centralized so the CV1 spill-file cleanup cannot drift between fault classes —
+  # mirrors the maybe_trip_batch centralization for the two batch modes.
+  def sink_batch_failed(asm, duration, reason \\ :sink_failed, shape \\ nil) do
+    Telemetry.event([:replicant, :sink, :failed], %{duration: duration}, %{reason: reason})
 
     # Delete the migrated spill files on the fault branch too (CV1): a flush fault halts fail-closed
     # and the batch re-streams from the durable checkpoint (fresh files) on restart, so the buffered
     # spill files must not orphan (cleartext row values at rest). Mirrors the {:ok} branch's cleanup
     # + deliver_now's fault cleanup (dab7f2f); clearing the list keeps a later reset_batch idempotent.
     Enum.each(asm.batch_spill_paths, &Spill.rm/1)
-    {:error, %Error{reason: :sink_failed, shape: shape}, %{asm | batch_spill_paths: []}}
+    {:error, %Error{reason: reason, shape: shape}, %{asm | batch_spill_paths: []}}
   end
 
   def flush_lib_batch(%Assembler{pending_lsn: lsn} = asm, reason) do

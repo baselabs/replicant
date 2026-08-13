@@ -2107,6 +2107,17 @@ defmodule Replicant.AssemblerTest do
       def handle_batch(_txns), do: {:error, :boom}
     end
 
+    # Forces the lazy Reader INSIDE handle_batch, so a missing spill file raises Spill.Error there —
+    # the batch-flush parity of deliver_now's ForcingSink (a Reader fault mid-read, spec §5).
+    defmodule ForcingFaultBatchSink do
+      def checkpoint, do: {:ok, nil}
+
+      def handle_batch(txns) do
+        Enum.each(txns, fn t -> Enum.to_list(t.changes) end)
+        {:ok, List.last(txns).commit_lsn}
+      end
+    end
+
     defp spill_batch_asm(base, sink) do
       alias Replicant.Decoder.Messages.Relation
       alias Replicant.Decoder.Messages.Relation.Column
@@ -2220,6 +2231,80 @@ defmodule Replicant.AssemblerTest do
                Assembler.flush_batch(asm, :max_transactions)
 
       refute File.exists?(path)
+      assert asm.batch_spill_paths == []
+    end
+
+    test "a Reader faulting mid-read during handle_batch halts :spill_io_failed (NOT :sink_failed), value-free — batch parity with deliver_now",
+         %{base: base} do
+      alias Replicant.Decoder.Messages.{Insert, Relation, StreamCommit, StreamStart, StreamStop}
+      alias Replicant.Decoder.Messages.Relation.Column
+
+      # A `text` column so the secret survives casting into record["v"] — makes the value-free refute
+      # non-vacuous (the secret lives in the spilled file at rest; a scrub regression that inlined the
+      # Reader's rows into %Error{} would surface it).
+      text_rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "t",
+        replica_identity: :default,
+        columns: [%Column{name: "v", type: "text", flags: [:key], type_modifier: nil}]
+      }
+
+      asm =
+        %{
+          Replicant.Assembler.new(ForcingFaultBatchSink,
+            batch: [max_transactions: 100, max_delay_ms: 1000, max_span: 1_000_000],
+            max_concurrent_txns: 64,
+            spill: [dir: base, max_spill_bytes: 1_000_000],
+            max_inflight_lag: 120,
+            slot_name: "sp"
+          )
+          | stream_floor: 0
+        }
+
+      {:ok, asm} = Assembler.handle_message(asm, text_rel)
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStart{xid: 100, first_segment: true})
+
+      # Force a spill: the secret-bearing rows land on disk (subxid 100).
+      asm =
+        Enum.reduce(1..3, asm, fn _i, acc ->
+          {:ok, acc} =
+            Assembler.handle_message(acc, %Insert{
+              xid: 100,
+              relation_id: 1,
+              tuple_data: {"SEKRET"}
+            })
+
+          Assembler.observe_bytes(acc, 60)
+        end)
+
+      {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
+      spill_path = asm.stream_txns[100].spill && asm.stream_txns[100].spill.path
+      assert spill_path && File.exists?(spill_path)
+
+      # Buffer the spilled txn into the sink-owned batch (handle_batch NOT called yet; file survives).
+      assert {:buffered, asm} =
+               Assembler.handle_message(asm, %StreamCommit{
+                 xid: 100,
+                 commit_lsn: 900,
+                 end_lsn: 901,
+                 commit_timestamp: nil
+               })
+
+      assert spill_path in asm.batch_spill_paths
+
+      # Delete the spill file BEFORE flush: handle_batch's force re-opens the now-missing path → ENOENT
+      # → Spill.Error raised INSIDE handle_batch (mirrors deliver_now's per-txn Reader-fault path).
+      File.rm!(spill_path)
+
+      # The spill-IO fault is distinguished from a sink fault (:spill_io_failed, NOT :sink_failed) —
+      # the batch parity deliver_now already had — and carries the fixed reason ONLY (Critical Rule 1).
+      assert {:error, %Replicant.Error{reason: :spill_io_failed} = err, asm} =
+               Assembler.flush_batch(asm, :max_transactions)
+
+      refute inspect(err) =~ "SEKRET"
+
+      # CV1 cleanup still runs on the spill-IO fault branch: the (now-gone) migrated path is cleared.
       assert asm.batch_spill_paths == []
     end
 

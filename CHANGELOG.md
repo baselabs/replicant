@@ -69,6 +69,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The Core↔Streaming/Core↔Batch call cycles are runtime-resolved in Elixir; the 8 widened `defp`→`def`
   internal seams carry `@doc false`. Closeout: fresh-context diff-review CLEAN; cross-vendor
   codex+claude CLEAN; crash-injection marquees loss=0 / effect-dup=0 green against live PG16.
+- **Batch spill-IO fault now labeled `:spill_io_failed` (was `:sink_failed`).** A spill-IO fault
+  (a lazy Reader raising `Spill.Error` while the sink forced its enumeration during sink-owned batch
+  delivery) is now distinguished from a sink fault — parity with the per-transaction `deliver_now`
+  path, which already labeled it `:spill_io_failed`. Still fail-closed and value-free (Critical Rule
+  1); only the surfaced error reason / telemetry `:reason` becomes more specific for triage.
 - **Batch flush-trigger deduplicated.** The lib-batch and sink-owned-batch flush triggers were
   two identical `cond` blocks (count cap OR LSN-span cap OR buffer); extracted to a shared
   `Assembler.maybe_trip_batch/3` so the two modes cannot drift (a drift would silently change the
