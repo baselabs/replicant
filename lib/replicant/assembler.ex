@@ -327,7 +327,7 @@ defmodule Replicant.Assembler do
          asm}
 
       {:ok, buf} ->
-        deliver_or_skip_stream(asm, top, buf, lsn, ts)
+        __MODULE__.Streaming.deliver_or_skip_stream(asm, top, buf, lsn, ts)
     end
   end
 
@@ -599,156 +599,13 @@ defmodule Replicant.Assembler do
     {:halt, %Error{reason: :unsupported_message}, asm}
   end
 
-  # Route a StreamCommit's buffer to empty-suppression, the unspilled in-memory replay, or the
-  # spilled lazy-Reader delivery. The buffer is removed from `stream_txns` and its spilled bytes are
-  # decremented from the assembler total up front (delivered once, effect-once) so every branch sees a
-  # clean assembler. `spilled_live` counts the NON-aborted spilled frames, so a spilled txn whose
-  # every spilled subxid later aborted is detected as EMPTY here (routed through the CV1 empty-
-  # suppression, spec §7 v1-indistinguishability) rather than delivered as an empty %Transaction{}.
-  defp deliver_or_skip_stream(%__MODULE__{} = asm, top, buf, lsn, ts) do
-    resident = Enum.reject(buf.changes, fn {sx, _c} -> MapSet.member?(buf.aborted, sx) end)
-
-    spilled_live =
-      Enum.reduce(buf.spilled_by_subxid, 0, fn {sx, c}, acc ->
-        if MapSet.member?(buf.aborted, sx), do: acc, else: acc + c
-      end)
-
-    asm = %{
-      asm
-      | stream_txns: Map.delete(asm.stream_txns, top),
-        current_stream_xid: nil,
-        spilled_total: asm.spilled_total - buf.spilled_bytes
-    }
-
-    # Transactional messages tagged to an aborted subxid are dropped (mirrors the change-reject
-    # above); the surviving ones must RIDE the txn even when it carries zero row-changes — the v1
-    # path (Begin→Message→Commit) delivers exactly that (effect-once, spec §7.1). A message-bearing
-    # txn is therefore v1-DISTINGUISHABLE and must NOT be empty-suppressed, or the message is
-    # silently lost (regression: the suppression keyed on row-changes alone).
-    live_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
-
-    cond do
-      resident == [] and spilled_live == 0 and live_messages == [] ->
-        # Empty after aborts (spilled or not) → v1-indistinguishable suppression (parent CV1, spec §7).
-        # Use Spill.discard (close + delete), NOT Spill.rm (delete only): this branch runs BEFORE the
-        # Spill.close below, so buf.spill is a live open device — Spill.rm would unlink the file but
-        # leak the FD (:emfile under repeated spill-then-all-aborted).
-        if buf.spill, do: Spill.discard(buf.spill)
-        suppress_empty_stream_commit(asm, lsn)
-
-      buf.spill == nil ->
-        # Unspilled, non-empty (row-changes and/or a transactional message): the in-memory List
-        # replay (stamp commit_lsn + ordinals at replay).
-        {changes, change_count} = replay_resident(resident, lsn)
-        deliver_stream_commit(asm, lsn, ts, buf.byte_size, changes, change_count, live_messages)
-
-      true ->
-        # Spilled, non-empty: close the file for reading, deliver a lazy Reader over frames + tail.
-        :ok = Spill.close(buf.spill)
-        reader = Spill.Reader.new(buf.spill.path, resident, buf.aborted, lsn)
-        deliver_spilled_stream_commit(asm, lsn, ts, buf, reader)
-    end
-  end
-
-  # Replay the newest-first resident tail into commit order in ONE pass (`Enum.reverse` then
-  # `Enum.map_reduce`), stamping the commit-granularity commit_lsn (streamed changes have no LSN
-  # before commit, spec §5) and yielding the change_count from the same traversal. The `ordinal` is
-  # PRESERVED (stamped at accumulation from the shared per-txn counter, so it interleaves with any
-  # transactional message's ordinal) — never re-numbered here; the counter is only a change tally.
-  # Extracted VERBATIM from the shipped StreamCommit body to keep `deliver_or_skip_stream` within
-  # credo's nesting depth (mirrors the `deliver_stream_commit` extraction).
-  defp replay_resident(resident, lsn) do
-    resident
-    |> Enum.reverse()
-    |> Enum.map_reduce(0, fn {_subxid, change}, count ->
-      {%{change | commit_lsn: lsn}, count + 1}
-    end)
-  end
-
-  # Deliver a SPILLED streamed txn as a lazy `Spill.Reader` %Transaction{} (spec §5): the sink forces
-  # the enumeration inside its own call (single-pass; disk frames then resident tail, aborted subxids
-  # rejected, commit_lsn + ordinals stamped by the Reader). `change_count` is unknown without forcing
-  # the lazy reader, so the `[:stream, :committed]` telemetry omits it (the allowlist permits a
-  # subset). Pre-skip at/below the watermark (effect-once, §2) — delete the file, no delivery — else
-  # deliver via the shared apply_sink path, threading the spill PATH so cleanup happens after durable
-  # delivery (per-txn / lib+batch delete the file; sink-owned batch keeps it until flush, Task 8).
-  defp deliver_spilled_stream_commit(%__MODULE__{} = asm, lsn, ts, buf, reader) do
-    buf_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
-
-    txn = %Transaction{
-      commit_lsn: lsn,
-      commit_timestamp: ts,
-      changes: reader,
-      messages: buf_messages
-    }
-
-    Telemetry.event([:replicant, :stream, :committed], %{}, %{
-      commit_lsn: lsn,
-      byte_size: buf.byte_size
-    })
-
-    if skip?(asm, txn) do
-      Spill.rm(buf.spill.path)
-      {:skipped, lsn, asm}
-    else
-      apply_sink(asm, txn, buf.spill.path)
-    end
-  end
-
-  # The non-empty StreamCommit delivery path (the pre-computed `change_count` comes from the replay
-  # map_reduce): emit the assembled + stream:committed telemetry, then pre-skip at/below the watermark
-  # (effect-once, §2) else deliver via the shared apply_sink/2 — a separate clause to keep the
-  # StreamCommit body within credo's nesting depth. An empty streamed txn never reaches here (it is
-  # suppressed in the StreamCommit clause, spec §7).
-  defp deliver_stream_commit(asm, lsn, ts, byte_size, changes, change_count, buf_messages) do
-    txn = %Transaction{
-      commit_lsn: lsn,
-      commit_timestamp: ts,
-      changes: changes,
-      messages: buf_messages
-    }
-
-    Telemetry.event([:replicant, :transaction, :assembled], %{}, %{
-      change_count: change_count,
-      commit_lsn: lsn,
-      byte_size: byte_size,
-      lag_ms: lag_ms(ts)
-    })
-
-    Telemetry.event([:replicant, :stream, :committed], %{}, %{
-      change_count: change_count,
-      commit_lsn: lsn,
-      byte_size: byte_size
-    })
-
-    if skip?(asm, txn) do
-      {:skipped, lsn, asm}
-    else
-      apply_sink(asm, txn)
-    end
-  end
-
-  # An empty streamed txn (spec §7 suppression) carries no changes to deliver, but it MUST NOT
-  # `{:skipped}`-ack ahead of an OPEN batch: in batch mode a buffered-but-unflushed txn has a
-  # commit_lsn BELOW this lsn (commit order), and `{:skipped}` acks the slot to `lsn` immediately
-  # (assembler_server.ex dispatch), which would advance `confirmed_flush` past that un-delivered /
-  # un-checkpointed WAL — a crash before flush then drops it (loss). When a batch is open, fold the
-  # empty txn's lsn INTO the batch (advance `pending_lsn` and re-check the span cap): the eventual
-  # flush acks it only AFTER the buffered data is durable, with no delivery, no `batch_count`
-  # increment, and `batch_txns` untouched (so a sink-owned flush never calls `handle_batch([])`).
-  # With no batch open there is nothing un-durable below this lsn, so skip-ack immediately —
-  # matching the non-batch path and v1-indistinguishability (spec §7). loss=0, effect-once preserved.
-  defp suppress_empty_stream_commit(%__MODULE__{} = asm, lsn) do
-    if batch_pending?(asm) do
-      asm = %{asm | pending_lsn: lsn}
-
-      if lsn - span_base(asm) >= Keyword.fetch!(asm.batch, :max_span),
-        do: {:flush, :max_span, asm},
-        else: {:buffered, asm}
-    else
-      {:skipped, lsn, asm}
-    end
-  end
+  # --- streamed-commit delivery (spec §5/§7) — moved to `Replicant.Assembler.Streaming` ---
+  # deliver_or_skip_stream/replay_resident/deliver_spilled_stream_commit/deliver_stream_commit/
+  # suppress_empty_stream_commit are pure functions on the shared `%Assembler{}` struct. The
+  # StreamCommit clause above delegates to `__MODULE__.Streaming.deliver_or_skip_stream/5`; they call
+  # back into Core's `skip?/2` + `apply_sink/3` (the dispatch + Rule-1 scrub seam) for the watermark
+  # check and delivery. The `[:transaction, :assembled]` event now emits from Streaming (streamed
+  # txns) AND Core (v1 Commit) — both value-free; a consistency item, not a leak.
 
   # --- relation + schema change ---
 
@@ -1021,7 +878,7 @@ defmodule Replicant.Assembler do
 
   # Lib mode: compare against the IN-MEMORY watermark (seeded from the store,
   # advanced on each write) — no per-transaction store round-trip.
-  defp skip?(%__MODULE__{mode: :lib, lib_checkpoint: cp}, %Transaction{commit_lsn: lsn}),
+  def skip?(%__MODULE__{mode: :lib, lib_checkpoint: cp}, %Transaction{commit_lsn: lsn}),
     do: is_integer(cp) and lsn <= cp
 
   # Sink-owned: read the sink's checkpoint live. Reproduces the prior Commit-path
@@ -1030,7 +887,7 @@ defmodule Replicant.Assembler do
   # raised/exited read all fail-OPEN (dup-safe by the §6 sink idempotency
   # contract: a re-dispatched already-persisted txn is deduped by the sink, and a
   # real store outage makes handle_transaction fail → halt).
-  defp skip?(%__MODULE__{sink: sink}, %Transaction{commit_lsn: lsn}) do
+  def skip?(%__MODULE__{sink: sink}, %Transaction{commit_lsn: lsn}) do
     case checkpoint(sink) do
       {:ok, cp} -> not is_nil(cp) and lsn <= cp
       _ -> false
@@ -1044,7 +901,7 @@ defmodule Replicant.Assembler do
   # §8). Sink-owned batch buffers the txn (with its Reader) and keeps the file until flush/reset (Task
   # 8), so it RECORDS `spill_path` on `batch_spill_paths` (via buffer_for_delivery/3) for a single
   # delete at flush_sink_batch / reset_batch — it never reaches deliver_now, so no double-delete.
-  defp apply_sink(%__MODULE__{} = asm, %Transaction{} = txn, spill_path \\ nil) do
+  def apply_sink(%__MODULE__{} = asm, %Transaction{} = txn, spill_path \\ nil) do
     if sink_owned_batching?(asm),
       do: buffer_for_delivery(asm, txn, spill_path),
       else: deliver_now(asm, txn, spill_path)
@@ -1313,7 +1170,7 @@ defmodule Replicant.Assembler do
   # The span-cap base (spec §7): the un-checkpointed window's start = the higher of the durable
   # watermark and the per-stream floor, mirroring the §4 lag floor. On a fresh slot lib_checkpoint
   # is 0 so the floor dominates; after the first flush the watermark dominates.
-  defp span_base(%__MODULE__{lib_checkpoint: cp, stream_floor: floor}),
+  def span_base(%__MODULE__{lib_checkpoint: cp, stream_floor: floor}),
     do: max(cp || 0, floor || 0)
 
   @doc """
@@ -1519,9 +1376,9 @@ defmodule Replicant.Assembler do
   # Live lag from the transaction's commit timestamp to now, clamped ≥ 0 (clock
   # skew must not surface a negative). A nil timestamp → 0. Uses runtime `now`, so
   # no fixed-date time-bomb; it is a WAL position/time gauge, never a row value.
-  defp lag_ms(nil), do: 0
+  def lag_ms(nil), do: 0
 
-  defp lag_ms(%DateTime{} = commit_timestamp) do
+  def lag_ms(%DateTime{} = commit_timestamp) do
     max(0, System.os_time(:millisecond) - DateTime.to_unix(commit_timestamp, :millisecond))
   end
 
