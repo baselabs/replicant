@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Incremental-reader "exactly-one" made structural (was comment-defended).** The
+  incremental-backfill reader is `spawn_link`'d to the Connection, and the "exactly one reader
+  per slot" invariant was previously defended only by comments (`reader_pid` carried across
+  reconnect + `retire_reader/1` on every reconnect path). A future reconnect path that forgot
+  `retire_reader` would spawn a second reader → double delivery of snapshot chunks. The reader
+  now registers under `{:incremental_reader, slot}` in `Replicant.Registry` (`:unique`) at start;
+  a live prior registration halts fail-closed (`:duplicate_reader`) instead of double-delivering.
+  Registry auto-frees the key on the owner's death, so the normal retire+restart flow is unchanged.
 - **v1 snapshot value-type convergence.** `snapshot: true` shipped Postgrex's native row
   decode (`SELECT *`), so a typed column delivered a different runtime type from the snapshot
   than from the stream — e.g. a `timestamp` column arrived as `%NaiveDateTime{}` from the v1
@@ -50,6 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Batch flush-trigger deduplicated.** The lib-batch and sink-owned-batch flush triggers were
+  two identical `cond` blocks (count cap OR LSN-span cap OR buffer); extracted to a shared
+  `Assembler.maybe_trip_batch/3` so the two modes cannot drift (a drift would silently change the
+  dup bound in one mode). Pure refactor, behavior unchanged.
+- **Conformance suite tamper-evidence is now machine-checked.** A parametric byte-flip test
+  (type byte + sampled payload, per message class) proves each real-captured fixture goes red on
+  mutation — previously tamper-red by construction (strict pattern-matches), not by test.
 - **Install constraint corrected.** The README and getting-started Livebook shipped
   `{:replicant, "~> 0.2"}` (= `< 0.3.0`), locking users out of every 0.3 feature; now `~> 0.3`
   (and the 1.0 tag bumps it to `~> 1.0`). The stale `ash_replicant` reference (`~> 0.1.0` / `v0.3.0`)

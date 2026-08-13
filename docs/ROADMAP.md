@@ -157,16 +157,16 @@ migration); the slug is the slice join key.
 
 ### P2 backlog (post-1.0 hardening)
 
-Not blocking the freeze; tracked here so nothing is lost.
+Not blocking the freeze; tracked here so nothing is lost. ✅ = shipped in the 1.0-hardening run.
 
-- **Reader "exactly-one" invariant is comment-defended, not structure-defended** — a future reconnect path that forgets `retire_reader/1` resurrects a double-reader (`connection.ex:293,795-804,1124`). Add a structural guard.
+- ✅ **Reader "exactly-one" invariant — structural guard** (was comment-defended): `Incremental.register_reader/1` registers under `{:incremental_reader, slot}` in `Replicant.Registry`; a forgotten `retire_reader/1` halts fail-closed (`:duplicate_reader`) instead of double-delivering. `37ab768`.
 - **`assembler.ex` is a 1630-LOC god module** — extract `Assembler.Streaming` and `Assembler.Batch` (mechanical; it is a pure state machine).
 - **B8 checkpoint-read cache** — `Assembler.skip?/2` does a live `sink.checkpoint()/0` read per Commit (`assembler.ex:1137-1142`); the throughput floor in sink-owned mode. Profiling-gated.
-- **Duplicated batch flush-trigger `cond`** across lib-batch and sink-owned-batch (`assembler.ex:1358-1362` vs `:1403-1407`) — a drift silently changes the dup bound in one mode.
-- **Spill cleartext-at-rest threat model** undocumented (`spill.ex:13-14`) — document for PII-sensitive deployments.
+- ✅ **Duplicated batch flush-trigger `cond`** — extracted to `Assembler.maybe_trip_batch/3` (lib-batch and sink-owned-batch trip identically; no drift). `55316e9`.
+- ✅ **Spill cleartext-at-rest threat model** — documented in ADR-0005 (D8) + README "Operator guidance".
 - **`Replicant.Config.t()` is a map, not a struct** — decide and freeze (a later defstruct breaks pattern-matchers).
 - **`handle_batch/1` arity** — no context arg unlike `handle_snapshot/2`/`handle_message/2`; adding one later is a breaking rename.
-- **Conformance tamper-evidence is structural, not machine-checked** — add a parametric bit-flip test proving each fixture goes red on mutation.
-- **Effect-once / loss=0 / §4 backpressure have zero unit-level proof** — all live behind `@moduletag :integration`; the local `mix test` loop is blind. Add ≥1 no-server test for the watermark-skip predicate and batch rollback.
+- ✅ **Conformance tamper-evidence** — machine-checked: a parametric byte-flip test (type byte + sampled payload) per message class proves each fixture goes red on mutation. `b04b4d7`.
+- ✅ (corrected) **Effect-once / loss=0 / §4 unit proof** — the readiness test-audit over-claimed "zero unit-level proof"; probing the suite shows the invariants ARE unit-covered: watermark-skip (`assembler_test.exs:188-246`), batch write-fault + watermark discipline (`:791-800`), `reset_batch`/reconnect-discard (`assembler_server_test.exs:405-470`), the §4 `:sink_too_slow` halt + first-frame no-false-halt (`connection_test.exs:295-362`), idle-ack ordering (`:200`). Crash-injection is integration-only by nature (the logic is unit-tested; the end-to-end marquees prove it under real reconnect). No gap to close.
 - **`Replicant.SnapshotProgress` ungrouped in HexDocs**; three public fns have `@spec` but no `@doc` (`Supervisor.start_link/1`, `Telemetry.span/3`, `Telemetry.event/3`).
 - **Telemetry test-noise** — `AssemblerTest` attaches anonymous-fn handlers (a `:info` warning); cosmetic, use module-qualified refs.
