@@ -489,7 +489,8 @@ defmodule Replicant.Assembler do
   # --- streamed-commit delivery (spec §5/§7) — moved to `Replicant.Assembler.Streaming` ---
   # deliver_or_skip_stream/replay_resident/deliver_spilled_stream_commit/deliver_stream_commit/
   # suppress_empty_stream_commit are pure functions on the shared `%Assembler{}` struct. The
-  # StreamCommit clause above delegates to `__MODULE__.Streaming.deliver_or_skip_stream/5`; they call
+  # StreamCommit clause above delegates to `__MODULE__.Streaming.handle_stream_commit/2` (which
+  # checks a recorded spill_fault FIRST, then routes to deliver_or_skip_stream/5); they call
   # back into Core's `skip?/2` + `apply_sink/3` (the dispatch + Rule-1 scrub seam) for the watermark
   # check and delivery. The `[:transaction, :assembled]` event now emits from Streaming (streamed
   # txns) AND Core (v1 Commit) — both value-free; a consistency item, not a leak.
