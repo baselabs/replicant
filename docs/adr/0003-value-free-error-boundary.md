@@ -31,8 +31,10 @@ enforced at four mechanically distinct points:
   in `rescue`/`catch`, AND **every sink-call site** (`deliver_now`, `deliver_message`,
   `flush_sink_batch`, `apply_chunk`, `commit_txn` checkpoint write, `checkpoint/0` read)
   independently scrubs `raise`/`throw`/`exit` to a value-free `:sink_failed` /
-  `:checkpoint_store_failed` / `:snapshot_failed` reason. This includes the batch-flush and
-  snapshot-chunk paths that run OUTSIDE `handle_message/2`'s rescue. (`lib/replicant/assembler.ex`,
+  `:checkpoint_store_failed` / `:snapshot_failed` reason (a spill-Reader fault raised while the sink
+  forces a lazy `changes` enumeration is distinguished as `:spill_io_failed`, still value-free).
+  This includes the batch-flush and snapshot-chunk paths that run OUTSIDE `handle_message/2`'s
+  rescue. (`lib/replicant/assembler.ex`, `lib/replicant/assembler/batch.ex`,
   `lib/replicant/assembler_server.ex`, `lib/replicant/snapshotter.ex`.)
 - **Telemetry allowlist** — `Replicant.Telemetry` defines `@allowed_meta_keys` (LSNs, table
   names, counts, durations, error-class atoms, `slot_name`, `attempt`, `transactional`) and

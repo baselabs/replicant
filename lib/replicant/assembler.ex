@@ -36,8 +36,11 @@ defmodule Replicant.Assembler do
   into `{:halt, %Error{reason: :decode_failure}}`; a sink raise/throw/exit is
   scrubbed by `apply_sink/2` into `{:halt, %Error{reason: :sink_failed}}` — never
   inspecting a throw/exit reason, which (e.g. a `GenServer.call` timeout carrying
-  the transaction) can embed row values (Critical Rule 1). A row/commit message
-  arriving before any `Begin` halts as `:config_invalid` rather than crashing.
+  the transaction) can embed row values (Critical Rule 1). A spill-Reader fault
+  raised while the sink forces a lazy `changes` enumeration is distinguished as
+  `:spill_io_failed` (per-txn via `deliver_now/3`, batch via `Batch.flush_sink_batch/2`),
+  still value-free. A row/commit message arriving before any `Begin` halts as
+  `:config_invalid` rather than crashing.
   """
 
   alias Replicant.{
