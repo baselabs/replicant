@@ -9,6 +9,7 @@ defmodule Replicant.Sink do
 
   | callback | required | purpose |
   |---|---|---|
+  | `c:handle_session_identity/2` | no | synchronously accept the actual replication-session identity before checkpoint lookup |
   | `c:checkpoint/0` | in sink-owned mode | last durably-persisted commit LSN (`nil` = never). In **lib mode** (`:checkpoint_store` configured) the library owns the checkpoint and this callback is not required. |
   | `c:handle_transaction/1` | **yes** | persist the txn + checkpoint atomically, return `{:ok, lsn}` |
   | `c:handle_batch/1` | in batch-delivery mode | deliver N txns + checkpoint atomically |
@@ -64,6 +65,27 @@ defmodule Replicant.Sink do
 
   @doc "Last durably-persisted commit LSN, for resume AND as the dedup watermark."
   @callback checkpoint() :: {:ok, Replicant.lsn() | nil} | {:error, term()}
+
+  @doc """
+  Optional. Synchronously accept the PostgreSQL system/database identity read by
+  `IDENTIFY_SYSTEM` on the exact replication connection that will stream WAL.
+
+  This callback runs on every connect and reconnect before `checkpoint/0`, any
+  checkpoint-store read, snapshot delivery, or `START_REPLICATION`. Return `:ok`
+  to accept. Any other return, raise, throw, or exit halts the pipeline
+  fail-closed with a fixed structural reason. `context` carries the configured
+  slot name and normalized publication list; it contains no row values.
+
+  A sink that binds checkpoints to their true source should implement this
+  callback. A separate PostgreSQL connection is not an equivalent identity
+  source because routing or failover can make it observe a different server.
+  """
+  @callback handle_session_identity(Replicant.SessionIdentity.t(), context) ::
+              :ok | {:error, term()}
+            when context: %{
+                   required(:slot_name) => String.t(),
+                   required(:publication) => [String.t()]
+                 }
 
   @doc """
   Persist the whole transaction AND its checkpoint atomically; return the commit
@@ -173,6 +195,7 @@ defmodule Replicant.Sink do
   @callback snapshot_progress() :: {:ok, binary() | nil} | {:error, term()}
 
   @optional_callbacks [
+    handle_session_identity: 2,
     checkpoint: 0,
     handle_transaction: 1,
     handle_batch: 1,
@@ -183,6 +206,26 @@ defmodule Replicant.Sink do
     handle_snapshot_complete: 1,
     snapshot_progress: 0
   ]
+
+  @doc false
+  @spec accept_session_identity(module(), Replicant.SessionIdentity.t(), map()) ::
+          :ok | {:error, :session_identity_rejected}
+  def accept_session_identity(module, identity, context) do
+    if function_exported?(module, :handle_session_identity, 2) do
+      try do
+        case module.handle_session_identity(identity, context) do
+          :ok -> :ok
+          _other -> {:error, :session_identity_rejected}
+        end
+      rescue
+        _ -> {:error, :session_identity_rejected}
+      catch
+        _kind, _reason -> {:error, :session_identity_rejected}
+      end
+    else
+      :ok
+    end
+  end
 
   @doc """
   The sink's kind, defaulting to `:state_mirror` when `c:sink_kind/0` is not

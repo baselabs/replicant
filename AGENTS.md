@@ -108,8 +108,9 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
 
 ## Docs & lifecycle-artifact policy
 
-- **Tracked / published:** `AGENTS.md`, `README.md`, `CHANGELOG.md`,
-  `CONTRIBUTING.md`, `usage-rules.md`, `LICENSE`, `NOTICE`,
+- **Tracked repository-only:** `AGENTS.md` (the contributor/agent contract; excluded from Hex).
+- **Tracked and Hex-published:** `README.md`, `CHANGELOG.md`,
+  `CONTRIBUTING.md`, `usage-rules.md`, `LICENSE`, `NOTICE`, `docs/INVARIANTS.md`,
   `docs/ROADMAP.md`, and accepted decisions under `docs/adr/`.
 - **Never tracked:** all brainstorm specs, plans, exec notes, reviews, and
   handoffs under `docs/superpowers/`, which is gitignored. Do not move those

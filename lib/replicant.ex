@@ -30,9 +30,10 @@ defmodule Replicant do
         go_forward_only: false         # must be true to start a :state_mirror sink from empty
       )
 
-  The `Replicant.Connection` owns the slot and advances it only after the sink has
-  durably persisted a transaction (ack-after-checkpoint); the `Replicant.AssemblerServer`
-  applies the sink synchronously off the keepalive path.
+  The `Replicant.Connection` owns the slot, reports the exact replication-session
+  identity to the sink before checkpoint lookup, and advances the slot only after
+  the sink has durably persisted a transaction (ack-after-checkpoint); the
+  `Replicant.AssemblerServer` applies the sink synchronously off the keepalive path.
   """
 
   @typedoc """

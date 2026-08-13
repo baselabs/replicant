@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-13
+
 ### Fixed
 
 - **Incremental-reader "exactly-one" made structural (was comment-defended).** The
@@ -46,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Actual replication-session identity.** Every connect and reconnect now runs
+  `IDENTIFY_SYSTEM` on the exact `Postgrex.ReplicationConnection` before reading
+  any sink-owned or library-owned checkpoint. The public
+  `%Replicant.SessionIdentity{}` and optional `handle_session_identity/2`
+  callback let a source-aware sink reject drift synchronously; malformed identity
+  or any callback failure halts with a fixed value-free reason.
+
 - **Foundational ADRs + published Critical Rules.** Four ADRs record the load-bearing 1.0
   posture decisions a bare-clone maintainer cannot recover from code alone: [0003](docs/adr/0003-value-free-error-boundary.md)
   the value-free error/log/telemetry boundary, [0004](docs/adr/0004-commit-lsn-transaction-watermark.md)
@@ -60,8 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`Replicant.Assembler` split into three modules.** The assembler was a 1633-LOC god module;
   it is now `Replicant.Assembler` (Core: v1 router + sink-dispatch/scrub cluster + change-building +
-  watermark, 1072 LOC), `Replicant.Assembler.Streaming` (proto-v2 streaming reassembly + spill,
-  398 LOC), and `Replicant.Assembler.Batch` (batched-checkpoint buffering + flush, 230 LOC). The
+  watermark, 1072 LOC), its streaming helper (proto-v2 reassembly + spill,
+  398 LOC), and its batch helper (batched-checkpoint buffering + flush, 230 LOC). The
   `%Assembler{}` struct is UNCHANGED; every moved function is a pure function on that struct, and
   the 545-unit + 613-integration suites are the preservation net (green at every commit, no
   behavior change). The cross-cutting Rule-1 scrub cluster stays intact (every sink-call site keeps
@@ -82,14 +91,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (type byte + sampled payload, per message class) proves each real-captured fixture goes red on
   mutation — previously tamper-red by construction (strict pattern-matches), not by test.
 - **Install constraint corrected.** The README and getting-started Livebook shipped
-  `{:replicant, "~> 0.2"}` (= `< 0.3.0`), locking users out of every 0.3 feature; now `~> 0.3`
-  (and the 1.0 tag bumps it to `~> 1.0`). The stale `ash_replicant` reference (`~> 0.1.0` / `v0.3.0`)
-  is corrected to the actual `~> 0.3` / `v0.4.0`.
-- **Release hygiene.** A `.tool-versions` pins Elixir 1.19.5-otp-28 / Erlang 28.5; CI's `setup-beam`
+  `{:replicant, "~> 0.2"}` (= `< 0.3.0`), locking users out of every 0.3 feature; the
+  prepared 1.0 source release now shows `~> 1.0`. The coordinated AshReplicant 1.0
+  release will require Replicant 1.x; that consumer dependency change lands separately.
+- **Release hygiene.** A `.tool-versions` pins Elixir 1.20.3-otp-29 / Erlang 29.0.3; CI's `setup-beam`
   is aligned to it (it was otp-27 / elixir-1.17, and the formatter's list-wrap heuristic is
   version-sensitive — `mix format --check-formatted` was red on the dev toolchain). `mix audit`
   (the declared-but-unenforced `deps.unlock --check-unused` + `hex.audit` + `deps.audit` alias) is
   now a CI gate before build, and the cache key binds the pinned toolchain + `mix.lock` + `.tool-versions`.
+- **Hex package boundary.** Package files now enumerate the published docs and
+  ADR directories instead of including all of `docs/`, so ignored local Forge
+  specs, plans, reviews, and handoffs cannot leak into release bytes.
 - **`Replicant.Config.t` no longer advertises a `:batch` key.** It is derived from
   `checkpoint_store[:batch]`; a top-level `batch:` option is rejected with `:config_invalid`, so the
   public type advertising it was a trapdoor.

@@ -730,7 +730,12 @@ defmodule Replicant.AssemblerTest do
 
     test "a txn under the count/span cap is BUFFERED (no writer call, watermark not advanced)" do
       parent = self()
-      writer = fn lsn -> send(parent, {:wrote, lsn}) && :ok end
+
+      writer = fn lsn ->
+        send(parent, {:wrote, lsn})
+        :ok
+      end
+
       asm = batched(writer, max_transactions: 3, max_delay_ms: 1000, max_span: 1_000_000)
 
       assert {:buffered, asm} = commit_txn(asm, 100)
@@ -742,7 +747,12 @@ defmodule Replicant.AssemblerTest do
 
     test "reaching max_transactions returns {:flush, :max_transactions, _}; flush_batch writes once and advances the watermark per-batch" do
       parent = self()
-      writer = fn lsn -> send(parent, {:wrote, lsn}) && :ok end
+
+      writer = fn lsn ->
+        send(parent, {:wrote, lsn})
+        :ok
+      end
+
       asm = batched(writer, max_transactions: 2, max_delay_ms: 1000, max_span: 1_000_000)
 
       assert {:buffered, asm} = commit_txn(asm, 100)

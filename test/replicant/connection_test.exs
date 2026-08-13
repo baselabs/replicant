@@ -21,6 +21,49 @@ defmodule Replicant.ConnectionTest do
     def handle_transaction(_txn), do: {:ok, 0}
   end
 
+  defmodule IdentitySink do
+    @behaviour Replicant.Sink
+    @key {__MODULE__, :test_pid}
+
+    def set_test_pid(pid), do: :persistent_term.put(@key, pid)
+    def clear_test_pid, do: :persistent_term.erase(@key)
+
+    @impl true
+    def checkpoint do
+      send(:persistent_term.get(@key), :checkpoint_read)
+      {:ok, 0x100}
+    end
+
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+
+    @impl true
+    def handle_session_identity(identity, context) do
+      send(:persistent_term.get(@key), {:session_identity, identity, context})
+      :ok
+    end
+  end
+
+  defmodule RejectIdentitySink do
+    def handle_session_identity(_identity, _context), do: {:error, {:secret, "must not leak"}}
+  end
+
+  defmodule UnexpectedIdentitySink do
+    def handle_session_identity(_identity, _context), do: {:accepted, {:secret, "must not leak"}}
+  end
+
+  defmodule RaiseIdentitySink do
+    def handle_session_identity(_identity, _context), do: raise("must not leak")
+  end
+
+  defmodule ThrowIdentitySink do
+    def handle_session_identity(_identity, _context), do: throw({:secret, "must not leak"})
+  end
+
+  defmodule ExitIdentitySink do
+    def handle_session_identity(_identity, _context), do: exit({:secret, "must not leak"})
+  end
+
   defp state(overrides) do
     # The A6 watchdog stores its mutable count and its budget together in ONE struct field
     # (`command_error: %{count, max_retries}`), so accept the two LOGICAL overrides the watchdog
@@ -1156,13 +1199,91 @@ defmodule Replicant.ConnectionTest do
   # ---- connect chain ----
 
   describe "handle_connect/1 + recovery telemetry" do
-    test "reads the sink checkpoint and queries recovery status" do
-      {:query, sql, new_state} =
-        Connection.handle_connect(state(checkpoint_lsn: 0, step: :disconnected))
+    test "IDENTIFY_SYSTEM is the first command and checkpoint is not read yet" do
+      IdentitySink.set_test_pid(self())
+      on_exit(&IdentitySink.clear_test_pid/0)
 
+      {:query, sql, new_state} =
+        Connection.handle_connect(
+          state(checkpoint_lsn: 0, step: :disconnected, sink: IdentitySink)
+        )
+
+      assert sql == Replicant.QueryBuilder.identify_system()
+      assert new_state.checkpoint_lsn == 0
+      assert new_state.step == :identity_check
+      refute_received :checkpoint_read
+    end
+
+    test "accepted identity is delivered with context before checkpoint read and recovery query" do
+      IdentitySink.set_test_pid(self())
+      on_exit(&IdentitySink.clear_test_pid/0)
+
+      identity_result = [
+        %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}
+      ]
+
+      st = state(step: :identity_check, sink: IdentitySink)
+
+      assert {:query, sql, new_state} = Connection.handle_result(identity_result, st)
       assert sql == Replicant.QueryBuilder.recovery_and_version()
+
+      assert_receive first_callback_event
+
+      assert {:session_identity, %Replicant.SessionIdentity{} = identity,
+              %{slot_name: "conn_test", publication: ["orders_pub"]}} = first_callback_event
+
+      assert identity.database == "source_db"
+      assert_receive :checkpoint_read
       assert new_state.checkpoint_lsn == 0x100
       assert new_state.step == :recovery_check
+    end
+
+    test "a generic sink without the callback remains compatible" do
+      result = [
+        %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}
+      ]
+
+      assert {:query, sql, new_state} =
+               Connection.handle_result(result, state(step: :identity_check, sink: StubSink))
+
+      assert sql == Replicant.QueryBuilder.recovery_and_version()
+      assert new_state.step == :recovery_check
+    end
+
+    test "identity callback failures halt fail-closed with a fixed structural reason" do
+      result = [
+        %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}
+      ]
+
+      for sink <- [
+            RejectIdentitySink,
+            UnexpectedIdentitySink,
+            RaiseIdentitySink,
+            ThrowIdentitySink,
+            ExitIdentitySink
+          ] do
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:noreply, _state} =
+                     Connection.handle_result(result, state(step: :identity_check, sink: sink))
+          end)
+
+        refute log =~ "must not leak"
+        refute log =~ "secret"
+      end
+    end
+
+    test "malformed identity halts before checkpoint or recovery" do
+      IdentitySink.set_test_pid(self())
+      on_exit(&IdentitySink.clear_test_pid/0)
+
+      assert {:noreply, _state} =
+               Connection.handle_result(
+                 [%Postgrex.Result{rows: []}],
+                 state(step: :identity_check, sink: IdentitySink)
+               )
+
+      refute_received :checkpoint_read
     end
 
     test "a reconnect resets the spilled_bytes mirror to 0 (never carries a stale-high value)" do
@@ -1171,8 +1292,14 @@ defmodule Replicant.ConnectionTest do
       # a CHANGE during message observation — never on reset. So handle_connect MUST re-zero the
       # Connection's mirror, or a stale-high spilled_bytes over-subtracts the §4 numerator and a
       # slow-sink reconnect that does not re-spill evades the RAM-bound halt indefinitely.
-      {:query, _sql, new_state} =
+      {:query, _sql, identity_state} =
         Connection.handle_connect(state(spilled_bytes: 4242, step: :disconnected))
+
+      identity_result = [
+        %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}
+      ]
+
+      {:query, _sql, new_state} = Connection.handle_result(identity_result, identity_state)
 
       assert new_state.spilled_bytes == 0
     end

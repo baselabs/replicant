@@ -138,6 +138,12 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
+  describe "identify_system/0" do
+    test "uses the replication protocol command verbatim" do
+      assert QueryBuilder.identify_system() == "IDENTIFY_SYSTEM"
+    end
+  end
+
   describe "create_export_slot/2" do
     test "failover?: false is the unchanged legacy EXPORT command" do
       {:ok, sql} = QueryBuilder.create_export_slot("orders_slot", false)

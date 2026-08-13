@@ -13,15 +13,17 @@ Everything below runs against a real Postgres; nothing is faked.
 
 ### The sink contract
 
-A sink is a module implementing `Replicant.Sink`. The two callbacks that matter
+A sink is a module implementing `Replicant.Sink`. The callbacks that matter
 first:
 
+- `handle_session_identity/2` (optional for generic sinks) — accept the actual
+  PostgreSQL system/database identity before any checkpoint is read.
 - `checkpoint/0` — the last durably-persisted commit LSN (your resume point **and**
   the dedup watermark). `nil` means "never persisted anything".
 - `handle_transaction/1` — persist a whole `%Replicant.Transaction{}` **and** its
   checkpoint atomically, then return `{:ok, commit_lsn}`.
 
-### The five critical rules (from `AGENTS.md`)
+### The five critical rules (from `docs/INVARIANTS.md`)
 
 1. **No row value in an error, log, or telemetry event** — every value is assumed PII.
 2. **Validate identifiers** (slot / publication names) before they reach SQL.
@@ -35,13 +37,14 @@ first:
 
 ```elixir
 Mix.install([
-  {:replicant, "~> 0.3"},
+  {:replicant, "~> 1.0"},
   {:kino, "~> 0.14"}
 ])
 ```
 
 > **Contributors:** to run against your working tree instead of the published
 > package, replace the `:replicant` line with `{:replicant, path: "/path/to/replicant"}`.
+> This path override is required until the 1.0.0 Hex package is published.
 
 ## Connect to a logical-replication Postgres
 

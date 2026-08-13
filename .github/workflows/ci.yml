@@ -5,6 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ELIXIR_VERSION: "1.20.3"
+  OTP_VERSION: "29"
+
 jobs:
   test:
     name: test (PG${{ matrix.postgres }})
@@ -17,7 +28,7 @@ jobs:
       MIX_ENV: test
       REPLICANT_TEST_URL: postgres://postgres@localhost:5432/postgres
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Start PostgreSQL ${{ matrix.postgres }} with logical replication
         # A `services:` block cannot pass `-c wal_level=logical` to the container, so run
@@ -27,7 +38,7 @@ jobs:
           docker run -d --name pg \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
-            postgres:${{ matrix.postgres }} \
+            postgres:${{ matrix.postgres }}@${{ matrix.postgres == '16' && 'sha256:95206741a5b214807675e14165369d05b93a9cf692223b616d07cca227e74b0b' || 'sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317' }} \
             -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
           for _ in $(seq 1 30); do
             docker exec pg pg_isready -U postgres && break
@@ -35,16 +46,16 @@ jobs:
           done
           docker exec pg pg_isready -U postgres || { echo "Postgres never became ready"; exit 1; }
 
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           # Pinned to the dev toolchain (.tool-versions) so the format check,
           # dialyzer PLT, and CI run on the same Elixir/OTP — a version skew here
           # lets the formatter list-wrap heuristic pass in one and fail in the other.
-          otp-version: "28.5"
-          elixir-version: "1.19.5"
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
 
       - name: Cache deps and build
-        uses: actions/cache@v4
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             deps
@@ -52,15 +63,78 @@ jobs:
             priv/plts
           # Key binds the cache to the pinned toolchain + mix.lock + .tool-versions,
           # so a toolchain or dep bump invalidates a stale PLT/build cache.
-          key: ${{ runner.os }}-pg${{ matrix.postgres }}-otp28.5-ex1.19.5-${{ hashFiles('mix.lock', '.tool-versions') }}
-          restore-keys: ${{ runner.os }}-pg${{ matrix.postgres }}-otp28.5-ex1.19.5-
+          key: ${{ runner.os }}-pg${{ matrix.postgres }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
+          restore-keys: ${{ runner.os }}-pg${{ matrix.postgres }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       - run: mix deps.get
+      - name: Assert release runtime
+        run: |
+          mix run --no-start -e '
+          unless System.version() == "1.20.3" and :erlang.system_info(:otp_release) == ~c"29" do
+            raise "unexpected release runtime"
+          end'
       # Supply-chain gate (declared in mix.exs `audit` alias: unused-dep + hex advisory +
       # deps audit). Runs before build so a vulnerable/unpinned dep reds before compile.
       - run: mix audit
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix credo --strict
-      - run: mix test
+      - run: mix test --warnings-as-errors
       - run: mix dialyzer
+
+  release-artifact:
+    name: docs and package
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: dev
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+
+      - name: Cache dependencies and build
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-release-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
+
+      - run: mix deps.get
+      - run: mix audit
+      - run: mix compile --warnings-as-errors
+      - run: mix docs --warnings-as-errors
+
+      - name: Build and inspect unpacked Hex package
+        run: |
+          package_dir=$(mktemp -d)
+          trap 'rm -rf "$package_dir"' EXIT
+          mix hex.build --unpack --output "$package_dir"
+
+          for required in lib/replicant/session_identity.ex docs/adr/0007-actual-replication-session-identity.md .formatter.exs mix.exs README.md LICENSE NOTICE CHANGELOG.md usage-rules.md; do
+            test -e "$package_dir/$required" || {
+              echo "::error::Missing package path: $required"
+              exit 1
+            }
+          done
+
+          test ! -e "$package_dir/AGENTS.md" || {
+            echo "::error::Package contains the private contributor-agent contract"
+            exit 1
+          }
+
+          if grep -nH 'AGENTS\.md' "$package_dir/README.md" "$package_dir/usage-rules.md" "$package_dir/CONTRIBUTING.md" "$package_dir/notebooks/getting_started.livemd"; then
+            echo "::error::Published documentation references the excluded AGENTS.md contract"
+            exit 1
+          fi
+
+          if find "$package_dir" -type d \( -name test -o -name .forge -o -name _build -o -name superpowers \) -print -quit | grep -q .; then
+            echo "::error::Package contains test, lifecycle, Forge, or build residue"
+            exit 1
+          fi
+
+          grep -q 'handle_session_identity' "$package_dir/lib/replicant/sink.ex"
+          grep -q 'IDENTIFY_SYSTEM' "$package_dir/lib/replicant/query_builder.ex"

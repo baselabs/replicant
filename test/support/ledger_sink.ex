@@ -29,17 +29,21 @@ defmodule Replicant.Test.LedgerSink do
   @impl true
   def handle_transaction(%Transaction{commit_lsn: lsn, changes: changes}) do
     result =
-      Postgrex.transaction(@conn, fn c ->
-        case current_checkpoint(c) do
-          cp when is_integer(cp) and lsn <= cp ->
-            record_call(c, lsn, "skipped")
+      Postgrex.transaction(
+        @conn,
+        fn c ->
+          case current_checkpoint(c) do
+            cp when is_integer(cp) and lsn <= cp ->
+              record_call(c, lsn, "skipped")
 
-          _not_yet_applied ->
-            Enum.each(changes, &apply_change(c, &1))
-            set_checkpoint(c, lsn)
-            record_call(c, lsn, "applied")
-        end
-      end)
+            _not_yet_applied ->
+              Enum.each(changes, &apply_change(c, &1))
+              set_checkpoint(c, lsn)
+              record_call(c, lsn, "applied")
+          end
+        end,
+        timeout: 60_000
+      )
 
     case result do
       {:ok, _} -> {:ok, lsn}

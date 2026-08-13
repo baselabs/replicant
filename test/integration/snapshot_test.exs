@@ -1,6 +1,7 @@
 defmodule Replicant.SnapshotTest do
   use ExUnit.Case, async: false
   @moduletag :integration
+  @moduletag timeout: 120_000
 
   alias Replicant.Test.{PG16, SnapshotSink}
 

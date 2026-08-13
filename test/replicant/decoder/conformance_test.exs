@@ -296,7 +296,7 @@ defmodule Replicant.Decoder.ConformanceTest do
   end
 
   defp flip_byte(bytes, i) do
-    <<head::binary-size(i), b, rest::binary>> = bytes
+    <<head::binary-size(^i), b, rest::binary>> = bytes
     <<head::binary, bxor(b, 0xFF), rest::binary>>
   end
 end

@@ -280,7 +280,13 @@ defmodule Replicant.AssemblerServerTest do
       pid = start("srv_batch_count", RecordingSink)
       test = self()
 
-      inject_batched(pid, "srv_batch_count", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+      inject_batched(
+        pid,
+        "srv_batch_count",
+        fn lsn ->
+          send(test, {:wrote, lsn})
+          :ok
+        end,
         max_transactions: 2,
         max_delay_ms: 60_000,
         max_span: 1_000_000
@@ -299,7 +305,13 @@ defmodule Replicant.AssemblerServerTest do
       pid = start("srv_batch_timer", RecordingSink)
       test = self()
 
-      inject_batched(pid, "srv_batch_timer", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+      inject_batched(
+        pid,
+        "srv_batch_timer",
+        fn lsn ->
+          send(test, {:wrote, lsn})
+          :ok
+        end,
         max_transactions: 100,
         max_delay_ms: 50,
         max_span: 1_000_000
@@ -348,7 +360,13 @@ defmodule Replicant.AssemblerServerTest do
       pid = start("srv_batch_halted", RecordingSink)
       test = self()
 
-      inject_batched(pid, "srv_batch_halted", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+      inject_batched(
+        pid,
+        "srv_batch_halted",
+        fn lsn ->
+          send(test, {:wrote, lsn})
+          :ok
+        end,
         max_transactions: 5,
         max_delay_ms: 60_000,
         max_span: 1_000_000
@@ -442,7 +460,13 @@ defmodule Replicant.AssemblerServerTest do
       pid = start("srv_batch_reseed", RecordingSink)
       test = self()
 
-      inject_batched(pid, "srv_batch_reseed", fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+      inject_batched(
+        pid,
+        "srv_batch_reseed",
+        fn lsn ->
+          send(test, {:wrote, lsn})
+          :ok
+        end,
         max_transactions: 5,
         max_delay_ms: 60_000,
         max_span: 1_000_000
@@ -767,7 +791,10 @@ defmodule Replicant.AssemblerServerTest do
         asm =
           Replicant.Assembler.new(RecordingSink,
             mode: :lib,
-            checkpoint_writer: fn lsn -> send(test, {:wrote, lsn}) && :ok end,
+            checkpoint_writer: fn lsn ->
+              send(test, {:wrote, lsn})
+              :ok
+            end,
             slot_name: "srv_msg_flush_first",
             lib_checkpoint: 0,
             batch: [max_transactions: 100, max_delay_ms: 60_000, max_span: 1_000_000]

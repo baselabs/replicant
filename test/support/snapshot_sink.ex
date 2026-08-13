@@ -21,18 +21,22 @@ defmodule Replicant.Test.SnapshotSink do
 
   @impl true
   def handle_snapshot(changes, %{first_for_table?: first?}) do
-    Postgrex.transaction(@conn, fn c ->
-      if first?, do: Postgrex.query!(c, "TRUNCATE sink_orders", [])
+    Postgrex.transaction(
+      @conn,
+      fn c ->
+        if first?, do: Postgrex.query!(c, "TRUNCATE sink_orders", [])
 
-      Enum.each(changes, fn %Change{record: r} ->
-        Postgrex.query!(
-          c,
-          "INSERT INTO sink_orders (id, note) VALUES ($1, $2) " <>
-            "ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note",
-          [r["id"], r["note"]]
-        )
-      end)
-    end)
+        Enum.each(changes, fn %Change{record: r} ->
+          Postgrex.query!(
+            c,
+            "INSERT INTO sink_orders (id, note) VALUES ($1, $2) " <>
+              "ON CONFLICT (id) DO UPDATE SET note = EXCLUDED.note",
+            [r["id"], r["note"]]
+          )
+        end)
+      end,
+      timeout: 60_000
+    )
 
     :ok
   rescue

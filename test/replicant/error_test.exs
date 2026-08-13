@@ -41,7 +41,11 @@ defmodule Replicant.ErrorTest do
     test "rejects a non-exception struct (fail loud, not silent mislabel)" do
       # decode_failure/1 scrubs a RAISED exception; a non-exception struct must
       # NOT be silently stamped :decode_failure (its @spec is Exception.t()).
-      assert_raise FunctionClauseError, fn -> Error.decode_failure(~D[2024-01-01]) end
+      decode_failure = Function.capture(Error, :decode_failure, 1)
+
+      assert_raise FunctionClauseError, fn ->
+        decode_failure.(~D[2024-01-01])
+      end
     end
   end
 

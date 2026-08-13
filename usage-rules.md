@@ -41,6 +41,12 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   UPDATE did not touch (never a value — sinks must leave those columns alone).
 - **`Replicant.SchemaChange`** — a detected DDL-shape change (column add/drop,
   type change, replica-identity change). Destructive changes halt fail-closed.
+- **`Replicant.SessionIdentity`** — the system identifier, timeline, current LSN,
+  and database returned by `IDENTIFY_SYSTEM` on the exact replication connection.
+  A source-bound sink implements `handle_session_identity/2` and returns `:ok`
+  only after accepting the identity plus context slot/publications. This callback
+  always precedes checkpoint lookup and runs again on reconnect; a separate
+  preflight connection is not authoritative.
 - **`Replicant.Sink`** — the behaviour a consumer implements. In the default **sink-owned
   transaction mode** (`batch_delivery` not set), receives one `Replicant.Transaction` at a time
   and must durably persist it (or raise) before the slot advances past its `commit_lsn`. When
@@ -80,7 +86,8 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
 - **`Replicant.Assembler`** — groups decoded messages into
   `Replicant.Transaction`s by `commit_lsn`.
 - **`Replicant.Connection`** — the `Postgrex.ReplicationConnection` that owns
-  the replication slot: ack-after-checkpoint keepalive replies, async ack,
+  the replication slot: actual-session identity before checkpoint lookup,
+  ack-after-checkpoint keepalive replies, async ack,
   slot-invalidation fail-closed halt, the bounded in-flight window, and the
   replication-command-error watchdog (below).
 - **`Replicant.AssemblerServer`** — the serial process that applies the sink
@@ -179,4 +186,4 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   belongs here — that boundary is the whole reason `replicant` and
   `ash_replicant` are separate libraries.
 
-See `AGENTS.md` for the full working rules.
+See [`docs/INVARIANTS.md`](docs/INVARIANTS.md) for the full published rules.

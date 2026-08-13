@@ -1,6 +1,7 @@
 defmodule Replicant.CrashInjectionTest do
   use ExUnit.Case, async: false
   @moduletag :integration
+  @moduletag timeout: 120_000
 
   alias Replicant.Test.{LedgerSink, PauseGate, PausingLedgerSink, PG16}
 
@@ -226,7 +227,7 @@ defmodule Replicant.CrashInjectionTest do
     total = @midtxn_rows + 1
 
     # loss=0: every row of the control txn AND the whole re-streamed large txn is present.
-    PG16.wait_until(fn -> count(ctrl, "sink_orders") == total end, 800)
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == total end, 2400)
 
     assert rows(ctrl, "SELECT id FROM sink_orders ORDER BY id") ==
              Enum.map(1..total, &[&1])

@@ -30,7 +30,7 @@ Adopt a **split guarantee keyed on the message's `transactional?` flag**, opt-in
   path's **effect-once** dedup (the txn's `commit_lsn`). They are delivered atomically with the
   transaction's row changes. (`decoder/messages.ex`, `assembler.ex` v1 + streamed clauses;
   `transaction.ex`.)
-- **Non-transactional messages route to a new optional `c:handle_message/2`** and are
+- **Non-transactional messages route to optional `c:Replicant.Sink.handle_message/2`** and are
   **at-least-once — NO dedup key; duplicates are possible on reconnect** (documented in the
   `handle_message/2` docstring — Critical Rule 3, guarantee honesty). (`sink.ex`, `config.ex`.)
 - **Fail-closed opt-in:** `messages: true` requires the sink to implement `handle_message/2`

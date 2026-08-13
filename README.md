@@ -10,11 +10,12 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** v1 is complete and production-hardened. Replicant owns
+> **Status:** the 1.0.0 source release is prepared and under final verification;
+> its Hex package and Git tag have not been published. Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
 > invalidation, and is proven by a real-PG16 crash-injection suite
-> (loss = 0, effect-dup = 0). As of **v0.3.1**, initial snapshot/backfill (incl. a
+> (loss = 0, effect-dup = 0). The 1.0 contract includes initial snapshot/backfill (incl. a
 > resumable incremental mode), a lib-owned checkpoint
 > store for non-transactional sinks, batched checkpointing, sink-owned atomic
 > batch delivery, in-progress-transaction streaming, consumer-side disk
@@ -45,6 +46,10 @@ Multitenancy, classification, and Ash resources live one layer up, in the
 - **Fail-closed on destructive schema drift** — a replica-identity change or a
   dropped column is classified `:destructive` and halts, rather than silently
   emitting incomplete or misattributed rows.
+- **Actual replication-session identity** — `IDENTIFY_SYSTEM` runs on the exact
+  replication connection before checkpoint lookup. A source-aware sink can
+  accept or reject `%Replicant.SessionIdentity{}` synchronously on every connect
+  and reconnect; no separate-connection preflight is treated as authoritative.
 - **Column names stay strings** — never `String.to_atom`, so a wide or
   attacker-influenced schema cannot exhaust the atom table.
 
@@ -115,7 +120,7 @@ there with its `confirmed_flush` position, so replication resumes with zero loss
 until promotion, and Replicant halts fail-closed (`{:slot_synced_unpromoted}`) rather than
 looping.
 
-## The 5 critical rules (see `AGENTS.md` for the full text)
+## The 5 critical rules (see [`docs/INVARIANTS.md`](docs/INVARIANTS.md) for the full text)
 
 1. **No row value in an error, log, or telemetry event.**
 2. **Validate identifiers** before they reach SQL.
@@ -130,10 +135,14 @@ looping.
 ```elixir
 def deps do
   [
-    {:replicant, "~> 0.3"}
+    {:replicant, "~> 1.0"}
   ]
 end
 ```
+
+This Hex constraint is the post-publication install path. Until 1.0.0 is
+published, contributors must use the repository checkout or the path override
+shown in the Livebook.
 
 ## Interactive tour (Livebook)
 
@@ -167,6 +176,13 @@ Replicant.start_link(
 
 defmodule MyApp.OrdersSink do
   @behaviour Replicant.Sink
+
+  @impl true
+  def handle_session_identity(identity, %{slot_name: slot, publication: publications}) do
+    # Before checkpoint/0 runs: bind or compare {identity.system_identifier,
+    # identity.database, slot, publications}. Return :ok only when safe to resume.
+    :ok
+  end
 
   @impl true
   def checkpoint, do: {:ok, MyApp.Repo.last_committed_lsn()}
@@ -381,9 +397,9 @@ mix test
 mix quality   # format --check-formatted + credo --strict + dialyzer
 ```
 
-Contributor and agent working rules — including the redaction,
-identifier-validation, and tenant-blind invariants — live in
-[`AGENTS.md`](AGENTS.md).
+The published redaction, identifier-validation, and tenant-blind invariants live
+in [`docs/INVARIANTS.md`](docs/INVARIANTS.md). Repository contributors also follow
+the checkout's repository-specific contributor contract.
 
 ## Roadmap
 
@@ -403,13 +419,13 @@ against a real-PG16 crash-injection suite:
 The sibling libraries live one layer up from this tenant-blind core:
 
 - **[`ash_replicant`](https://github.com/baselabs/ash_replicant)** — the Ash /
-  multitenancy / classification sink adapter (published `v0.4.0`), built on this core
-  via `{:replicant, "~> 0.3"}`.
+  multitenancy / classification sink adapter. Its coordinated 1.0 release will
+  require Replicant 1.x so the actual-session identity check cannot be resolved away.
 - **[`ash_onetime`](https://hex.pm/packages/ash_onetime)** — the authoritative
-  idempotency-key / one-time-nonce admission layer for Ash/Postgres sinks. This is the
-  sink's half of Critical Rule 3: `protect` the apply action with `strategy :idempotency`
-  keyed on the transaction's `commit_lsn`, and the DB unique constraint decides the replay.
-  See [`docs/INVARIANTS.md`](docs/INVARIANTS.md) § 3 for the delivery/admission split.
+  idempotency-key / one-time-nonce admission layer for Ash/Postgres actions.
+  AshReplicant uses idempotency, not nonce rejection, for retryable
+  non-transactional logical-message effects. Replicant transaction replay remains
+  governed by the durable commit-LSN watermark; it is not replaced by AshOnetime.
 
 ## Credits
 

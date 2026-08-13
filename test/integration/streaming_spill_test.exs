@@ -46,9 +46,7 @@ defmodule Replicant.StreamingSpillTest do
         max_spill_bytes: 64 * 1024 * 1024
       )
 
-      Postgrex.transaction(ctrl, fn c -> Enum.each(1..20_000, &insert(c, &1)) end,
-        timeout: 120_000
-      )
+      Postgrex.transaction(ctrl, fn c -> bulk_insert(c, 20_000) end, timeout: 120_000)
 
       PG16.wait_until(fn -> cp_lsn(ctrl) not in [nil, 0] end, 2000)
       PG16.wait_until(fn -> MapSet.subset?(MapSet.new([1, 20_000]), row_ids(ctrl)) end, 2000)
@@ -76,9 +74,7 @@ defmodule Replicant.StreamingSpillTest do
         max_spill_bytes: 64 * 1024 * 1024
       )
 
-      Postgrex.transaction(ctrl, fn c -> Enum.each(1..20_000, &insert(c, &1)) end,
-        timeout: 120_000
-      )
+      Postgrex.transaction(ctrl, fn c -> bulk_insert(c, 20_000) end, timeout: 120_000)
 
       assert_receive {:spilled, ^ref}, 10_000
       :telemetry.detach({__MODULE__, ref})
@@ -99,9 +95,7 @@ defmodule Replicant.StreamingSpillTest do
         []
       )
 
-      Postgrex.transaction(ctrl, fn c -> Enum.each(1..20_000, &insert(c, &1)) end,
-        timeout: 120_000
-      )
+      Postgrex.transaction(ctrl, fn c -> bulk_insert(c, 20_000) end, timeout: 120_000)
 
       PG16.wait_until(
         fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
@@ -145,9 +139,7 @@ defmodule Replicant.StreamingSpillTest do
 
       start_pipeline(slot, spill_dir, max_inflight_lag: 64 * 1024, max_spill_bytes: 128 * 1024)
 
-      Postgrex.transaction(ctrl, fn c -> Enum.each(1..40_000, &insert(c, &1)) end,
-        timeout: 120_000
-      )
+      Postgrex.transaction(ctrl, fn c -> bulk_insert(c, 40_000) end, timeout: 120_000)
 
       # A single in-progress txn far larger than max_inflight_lag + max_spill_bytes arrives as a
       # burst: the Connection reads its WAL faster than the assembler spills it, so the §4
@@ -219,11 +211,14 @@ defmodule Replicant.StreamingSpillTest do
         do: Postgrex.query!(c, stmt, [])
   end
 
-  defp insert(c, id),
-    do:
-      Postgrex.query!(c, "INSERT INTO sp_orders (id) VALUES ($1) ON CONFLICT (id) DO NOTHING", [
-        id
-      ])
+  defp bulk_insert(c, row_count) do
+    Postgrex.query!(
+      c,
+      "INSERT INTO sp_orders (id) SELECT id FROM generate_series(1, $1) AS id " <>
+        "ON CONFLICT (id) DO NOTHING",
+      [row_count]
+    )
+  end
 
   defp row_ids(c) do
     %Postgrex.Result{rows: rows} = Postgrex.query!(c, "SELECT id FROM sp_sink_rows", [])

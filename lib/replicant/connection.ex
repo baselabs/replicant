@@ -30,7 +30,9 @@ defmodule Replicant.Connection do
       dropping and recreating the slot (spec §8 R-ISO).
 
   The connect chain is a `handle_result/2` state machine:
-  `:recovery_check` → `:invalidation_check` → (`:create_slot` if absent) → `:streaming`.
+  `:identity_check` → `:recovery_check` → `:publication_check` →
+  `:invalidation_check` →
+  (`:create_slot` if absent) → `:streaming`.
 
   ## Why a fail-closed halt and not soft pacing (Postgrex flow-control)
 
@@ -84,6 +86,7 @@ defmodule Replicant.Connection do
 
   @type step ::
           :disconnected
+          | :identity_check
           | :recovery_check
           | :publication_check
           | :invalidation_check
@@ -248,6 +251,10 @@ defmodule Replicant.Connection do
   end
 
   defp handle_connect_proceed(state) do
+    {:query, QueryBuilder.identify_system(), %{state | step: :identity_check}}
+  end
+
+  defp begin_recovery(state) do
     # Read the durable checkpoint (off the keepalive path — a blocking read is fine
     # here). In lib mode the store is the connect authority (a read FAULT halts
     # fail-closed in :invalidation_check — never fail-open, since a non-idempotent
@@ -328,6 +335,19 @@ defmodule Replicant.Connection do
   end
 
   @impl true
+  def handle_result([%Postgrex.Result{} = result], %{step: :identity_check} = state) do
+    with {:ok, identity} <- Replicant.SessionIdentity.from_result(result),
+         :ok <-
+           Replicant.Sink.accept_session_identity(state.sink, identity, %{
+             slot_name: state.slot_name,
+             publication: state.publication
+           }) do
+      begin_recovery(state)
+    else
+      {:error, _reason} -> halt_session_identity(state)
+    end
+  end
+
   def handle_result(
         [%Postgrex.Result{rows: [[in_recovery, version]]}],
         %{step: :recovery_check} = state
@@ -842,6 +862,15 @@ defmodule Replicant.Connection do
     })
 
     Replicant.Supervisor.halt(state.slot_name, {:command_error, :exhausted})
+    {:noreply, state}
+  end
+
+  defp halt_session_identity(state) do
+    Telemetry.event([:replicant, :connection, :session_identity_rejected], %{}, %{
+      reason: :session_identity_rejected
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:session_identity, :rejected})
     {:noreply, state}
   end
 

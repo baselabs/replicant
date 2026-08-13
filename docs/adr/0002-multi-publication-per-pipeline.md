@@ -35,8 +35,8 @@ Two facts were probe-established on live PG16 during design:
   THEN join — collapsing the pubname dimension before the joins so `array_agg` never duplicates
   PK/column entries (decision #19; probe-proven `pk_raw = ["id"]` for a shared table).
   (`query_builder.ex` `publication_tables/1`, `pk_columns/0`, `table_columns/0`.)
-- **A new fail-closed connect-chain `:publication_check` step.** After recovery/invalidation
-  checks and before slot classification, run `publication_exists` (`pubname = ANY(...)`) and
+- **A new fail-closed connect-chain `:publication_check` step.** After the recovery check and
+  before slot invalidation/classification, run `publication_exists` (`pubname = ANY(...)`) and
   **halt if the found set ≠ the requested set** — because START_REPLICATION would otherwise
   silently stream the subset. `publication_exists` interpolates a **validated `IN (...)` list**
   (the connect-chain simple-query protocol can't bind `$1`), each name allowlist-guarded.

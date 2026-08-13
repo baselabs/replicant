@@ -1,14 +1,14 @@
 defmodule Replicant.MixProject do
   use Mix.Project
 
-  @version "0.3.1"
+  @version "1.0.0"
   @source_url "https://github.com/baselabs/replicant"
 
   def project do
     [
       app: :replicant,
       version: @version,
-      elixir: "~> 1.15",
+      elixir: "~> 1.20.3",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
       consolidate_protocols: Mix.env() != :test,
@@ -72,7 +72,7 @@ defmodule Replicant.MixProject do
     [
       maintainers: ["rjpalermo"],
       files:
-        ~w(lib notebooks docs .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
+        ~w(lib notebooks docs/INVARIANTS.md docs/ROADMAP.md docs/adr .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -84,23 +84,27 @@ defmodule Replicant.MixProject do
 
   defp docs do
     [
-      main: "readme",
-      source_ref: "v#{@version}",
+      main: "Replicant",
+      # The release tag does not exist until the separately authorized publication step.
+      # Change this to v#{@version} only in the final tag/publish change.
+      source_ref: "main",
       source_url: @source_url,
       extras: [
         "README.md",
         "docs/INVARIANTS.md",
         "docs/ROADMAP.md",
         "docs/adr/README.md",
+        "docs/adr/0001-logical-decoding-messages-delivery-guarantees.md",
+        "docs/adr/0002-multi-publication-per-pipeline.md",
         "docs/adr/0003-value-free-error-boundary.md",
         "docs/adr/0004-commit-lsn-transaction-watermark.md",
         "docs/adr/0005-spill-is-ephemeral-scratch.md",
         "docs/adr/0006-fail-closed-supervision.md",
+        "docs/adr/0007-actual-replication-session-identity.md",
         "notebooks/getting_started.livemd",
         "usage-rules.md",
         "CHANGELOG.md",
         "CONTRIBUTING.md",
-        "AGENTS.md",
         "LICENSE",
         "NOTICE"
       ],
@@ -108,13 +112,16 @@ defmodule Replicant.MixProject do
         "Invariants & ADRs": [
           "docs/INVARIANTS.md",
           "docs/adr/README.md",
+          "docs/adr/0001-logical-decoding-messages-delivery-guarantees.md",
+          "docs/adr/0002-multi-publication-per-pipeline.md",
           "docs/adr/0003-value-free-error-boundary.md",
           "docs/adr/0004-commit-lsn-transaction-watermark.md",
           "docs/adr/0005-spill-is-ephemeral-scratch.md",
-          "docs/adr/0006-fail-closed-supervision.md"
+          "docs/adr/0006-fail-closed-supervision.md",
+          "docs/adr/0007-actual-replication-session-identity.md"
         ],
         Guides: ["notebooks/getting_started.livemd", "usage-rules.md"],
-        Project: ["CONTRIBUTING.md", "AGENTS.md", "LICENSE", "NOTICE", "docs/ROADMAP.md"]
+        Project: ["CONTRIBUTING.md", "LICENSE", "NOTICE", "docs/ROADMAP.md"]
       ],
       groups_for_modules: [
         "Core API": [Replicant, Replicant.Sink, Replicant.Config],
@@ -123,7 +130,8 @@ defmodule Replicant.MixProject do
           Replicant.Change,
           Replicant.SchemaChange,
           Replicant.Error,
-          Replicant.SnapshotProgress
+          Replicant.SnapshotProgress,
+          Replicant.SessionIdentity
         ],
         Observability: [Replicant.Telemetry],
         Runtime: [

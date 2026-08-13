@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Replicant!
 
 ## Prerequisites
 
-- **Elixir** 1.15+ and **Erlang/OTP** 26+
+- **Elixir** 1.20.3 and **Erlang/OTP** 29 (the exact local/CI toolchain is in `.tool-versions`)
 - **PostgreSQL 16** with `wal_level=logical` (for integration tests) — e.g.
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:16`
 
@@ -49,8 +49,9 @@ mix quality
 
 - Use `mix format` — `.formatter.exs` holds the config.
 - Add `@moduledoc` and `@doc` to public modules and functions.
-- Read `AGENTS.md` before changing decoder, assembler, identifier, or telemetry
-  code — its Critical Rules (no row values in errors/logs/telemetry, validated
+- Read [`docs/INVARIANTS.md`](docs/INVARIANTS.md) before changing decoder,
+  assembler, identifier, or telemetry code — its Critical Rules (no row values
+  in errors/logs/telemetry, validated
   identifiers, transaction-granularity exactly-once, TOAST-sentinel handling,
   tenant-blindness) are binding.
 

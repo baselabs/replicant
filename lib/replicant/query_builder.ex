@@ -12,6 +12,10 @@ defmodule Replicant.QueryBuilder do
 
   @pgoutput "pgoutput"
 
+  @doc "The replication-protocol command that identifies the exact source session."
+  @spec identify_system() :: String.t()
+  def identify_system, do: "IDENTIFY_SYSTEM"
+
   # PG exports a snapshot name as "%08X-%08X-%d". This allowlist forbids quotes and
   # whitespace so the name is safe inside the SET TRANSACTION SNAPSHOT '<name>' STRING
   # LITERAL — it is NOT an identifier position, so `Identifier.validate/1` (which rejects

@@ -139,6 +139,11 @@ defmodule Replicant.SinkTest do
   end
 
   describe "optional callbacks are truly optional" do
+    test "handle_session_identity/2 is optional for generic sinks" do
+      assert {:handle_session_identity, 2} in Replicant.Sink.behaviour_info(:optional_callbacks)
+      refute function_exported?(RecordingSink, :handle_session_identity, 2)
+    end
+
     test "sink_kind/0 defaults to :state_mirror when the callback is absent" do
       # function_exported?/3 is how the Assembler must dispatch.
       refute function_exported?(RecordingSink, :sink_kind, 0)
