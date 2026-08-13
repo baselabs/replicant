@@ -1355,11 +1355,7 @@ defmodule Replicant.Assembler do
         last_buffered_changes: changes_for_tracking(changes)
     }
 
-    cond do
-      count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
-      lsn - span_base(asm) >= Keyword.fetch!(asm.batch, :max_span) -> {:flush, :max_span, asm}
-      true -> {:buffered, asm}
-    end
+    maybe_trip_batch(count, lsn, asm)
   end
 
   # Retain a delivered lib+batch txn's `changes` for drop-set tracking: a plain list passes through
@@ -1400,6 +1396,13 @@ defmodule Replicant.Assembler do
         batch_spill_paths: prepend_path(asm.batch_spill_paths, spill_path)
     }
 
+    maybe_trip_batch(count, lsn, asm)
+  end
+
+  # Shared flush-trigger predicate (spec §6) for BOTH batch modes: trip on the count cap OR the
+  # LSN-span cap, else buffer. Centralized so lib-batch (buffer_txn) and sink-owned batch
+  # (buffer_for_delivery) cannot drift — a drift would silently change the dup bound for one mode.
+  defp maybe_trip_batch(count, lsn, asm) do
     cond do
       count >= Keyword.fetch!(asm.batch, :max_transactions) -> {:flush, :max_transactions, asm}
       lsn - span_base(asm) >= Keyword.fetch!(asm.batch, :max_span) -> {:flush, :max_span, asm}
