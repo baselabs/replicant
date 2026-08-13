@@ -765,6 +765,7 @@ defmodule Replicant.Assembler do
 
   # Lib mode: compare against the IN-MEMORY watermark (seeded from the store,
   # advanced on each write) — no per-transaction store round-trip.
+  @doc false
   def skip?(%__MODULE__{mode: :lib, lib_checkpoint: cp}, %Transaction{commit_lsn: lsn}),
     do: is_integer(cp) and lsn <= cp
 
@@ -788,6 +789,7 @@ defmodule Replicant.Assembler do
   # §8). Sink-owned batch buffers the txn (with its Reader) and keeps the file until flush/reset (Task
   # 8), so it RECORDS `spill_path` on `batch_spill_paths` (via buffer_for_delivery/3) for a single
   # delete at flush_sink_batch / reset_batch — it never reaches deliver_now, so no double-delete.
+  @doc false
   def apply_sink(%__MODULE__{} = asm, %Transaction{} = txn, spill_path \\ nil) do
     if __MODULE__.Batch.sink_owned_batching?(asm),
       do: __MODULE__.Batch.buffer_for_delivery(asm, txn, spill_path),
@@ -869,6 +871,7 @@ defmodule Replicant.Assembler do
   # by kind. Value-free (Critical Rule 1): only `commit_lsn` (the txn's) + `byte_size` + the boolean —
   # never `prefix`/`content`. `txn.messages` is an in-memory list (never the lazy spill Reader), so
   # iterating it is safe even for a spilled txn.
+  @doc false
   def emit_txn_messages_received(%Transaction{commit_lsn: lsn, messages: messages}) do
     Enum.each(messages, fn %Message{content: content} ->
       Telemetry.event([:replicant, :message, :received], %{}, %{
@@ -945,6 +948,7 @@ defmodule Replicant.Assembler do
   # write via the injected writer. A writer raise/exit (e.g. a dead
   # CheckpointStore) is caught value-free and categorised :checkpoint_store_failed
   # (NOT :decode_failure) — never inspecting the reason (Critical Rule 1).
+  @doc false
   def write_checkpoint(%__MODULE__{mode: :sink_owned}, _lsn), do: :ok
 
   def write_checkpoint(%__MODULE__{mode: :lib, checkpoint_writer: writer}, lsn)
@@ -974,6 +978,7 @@ defmodule Replicant.Assembler do
   # The span-cap base (spec §7): the un-checkpointed window's start = the higher of the durable
   # watermark and the per-stream floor, mirroring the §4 lag floor. On a fresh slot lib_checkpoint
   # is 0 so the floor dominates; after the first flush the watermark dominates.
+  @doc false
   def span_base(%__MODULE__{lib_checkpoint: cp, stream_floor: floor}),
     do: max(cp || 0, floor || 0)
 
@@ -1056,17 +1061,20 @@ defmodule Replicant.Assembler do
     {:halt, %Error{reason: :sink_failed, shape: shape}, asm}
   end
 
+  @doc false
   def safe_shape(%{__struct__: mod}), do: inspect(mod)
   def safe_shape(_), do: nil
 
   # Live lag from the transaction's commit timestamp to now, clamped ≥ 0 (clock
   # skew must not surface a negative). A nil timestamp → 0. Uses runtime `now`, so
   # no fixed-date time-bomb; it is a WAL position/time gauge, never a row value.
+  @doc false
   def lag_ms(nil), do: 0
 
   def lag_ms(%DateTime{} = commit_timestamp) do
     max(0, System.os_time(:millisecond) - DateTime.to_unix(commit_timestamp, :millisecond))
   end
 
+  @doc false
   def reset(asm), do: %{asm | txn: nil, ordinal: 0}
 end
