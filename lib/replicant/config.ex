@@ -14,6 +14,12 @@ defmodule Replicant.Config do
   # `:batch` is deliberately NOT in this type: it is a DERIVED key (normalized from
   # `checkpoint_store[:batch]` by `fetch_batch/3`), and a top-level `batch:` option is
   # rejected with `:config_invalid`. Advertising it here would invite the trapdoor.
+  @typedoc """
+  The validated pipeline config — a **plain map** (by contract, not a struct), built exclusively
+  by `validate/1` from `Replicant.start_link/1` options. The map shape is the frozen 1.0 contract:
+  adding keys is allowed, but renaming/re-typing existing keys is a 2.0 change. Callers consume it
+  opaquely (pass it to `start_link/1`); do not pattern-match on the full shape across releases.
+  """
   @type t :: %{
           optional(:batch_delivery) => keyword() | nil,
           optional(:streaming) => keyword() | nil,

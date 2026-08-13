@@ -85,6 +85,10 @@ defmodule Replicant.Sink do
   `first_for_table?`. A non-`{:ok, _}` return (or a raise/throw/exit) halts the pipeline
   fail-closed; the batch is discarded un-acked and re-delivered on resume (deduped to zero net
   effect by the idempotent sink).
+
+  The arity is frozen at 1 for 1.0: unlike `handle_snapshot/2` / `handle_message/2`, NO context
+  arg is provided — the batch's high-water LSN is `List.last(transactions).commit_lsn`, and each
+  transaction carries its own `commit_lsn`. Adding a context arg later is a 2.0 callback change.
   """
   @callback handle_batch([Replicant.Transaction.t()]) ::
               {:ok, Replicant.lsn()} | {:error, term()}

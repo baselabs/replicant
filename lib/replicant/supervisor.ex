@@ -7,6 +7,11 @@ defmodule Replicant.Supervisor do
   """
   use DynamicSupervisor
 
+  @doc """
+  Starts the top-level `DynamicSupervisor` (named `Replicant.Supervisor`) that owns every running
+  pipeline (one `:temporary` child per `Replicant.start_link/1`, so a fail-closed halt is permanent
+  — restart is explicit). Generally started by the `replicant` OTP application, not called directly.
+  """
   @spec start_link(term()) :: Supervisor.on_start()
   def start_link(init_arg \\ []) do
     DynamicSupervisor.start_link(__MODULE__, init_arg, name: __MODULE__)

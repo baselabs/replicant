@@ -13,6 +13,11 @@ defmodule Replicant.Telemetry do
   @spec allowed_meta_keys() :: [atom()]
   def allowed_meta_keys, do: @allowed_meta_keys
 
+  @doc """
+  Wrap `fun` in a `[:replicant, op]` span, validating BOTH the start metadata and the returned
+  stop metadata against the value-free allowlist (`validate!/1` raises on an off-allowlist key).
+  `fun` must return `{result, stop_meta}`.
+  """
   @spec span(atom(), map(), (-> {term(), map()})) :: term()
   def span(op, start_meta, fun) when is_atom(op) and is_map(start_meta) and is_function(fun, 0) do
     :telemetry.span([:replicant, op], validate!(start_meta), fn ->
@@ -21,6 +26,10 @@ defmodule Replicant.Telemetry do
     end)
   end
 
+  @doc """
+  Emit a value-free telemetry event. `meta` is validated against the allowlist (`validate!/1`
+  raises on an off-allowlist key), so no row/column value can reach a telemetry consumer.
+  """
   @spec event([atom(), ...], map(), map()) :: :ok
   def event(name, measurements, meta)
       when is_list(name) and is_map(measurements) and is_map(meta) do

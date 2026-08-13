@@ -122,7 +122,8 @@ defmodule Replicant.MixProject do
           Replicant.Transaction,
           Replicant.Change,
           Replicant.SchemaChange,
-          Replicant.Error
+          Replicant.Error,
+          Replicant.SnapshotProgress
         ],
         Observability: [Replicant.Telemetry],
         Runtime: [
