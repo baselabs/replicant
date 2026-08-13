@@ -1,0 +1,40 @@
+#!/bin/sh
+# Pre-commit gate (replicant): block the commit when the SILENT gates are red.
+#
+# Scope: `mix format --check-formatted` + `mix credo --strict` — the two gates
+# whose drift is silent (a red format/credo does not block normal `mix` dev, so
+# it ships unless checked here). compile/dialyzer/test stay CI-enforced
+# (.github/workflows/ci.yml); they are loud and heavy for a per-commit hook.
+#
+# Why this exists: 2026-08-12 — format drift (6 files) + credo issues (3) shipped
+# across 28e0b62/b04b4d7/37ab768 with commit trailers claiming "format/credo
+# clean"; the gates were asserted, not measured. CI (ci.yml:62) would have red on
+# push. This hook makes the check fire at commit time, on the working tree.
+#
+# Install once per clone (graphify owns .git/hooks/post-commit; this does NOT
+# touch core.hooksPath, so graphify stays put):
+#   cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+#
+# Bypass for WIP: `git commit --no-verify`  (CI still enforces both on push).
+
+# Not an Elixir environment (e.g. a docs-only checkout) — don't block.
+command -v mix >/dev/null 2>&1 || { echo "pre-commit: mix not found — skipping format/credo gate."; exit 0; }
+
+if ! mix format --check-formatted; then
+  echo "" >&2
+  echo "  pre-commit: mix format --check-formatted FAILED." >&2
+  echo "  Run \`mix format\`, re-stage the rewritten files, and retry." >&2
+  echo "  (bypass: \`git commit --no-verify\` — CI still enforces this on push.)" >&2
+  exit 1
+fi
+
+if ! mix credo --strict >/dev/null; then
+  echo "" >&2
+  echo "  pre-commit: mix credo --strict FAILED." >&2
+  echo "  Run \`mix credo --strict\`, fix the reported issues, and retry." >&2
+  echo "  (bypass: \`git commit --no-verify\` — CI still enforces this on push.)" >&2
+  exit 1
+fi
+
+echo "pre-commit: format + credo green."
+exit 0

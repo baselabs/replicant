@@ -74,6 +74,17 @@ separate.
 All gates must pass before a commit/PR. Update `CHANGELOG.md` under
 `[Unreleased]`.
 
+**Pre-commit hook (one-time install per clone):** `.githooks/pre-commit` runs
+`mix format --check-formatted` + `mix credo --strict` and **blocks the commit on
+red** — a backstop for the two silent gates whose drift won't otherwise surface
+until CI (`.github/workflows/ci.yml`). It installs into the default hook dir
+alongside graphify's `post-commit`; it does **not** set `core.hooksPath`, so
+graphify is unaffected.
+
+    cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+Bypass with `git commit --no-verify` (CI still enforces both on push).
+
 ## Testing
 
 - **Unit + real-byte conformance tests** (`test/**/*_test.exs`): no live server,

@@ -17,6 +17,13 @@ mix deps.get
 mix test
 ```
 
+Optionally install the pre-commit hook (runs `mix format --check-formatted` +
+`mix credo --strict`, blocks the commit on red):
+
+```bash
+cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
 ## Development Workflow
 
 1. Work directly on `main` (or a short-lived branch if required by your
