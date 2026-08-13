@@ -9,7 +9,9 @@ defmodule Replicant.Assembler.Streaming do
   # Rule-1 telemetry/`%Error{}` sites that live in the moved functions are value-free (counts
   # + allowlisted reasons) and move WITH the functions.
 
-  alias Replicant.{Assembler, Error, Spill, Telemetry, Transaction}
+  alias Replicant.{Assembler, Decoder.Messages, Error, Spill, Telemetry, Transaction}
+
+  alias Messages.{Message, StreamAbort, StreamCommit, StreamStart, StreamStop}
 
   # --- aggregate-resident spill (spec §5) ---
 
@@ -265,5 +267,132 @@ defmodule Replicant.Assembler.Streaming do
     else
       {:skipped, lsn, asm}
     end
+  end
+
+  # --- streamed-message handling (spec §5/§8) — moved from Assembler.do_handle_message ---
+  # Core's `do_handle_message` keeps the clause HEADS (delegating here) so the load-bearing clause
+  # ordering — the xid-guarded streamed-row clauses and the `txn: nil` "row before Begin" guard —
+  # is preserved exactly. Only the bodies move.
+
+  # StreamStart opens a per-xid buffer (spec §5). The §8 halt matrix: more than max_concurrent_txns
+  # concurrent in-progress streamed transactions halts fail-closed with the spec-named reason so an
+  # operator can distinguish a stream-count overflow (tune max_concurrent_txns) from a generic config
+  # error.
+  def handle_stream_start(%Assembler{} = asm, %StreamStart{xid: xid}) do
+    cond do
+      Map.has_key?(asm.stream_txns, xid) ->
+        {:ok, %{asm | current_stream_xid: xid}}
+
+      map_size(asm.stream_txns) >= (asm.max_concurrent_txns || 64) ->
+        {:halt,
+         %Error{reason: :too_many_streams, shape: "too many concurrent streamed transactions"},
+         asm}
+
+      true ->
+        {:ok,
+         %{
+           asm
+           | current_stream_xid: xid,
+             stream_txns:
+               Map.put(asm.stream_txns, xid, %{
+                 changes: [],
+                 messages: [],
+                 byte_size: 0,
+                 resident_bytes: 0,
+                 spilled_bytes: 0,
+                 spilled_by_subxid: %{},
+                 aborted: MapSet.new(),
+                 spill: nil,
+                 seq: 0
+               })
+         }}
+    end
+  end
+
+  def handle_stream_stop(%Assembler{} = asm, %StreamStop{}) do
+    {:ok, %{asm | current_stream_xid: nil}}
+  end
+
+  # A recorded spill fault (a disk-ceiling breach or an I/O fault flagged on `spill_fault` by the
+  # value-free observe_bytes/maybe_spill path, which runs OUTSIDE handle_message/2's rescue) halts
+  # the stream fail-closed at its commit boundary (spec §8) — never deliver a transaction assembled
+  # past a spill fault. Checked FIRST, before dispatching, so it preempts both the spilled and the
+  # resident delivery paths.
+  def handle_stream_commit(%Assembler{spill_fault: %Error{} = err} = asm, %StreamCommit{}),
+    do: {:halt, err, asm}
+
+  # StreamCommit: route the buffer to empty-suppression, in-memory replay, or lazy-Reader delivery
+  # (deliver_or_skip_stream).
+  def handle_stream_commit(%Assembler{} = asm, %StreamCommit{
+        xid: top,
+        commit_lsn: lsn,
+        commit_timestamp: ts
+      }) do
+    case Map.fetch(asm.stream_txns, top) do
+      :error ->
+        {:halt, %Error{reason: :config_invalid, shape: "stream commit for unknown transaction"},
+         asm}
+
+      {:ok, buf} ->
+        deliver_or_skip_stream(asm, top, buf, lsn, ts)
+    end
+  end
+
+  # StreamAbort: whole-transaction (top == sub) discards the buffer + its spill file and decrements
+  # spilled bytes; subtransaction (top != sub) drops just the aborted subxid's resident changes and
+  # records it in `aborted` for spilled-frame replay filtering (spec §5). An unknown top halts.
+  def handle_stream_abort(%Assembler{} = asm, %StreamAbort{xid: top, subxid: sub}) do
+    case {Map.fetch(asm.stream_txns, top), top == sub} do
+      {{:ok, buf}, true} ->
+        Telemetry.event([:replicant, :stream, :aborted], %{}, %{reason: :stream_abort})
+        if buf.spill, do: Spill.discard(buf.spill)
+        cleared = if asm.current_stream_xid == top, do: nil, else: asm.current_stream_xid
+
+        {:ok,
+         %{
+           asm
+           | stream_txns: Map.delete(asm.stream_txns, top),
+             current_stream_xid: cleared,
+             spilled_total: asm.spilled_total - buf.spilled_bytes
+         }}
+
+      {{:ok, buf}, false} ->
+        # In-memory tail: reject-at-abort. Already-spilled frames can't be rejected from an
+        # append-only file, so record `sub` in the aborted set — replay skips any spilled frame
+        # tagged `sub` (spec §5).
+        kept = Enum.reject(buf.changes, fn {subxid, _change} -> subxid == sub end)
+        buf = %{buf | changes: kept, aborted: MapSet.put(buf.aborted, sub)}
+        {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
+
+      {:error, _} ->
+        {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"},
+         asm}
+    end
+  end
+
+  # A STREAMED transactional message (spec §7.1) carries `xid` and arrives inside an open stream
+  # segment. The ordinal is the shared per-txn counter at attach (mirrors the v1 counter) so the
+  # message interleaves correctly with the surrounding changes' ordinals (spec §5). `prefix`/
+  # `content` are user bytes (Critical Rule 1) — carried on the %Message{} struct, never logged or
+  # inspected here; the value-free boundary is Core's `handle_message/2` rescue (which still wraps
+  # this call via the delegating clause).
+  def handle_streamed_message(
+        %Assembler{current_stream_xid: top} = asm,
+        %Message{transactional?: true, xid: sx, lsn: lsn, prefix: prefix, content: content}
+      )
+      when is_integer(top) do
+    buf = Map.fetch!(asm.stream_txns, top)
+
+    msg = %Message{
+      transactional?: true,
+      lsn: lsn,
+      prefix: prefix,
+      content: content,
+      xid: sx,
+      ordinal: buf.seq
+    }
+
+    buf = %{buf | messages: [msg | buf.messages], seq: buf.seq + 1}
+    {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
   end
 end

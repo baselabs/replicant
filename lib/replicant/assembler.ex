@@ -263,115 +263,21 @@ defmodule Replicant.Assembler do
   # these to reach the v1 clauses unchanged). Streamed Relation/Type messages fall through to the
   # existing v1 clauses (relation schema is cached globally, not per-stream — correct).
 
-  defp do_handle_message(%__MODULE__{} = asm, %StreamStart{xid: xid}) do
-    cond do
-      Map.has_key?(asm.stream_txns, xid) ->
-        {:ok, %{asm | current_stream_xid: xid}}
+  defp do_handle_message(%__MODULE__{} = asm, %StreamStart{} = msg),
+    do: __MODULE__.Streaming.handle_stream_start(asm, msg)
 
-      map_size(asm.stream_txns) >= (asm.max_concurrent_txns || 64) ->
-        # More than max_concurrent_txns concurrent in-progress streamed transactions (spec §8 halt
-        # matrix): halt fail-closed with the spec-named reason so an operator can distinguish a
-        # stream-count overflow (tune max_concurrent_txns) from a generic config error.
-        {:halt,
-         %Error{reason: :too_many_streams, shape: "too many concurrent streamed transactions"},
-         asm}
+  defp do_handle_message(%__MODULE__{} = asm, %StreamStop{} = msg),
+    do: __MODULE__.Streaming.handle_stream_stop(asm, msg)
 
-      true ->
-        {:ok,
-         %{
-           asm
-           | current_stream_xid: xid,
-             stream_txns:
-               Map.put(asm.stream_txns, xid, %{
-                 changes: [],
-                 messages: [],
-                 byte_size: 0,
-                 resident_bytes: 0,
-                 spilled_bytes: 0,
-                 spilled_by_subxid: %{},
-                 aborted: MapSet.new(),
-                 spill: nil,
-                 seq: 0
-               })
-         }}
-    end
-  end
+  # StreamCommit: delegate to Streaming (which checks a recorded `spill_fault` FIRST, then routes
+  # the buffer to empty-suppression / in-memory replay / lazy-Reader delivery — spec §5/§7/§8).
+  defp do_handle_message(%__MODULE__{} = asm, %StreamCommit{} = msg),
+    do: __MODULE__.Streaming.handle_stream_commit(asm, msg)
 
-  defp do_handle_message(%__MODULE__{} = asm, %StreamStop{}) do
-    {:ok, %{asm | current_stream_xid: nil}}
-  end
-
-  # A recorded spill fault (a disk-ceiling breach or an I/O fault flagged on `spill_fault` by the
-  # value-free `observe_bytes`/`maybe_spill` path, which runs OUTSIDE this rescue) halts the stream
-  # fail-closed at its commit boundary (spec §8) — never deliver a transaction assembled past a spill
-  # fault. Checked FIRST, before dispatching the StreamCommit, so it preempts both the spilled and
-  # the resident delivery paths.
-  defp do_handle_message(%__MODULE__{spill_fault: %Error{} = err} = asm, %StreamCommit{}),
-    do: {:halt, err, asm}
-
-  # StreamCommit: deliver the buffered streamed changes as a complete %Transaction{}, stamping the
-  # transaction-granularity commit_lsn and ascending ordinals AT REPLAY (streamed changes have no
-  # LSN before commit — spec §5). A SPILLED buffer delivers a lazy `Spill.Reader` over its disk
-  # frames + resident tail; an unspilled buffer replays the in-memory list. An EMPTY streamed txn (no
-  # published changes, or all subxids aborted) is suppressed to stay v1-indistinguishable at the sink
-  # (spec §7). Otherwise pre-skip if at/below the watermark (effect-once, §2) else deliver via the
-  # shared apply_sink path — mirroring the v1 Commit clause's stamp+skip?+deliver structure.
-  defp do_handle_message(%__MODULE__{} = asm, %StreamCommit{
-         xid: top,
-         commit_lsn: lsn,
-         commit_timestamp: ts
-       }) do
-    case Map.fetch(asm.stream_txns, top) do
-      :error ->
-        {:halt, %Error{reason: :config_invalid, shape: "stream commit for unknown transaction"},
-         asm}
-
-      {:ok, buf} ->
-        __MODULE__.Streaming.deliver_or_skip_stream(asm, top, buf, lsn, ts)
-    end
-  end
-
-  # Whole-transaction abort (subxid == top): discard the buffer, deliver nothing. Delete any open
-  # spill file (the aborted txn's disk frames must not survive — spec §5 commit/abort/reset cleanup)
-  # and decrement its spilled bytes from the assembler total.
-  defp do_handle_message(%__MODULE__{} = asm, %StreamAbort{xid: top, subxid: sub})
-       when top == sub do
-    case Map.fetch(asm.stream_txns, top) do
-      {:ok, buf} ->
-        Telemetry.event([:replicant, :stream, :aborted], %{}, %{reason: :stream_abort})
-        if buf.spill, do: Spill.discard(buf.spill)
-        cleared = if asm.current_stream_xid == top, do: nil, else: asm.current_stream_xid
-
-        {:ok,
-         %{
-           asm
-           | stream_txns: Map.delete(asm.stream_txns, top),
-             current_stream_xid: cleared,
-             spilled_total: asm.spilled_total - buf.spilled_bytes
-         }}
-
-      :error ->
-        {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"},
-         asm}
-    end
-  end
-
-  # Subtransaction (savepoint) abort: drop the aborted subxid's changes, keep the rest in order.
-  defp do_handle_message(%__MODULE__{} = asm, %StreamAbort{xid: top, subxid: sub}) do
-    case Map.fetch(asm.stream_txns, top) do
-      :error ->
-        {:halt, %Error{reason: :config_invalid, shape: "stream abort for unknown transaction"},
-         asm}
-
-      {:ok, buf} ->
-        # In-memory tail: reject-at-abort (shipped behavior, unchanged). Already-spilled frames can't
-        # be rejected from an append-only file, so record `sub` in the aborted set — Task-8 replay
-        # skips any spilled frame tagged `sub` (spec §5).
-        kept = Enum.reject(buf.changes, fn {subxid, _change} -> subxid == sub end)
-        buf = %{buf | changes: kept, aborted: MapSet.put(buf.aborted, sub)}
-        {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
-    end
-  end
+  # StreamAbort (whole-transaction or subtransaction/savepoint): delegate to Streaming, which folds
+  # the top==sub whole-abort and the sub abort into one handler (spec §5).
+  defp do_handle_message(%__MODULE__{} = asm, %StreamAbort{} = msg),
+    do: __MODULE__.Streaming.handle_stream_abort(asm, msg)
 
   defp do_handle_message(%__MODULE__{} = asm, %Insert{
          xid: sx,
@@ -408,35 +314,16 @@ defmodule Replicant.Assembler do
     stream_accumulate_truncate(asm, rids, sx)
   end
 
-  # (a) A STREAMED transactional message (spec §7.1) carries `xid` and arrives inside an open stream
-  # segment with `txn: nil` (streamed changes live in `stream_txns`, not the v1 buffer). It MUST match
-  # here — BEFORE the `txn: nil` row-before-Begin guard below — so it is not mis-halted as malformed.
-  # The `current_stream_xid: top when is_integer(top)` guard makes this clause disjoint from the v1
-  # transactional clauses (b)/(c): a v1 message has no open stream and `xid: nil`. The ordinal is the
-  # shared per-txn ordinal counter at attach (mirrors the v1 counter) so the message interleaves
-  # correctly with the surrounding changes' ordinals (spec §5).
-  defp do_handle_message(%__MODULE__{current_stream_xid: top} = asm, %Message{
-         transactional?: true,
-         xid: sx,
-         lsn: lsn,
-         prefix: prefix,
-         content: content
-       })
-       when is_integer(top) do
-    buf = Map.fetch!(asm.stream_txns, top)
-
-    msg = %Message{
-      transactional?: true,
-      lsn: lsn,
-      prefix: prefix,
-      content: content,
-      xid: sx,
-      ordinal: buf.seq
-    }
-
-    buf = %{buf | messages: [msg | buf.messages], seq: buf.seq + 1}
-    {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
-  end
+  # (a) A STREAMED transactional message (spec §7.1) arrives inside an open stream segment. The
+  # `current_stream_xid: top when is_integer(top)` guard keeps this clause disjoint from the v1 (b)/(c)
+  # message clauses below (a v1 message has no open stream) and ahead of the `txn: nil` row-before-
+  # Begin guard — order preserved, only the body moved to Streaming.handle_streamed_message/2.
+  defp do_handle_message(
+         %__MODULE__{current_stream_xid: top} = asm,
+         %Message{transactional?: true} = msg
+       )
+       when is_integer(top),
+       do: __MODULE__.Streaming.handle_streamed_message(asm, msg)
 
   # A row/commit message that arrives before any Begin is malformed → fail-closed
   # (without this guard the nil-buffer crash is caught by the outer rescue and
