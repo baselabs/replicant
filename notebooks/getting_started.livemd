@@ -44,7 +44,6 @@ Mix.install([
 
 > **Contributors:** to run against your working tree instead of the published
 > package, replace the `:replicant` line with `{:replicant, path: "/path/to/replicant"}`.
-> This path override is required until the 1.0.0 Hex package is published.
 
 ## Connect to a logical-replication Postgres
 

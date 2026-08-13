@@ -1,7 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-07-29 · **Core HEAD:** `783241c` (one code-quality commit past
-published/tagged `v0.3.1` at `b68593b`) · **Branch:** `main`
+**Updated:** 2026-08-13 · **Release:** `v1.0.0` (tagged) · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -16,12 +15,10 @@ published/tagged `v0.3.1` at `b68593b`) · **Branch:** `main`
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 0.3.1 is published and tagged** at `b68593b`; current `main`
-  (`783241c`) is one refactor commit ahead and keeps the same package version.
-- **`ash_replicant` 0.3.0 is published and tagged** at `c5ef154`; current `main`
-  (`4000681`) is four maintenance commits ahead, including isolated integration
-  setup, CI, and the Postgrex 0.22.3 security patch. Its source dependency remains
-  `{:replicant, "~> 0.1.0"}`.
+- **`replicant` 1.0.0 is published and tagged** `v1.0.0`.
+- **`ash_replicant` 0.3.0 is published and tagged** at `c5ef154`; a coordinated
+  1.0 release requiring Replicant `~> 1.0` is in progress. Its source dependency
+  remains `{:replicant, "~> 0.1.0"}` until that coordinated release.
 
 ## Sequencing (user directive, 2026-07-05) — ✅ FULLY EXECUTED
 

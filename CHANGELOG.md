@@ -7,12 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Bound the lib-mode incremental-snapshot concurrency marquee's writer and
-  assert real chunk/stream overlap before quiescing it, so constrained CI
-  runners prove convergence instead of being starved by an unbounded WAL source.
-
 ## [1.0.0] - 2026-08-13
 
 ### Fixed
@@ -51,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project's primary correctness evidence) were not running. `PG16.named_conn/2` now centralizes
   per-test isolation (start the pool unlinked + register an `on_exit` that stops it); all 23
   named-pool sites route through it. The full suite is now 66/0.
+- **Bound the lib-mode incremental-snapshot concurrency marquee's writer** and
+  assert real chunk/stream overlap before quiescing it, so constrained CI
+  runners prove convergence instead of being starved by an unbounded WAL source.
 
 ### Added
 
@@ -422,7 +419,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/baselabs/replicant/compare/v0.3.1...v1.0.0
 [0.3.1]: https://github.com/baselabs/replicant/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/baselabs/replicant/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/baselabs/replicant/compare/v0.2.1...v0.2.2

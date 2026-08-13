@@ -85,9 +85,9 @@ defmodule Replicant.MixProject do
   defp docs do
     [
       main: "Replicant",
-      # The release tag does not exist until the separately authorized publication step.
-      # Change this to v#{@version} only in the final tag/publish change.
-      source_ref: "main",
+      # HexDocs source links resolve against the v#{@version} tag, created at the
+      # publish step (git tag v#{@version} && git push --tags before mix hex.publish).
+      source_ref: "v#{@version}",
       source_url: @source_url,
       extras: [
         "README.md",

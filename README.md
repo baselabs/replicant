@@ -10,8 +10,7 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** the 1.0.0 source release is prepared and under final verification;
-> its Hex package and Git tag have not been published. Replicant owns
+> **Status:** 1.0.0 is published on Hex (tagged `v1.0.0`). Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
 > invalidation, and is proven by a real-PG16 crash-injection suite
@@ -140,9 +139,8 @@ def deps do
 end
 ```
 
-This Hex constraint is the post-publication install path. Until 1.0.0 is
-published, contributors must use the repository checkout or the path override
-shown in the Livebook.
+Contributors working from a source checkout can point Mix at the local checkout
+via a path override, as shown in the Livebook.
 
 ## Interactive tour (Livebook)
 
