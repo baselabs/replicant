@@ -17,9 +17,11 @@ through later releases:
 
 - **`replicant` 1.1.0 is published and tagged** `v1.1.0` (a post-1.0 hardening patch —
   see CHANGELOG `[1.1.0]`; 1.0.0 shipped at `v1.0.0`).
-- **`ash_replicant` 0.3.0 is published and tagged** at `c5ef154`; a coordinated
-  1.0 release requiring Replicant `~> 1.0` is in progress. Its source dependency
-  remains `{:replicant, "~> 0.1.0"}` until that coordinated release.
+- **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
+  Its current `main` at `197fca18594a4dbb20e57bc065ef78f30133ae5c` now consumes
+  Replicant `>= 1.0.0 and < 2.0.0-0`, locks 1.1.0, and independently tests exact
+  1.0.0 plus the latest compatible release. AshReplicant's own 1.0 publication
+  remains governed by its release roadmap and explicit publish authorization.
 
 ## Sequencing (user directive, 2026-07-05) — ✅ FULLY EXECUTED
 
@@ -52,7 +54,7 @@ closeout-reviewed to 100/100, and first published in `replicant` 0.1.0.**
 
 | # | Slice | Unlocks | Depends on | Status |
 |---|---|---|---|---|
-| — | **`ash_replicant`** (standalone lib) | The first-class consumer: an Ash/Postgres sink adapter carrying multitenancy + classification, one layer up from the tenant-blind core. This is what turns the primitive into a usable product. | `replicant` published (gate cleared) | ✅ **BUILT + PUBLISHED — 0.3.0 on Hex** (tagged at `c5ef154`; repo `/Users/rp/Developer/Base/ash_replicant`, current `main` `4000681`). Consumes `{:replicant, "~> 0.1.0"}` from Hex. Sibling to `arcadic`→`ash_arcadic`. |
+| — | **`ash_replicant`** (standalone lib) | The first-class consumer: an Ash/Postgres sink adapter carrying multitenancy + classification, one layer up from the tenant-blind core. This is what turns the primitive into a usable product. | `replicant` published (gate cleared) | ✅ **BUILT + PUBLISHED — 0.3.0 on Hex** at that milestone (tagged at `c5ef154`, then consuming `{:replicant, "~> 0.1.0"}`). Current package/source state is recorded in the snapshot above. Sibling to `arcadic`→`ash_arcadic`. |
 | 1 | `replicant-checkpoint-store` | Non-transactional sinks (files, external APIs): a lib-owned checkpoint table with a mandatory checkpoint-**after**-persist write order (dup, never loss). | Core (shipped) | ✅ Shipped + closeout-ready 2026-07-05 (13/13 tasks, exec-autopilot) · `/review-autopilot --fix` HEAD `2d23832`: graded **89/100 → 100** on user ruling for the sole design-decision; 6 findings fixed, gate battery ALL-PASS 231/0 dialyzer 0. **F3 RESOLVED** (2026-07-05: build §14.18 next — spawns slice 1b). |
 | 1b | `replicant-store-fault-retry` (§14.18) | Bounded-retry-then-halt on a checkpoint-store fault: a transient blip self-heals within N; a persistent outage retries N times then **HALTS + alerts the operator** (replaces the current UNPACED connect-retry interim + the immediate mid-stream write halt). Closes checkpoint-store closeout F3. | `replicant-checkpoint-store` (shipped) | ✅ **Shipped 2026-07-05** (exec-autopilot; 7/7 tasks, per-task two-stage opus review; unit **224/0**, integration **25/0**, dialyzer 0, credo/format clean; 0 tier escalations, 3 test-hardening review-fix rounds T1/T5/T6). Closeout `/review-autopilot` pending. Design adversarially reviewed (9 challenges 8-acc/1-refuted); plan machine-gated + independently reviewed (5/5 fixed). |
 | 2 | `replicant-batching` | Throughput: batched **checkpointing** for lib mode — defer the lib-owned checkpoint write + slot ack to once per batch of N txns (sink delivery stays per-txn). Amortizes the synchronous serial store round-trip. Per-transaction checkpointing is the correctness baseline it optimizes. | Core + checkpoint-store + store-fault-retry (shipped) | ✅ **Shipped + closed-out 2026-07-06** (exec-autopilot 5 tasks 2 opus/3 sonnet, 0 tier escalations/0 review-fix rounds → `/review-autopilot --fix` **100/100 grader-verified**; post-fix HEAD `7bfa193`, unit **249/0** + integration **28/0**, dialyzer 0, credo **677/0**, format/compile clean). Commits: config `c22f03e`, assembler/server `2ef4d7d`, pipeline `3c4734b`, integration `ce9bf25`, docs `904d153`; closeout fixes `113a2a4`/`65040f3`/`7a9812f`/`c6c1c48`/`85672f1`/`7bfa193`. Both closeout design-decisions user-ratified + implemented (spec §15 amendments): LSN-span base → `max(lib_checkpoint, stream_floor)`; batch discarded on mid-stream reconnect. Cross-vendor Codex: 2 uniques (reconnect-stale-batch, value-free-leak). Opt-in `checkpoint_store: [batch: [max_transactions: 100, max_delay_ms: 1000]]` + auto LSN-span lag-cap (`max_inflight_lag/4`); dup bound widens to one batch (crash + graceful stop + mid-stream reconnect), loss=0 unconditional. Sink-owned batching → `replicant-batch-delivery` ✅ executed 2026-07-06 (row 2b). |
@@ -139,7 +141,7 @@ migration); the slug is the slice join key.
 | ID | What | Acceptance | Depends | Why |
 |---|---|---|---|---|
 | D1 | **Stale install constraint** — README + getting-started Livebook ship `{:replicant, "~> 0.2"}`, which resolves `< 0.3.0` and locks users out of every 0.3 feature (and 1.0). slug:d1-install-constraint | `README.md` + `notebooks/getting_started.livemd` show `~> 1.0`; grep finds no `~> 0.2` / `~> 0.1.0` install reference | — | Currency — the most-copied snippet |
-| D2 | **Coordinate the Replicant/AshReplicant major contract** — Replicant 1.0 must expose authoritative actual-session identity before checkpoint lookup, and AshReplicant must not admit a 0.3 install that lacks it. slug:d2-ash-replicant-coord | Replicant's fetched package exposes `SessionIdentity` and `handle_session_identity/2`, the live callback reports system/database identity from the exact replication connection before checkpoint lookup, AshReplicant requires Replicant `~> 1.0`, and the two release in dependency order without moving or deleting a tag | D1 | Release coordination — a 1.0 that orphans its consumer or permits an unsafe downgrade |
+| D2 | **Coordinate the Replicant/AshReplicant major contract** — Replicant 1.0 must expose authoritative actual-session identity before checkpoint lookup, and AshReplicant must not admit a 0.3 install that lacks it. slug:d2-ash-replicant-coord | Replicant's fetched package exposes `SessionIdentity` and `handle_session_identity/2`, the live callback reports system/database identity from the exact replication connection before checkpoint lookup, AshReplicant requires Replicant `>= 1.0.0 and < 2.0.0-0` and tests exact 1.0.0/current 1.1.0/latest compatible; Replicant releases first, while AshReplicant publication remains blocked on its own completed release roadmap and explicit authorization | D1 | Release coordination — a 1.0 that orphans its consumer or permits an unsafe downgrade |
 | D3 | **Release hygiene** — toolchain/CI skew, a previously red format gate, an unenforced audit alias, and a vulnerable Postgrex floor cannot ship in 1.0. slug:d3-release-hygiene | `.tool-versions` pins Elixir 1.20.3-otp-29 / Erlang 29.0.3; CI matches it; format, audits, and gate red-probes pass; Postgrex is at least 0.22.4; actions and database images use immutable revisions | — | A red gate and an unpatched dependency cannot ship 1.0 |
 | D4 | **`:batch` type trapdoor** — `Replicant.Config.t` lists `optional(:batch)` but `fetch_batch/3` rejects a top-level `:batch` with `:config_invalid` (it is derived). slug:d4-batch-type-trapdoor | The public type no longer advertises a key the user cannot set; dialyzer + compile clean | — | Freeze the type honestly |
 | D5 | **v1 snapshot casting divergence** — `snapshot: true` runs `SELECT *` and zips raw Postgrex-decoded values (no cast), so a `timestamp` arrives as `NaiveDateTime` from the snapshot and `DateTime` from the stream; the incremental path was fixed (`::text` + `cast_record`) but v1 was never back-ported. slug:d5-snapshot-casting | A red-first convergence test proves a typed column delivers the SAME runtime type from v1 snapshot and the stream; v1 routes values through the shared `Casting.Types.cast_record/2` (or v1 is explicitly deprecated); value-free boundary intact | — | Convergence correctness (Critical Rule 1 boundary preserved) |
@@ -151,15 +153,21 @@ migration); the slug is the slice join key.
 
 ### Status (2026-08-13 closeout)
 
-**All ten rows shipped in 1.0.0** (`v1.0.0`): D1 (install constraint), D4–D10 closed in the
-hardening run, and the two 2026-08-13 major-contract rows — D2 (actual-session identity:
+**All Replicant-side requirements across the ten rows shipped in 1.0.0** (`v1.0.0`):
+D1 (install constraint), D4–D10 closed in the hardening run, and the two 2026-08-13
+major-contract rows — D2 (actual-session identity:
 `Replicant.SessionIdentity`, `handle_session_identity/2`, the `IDENTIFY_SYSTEM` connect step,
 ADR-0007) and D3 (release hygiene: `.tool-versions` pins Elixir 1.20.3-otp-29 / Erlang 29.0.3,
 CI matches and uses immutable action/image revisions, `mix audit` is a gate, postgrex floors at
-`~> 0.22.4`) — both verified against the fetched package. The only separately-authorized item is
-the coordinated AshReplicant `~> 1.0` dependency publication. **1.1.0** (`v1.1.0`) is a
-post-1.0 hardening patch: a float-array casting fix, a post-halt window-guard consistency fix,
-and connection-opt merge hardening (see CHANGELOG `[1.1.0]`).
+`~> 0.22.4`) — both verified against the fetched package. D2's consumer-side source coordination
+is now complete
+at AshReplicant `197fca18594a4dbb20e57bc065ef78f30133ae5c`: exact 1.0.0, locked 1.1.0,
+and latest-compatible CI all pass; the generated sink rejects actual-session identity drift
+before checkpoint lookup. AshReplicant publication remains a separate release action.
+**1.1.0** (`v1.1.0`) is the current Replicant release and a post-1.0 hardening patch:
+float-array casting accepts all valid PostgreSQL text forms, post-halt snapshot-window calls
+return `{:error, :window_reset}`, and snapshot reader connection options use library-wins
+merging (see CHANGELOG `[1.1.0]`).
 
 ### P2 backlog (post-1.0 hardening)
 
