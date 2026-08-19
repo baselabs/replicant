@@ -25,7 +25,7 @@ defmodule Replicant.MessageValueSafetyTest do
   code runs against synthetic hostile bytes. The live-PG delivery marquees are unchanged in
   `test/integration/messages_test.exs`.
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Replicant.{Assembler, Decoder, Error}
   alias Replicant.Decoder.Messages.Message
