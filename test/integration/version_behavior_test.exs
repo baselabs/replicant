@@ -32,11 +32,25 @@ defmodule Replicant.Integration.VersionBehaviorTest do
     drop_slot(ctrl, slot)
 
     on_exit(fn ->
-      Replicant.stop(slot)
-      PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 200)
-      {:ok, c} = Postgrex.start_link(PG16.pg_opts())
-      drop_slot(c, slot)
-      Postgrex.query!(c, "DROP PUBLICATION IF EXISTS #{pub}", [])
+      try do
+        Replicant.stop(slot)
+
+        PG16.wait_until(
+          fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
+          200
+        )
+
+        {:ok, c} = Postgrex.start_link(PG16.pg_opts())
+
+        try do
+          drop_slot(c, slot)
+          Postgrex.query!(c, "DROP PUBLICATION IF EXISTS #{pub}", [])
+        after
+          PG16.stop_conn(c)
+        end
+      after
+        PG16.stop_conn(ctrl)
+      end
     end)
 
     %{ctrl: ctrl, slot: slot, pub: pub, version: server_version_num(ctrl)}
@@ -127,7 +141,7 @@ defmodule Replicant.Integration.VersionBehaviorTest do
 
       on_exit(fn -> :telemetry.detach(handler) end)
 
-      {:ok, _pid} =
+      {:ok, pid} =
         Replicant.start_link(
           connection: PG16.pg_opts(),
           slot_name: slot,
@@ -137,10 +151,16 @@ defmodule Replicant.Integration.VersionBehaviorTest do
           failover: true
         )
 
+      ref = Process.monitor(pid)
+
       assert_receive {:failover_unsup, %{reason: :failover_unsupported}},
                      10_000,
                      "PG#{div(version, 10_000)} rejects failover slots; the pipeline must halt " <>
                        "{:config, :failover_unsupported} BEFORE emitting FAILOVER to the server"
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason},
+                     10_000,
+                     "a failover-unsupported pipeline must terminate after the halt signal"
 
       # The slot must NOT have been created — the gate halts before CREATE_REPLICATION_SLOT.
       # Query by slot_name only: PG<17 has no `failover` column (selecting it would itself error).
@@ -176,7 +196,5 @@ defmodule Replicant.Integration.VersionBehaviorTest do
       "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
       [slot]
     )
-  rescue
-    _ -> :ok
   end
 end
