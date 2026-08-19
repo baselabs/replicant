@@ -99,7 +99,7 @@ defmodule Replicant.TelemetryTest do
     end
   end
 
-  describe "value-shape contract (R02)" do
+  describe "value-shape contract" do
     # Each allowlisted key now carries a type/shape contract, not just key-closure.
     # A row/column value smuggled into an allowlisted key as the WRONG shape (a string
     # where an LSN/count/duration/boolean belongs) must raise, not ship downstream.
@@ -189,6 +189,33 @@ defmodule Replicant.TelemetryTest do
 
     test "table admits nil (schema-change sites carry String.t() | nil, value-free)" do
       assert %{table: nil} = Telemetry.validate!(%{table: nil})
+    end
+
+    test "slot_name admits nil when library mode has no replication slot" do
+      assert %{slot_name: nil} = Telemetry.validate!(%{slot_name: nil})
+    end
+
+    test "VALUE-FREE: off-list metadata and measurement errors elide arbitrary keys" do
+      secret_key = "S3CR3T-attacker-controlled-key-bytes"
+      secret_value = "S3CR3T-attacker-controlled-value-bytes"
+
+      errors = [
+        assert_raise(ArgumentError, fn ->
+          Telemetry.validate!(%{secret_key => secret_value})
+        end),
+        assert_raise(ArgumentError, fn ->
+          Telemetry.event(
+            [:replicant, :sink, :committed],
+            %{secret_key => secret_value},
+            %{}
+          )
+        end)
+      ]
+
+      Enum.each(errors, fn error ->
+        refute error.message =~ secret_key
+        refute error.message =~ secret_value
+      end)
     end
 
     test "the lag measurement admits a NEGATIVE value (signed WAL-byte arithmetic)" do

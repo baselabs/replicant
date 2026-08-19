@@ -4,12 +4,14 @@ defmodule Replicant.Telemetry do
   the single enforcement point for "no row values in telemetry" (Critical Rule 1). Each
   permitted key carries a closed value-SHAPE contract, not just key-closure: an LSN is a
   non-negative integer, a count is a non-negative integer, a duration is a non-negative
-  integer, a boolean is a boolean, a table/slot name is a string, an error class is an
-  atom. A key that is off-list, or on-list with the WRONG shape (a row value smuggled in
+  integer, a boolean is a boolean, a table/slot name is a string or a value-free nil
+  absent marker, and an error class is an atom. A key that is off-list, or on-list with
+  the WRONG shape (a row value smuggled in
   as a string where an LSN belongs), raises rather than shipping a value downstream. The
-  shape-violation error renders only the key and the value's TYPE — never the value
-  itself, so the guard can never leak the bytes it exists to keep out. Mirrors `arcadic`'s
-  allowlist pattern.
+  shape-violation error renders only an allowed atom key and the value's TYPE — never the
+  value itself. Off-list errors elide the rejected keys as well, because map keys can be
+  attacker-controlled terms. The guard therefore cannot leak the bytes it exists to keep
+  out. Mirrors `arcadic`'s allowlist pattern.
   """
 
   # Metadata (the 3rd arg): key => value-shape contract. Derived from every emission site.
@@ -20,8 +22,9 @@ defmodule Replicant.Telemetry do
   #   * :non_neg_integer — counts (`change_count`, `byte_size`, `attempt`, `max_retries`)
   #     and durations in ms (`lag_ms`, `duration`).
   #   * :boolean         — `transactional`.
-  #   * :name            — a table/`slot_name` string. `table` is `String.t() | nil` at
-  #     the schema-change sites (a nil table name is value-free), so nil is admitted.
+  #   * :nullable_name   — a table/slot string or nil. Schema-change sites can carry a
+  #     nil table name, and library mode has no replication slot; nil is a value-free
+  #     absent marker, not row bytes.
   #   * :atom            — value-free error/`kind` classes (`reason`, `error_class`,
   #     `kind`); these are compile-time atoms, never `String.to_atom` of row bytes.
   @meta_shapes %{
@@ -33,8 +36,8 @@ defmodule Replicant.Telemetry do
     attempt: :non_neg_integer,
     max_retries: :non_neg_integer,
     transactional: :boolean,
-    table: :name,
-    slot_name: :name,
+    table: :nullable_name,
+    slot_name: :nullable_name,
     reason: :atom,
     error_class: :atom,
     kind: :atom
@@ -104,8 +107,8 @@ defmodule Replicant.Telemetry do
     measurements
   end
 
-  # Key-closure: every key must be on the allowlist. The error lists only the offending KEYS
-  # (atoms) and the allowlist — never a value.
+  # Key-closure: every key must be on the allowlist. The rejected keys are arbitrary map
+  # terms, so the error elides them and reports only a safe count plus the static allowlist.
   defp validate_keys!(map, allowed, kind) do
     case Map.keys(map) -- allowed do
       [] ->
@@ -113,7 +116,7 @@ defmodule Replicant.Telemetry do
 
       bad ->
         raise ArgumentError,
-              "telemetry #{kind} keys #{inspect(bad)} are not in the value-free allowlist " <>
+              "telemetry #{kind} contains #{length(bad)} key(s) not in the value-free allowlist " <>
                 "#{inspect(allowed)} (no row values / column values in telemetry)"
     end
   end
@@ -137,14 +140,14 @@ defmodule Replicant.Telemetry do
   defp shape_ok?(:non_neg_integer, value), do: is_integer(value) and value >= 0
   defp shape_ok?(:integer, value), do: is_integer(value)
   defp shape_ok?(:boolean, value), do: is_boolean(value)
-  defp shape_ok?(:name, value), do: is_binary(value) or is_nil(value)
+  defp shape_ok?(:nullable_name, value), do: is_binary(value) or is_nil(value)
   defp shape_ok?(:atom, value), do: is_atom(value)
 
   defp describe(:lsn), do: "a non-negative integer or nil"
   defp describe(:non_neg_integer), do: "a non-negative integer"
   defp describe(:integer), do: "an integer"
   defp describe(:boolean), do: "a boolean"
-  defp describe(:name), do: "a string or nil"
+  defp describe(:nullable_name), do: "a string or nil"
   defp describe(:atom), do: "an atom"
 
   # Type name only — the value is NEVER rendered (Critical Rule 1). `is_boolean` precedes

@@ -16,12 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string where an LSN/count/duration belongs) would still ship downstream, and measurements
   (the `:telemetry` event's 2nd argument) were not validated at all. Every permitted key now
   carries a type contract — LSNs are a non-negative integer or nil, counts and durations are
-  non-negative integers, `transactional` is a boolean, `table`/`slot_name` are strings,
+  non-negative integers, `transactional` is a boolean, `table`/`slot_name` are strings or
+  value-free nil absent markers,
   `reason`/`error_class`/`kind` are atoms; measurement `duration`/`byte_size`/`change_count`
   are non-negative integers and `lag` is a signed integer (WAL-byte arithmetic). An off-list
-  key or a wrong-shape value raises rather than emitting, and the raised error renders only
-  the offending key and the value's TYPE — never the value itself, so the guard can never
-  leak the bytes it exists to keep out. No emission site changed: all current events pass.
+  key or a wrong-shape value raises rather than emitting. Shape errors render only an allowed
+  atom key and the value's TYPE; off-list errors elide arbitrary rejected keys as well as values,
+  so the guard cannot leak attacker-controlled bytes. No emission site changed: all current
+  events pass.
   Covered by red-first mutation tripwires (a string in each numeric/boolean field, a non-atom
   reason, an off-list measurement key, and a value-free-error assertion) plus the full live
   PostgreSQL suite.
