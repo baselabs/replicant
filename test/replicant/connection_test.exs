@@ -565,6 +565,17 @@ defmodule Replicant.ConnectionTest do
       assert Connection.classify_slot_status([["reserved", true, nil, false]]) ==
                {:invalidated, :conflict}
     end
+
+    # PG15 has NO `conflicting` column, so the invalidation query returns a 1-col row
+    # `[wal_status]` (probe-confirmed). `wal_status = 'lost'` is PG15's sole invalidation
+    # signal; anything else is :ok.
+    test "PG15 1-col row: a reserved slot is :ok" do
+      assert Connection.classify_slot_status([["reserved"]]) == :ok
+    end
+
+    test "PG15 1-col row: wal_status 'lost' is an invalidation (WAL removed → data gap)" do
+      assert Connection.classify_slot_status([["lost"]]) == {:invalidated, :wal_lost}
+    end
   end
 
   describe "handle_result(:publication_check)" do

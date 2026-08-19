@@ -736,7 +736,9 @@ defmodule Replicant.Connection do
 
   @doc """
   Classify a `pg_replication_slots` invalidation-status result (spec §5/§8). `[]` →
-  `:absent`. On the **PG16 2-col** row `[wal_status, conflicting]`: `wal_status = "lost"` →
+  `:absent`. On the **PG15 1-col** row `[wal_status]` (PG15 has no `conflicting` column):
+  `wal_status = "lost"` → `{:invalidated, :wal_lost}`, otherwise `:ok`. On the **PG16 2-col**
+  row `[wal_status, conflicting]`: `wal_status = "lost"` →
   `{:invalidated, :wal_lost}`; `conflicting = true` → `{:invalidated, :conflict}`; otherwise
   `:ok`. On the **PG17 4-col** row `[wal_status, conflicting, invalidation_reason, synced]`:
   the legacy signals classify first (same as above), then any non-empty `invalidation_reason`
@@ -765,6 +767,13 @@ defmodule Replicant.Connection do
       conflicting == true -> {:invalidated, :conflict}
       true -> :ok
     end
+  end
+
+  # PG15 1-col row `[wal_status]` — `conflicting` does not exist on PG15, so recovery-conflict
+  # is not observable by construction; `wal_status = 'lost'` (WAL removed) is PG15's sole
+  # invalidation signal. Anything else is :ok.
+  def classify_slot_status([[wal_status] | _rest]) do
+    if wal_status == "lost", do: {:invalidated, :wal_lost}, else: :ok
   end
 
   # Map PG's invalidation_reason enum string to a FIXED atom class (spec §5.2). NEVER
@@ -1350,7 +1359,10 @@ defmodule Replicant.Connection do
 
   # Replication simple-query results arrive as TEXT; coerce the invalidation-status boolean
   # columns (conflicting, synced) so classify_slot_status / synced_unpromoted? see real booleans.
-  # 2-col PG16 row: [wal_status, conflicting]; 4-col PG17: [wal_status, conflicting, reason, synced].
+  # 1-col PG15 row: [wal_status] (no boolean to coerce); 2-col PG16 row: [wal_status, conflicting];
+  # 4-col PG17: [wal_status, conflicting, reason, synced].
+  defp coerce_status_row([wal_status]), do: [wal_status]
+
   defp coerce_status_row([wal_status, conflicting]), do: [wal_status, repl_bool(conflicting)]
 
   defp coerce_status_row([wal_status, conflicting, reason, synced]),

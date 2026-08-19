@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Proven support for PostgreSQL 15, 16, 17, and 18, with version-gated capabilities.** The CI
+  matrix now runs the full suite (Docker-only, `wal_level=logical`) against all four majors on the
+  operator-approved port mappings (`5615`/`5599`/`5617`/`5618`; `localhost:5432` is never used),
+  each matrix row asserting its live `server_version_num` matches the expected major and grepping
+  for an `R05-SUBSTRATE-RECEIPT pg=<major>` line emitted by a live integration test — so a skipped
+  or mis-wired row reds rather than passing vacuously. A new
+  `test/integration/version_behavior_test.exs` runs against whatever major the substrate is and
+  branches on the live version: failover slots are proved created on PG17/18 and structurally
+  rejected on PG15/16 (`{:config, :failover_unsupported}` — those majors reject the `FAILOVER`
+  slot option).
+
 - **Typed logical-slot consistent-point callback for go-forward append consumers.** The optional
   `Replicant.Sink` callback `handle_slot_origin/2` receives the LSN a go-forward
   stream begins at, on every connect and reconnect, before `START_REPLICATION`, for BOTH a
@@ -27,6 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail-closed veto proven RED by a `start_streaming` mutation) plus a live-PostgreSQL suite that
   proves the new-slot origin falls in the source-WAL creation window and the reused origin advances
   and is bracketed by the live slot state across a forced reconnect.
+
+### Fixed
+
+- **The slot-invalidation query no longer errors on PostgreSQL 15.**
+  `pg_replication_slots.conflicting` was added in PG16; the previous PG<17 query selected
+  `wal_status, conflicting`, so on PG15 it errored `column "conflicting" does not exist` — crashing
+  a PG15 pipeline at the invalidation check into a reconnect storm. The query is now gated in three
+  tiers by `server_version_num` (PG15 → `wal_status`; PG16 → `+ conflicting`; PG17+ → `+
+  invalidation_reason, synced`), and `classify_slot_status/1` handles the PG15 single-column row
+  (`wal_status = 'lost'` is PG15's sole invalidation signal). Proven red-first at the unit level and
+  verified against live PostgreSQL 15/16/17/18.
 
 ### Security
 

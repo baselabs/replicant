@@ -18,33 +18,56 @@ env:
 
 jobs:
   test:
-    name: test (PG${{ matrix.postgres }})
+    name: test (PG${{ matrix.pg.major }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # R05 supported-version matrix: PostgreSQL 15, 16, 17, 18. Each row uses the
+      # operator-approved local port mapping (5615/5599/5617/5618) — `localhost:5432` is
+      # never the substrate — and pins the image by manifest-list digest (supply-chain: a
+      # moved tag cannot silently change the tested image). `major` is exported as
+      # EXPECTED_PG_MAJOR so the integration suite fails a row wired to the wrong container.
       matrix:
-        postgres: ["16", "17"]
+        pg:
+          - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111" }
+          - { major: "16", port: "5599", digest: "sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5" }
+          - { major: "17", port: "5617", digest: "sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449" }
+          - { major: "18", port: "5618", digest: "sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941" }
     env:
       MIX_ENV: test
-      REPLICANT_TEST_URL: postgres://postgres@localhost:5432/postgres
+      REPLICANT_TEST_URL: postgres://postgres@localhost:${{ matrix.pg.port }}/postgres
+      EXPECTED_PG_MAJOR: ${{ matrix.pg.major }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-      - name: Start PostgreSQL ${{ matrix.postgres }} with logical replication
+      - name: Start PostgreSQL ${{ matrix.pg.major }} with logical replication
         # A `services:` block cannot pass `-c wal_level=logical` to the container, so run
         # Postgres directly with the flags (mirrors AGENTS.md). Without wal_level=logical the
         # integration suite would silently skip and CI would be green-but-vacuous.
         run: |
           docker run -d --name pg \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
-            -p 5432:5432 \
-            postgres:${{ matrix.postgres }}@${{ matrix.postgres == '16' && 'sha256:95206741a5b214807675e14165369d05b93a9cf692223b616d07cca227e74b0b' || 'sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317' }} \
+            -p ${{ matrix.pg.port }}:5432 \
+            postgres:${{ matrix.pg.major }}@${{ matrix.pg.digest }} \
             -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
           for _ in $(seq 1 30); do
             docker exec pg pg_isready -U postgres && break
             sleep 1
           done
           docker exec pg pg_isready -U postgres || { echo "Postgres never became ready"; exit 1; }
+
+      - name: Assert the live server is the expected major (substrate wiring)
+        # Fail closed if the started container's version does not match the matrix row — a
+        # mis-pinned digest or wrong tag is caught BEFORE the suite runs, never a silent
+        # green against the wrong version.
+        run: |
+          got=$(docker exec pg psql -U postgres -tAc "SELECT current_setting('server_version_num')")
+          echo "server_version_num=$got"
+          major=$(( got / 10000 ))
+          test "$major" = "${{ matrix.pg.major }}" \
+            || { echo "::error::started PG$major but the matrix row expects PG${{ matrix.pg.major }}"; exit 1; }
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
@@ -63,8 +86,8 @@ jobs:
             priv/plts
           # Key binds the cache to the pinned toolchain + mix.lock + .tool-versions,
           # so a toolchain or dep bump invalidates a stale PLT/build cache.
-          key: ${{ runner.os }}-pg${{ matrix.postgres }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
-          restore-keys: ${{ runner.os }}-pg${{ matrix.postgres }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
+          key: ${{ runner.os }}-pg${{ matrix.pg.major }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
+          restore-keys: ${{ runner.os }}-pg${{ matrix.pg.major }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       - run: mix deps.get
       - name: Assert release runtime
@@ -79,7 +102,20 @@ jobs:
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix credo --strict
-      - run: mix test --warnings-as-errors
+      - name: Run tests and prove this matrix row ran integration against PG${{ matrix.pg.major }}
+        # R05 CI discovery: the integration suite emits `R05-SUBSTRATE-RECEIPT pg=<major>` from a
+        # live-server test. Grepping for THIS row's major proves the row actually exercised the
+        # integration suite against the version it claims — a skipped or mis-wired row (which
+        # would print nothing, or a different major) reds here rather than passing vacuously.
+        # (pipefail is on in the default Actions bash shell, so a `mix test` failure still fails
+        # the step before the grep.)
+        run: |
+          mix test --warnings-as-errors 2>&1 | tee test-output.log
+          # No `^` anchor: ExUnit prints inline progress dots with no trailing newline, so the
+          # receipt from IO.puts lands mid-line (`....R05-SUBSTRATE-RECEIPT ...`). The pattern is
+          # specific enough that a substring match anywhere is unambiguous.
+          grep -qE "R05-SUBSTRATE-RECEIPT pg=${{ matrix.pg.major }} version_num=" test-output.log \
+            || { echo "::error::integration did not run against PG${{ matrix.pg.major }} (no R05-SUBSTRATE-RECEIPT)"; exit 1; }
       - run: mix dialyzer
 
   release-artifact:
@@ -90,6 +126,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           otp-version: ${{ env.OTP_VERSION }}

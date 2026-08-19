@@ -166,21 +166,31 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  Query returning the slot's invalidation signals (spec §5/§8). On **PG < 17** (`version <
-  170000`): `wal_status` + `conflicting` (the PG16 columns; `invalidation_reason` errors there).
-  On **PG ≥ 17**: also `invalidation_reason` (Postgres's authoritative invalidation field) and
-  `synced` (true on a standby holding a slot synced from the primary). `wal_status = 'lost'` =
-  WAL removed; `conflicting = true` = standby recovery conflict; any non-null `invalidation_reason`
-  = invalidated. All are unrecoverable → fail-closed halt.
+  Query returning the slot's invalidation signals (spec §5/§8), gated by the numeric server
+  version because the available `pg_replication_slots` columns differ per major (probe-confirmed
+  on live PG 15/16/17/18):
+
+    * **PG 15** (`version < 160000`) — `wal_status` ONLY. `conflicting` was added in PG16, so
+      selecting it on PG15 errors `column "conflicting" does not exist`. `wal_status = 'lost'`
+      is PG15's sole invalidation signal.
+    * **PG 16** (`160000 <= version < 170000`) — `wal_status` + `conflicting`
+      (`invalidation_reason`/`synced` were added in PG17 and error here).
+    * **PG 17+** (`version >= 170000`) — also `invalidation_reason` (Postgres's authoritative
+      invalidation field) and `synced` (true on a standby holding a slot synced from the primary).
+
+  `wal_status = 'lost'` = WAL removed; `conflicting = true` = standby recovery conflict; any
+  non-null `invalidation_reason` = invalidated. All are unrecoverable → fail-closed halt.
   """
   @spec slot_invalidation_status(String.t(), non_neg_integer()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
   def slot_invalidation_status(slot_name, version) do
     with :ok <- Identifier.validate(slot_name) do
       cols =
-        if version >= 170_000,
-          do: "wal_status, conflicting, invalidation_reason, synced",
-          else: "wal_status, conflicting"
+        cond do
+          version >= 170_000 -> "wal_status, conflicting, invalidation_reason, synced"
+          version >= 160_000 -> "wal_status, conflicting"
+          true -> "wal_status"
+        end
 
       {:ok,
        "SELECT #{cols} FROM pg_replication_slots " <>
