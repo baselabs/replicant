@@ -98,4 +98,146 @@ defmodule Replicant.TelemetryTest do
                end)
     end
   end
+
+  describe "value-shape contract" do
+    # Each allowlisted key now carries a type/shape contract, not just key-closure.
+    # A row/column value smuggled into an allowlisted key as the WRONG shape (a string
+    # where an LSN/count/duration/boolean belongs) must raise, not ship downstream.
+
+    test "TRIPWIRE: a string in the LSN field (commit_lsn) raises" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{commit_lsn: "0/16B3748"}) end
+    end
+
+    test "commit_lsn admits nil (checkpoint-store :read on a fresh slot = no checkpoint)" do
+      assert %{commit_lsn: nil} = Telemetry.validate!(%{commit_lsn: nil})
+    end
+
+    test "TRIPWIRE: a NON-nil atom in the LSN field still raises (nil-admission is nil-specific)" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{commit_lsn: :absent}) end
+    end
+
+    test "TRIPWIRE: a string in a count field (change_count) raises" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{change_count: "5"}) end
+    end
+
+    test "TRIPWIRE: a string in the boolean field (transactional) raises" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{transactional: "true"}) end
+    end
+
+    test "TRIPWIRE: a string in a duration field (lag_ms) raises" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{lag_ms: "12"}) end
+    end
+
+    test "TRIPWIRE: a negative value in a non-negative count field (byte_size) raises" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{byte_size: -1}) end
+    end
+
+    test "TRIPWIRE: a non-atom in the reason field raises" do
+      assert_raise ArgumentError, fn -> Telemetry.validate!(%{reason: "sink_failed"}) end
+    end
+
+    test "TRIPWIRE: a string measurement value (duration) raises" do
+      assert_raise ArgumentError, fn ->
+        Telemetry.event([:replicant, :sink, :committed], %{duration: "1"}, %{commit_lsn: 0})
+      end
+    end
+
+    test "TRIPWIRE: an off-allowlist MEASUREMENT key raises" do
+      assert_raise ArgumentError, ~r/value-free allowlist/, fn ->
+        Telemetry.event([:replicant, :sink, :committed], %{customer_balance: 1}, %{commit_lsn: 0})
+      end
+    end
+
+    test "VALUE-FREE: a shape-violation error never renders the offending value (Rule 1)" do
+      # The secret byte-string smuggled into an LSN field must NOT appear in the raised
+      # message — only the key and the TYPE. inspect(value) here would be the exact leak.
+      secret = "S3CR3T-row-bytes-do-not-leak"
+
+      err =
+        assert_raise ArgumentError, fn -> Telemetry.validate!(%{commit_lsn: secret}) end
+
+      refute err.message =~ secret
+      assert err.message =~ "commit_lsn"
+    end
+
+    test "VALUE-FREE: an off-allowlist metadata error never renders the value" do
+      err =
+        assert_raise ArgumentError, fn ->
+          Telemetry.validate!(%{customer_email: "a@b.c"})
+        end
+
+      refute err.message =~ "a@b.c"
+    end
+
+    test "all current metadata shapes pass" do
+      assert %{} =
+               Telemetry.validate!(%{
+                 commit_lsn: 0x10,
+                 change_count: 0,
+                 byte_size: 64,
+                 lag_ms: 0,
+                 duration: 5,
+                 attempt: 2,
+                 max_retries: 5,
+                 transactional: false,
+                 table: "public.orders",
+                 slot_name: "rep_x",
+                 reason: :sink_failed,
+                 kind: :additive
+               })
+    end
+
+    test "table admits nil (schema-change sites carry String.t() | nil, value-free)" do
+      assert %{table: nil} = Telemetry.validate!(%{table: nil})
+    end
+
+    test "slot_name admits nil when library mode has no replication slot" do
+      assert %{slot_name: nil} = Telemetry.validate!(%{slot_name: nil})
+    end
+
+    test "VALUE-FREE: off-list metadata and measurement errors elide arbitrary keys" do
+      secret_key = "S3CR3T-attacker-controlled-key-bytes"
+      secret_value = "S3CR3T-attacker-controlled-value-bytes"
+
+      errors = [
+        assert_raise(ArgumentError, fn ->
+          Telemetry.validate!(%{secret_key => secret_value})
+        end),
+        assert_raise(ArgumentError, fn ->
+          Telemetry.event(
+            [:replicant, :sink, :committed],
+            %{secret_key => secret_value},
+            %{}
+          )
+        end)
+      ]
+
+      Enum.each(errors, fn error ->
+        refute error.message =~ secret_key
+        refute error.message =~ secret_value
+      end)
+    end
+
+    test "the lag measurement admits a NEGATIVE value (signed WAL-byte arithmetic)" do
+      # connection.ex emits `%{lag: received - max(cp, floor) - spilled}` — signed; a
+      # non-negative guard here would over-reject a legitimate current emission site.
+      assert :ok =
+               Telemetry.event([:replicant, :connection, :disconnected], %{lag: -3}, %{
+                 reason: :sink_too_slow
+               })
+    end
+
+    test "current measurement shapes (duration, byte_size, change_count) pass" do
+      assert :ok =
+               Telemetry.event(
+                 [:replicant, :transaction, :assembled],
+                 %{
+                   duration: 7,
+                   byte_size: 64,
+                   change_count: 2
+                 },
+                 %{commit_lsn: 0x10}
+               )
+    end
+  end
 end
