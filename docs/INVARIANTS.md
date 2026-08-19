@@ -50,9 +50,16 @@ the apply action with `strategy :idempotency` keyed on the transaction's `commit
 Postgres unique constraint (not a hand-rolled "did this run?" pre-check) decides the replay within
 the retention boundary — the clean split `ash_onetime` itself draws between local admission and
 end-to-end delivery. The same mechanism upgrades the at-least-once `handle_message/2` *delivery*
-path to effect-once *at the sink*: `strategy :one_time_nonce` keyed on the message's
-`{lsn, ordinal}` makes the *effect* once while replicant still states that path's *delivery* honestly
-as at-least-once.
+path to effect-once *at the sink*: `strategy :idempotency` keyed on the message's LSN (the non-txn
+`handle_message/2` context is `%{lsn: lsn}`, unique per non-transactional WAL record — `ordinal` is
+a *transactional*-message field and is absent here) makes the *effect* once while replicant still
+states that path's *delivery* honestly as at-least-once. Use idempotency, **not** a one-time nonce,
+here: a non-transactional message is at-least-once, so a lawful reconnect *re-delivers* the same
+LSN; a one-time-nonce admission *rejects* that second delivery as a replay attempt and would fail
+the retry — dropping the effect — whereas idempotency keyed on the LSN makes the replay a durable
+no-op. This matches `README.md` ("AshReplicant uses idempotency, not nonce rejection, for retryable
+non-transactional logical-message effects") and ADR-0001 ("Non-transactional message consumers
+must be idempotent").
 
 ## 4. Unchanged TOAST is a sentinel, not a value
 

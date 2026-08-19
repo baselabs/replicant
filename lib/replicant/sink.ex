@@ -123,6 +123,14 @@ defmodule Replicant.Sink do
   `handle_transaction/1` downgrade. A transactional message (`transactional => true`) does NOT
   route here: it rides `%Transaction.messages` and inherits the txn path's effect-once.
 
+  Your `handle_message/2` MUST be idempotent — make the effect once by keying on the message's
+  LSN (`context.lsn`, unique per non-transactional WAL record) with an **idempotency** strategy
+  (e.g. `ash_onetime`'s `strategy :idempotency`), NOT a one-time nonce. Because delivery is
+  at-least-once, a lawful reconnect re-delivers the same LSN; a one-time-nonce admission would
+  *reject* that as a replay and fail the retry, dropping the effect. Idempotency turns the replay
+  into a durable no-op instead. (See `docs/INVARIANTS.md` §3, `README.md`, and ADR-0001 — the
+  guidance agrees across all three.)
+
   On `:ok` / `{:ok, _}` the library advances the checkpoint to the message's LSN; a non-`:ok`
   return (or a raise/throw/exit) halts the pipeline fail-closed. `context` carries `%{lsn: lsn}`.
   Enabled by the top-level `messages: true` config; a sink missing this callback is rejected at

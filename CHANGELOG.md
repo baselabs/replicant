@@ -28,6 +28,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason, an off-list measurement key, and a value-free-error assertion) plus the full live
   PostgreSQL suite.
 
+- **Logical-decoding message `prefix`/`content` bytes are now guarded against leaking into any
+  failure surface by an adversarial regression suite (value-free hardening, Critical Rule 1).**
+  A message's `prefix` and `content` are user-controlled bytes (a `pg_logical_emit_message`
+  caller chooses them), so they can carry a secret or a row value. `test/replicant/message_value_safety_test.exs`
+  drives a hostile prefix/content — including a NUL and an invalid-UTF-8 byte — through every
+  replicant-owned failure surface (a malformed `'M'` frame decode, a sink `raise`/`throw`/`exit`/
+  non-`:ok` return, the transactional-message-before-`Begin` halt, and the `[:message, :received]`
+  / `[:sink, :failed]` telemetry events) and asserts the bytes never appear in the resulting
+  `%Replicant.Error{}`, its `Exception.message/1`, or the telemetry event — in either the printable
+  or the raw byte-list rendering. Replicant remains prefix-blind: an unknown/hostile prefix yields
+  only the structural reason atom. No production behavior changed (the boundary already held); each
+  assertion is proven non-vacuous by a documented mutation of the exact scrub it guards.
+
+### Changed
+
+- **Retry-guidance for retryable non-transactional messages is reconciled to idempotency, not a
+  one-time nonce.** `docs/INVARIANTS.md` §3 previously suggested `strategy :one_time_nonce` keyed
+  on a message's `{lsn, ordinal}` to make its effect once. Because non-transactional delivery is
+  at-least-once, a lawful reconnect re-delivers the same message, and a one-time-nonce admission
+  would *reject* that replay and fail the retry — dropping the effect. The guidance now recommends
+  `strategy :idempotency` keyed on the message's **LSN** (the `handle_message/2` context is
+  `%{lsn: lsn}`, unique per non-transactional WAL record; `ordinal` is a transactional-message
+  field and is absent here) so the replay is a durable no-op, agreeing with `README.md` and
+  ADR-0001; the `handle_message/2` docstring states the same.
+
 ### Fixed
 
 - **An unknown checkpoint with an absent replication slot now halts fail-closed instead of
