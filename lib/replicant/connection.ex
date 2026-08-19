@@ -1369,6 +1369,29 @@ defmodule Replicant.Connection do
 
   defp begin_absent_slot(%{snapshot: true} = state), do: create_export_slot(state)
 
+  # Slot ABSENT, checkpoint state UNKNOWN (a sink-owned checkpoint READ FAULT, §14.15 — a
+  # raise/error from `sink.checkpoint()` reads as checkpoint_lsn 0). The §14.15 streaming
+  # fail-open (resume-from-0, the idempotent sink dedups the re-stream) is SAFE only when
+  # the slot is PRESENT: a resume clamps to the slot's server-side confirmed_flush_lsn, so
+  # nothing is skipped. With the slot ABSENT there is nothing to resume — creating a fresh
+  # slot would begin streaming at its own creation LSN and silently skip every transaction
+  # between the (unknown) real checkpoint and now, an unrecoverable data gap. A read fault
+  # is NOT a genuine first run, so we cannot treat it as :empty. Fail closed with the
+  # :data_gap family (spec §8: never silently drop and recreate); a DISTINCT telemetry
+  # reason (`:checkpoint_unknown`, value-free) separates this from the checkpoint-present
+  # gap above. (`:fault_permanent` is defensive: sink-owned mode only ever yields :fault,
+  # and lib mode's fault is already halted in :invalidation_check before it reaches here —
+  # but a fail-closed guard admits every not-known-good state, never just the one observed.)
+  defp begin_absent_slot(%{checkpoint_state: cp_state} = state)
+       when cp_state in [:fault, :fault_permanent] do
+    Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
+      reason: :checkpoint_unknown
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_checkpoint_unknown})
+    {:disconnect, :data_gap}
+  end
+
   defp begin_absent_slot(state) do
     {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name, state.failover)
     {:query, sql, %{state | step: :create_slot}}

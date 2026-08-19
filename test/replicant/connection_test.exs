@@ -668,6 +668,37 @@ defmodule Replicant.ConnectionTest do
       :telemetry.detach({__MODULE__, :data_gap})
     end
 
+    test "an absent slot with an UNKNOWN checkpoint (read fault) halts fail-closed and NEVER creates a slot (R01)" do
+      # A sink-owned checkpoint READ FAULT (§14.15) reads as checkpoint_lsn 0 with
+      # checkpoint_state :fault. The streaming fail-open (resume-from-0, the idempotent
+      # sink dedups the re-stream) is SAFE only when the slot is PRESENT — a resume clamps
+      # to the slot's server-side confirmed_flush_lsn. With the slot ABSENT there is nothing
+      # to resume: a fresh slot would begin at its own creation LSN and silently skip every
+      # transaction between the (unknown) real checkpoint and now — unrecoverable loss.
+      # Fail closed; the CREATE_REPLICATION_SLOT query MUST NOT be emitted for an unknown
+      # checkpoint. (Contrast the EMPTY-checkpoint first-run test above, which DOES create.)
+      :telemetry.attach(
+        {__MODULE__, :cp_unknown},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:cp_unknown, meta}) end,
+        self()
+      )
+
+      result = [%Postgrex.Result{rows: []}]
+
+      assert {:disconnect, :data_gap} =
+               Connection.handle_result(
+                 result,
+                 state(step: :invalidation_check, checkpoint_lsn: 0, checkpoint_state: :fault)
+               )
+
+      # The disconnect shape structurally excludes slot creation; the reason is DISTINCT
+      # from the present-checkpoint data gap so an operator can tell "checkpoint unknown"
+      # apart from "checkpoint present, slot gone". Value-free (Rule 1): a bare atom.
+      assert_received {:cp_unknown, %{reason: :checkpoint_unknown}}
+      :telemetry.detach({__MODULE__, :cp_unknown})
+    end
+
     test "a valid slot streams from the durable checkpoint LSN" do
       result = [%Postgrex.Result{rows: [["reserved", false]]}]
       st = state(step: :invalidation_check, checkpoint_lsn: 0x16E3778)
