@@ -73,6 +73,17 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `messages: true` config whose sink lacks this callback is rejected at start
   (`:messages_unsupported`). **Transactional** messages do NOT route here — they ride
   `%Transaction.messages` and inherit the txn path's effect-once.
+- **`handle_slot_origin/2`** (optional) — receives the slot's typed consistent-point **origin**
+  LSN a go-forward stream begins at, on every connect/reconnect before `START_REPLICATION`, for
+  a go-forward **append** consumer. `context` is `%{slot_name, reused?}` (value-free): `reused?:
+  false` → the `CREATE_REPLICATION_SLOT` consistent_point (new slot); `reused?: true` → the
+  greater of the durable checkpoint and the slot's live `confirmed_flush_lsn` (the effective
+  `START_REPLICATION` origin for a resumed slot).
+  Return `:ok` to proceed; any other return/raise/throw/exit halts fail-closed
+  (`:slot_origin_rejected`) — a veto for an origin that gapped past the consumer's last appended
+  LSN, instead of silently skipping WAL. A missing/NULL/malformed database origin halts before the
+  callback with `:slot_origin_unavailable`; origin `0` is never fabricated. A sink without the
+  callback is unaffected (no extra query).
 - **Incremental snapshot** (`snapshot: [mode: :incremental]`) — a resumable, chunked backfill
   for large tables, interleaved with the live stream. Chunks arrive through the SAME
   `handle_snapshot/2` (same `first_for_table?` redo-safety obligation; `handle_snapshot_complete/1`

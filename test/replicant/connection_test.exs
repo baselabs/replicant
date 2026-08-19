@@ -74,6 +74,37 @@ defmodule Replicant.ConnectionTest do
     def handle_session_identity(_identity, _context), do: exit({:secret, "must not leak"})
   end
 
+  defmodule OriginSink do
+    @behaviour Replicant.Sink
+    @key {__MODULE__, :test_pid}
+
+    def set_test_pid(pid), do: :persistent_term.put(@key, pid)
+    def clear_test_pid, do: :persistent_term.erase(@key)
+
+    @impl true
+    def checkpoint, do: {:ok, 0x100}
+
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+
+    @impl true
+    def handle_slot_origin(origin, context) do
+      send(:persistent_term.get(@key), {:slot_origin, origin, context})
+      :ok
+    end
+  end
+
+  defmodule RejectOriginSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, 0x100}
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+    # value-bearing reason on purpose — the fail-closed boundary must not surface it
+    @impl true
+    def handle_slot_origin(_origin, _context), do: {:error, {:gap, "must not leak"}}
+  end
+
   defp state(overrides) do
     # The A6 watchdog stores its mutable count and its budget together in ONE struct field
     # (`command_error: %{count, max_retries}`), so accept the two LOGICAL overrides the watchdog
@@ -908,6 +939,186 @@ defmodule Replicant.ConnectionTest do
       assert {:query, sql, new_state} = Connection.handle_result(result, st)
       assert sql =~ "NOEXPORT_SNAPSHOT"
       assert new_state.step == :create_slot
+    end
+  end
+
+  describe "R04 slot-origin exposure — new slot (:create_slot result)" do
+    setup do
+      OriginSink.set_test_pid(self())
+      on_exit(&OriginSink.clear_test_pid/0)
+      :ok
+    end
+
+    test "notifies handle_slot_origin with the typed CREATE consistent_point, reused?: false, then streams" do
+      # NOEXPORT CREATE_REPLICATION_SLOT result row: [slot, consistent_point, snapshot_name(nil), plugin].
+      result = [%Postgrex.Result{rows: [["conn_test", "0/16E3778", nil, "pgoutput"]]}]
+      st = state(step: :create_slot, sink: OriginSink)
+
+      assert {:stream, sql, [], new_state} = Connection.handle_result(result, st)
+      assert sql =~ "START_REPLICATION SLOT conn_test"
+      assert new_state.step == :streaming
+      assert_receive {:slot_origin, 0x16E3778, %{slot_name: "conn_test", reused?: false}}
+    end
+
+    test "an unavailable CREATE consistent_point halts fail-closed without notifying the sink" do
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:replicant, :connection, :slot_invalidated],
+          fn _event, _measurements, metadata, pid ->
+            send(pid, {:origin_unavailable, metadata})
+          end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      result = [%Postgrex.Result{rows: [["conn_test", nil, nil, "pgoutput"]]}]
+      st = state(step: :create_slot, sink: OriginSink)
+
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
+      assert_received {:origin_unavailable, %{reason: :slot_origin_unavailable}}
+      refute_receive {:slot_origin, _, _}
+    end
+
+    test "signed CREATE consistent_point components halt as unavailable" do
+      for lsn <- ["0/+1", "-1/0"] do
+        result = [%Postgrex.Result{rows: [["conn_test", lsn, nil, "pgoutput"]]}]
+        st = state(step: :create_slot, sink: OriginSink)
+
+        assert {:noreply, ^st} = Connection.handle_result(result, st)
+        refute_receive {:slot_origin, _, _}
+      end
+    end
+
+    test "TRIPWIRE: a vetoing sink halts fail-closed (never proceeds to stream)" do
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:replicant, :connection, :slot_invalidated],
+          fn _e, _m, meta, pid -> send(pid, {:origin_new, meta}) end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      result = [%Postgrex.Result{rows: [["conn_test", "0/16E3778", nil, "pgoutput"]]}]
+      st = state(step: :create_slot, sink: RejectOriginSink)
+
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
+      assert_received {:origin_new, %{reason: :slot_origin_rejected}}
+    end
+
+    test "a sink WITHOUT the callback is byte-identical: streams, no origin notification" do
+      result = [%Postgrex.Result{rows: [["conn_test", "0/16E3778", nil, "pgoutput"]]}]
+      st = state(step: :create_slot, sink: StubSink)
+
+      assert {:stream, _sql, [], new_state} = Connection.handle_result(result, st)
+      assert new_state.step == :streaming
+      refute_receive {:slot_origin, _, _}
+    end
+  end
+
+  describe "R04 slot-origin exposure — reused slot (present-slot dispatch + :read_slot_origin)" do
+    setup do
+      OriginSink.set_test_pid(self())
+      on_exit(&OriginSink.clear_test_pid/0)
+      :ok
+    end
+
+    test "a present slot with the callback reads confirmed_flush_lsn before streaming" do
+      result = [%Postgrex.Result{rows: [["reserved", false]]}]
+      st = state(step: :invalidation_check, checkpoint_lsn: 0x100, sink: OriginSink)
+
+      assert {:query, sql, new_state} = Connection.handle_result(result, st)
+      assert sql =~ "confirmed_flush_lsn"
+      assert sql =~ "pg_replication_slots"
+      assert new_state.step == :read_slot_origin
+    end
+
+    test "a present slot WITHOUT the callback streams directly (unchanged, no extra query)" do
+      result = [%Postgrex.Result{rows: [["reserved", false]]}]
+      st = state(step: :invalidation_check, checkpoint_lsn: 0x100, sink: StubSink)
+
+      assert {:stream, _sql, [], new_state} = Connection.handle_result(result, st)
+      assert new_state.step == :streaming
+    end
+
+    test "the confirmed_flush_lsn read notifies with the typed origin, reused?: true, then streams" do
+      result = [%Postgrex.Result{rows: [["0/16E3778"]]}]
+      st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
+
+      assert {:stream, sql, [], new_state} = Connection.handle_result(result, st)
+      assert sql =~ "START_REPLICATION SLOT conn_test"
+      assert new_state.step == :streaming
+      assert_receive {:slot_origin, 0x16E3778, %{slot_name: "conn_test", reused?: true}}
+    end
+
+    test "reports the actual resume origin when the requested checkpoint exceeds confirmed_flush_lsn" do
+      result = [%Postgrex.Result{rows: [["0/16E3778"]]}]
+      st = state(step: :read_slot_origin, checkpoint_lsn: 0x2000000, sink: OriginSink)
+
+      assert {:stream, sql, [], _new_state} = Connection.handle_result(result, st)
+      assert sql =~ "START_REPLICATION SLOT conn_test LOGICAL 0/2000000"
+      assert_receive {:slot_origin, 0x2000000, %{reused?: true}}
+    end
+
+    test "a NULL confirmed_flush_lsn halts fail-closed without notifying the sink" do
+      result = [%Postgrex.Result{rows: [[nil]]}]
+      st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
+
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
+      refute_receive {:slot_origin, _, _}
+    end
+
+    test "a vanished slot row halts fail-closed without notifying the sink" do
+      result = [%Postgrex.Result{rows: []}]
+      st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
+
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
+      refute_receive {:slot_origin, _, _}
+    end
+
+    test "a malformed confirmed_flush_lsn halts fail-closed without exposing parser details" do
+      result = [%Postgrex.Result{rows: [["not-an-lsn"]]}]
+      st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
+
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
+      refute_receive {:slot_origin, _, _}
+    end
+
+    test "signed confirmed_flush_lsn components halt as unavailable" do
+      for lsn <- ["0/+1", "-1/0"] do
+        result = [%Postgrex.Result{rows: [[lsn]]}]
+        st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
+
+        assert {:noreply, ^st} = Connection.handle_result(result, st)
+        refute_receive {:slot_origin, _, _}
+      end
+    end
+
+    test "TRIPWIRE: a vetoing sink halts fail-closed on the reused-slot origin read" do
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:replicant, :connection, :slot_invalidated],
+          fn _e, _m, meta, pid -> send(pid, {:origin_reused, meta}) end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      result = [%Postgrex.Result{rows: [["0/16E3778"]]}]
+      st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: RejectOriginSink)
+
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
+      assert_received {:origin_reused, %{reason: :slot_origin_rejected}}
     end
   end
 

@@ -106,10 +106,71 @@ defmodule Replicant.SinkTest.ProgressOnlySink do
   # deliberately missing handle_snapshot/2
 end
 
+defmodule Replicant.SinkTest.SlotOriginSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+  @key {__MODULE__, :test_pid}
+
+  def set_test_pid(pid), do: :persistent_term.put(@key, pid)
+  def clear_test_pid, do: :persistent_term.erase(@key)
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  @impl Replicant.Sink
+  def handle_slot_origin(origin, context) do
+    send(:persistent_term.get(@key), {:slot_origin, origin, context})
+    :ok
+  end
+end
+
+defmodule Replicant.SinkTest.RejectOriginSink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  @impl Replicant.Sink
+  def checkpoint, do: {:ok, nil}
+
+  @impl Replicant.Sink
+  def handle_transaction(_txn), do: {:ok, 0}
+
+  # A go-forward append consumer that vetoes an unacceptable origin. The reason term
+  # is value-bearing on purpose — the boundary must NOT surface it.
+  @impl Replicant.Sink
+  def handle_slot_origin(_origin, _context), do: {:error, {:gap, "must not leak"}}
+end
+
+defmodule Replicant.SinkTest.RaiseOriginSink do
+  @moduledoc false
+  def handle_slot_origin(_origin, _context), do: raise("must not leak")
+end
+
+defmodule Replicant.SinkTest.ThrowOriginSink do
+  @moduledoc false
+  def handle_slot_origin(_origin, _context), do: throw({:secret, "must not leak"})
+end
+
+defmodule Replicant.SinkTest.ExitOriginSink do
+  @moduledoc false
+  def handle_slot_origin(_origin, _context), do: exit({:secret, "must not leak"})
+end
+
 defmodule Replicant.SinkTest do
   use ExUnit.Case, async: false
 
   alias Replicant.{Change, Sink, Test.RecordingSink, Transaction}
+
+  alias Replicant.SinkTest.{
+    AppendLogSink,
+    ExitOriginSink,
+    RaiseOriginSink,
+    RejectOriginSink,
+    SlotOriginSink,
+    ThrowOriginSink
+  }
 
   setup do
     {:ok, pid} = RecordingSink.start_link()
@@ -236,6 +297,51 @@ defmodule Replicant.SinkTest do
       end
 
       refute Replicant.Sink.supports_messages?(NoMessageSink)
+    end
+  end
+
+  describe "supports_slot_origin?/1 (R04)" do
+    test "true when the sink implements handle_slot_origin/2" do
+      assert Sink.supports_slot_origin?(SlotOriginSink)
+    end
+
+    test "false when the sink does not implement handle_slot_origin/2" do
+      refute Sink.supports_slot_origin?(RecordingSink)
+      refute Sink.supports_slot_origin?(AppendLogSink)
+    end
+  end
+
+  describe "notify_slot_origin/3 (R04 value-free slot-origin exposure)" do
+    test "a sink WITHOUT the callback is a no-op :ok (no query, unchanged behavior)" do
+      assert :ok =
+               Sink.notify_slot_origin(AppendLogSink, 0x16E3778, %{
+                 slot_name: "s",
+                 reused?: false
+               })
+    end
+
+    test "invokes the callback with the typed origin + value-free context, returns :ok" do
+      SlotOriginSink.set_test_pid(self())
+      on_exit(&SlotOriginSink.clear_test_pid/0)
+
+      ctx = %{slot_name: "orders_slot", reused?: true}
+      assert :ok = Sink.notify_slot_origin(SlotOriginSink, 0x16E3778, ctx)
+      assert_receive {:slot_origin, 0x16E3778, ^ctx}
+    end
+
+    test "a {:error, _} veto returns the structural reason, never the value-bearing term" do
+      assert {:error, :slot_origin_rejected} =
+               Sink.notify_slot_origin(RejectOriginSink, 0x10, %{
+                 slot_name: "s",
+                 reused?: false
+               })
+    end
+
+    test "a raise/throw/exit is contained as :slot_origin_rejected (no leak)" do
+      for sink <- [RaiseOriginSink, ThrowOriginSink, ExitOriginSink] do
+        assert {:error, :slot_origin_rejected} =
+                 Sink.notify_slot_origin(sink, 0x10, %{slot_name: "s", reused?: false})
+      end
     end
   end
 end

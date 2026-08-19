@@ -93,6 +93,7 @@ defmodule Replicant.Connection do
           | :create_slot
           | :create_export_slot
           | :create_incremental_slot
+          | :read_slot_origin
           | :snapshotting
           | :streaming
 
@@ -415,9 +416,18 @@ defmodule Replicant.Connection do
     end
   end
 
-  def handle_result([%Postgrex.Result{}], %{step: :create_slot} = state) do
+  # A fresh go-forward slot was created (R04): its CREATE result row is
+  # `[slot, consistent_point, snapshot_name(nil for NOEXPORT), plugin]`. Expose the typed
+  # consistent_point to a go-forward append consumer (`handle_slot_origin/2`, reused?: false)
+  # before streaming; a veto/raise halts fail-closed. A sink without the callback is byte-identical
+  # (notify is a no-op :ok → start_streaming), matching the prior struct-only match.
+  def handle_result([%Postgrex.Result{} = result], %{step: :create_slot} = state) do
     Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
-    start_streaming(state)
+
+    case notify_new_slot_origin(state, result) do
+      :ok -> start_streaming(state)
+      {:error, reason} -> halt_slot_origin(state, reason)
+    end
   end
 
   # The EXPORT_SNAPSHOT slot was created (spec §4): capture its consistent point and
@@ -459,6 +469,24 @@ defmodule Replicant.Connection do
     Telemetry.event([:replicant, :snapshot, :started], %{}, %{commit_lsn: floor})
     state = %{state | backfill_floor: floor}
     start_streaming_with_backfill(state, nil)
+  end
+
+  # A reused (present) logical slot's origin read (R04): PostgreSQL starts at the greater of the
+  # requested checkpoint and the slot's confirmed_flush_lsn. Expose that effective origin
+  # (`handle_slot_origin/2`, reused?: true) before streaming. Missing/NULL/malformed slot state and
+  # callback vetoes halt fail-closed. Only reached when the sink implements the callback.
+  def handle_result([%Postgrex.Result{rows: rows}], %{step: :read_slot_origin} = state) do
+    with {:ok, confirmed_flush} <- parse_confirmed_flush(rows),
+         origin = max(state.checkpoint_lsn, confirmed_flush),
+         :ok <-
+           Replicant.Sink.notify_slot_origin(state.sink, origin, %{
+             slot_name: state.slot_name,
+             reused?: true
+           }) do
+      start_streaming(state)
+    else
+      {:error, reason} -> halt_slot_origin(state, reason)
+    end
   end
 
   def handle_result(%Postgrex.Error{}, _state) do
@@ -1442,9 +1470,12 @@ defmodule Replicant.Connection do
     do: halt_snapshot(state, :snapshot_incomplete)
 
   defp begin_present_slot(state) do
-    # :present (resume) or non-snapshot go-forward with an existing slot — unchanged.
+    # :present (resume) or non-snapshot go-forward with an existing slot. R04: when the sink wants
+    # the slot origin, read the reused slot's confirmed_flush_lsn (a `:read_slot_origin` step) before
+    # streaming; otherwise stream directly (byte-identical to the prior behavior — no extra query).
     Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
-    start_streaming(state)
+
+    if wants_slot_origin?(state), do: read_slot_origin(state), else: start_streaming(state)
   end
 
   defp create_export_slot(state) do
@@ -1458,6 +1489,80 @@ defmodule Replicant.Connection do
     Replicant.Supervisor.halt(state.slot_name, {:snapshot, reason})
     {:disconnect, reason}
   end
+
+  # ---- R04 slot-origin exposure (go-forward append consumers) ----
+
+  # True when the sink implements handle_slot_origin/2. Gates BOTH the reused-slot confirmed_flush
+  # read and (via notify_new_slot_origin/2) the new-slot exposure, so a sink without the callback
+  # keeps the prior connect behavior exactly.
+  defp wants_slot_origin?(%{sink: sink}), do: Replicant.Sink.supports_slot_origin?(sink)
+
+  # Reused slot: issue the confirmed_flush_lsn read (only ever called when wants_slot_origin?).
+  defp read_slot_origin(state) do
+    {:ok, sql} = QueryBuilder.slot_confirmed_flush(state.slot_name)
+    {:query, sql, %{state | step: :read_slot_origin}}
+  end
+
+  # New slot: notify with the CREATE consistent_point (reused?: false). A no-op :ok when the sink
+  # does not implement the callback (parse is skipped — the prior struct-only path).
+  defp notify_new_slot_origin(state, result) do
+    if wants_slot_origin?(state) do
+      with {:ok, origin} <- parse_consistent_point(result.rows) do
+        Replicant.Sink.notify_slot_origin(state.sink, origin, %{
+          slot_name: state.slot_name,
+          reused?: false
+        })
+      end
+    else
+      :ok
+    end
+  end
+
+  # Fail-closed halt when the database cannot supply a valid origin or the consumer vetoes it.
+  # Both reasons are structural and value-free; the database value and sink reason are discarded.
+  # Stay idle while the asynchronous supervisor teardown lands: returning :disconnect here would
+  # let auto-reconnect re-enter the same terminal fault and eventually obscure this halt reason.
+  defp halt_slot_origin(state, reason)
+       when reason in [:slot_origin_unavailable, :slot_origin_rejected] do
+    Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
+      reason: reason
+    })
+
+    Replicant.Supervisor.halt(state.slot_name, {:slot_origin, reason})
+    {:noreply, state}
+  end
+
+  # The CREATE_REPLICATION_SLOT result's consistent_point (row 2 of `[slot, cp, snap, plugin]`;
+  # NOEXPORT sets snap = nil). Any other shape fails closed; 0 is not a fabricated origin.
+  defp parse_consistent_point([[_slot, cp, _snap, _plugin]]) when is_binary(cp),
+    do: parse_slot_origin(cp)
+
+  defp parse_consistent_point(_rows), do: {:error, :slot_origin_unavailable}
+
+  # A logical slot's confirmed_flush_lsn is pg_lsn text. NULL identifies no usable logical origin
+  # (PostgreSQL documents it for physical slots); a missing row can also mean the slot vanished
+  # between checks. Both, plus malformed text, fail closed rather than fabricating origin 0.
+  defp parse_confirmed_flush([[lsn]]) when is_binary(lsn) and lsn != "",
+    do: parse_slot_origin(lsn)
+
+  defp parse_confirmed_flush(_rows), do: {:error, :slot_origin_unavailable}
+
+  defp parse_slot_origin(lsn) do
+    with [upper, lower] <- String.split(lsn, "/", parts: 2),
+         true <- valid_lsn_component?(upper),
+         true <- valid_lsn_component?(lower) do
+      {:ok, Replicant.lsn_from_string(lsn)}
+    else
+      _ -> {:error, :slot_origin_unavailable}
+    end
+  rescue
+    _ -> {:error, :slot_origin_unavailable}
+  end
+
+  defp valid_lsn_component?(component) when byte_size(component) in 1..8,
+    do: String.match?(component, ~r/\A[0-9A-Fa-f]+\z/)
+
+  defp valid_lsn_component?(_component), do: false
 
   # Definitive checkpoint read for the connect decision. Distinguishes a durable value
   # (:present) from a genuine first-run/empty (:empty) from a read fault (:fault).
