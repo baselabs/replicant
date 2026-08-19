@@ -96,9 +96,20 @@ fire-and-forget `wal_end + 1` ack does not have.
 
 ## PostgreSQL version support
 
-Replicant targets **PostgreSQL 16 as the tested baseline** and is forward-compatible with
-**17+**. On PG17+ it reads the authoritative `invalidation_reason` slot column (a superset of
-the PG16 `wal_status`/`conflicting` signals) and supports **failover slots** for HA.
+Replicant is **tested on PostgreSQL 15, 16, 17, and 18** — the CI matrix runs the full suite
+against all four majors (Docker-only, `wal_level=logical`). Capabilities are gated by the
+server's `server_version_num`, so a single build runs correctly across the range:
+
+| Capability | PG15 | PG16 | PG17 | PG18 |
+|---|:---:|:---:|:---:|:---:|
+| Logical streaming, snapshot, checkpoint, exactly-once | ✅ | ✅ | ✅ | ✅ |
+| Slot-invalidation columns queried | `wal_status` | `+ conflicting` | `+ invalidation_reason, synced` | same as 17 |
+| Failover slots (`failover: true`) | ❌ rejected | ❌ rejected | ✅ | ✅ |
+
+The slot-invalidation query selects only the columns that exist on the connected major
+(`conflicting` was added in PG16, `invalidation_reason`/`synced` in PG17), so it never errors
+on an older server. On PG17+ Replicant reads the authoritative `invalidation_reason` column (a
+superset of the PG15/16 signals) and supports **failover slots** for HA.
 
 ### Failover slots (PG17+)
 
@@ -110,7 +121,7 @@ Pass `failover: true` to `Replicant.start_link/1` to create the replication slot
       slot_name: "replicant_orders",
       publication: "orders_pub",
       sink: MyApp.OrdersSink,
-      failover: true            # PG17+ only; on PG16 the pipeline halts {:config, :failover_unsupported}
+      failover: true            # PG17+ only; on PG15/16 the pipeline halts {:config, :failover_unsupported}
     )
 
 After a failover, repoint the connection at the promoted primary — the slot already exists
@@ -154,7 +165,7 @@ demonstrates the unchanged-TOAST sentinel, transaction-granularity exactly-once,
 snapshot/backfill, and logical-decoding messages. Click the badge to open it in
 [Livebook](https://livebook.dev), or read it rendered on
 [HexDocs](https://hexdocs.pm/replicant/getting_started.html). The notebook's code
-is executed against a live PG16/PG17 on every CI run
+is executed against live PostgreSQL 15/16/17/18 on every CI run
 (`test/integration/livebook_getting_started_test.exs`), so it never drifts from the
 library.
 

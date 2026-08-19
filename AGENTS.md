@@ -94,16 +94,28 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
   modes. It never self-signs fixtures. An independent docker-PG16 capture
   (`test/integration/pg16_conformance_test.exs`) corroborates it against a live
   server.
-- **Integration + crash-injection tests** (`test/integration/**`): gate
-  on `REPLICANT_TEST_URL` pointing at a live PG16 with `wal_level=logical`;
-  skip when unset. Spin PG16 with
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
-  then `export REPLICANT_TEST_URL="postgres://postgres@localhost:5599/postgres"`.
-- **PG17 forward-compat tests** (`test/integration/pg17_failover_test.exs`, tagged `:pg17`):
-  run against a PG17 server. Spin one alongside PG16 and point `REPLICANT_TEST_URL` at it:
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5617:5432 postgres:17 -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
-  then `export REPLICANT_TEST_URL="postgres://postgres@localhost:5617/postgres"`. The `:pg17`
-  tests are auto-excluded (skipped, never vacuously passed) when the server is < 17.
+- **Supported PostgreSQL versions: 15, 16, 17, 18.** Behavior is version-gated by
+  `server_version_num`: the slot-invalidation query selects only the columns that exist on
+  the connected major (PG15 → `wal_status`; PG16 → `+ conflicting`; PG17/18 → `+
+  invalidation_reason, synced`), and failover slots are created on PG17/18 but structurally
+  rejected on PG15/16 (`{:config, :failover_unsupported}` halt — PG15/16 reject the FAILOVER
+  slot option). The CI matrix runs the full suite on all four majors.
+- **Integration + crash-injection tests** (`test/integration/**`): gate on
+  `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
+  unset. **Operator-approved Docker port mappings (never `localhost:5432`): PG15 → 5615,
+  PG16 → 5599, PG17 → 5617, PG18 → 5618.** Spin any major with
+  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
+  then `export REPLICANT_TEST_URL="postgres://postgres@localhost:<PORT>/postgres"`. Run the
+  whole matrix locally by spinning all four and running `mix test` against each URL in turn.
+- **Version-behavior tests** (`test/integration/version_behavior_test.exs`, tagged
+  `:integration`): run against whatever major `REPLICANT_TEST_URL` points at and branch on
+  the live version — proving failover is created on PG17+ and rejected on PG<17, and that the
+  version-gated invalidation query runs (on PG15 selecting `conflicting` would error). Each
+  run emits an `R05-SUBSTRATE-RECEIPT pg=<major>` line; CI greps for the row's expected major
+  (via `EXPECTED_PG_MAJOR`) to prove the matrix row actually ran integration non-vacuously.
+- **PG17+ failover tests** (`test/integration/pg17_failover_test.exs`, tagged `:pg17`): run
+  against a PG17 or PG18 server; auto-excluded (skipped, never vacuously passed) when the
+  server is < 17.
 - **TDD:** write the test first.
 
 ## Docs & lifecycle-artifact policy
