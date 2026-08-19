@@ -80,6 +80,7 @@ defmodule Replicant.Integration.VersionBehaviorTest do
     cond do
       version >= 170_000 ->
         assert status_sql =~ "invalidation_reason"
+        assert status_sql =~ "synced"
 
       version >= 160_000 ->
         assert status_sql =~ "conflicting"
