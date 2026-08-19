@@ -5,8 +5,9 @@ Thank you for your interest in contributing to Replicant!
 ## Prerequisites
 
 - **Elixir** 1.20.3 and **Erlang/OTP** 29 (the exact local/CI toolchain is in `.tool-versions`)
-- **PostgreSQL 16** with `wal_level=logical` (for integration tests) — e.g.
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5432:5432 postgres:16 \
+- **PostgreSQL 15, 16, 17, or 18** with `wal_level=logical` (for integration tests).
+  Use the approved host ports PG15 `5615`, PG16 `5599`, PG17 `5617`, or PG18 `5618` — e.g.
+  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 \
     -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
 
 ## Getting Started
