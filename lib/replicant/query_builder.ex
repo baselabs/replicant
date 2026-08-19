@@ -189,18 +189,20 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  Query returning a reused slot's `confirmed_flush_lsn` — the origin a go-forward stream resumes
-  at, exposed to append consumers via `handle_slot_origin/2` (R04). `pg_lsn` text ("X/Y"), or NULL
-  on a slot that has never flushed. Runs in the replication connect chain's SIMPLE query protocol
-  (no `$1` bind), so the Identifier-validated slot name is interpolated — the
-  `slot_invalidation_status/2` / `slot_exists/1` precedent (Critical Rule 2).
+  Query returning a reused logical slot's `confirmed_flush_lsn` in the current database. This is
+  one input to the origin a go-forward stream resumes at, exposed to append consumers via
+  `handle_slot_origin/2` (R04). Runs in the replication connect chain's SIMPLE query protocol (no
+  `$1` bind), so the Identifier-validated slot name is interpolated — the
+  `slot_invalidation_status/2` / `slot_exists/1` precedent (Critical Rule 2). A missing row or NULL
+  is not a logical-slot origin and is rejected fail-closed by the connection.
   """
   @spec slot_confirmed_flush(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
   def slot_confirmed_flush(slot_name) do
     with :ok <- Identifier.validate(slot_name) do
       {:ok,
        "SELECT confirmed_flush_lsn FROM pg_replication_slots " <>
-         "WHERE slot_name = '#{slot_name}' LIMIT 1;"}
+         "WHERE slot_name = '#{slot_name}' AND slot_type = 'logical' " <>
+         "AND database = current_database() LIMIT 1;"}
     end
   end
 

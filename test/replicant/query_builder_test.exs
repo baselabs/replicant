@@ -104,6 +104,8 @@ defmodule Replicant.QueryBuilderTest do
       assert sql =~ "confirmed_flush_lsn"
       assert sql =~ "pg_replication_slots"
       assert sql =~ "slot_name = 'replicant_orders'"
+      assert sql =~ "slot_type = 'logical'"
+      assert sql =~ "database = current_database()"
     end
 
     test "rejects an invalid slot name (no raw interpolation into SQL)" do

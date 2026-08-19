@@ -9,18 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`Replicant.Sink.handle_slot_origin/2` — the typed logical-slot consistent-point origin for
-  go-forward append consumers.** An optional sink callback that receives the LSN a go-forward
+- **Typed logical-slot consistent-point callback for go-forward append consumers.** The optional
+  `Replicant.Sink` callback `handle_slot_origin/2` receives the LSN a go-forward
   stream begins at, on every connect and reconnect, before `START_REPLICATION`, for BOTH a
   freshly-created and a reused slot (distinguished by `context.reused?`). For a new slot the origin
   is the `CREATE_REPLICATION_SLOT` `consistent_point` (previously parsed internally and discarded on
-  the plain go-forward path); for a reused slot it is the slot's live
-  `pg_replication_slots.confirmed_flush_lsn` (which advances across reconnects as the stream is
-  acked). `context` is value-free (`%{slot_name, reused?}`), carrying no row bytes. Returning `:ok`
+  the plain go-forward path); for a reused slot it is the greater of the durable checkpoint and the
+  slot's live `pg_replication_slots.confirmed_flush_lsn` — PostgreSQL's effective
+  `START_REPLICATION` origin. `context` is value-free (`%{slot_name, reused?}`), carrying no row
+  bytes. Returning `:ok`
   accepts; any other return, raise, throw, or exit halts the pipeline fail-closed
   (`:slot_origin_rejected`) — an append consumer that detects a gap past its last appended LSN gets
-  a veto instead of silently skipping WAL. A sink that does not implement the callback is completely
-  unaffected: no extra query, byte-identical streaming. Covered by red-first unit tripwires (the
+  a veto instead of silently skipping WAL. Missing, NULL, or malformed logical-slot state halts
+  before callback/streaming as `:slot_origin_unavailable`; origin `0` is never fabricated. A sink
+  that does not implement the callback is completely unaffected: no extra query, byte-identical
+  streaming. Covered by red-first unit tripwires (the
   fail-closed veto proven RED by a `start_streaming` mutation) plus a live-PostgreSQL suite that
   proves the new-slot origin falls in the source-WAL creation window and the reused origin advances
   and is bracketed by the live slot state across a forced reconnect.

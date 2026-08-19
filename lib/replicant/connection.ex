@@ -471,18 +471,20 @@ defmodule Replicant.Connection do
     start_streaming_with_backfill(state, nil)
   end
 
-  # A reused (present) slot's origin read (R04): the row is `[[confirmed_flush_lsn]]` (pg_lsn text,
-  # or nil on a never-flushed slot → origin 0). Expose it (`handle_slot_origin/2`, reused?: true)
-  # before streaming; a veto/raise halts fail-closed. Only reached when the sink implements the
-  # callback (`begin_present_slot` issues this step only then).
+  # A reused (present) logical slot's origin read (R04): PostgreSQL starts at the greater of the
+  # requested checkpoint and the slot's confirmed_flush_lsn. Expose that effective origin
+  # (`handle_slot_origin/2`, reused?: true) before streaming. Missing/NULL/malformed slot state and
+  # callback vetoes halt fail-closed. Only reached when the sink implements the callback.
   def handle_result([%Postgrex.Result{rows: rows}], %{step: :read_slot_origin} = state) do
-    origin = parse_confirmed_flush(rows)
-
-    case Replicant.Sink.notify_slot_origin(state.sink, origin, %{
-           slot_name: state.slot_name,
-           reused?: true
-         }) do
-      :ok -> start_streaming(state)
+    with {:ok, confirmed_flush} <- parse_confirmed_flush(rows),
+         origin = max(state.checkpoint_lsn, confirmed_flush),
+         :ok <-
+           Replicant.Sink.notify_slot_origin(state.sink, origin, %{
+             slot_name: state.slot_name,
+             reused?: true
+           }) do
+      start_streaming(state)
+    else
       {:error, reason} -> halt_slot_origin(state, reason)
     end
   end
@@ -1505,42 +1507,49 @@ defmodule Replicant.Connection do
   # does not implement the callback (parse is skipped — the prior struct-only path).
   defp notify_new_slot_origin(state, result) do
     if wants_slot_origin?(state) do
-      origin = parse_consistent_point(result.rows)
-
-      Replicant.Sink.notify_slot_origin(state.sink, origin, %{
-        slot_name: state.slot_name,
-        reused?: false
-      })
+      with {:ok, origin} <- parse_consistent_point(result.rows) do
+        Replicant.Sink.notify_slot_origin(state.sink, origin, %{
+          slot_name: state.slot_name,
+          reused?: false
+        })
+      end
     else
       :ok
     end
   end
 
-  # Fail-closed halt when a go-forward append consumer vetoes (or its callback raises on) the slot
-  # origin. Value-free reason (`:slot_origin_rejected`); the sink's reason is never surfaced.
-  defp halt_slot_origin(state, _reason) do
+  # Fail-closed halt when the database cannot supply a valid origin or the consumer vetoes it.
+  # Both reasons are structural and value-free; the database value and sink reason are discarded.
+  defp halt_slot_origin(state, reason)
+       when reason in [:slot_origin_unavailable, :slot_origin_rejected] do
     Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
-      reason: :slot_origin_rejected
+      reason: reason
     })
 
-    Replicant.Supervisor.halt(state.slot_name, {:slot_origin, :rejected})
-    {:disconnect, :slot_origin_rejected}
+    Replicant.Supervisor.halt(state.slot_name, {:slot_origin, reason})
+    {:disconnect, reason}
   end
 
   # The CREATE_REPLICATION_SLOT result's consistent_point (row 2 of `[slot, cp, snap, plugin]`;
-  # NOEXPORT sets snap = nil). Any other shape → 0 (defensive; the go-forward create always yields
-  # this 4-col row — the create_incremental_slot precedent).
+  # NOEXPORT sets snap = nil). Any other shape fails closed; 0 is not a fabricated origin.
   defp parse_consistent_point([[_slot, cp, _snap, _plugin]]) when is_binary(cp),
-    do: Replicant.lsn_from_string(cp)
+    do: parse_slot_origin(cp)
 
-  defp parse_consistent_point(_rows), do: 0
+  defp parse_consistent_point(_rows), do: {:error, :slot_origin_unavailable}
 
-  # A reused slot's confirmed_flush_lsn (pg_lsn text). NULL/empty (never-flushed slot) or any other
-  # shape → 0.
+  # A logical slot's confirmed_flush_lsn is pg_lsn text. NULL identifies no usable logical origin
+  # (PostgreSQL documents it for physical slots); a missing row can also mean the slot vanished
+  # between checks. Both, plus malformed text, fail closed rather than fabricating origin 0.
   defp parse_confirmed_flush([[lsn]]) when is_binary(lsn) and lsn != "",
-    do: Replicant.lsn_from_string(lsn)
+    do: parse_slot_origin(lsn)
 
-  defp parse_confirmed_flush(_rows), do: 0
+  defp parse_confirmed_flush(_rows), do: {:error, :slot_origin_unavailable}
+
+  defp parse_slot_origin(lsn) do
+    {:ok, Replicant.lsn_from_string(lsn)}
+  rescue
+    _ -> {:error, :slot_origin_unavailable}
+  end
 
   # Definitive checkpoint read for the connect decision. Distinguishes a durable value
   # (:present) from a genuine first-run/empty (:empty) from a read fault (:fault).

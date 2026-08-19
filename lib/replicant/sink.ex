@@ -99,17 +99,19 @@ defmodule Replicant.Sink do
     * `reused?: false` — a slot just created this session; `origin` is the
       `CREATE_REPLICATION_SLOT` `consistent_point` (per the PostgreSQL streaming-replication
       protocol, the earliest location from which the new slot can stream).
-    * `reused?: true` — an existing slot resumed this session; `origin` is the slot's
-      `pg_replication_slots.confirmed_flush_lsn` (the point `START_REPLICATION` resumes at). It
-      advances across reconnects as the stream is acked, so a reconnect re-invokes this callback
-      with the current resume origin.
+    * `reused?: true` — an existing slot resumed this session; `origin` is the effective
+      `START_REPLICATION` origin: the greater of the requested durable checkpoint and the slot's
+      `pg_replication_slots.confirmed_flush_lsn`. It advances across reconnects as the stream is
+      acked, so a reconnect re-invokes this callback with the actual resume origin.
 
   Return `:ok` to accept. Any other return, raise, throw, or exit halts the pipeline fail-closed
   with a fixed structural reason — a consumer that detects an unacceptable origin (e.g. a
   confirmed-flush that jumped past its last appended LSN, i.e. a gap) gets a veto instead of
   silently skipping WAL. `context` carries the configured slot name and the boolean; it contains
   no row values. Only sinks that implement this callback pay for it — a sink without it keeps the
-  exact prior connect behavior (no extra query, unchanged streaming).
+  exact prior connect behavior (no extra query, unchanged streaming). A missing, NULL, or malformed
+  logical-slot origin halts before the callback and `START_REPLICATION` with the structural reason
+  `:slot_origin_unavailable`; Replicant never fabricates origin `0`.
   """
   @callback handle_slot_origin(Replicant.lsn(), context) :: :ok | {:error, term()}
             when context: %{

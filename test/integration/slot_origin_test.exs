@@ -7,9 +7,9 @@ defmodule Replicant.SlotOriginIntegrationTest do
 
     * NEW slot — the origin (reused?: false) equals the `CREATE_REPLICATION_SLOT` consistent_point,
       which must fall in the source-WAL window the slot was created in.
-    * REUSED slot — a forced reconnect re-invokes the callback (reused?: true) with the slot's
-      current `confirmed_flush_lsn`, which has ADVANCED past the new-slot origin and is bracketed by
-      the live `pg_replication_slots.confirmed_flush_lsn` read across the reconnect.
+    * REUSED slot — a forced reconnect re-invokes the callback (reused?: true) with the effective
+      `START_REPLICATION` origin, `max(durable checkpoint, confirmed_flush_lsn)`, which has ADVANCED
+      past the new-slot origin and is bracketed by the live slot state across the reconnect.
   """
   use ExUnit.Case, async: false
 
@@ -107,7 +107,7 @@ defmodule Replicant.SlotOriginIntegrationTest do
 
       # Drive a transaction so the ack advances the slot's confirmed_flush_lsn past the origin.
       Postgrex.query!(ctrl, "INSERT INTO rep_origin_rows (id) VALUES (1)", [])
-      assert_receive {:txn, _lsn}, 15_000
+      assert_receive {:txn, durable_checkpoint}, 15_000
       PG16.wait_until(fn -> confirmed_flush(ctrl, slot) > new_origin end, 400)
       cf_before_reconnect = confirmed_flush(ctrl, slot)
 
@@ -120,10 +120,12 @@ defmodule Replicant.SlotOriginIntegrationTest do
       assert_receive {:slot_origin, reused_origin, %{slot_name: ^slot, reused?: true}}, 15_000
       cf_after_reconnect = confirmed_flush(ctrl, slot)
 
-      # It advanced past the new-slot origin AND is bracketed by the live slot state across the
-      # reconnect — the value comes from the actual slot, not a stale creation constant.
+      # It advanced past the new-slot origin AND is bracketed by PostgreSQL's effective start rule
+      # across the reconnect: max(requested durable checkpoint, confirmed_flush_lsn).
       assert reused_origin > new_origin
-      assert cf_before_reconnect <= reused_origin and reused_origin <= cf_after_reconnect
+
+      assert max(durable_checkpoint, cf_before_reconnect) <= reused_origin and
+               reused_origin <= max(durable_checkpoint, cf_after_reconnect)
     end
   end
 
