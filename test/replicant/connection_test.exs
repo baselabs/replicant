@@ -21,6 +21,16 @@ defmodule Replicant.ConnectionTest do
     def handle_transaction(_txn), do: {:ok, 0}
   end
 
+  defmodule EmptyProgressSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def snapshot_progress, do: {:ok, nil}
+    @impl true
+    def handle_snapshot(_rows, _context), do: :ok
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+  end
+
   defmodule IdentitySink do
     @behaviour Replicant.Sink
     @key {__MODULE__, :test_pid}
@@ -668,7 +678,7 @@ defmodule Replicant.ConnectionTest do
       :telemetry.detach({__MODULE__, :data_gap})
     end
 
-    test "an absent slot with an UNKNOWN checkpoint (read fault) halts fail-closed and NEVER creates a slot (R01)" do
+    test "an absent slot with an UNKNOWN checkpoint (read fault) halts fail-closed and NEVER creates a slot" do
       # A sink-owned checkpoint READ FAULT (§14.15) reads as checkpoint_lsn 0 with
       # checkpoint_state :fault. The streaming fail-open (resume-from-0, the idempotent
       # sink dedups the re-stream) is SAFE only when the slot is PRESENT — a resume clamps
@@ -697,6 +707,49 @@ defmodule Replicant.ConnectionTest do
       # apart from "checkpoint present, slot gone". Value-free (Rule 1): a bare atom.
       assert_received {:cp_unknown, %{reason: :checkpoint_unknown}}
       :telemetry.detach({__MODULE__, :cp_unknown})
+    end
+
+    test "an absent slot with UNKNOWN checkpoint and empty incremental progress never creates a slot" do
+      ref = make_ref()
+
+      :telemetry.attach(
+        {__MODULE__, ref},
+        [:replicant, :connection, :slot_invalidated],
+        fn _e, _m, meta, pid -> send(pid, {:incremental_cp_unknown, meta}) end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+      assert {:disconnect, :data_gap} =
+               Connection.handle_result(
+                 [%Postgrex.Result{rows: []}],
+                 state(
+                   step: :invalidation_check,
+                   checkpoint_lsn: 0,
+                   checkpoint_state: :fault,
+                   snapshot: [mode: :incremental],
+                   sink: EmptyProgressSink
+                 )
+               )
+
+      assert_received {:incremental_cp_unknown, %{reason: :checkpoint_unknown}}
+    end
+
+    test "an absent slot with EMPTY checkpoint and empty incremental progress still creates the slot" do
+      assert {:query, sql, %{step: :create_incremental_slot}} =
+               Connection.handle_result(
+                 [%Postgrex.Result{rows: []}],
+                 state(
+                   step: :invalidation_check,
+                   checkpoint_lsn: 0,
+                   checkpoint_state: :empty,
+                   snapshot: [mode: :incremental],
+                   sink: EmptyProgressSink
+                 )
+               )
+
+      assert sql =~ "CREATE_REPLICATION_SLOT"
     end
 
     test "a valid slot streams from the durable checkpoint LSN" do

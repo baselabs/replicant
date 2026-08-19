@@ -21,10 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real checkpoint and now — an unrecoverable data gap. That path now halts fail-closed in the
   `:data_gap` family with a distinct, value-free telemetry reason
   (`[:replicant, :connection, :slot_invalidated]`, `reason: :checkpoint_unknown`) and never
-  emits `CREATE_REPLICATION_SLOT`. A genuinely **empty** checkpoint (`checkpoint_state: :empty`
-  — a real first activation / go-forward) still creates the slot as before. Covered by a
-  red-first connect-decision unit test and a live PostgreSQL fault probe (raising-checkpoint
-  sink, absent slot → structural halt, zero slots created on the server).
+  emits `CREATE_REPLICATION_SLOT`, including in incremental-snapshot mode when its separate
+  progress token is empty. A genuinely **empty** checkpoint (`checkpoint_state: :empty` — a real
+  first activation / go-forward) still creates the slot as before. Covered by red-first
+  connect-decision unit tests across plain and incremental modes and a live PostgreSQL fault probe
+  (raising-checkpoint sink, absent slot → structural halt, zero slots created on the server).
 
 ## [1.1.0] - 2026-08-13
 

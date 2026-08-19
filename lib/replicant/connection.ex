@@ -1347,6 +1347,12 @@ defmodule Replicant.Connection do
   # Slot ABSENT. Progress in flight/complete + an absent slot = the stream gap between the
   # backfill floor and now is unfillable (deletes lost) → :data_gap (the §14.19 family). No
   # progress → a genuine fresh run: create the NOEXPORT slot. A decode/read fault → fail-closed.
+  # Checkpoint UNKNOWN takes precedence over empty progress: without a known checkpoint, a fresh
+  # durable slot would silently skip the unknown WAL interval before its creation LSN.
+  defp begin_absent_slot(%{snapshot: s, checkpoint_state: cp_state} = state)
+       when is_list(s) and cp_state in [:fault, :fault_permanent],
+       do: halt_checkpoint_unknown(state)
+
   defp begin_absent_slot(%{snapshot: s} = state) when is_list(s) do
     case classify_progress(read_progress(state)) do
       :none ->
@@ -1383,18 +1389,21 @@ defmodule Replicant.Connection do
   # and lib mode's fault is already halted in :invalidation_check before it reaches here —
   # but a fail-closed guard admits every not-known-good state, never just the one observed.)
   defp begin_absent_slot(%{checkpoint_state: cp_state} = state)
-       when cp_state in [:fault, :fault_permanent] do
+       when cp_state in [:fault, :fault_permanent],
+       do: halt_checkpoint_unknown(state)
+
+  defp begin_absent_slot(state) do
+    {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name, state.failover)
+    {:query, sql, %{state | step: :create_slot}}
+  end
+
+  defp halt_checkpoint_unknown(state) do
     Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
       reason: :checkpoint_unknown
     })
 
     Replicant.Supervisor.halt(state.slot_name, {:data_gap, :slot_missing_checkpoint_unknown})
     {:disconnect, :data_gap}
-  end
-
-  defp begin_absent_slot(state) do
-    {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name, state.failover)
-    {:query, sql, %{state | step: :create_slot}}
   end
 
   # Slot PRESENT (incremental — FIRST; `is_list/1` guard keeps it disjoint from the v1 clauses).

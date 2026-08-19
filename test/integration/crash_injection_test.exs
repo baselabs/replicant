@@ -421,7 +421,7 @@ defmodule Replicant.CrashInjectionTest do
   # (unknown) real checkpoint and now — unrecoverable loss. The unit test proves the connect
   # DECISION emits no CREATE_REPLICATION_SLOT; this drives it end-to-end against live PG and
   # proves the structural halt AND that no slot exists on the server afterwards.
-  test "R01 live: unknown checkpoint + absent slot halts :data_gap and creates no slot", %{
+  test "unknown checkpoint + absent slot halts :data_gap and creates no slot", %{
     ctrl: ctrl,
     slot: slot
   } do
