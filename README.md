@@ -388,6 +388,27 @@ end
 `messages: true` requires the sink to implement `handle_message/2`; a sink missing it is rejected at
 start (`:messages_unsupported`) rather than silently dropping non-transactional messages later.
 
+### Slot origin for go-forward append consumers
+
+A go-forward **append-log** sink can learn the LSN its slot streams from — the *consistent-point
+origin* — by implementing the optional `handle_slot_origin/2` callback. It fires on every connect and
+reconnect, before `START_REPLICATION`, for both a freshly-created and a reused slot:
+
+```elixir
+@impl true
+def handle_slot_origin(origin, %{slot_name: slot, reused?: reused?}) do
+  # reused? == false → origin is the CREATE_REPLICATION_SLOT consistent_point (a new slot).
+  # reused? == true  → origin is the slot's current confirmed_flush_lsn (a resumed slot;
+  #                    it advances across reconnects as the stream is acked).
+  # Return :ok to proceed; return {:error, _}/raise to halt fail-closed (e.g. on a gap
+  # past your last appended LSN) instead of silently skipping WAL.
+  :ok
+end
+```
+
+`context` is value-free (the slot name and a boolean — never row bytes). A sink that does not
+implement the callback is unaffected: no extra query, unchanged streaming.
+
 ## Development
 
 ```bash

@@ -10,6 +10,7 @@ defmodule Replicant.Sink do
   | callback | required | purpose |
   |---|---|---|
   | `c:handle_session_identity/2` | no | synchronously accept the actual replication-session identity before checkpoint lookup |
+  | `c:handle_slot_origin/2` | no | receive the typed consistent-point LSN a go-forward slot streams from (new or reused) before `START_REPLICATION` |
   | `c:checkpoint/0` | in sink-owned mode | last durably-persisted commit LSN (`nil` = never). In **lib mode** (`:checkpoint_store` configured) the library owns the checkpoint and this callback is not required. |
   | `c:handle_transaction/1` | **yes** | persist the txn + checkpoint atomically, return `{:ok, lsn}` |
   | `c:handle_batch/1` | in batch-delivery mode | deliver N txns + checkpoint atomically |
@@ -85,6 +86,35 @@ defmodule Replicant.Sink do
             when context: %{
                    required(:slot_name) => String.t(),
                    required(:publication) => [String.t()]
+                 }
+
+  @doc """
+  Optional. Receive the replication slot's typed consistent-point `origin` — the LSN the
+  go-forward stream begins at — before `START_REPLICATION`, on every connect and reconnect.
+
+  This is the origin a go-forward **append-log** consumer needs to align its append log. It is
+  exposed for BOTH a freshly-created slot and a reused (already-present) slot, distinguished by
+  `context.reused?`:
+
+    * `reused?: false` — a slot just created this session; `origin` is the
+      `CREATE_REPLICATION_SLOT` `consistent_point` (per the PostgreSQL streaming-replication
+      protocol, the earliest location from which the new slot can stream).
+    * `reused?: true` — an existing slot resumed this session; `origin` is the slot's
+      `pg_replication_slots.confirmed_flush_lsn` (the point `START_REPLICATION` resumes at). It
+      advances across reconnects as the stream is acked, so a reconnect re-invokes this callback
+      with the current resume origin.
+
+  Return `:ok` to accept. Any other return, raise, throw, or exit halts the pipeline fail-closed
+  with a fixed structural reason — a consumer that detects an unacceptable origin (e.g. a
+  confirmed-flush that jumped past its last appended LSN, i.e. a gap) gets a veto instead of
+  silently skipping WAL. `context` carries the configured slot name and the boolean; it contains
+  no row values. Only sinks that implement this callback pay for it — a sink without it keeps the
+  exact prior connect behavior (no extra query, unchanged streaming).
+  """
+  @callback handle_slot_origin(Replicant.lsn(), context) :: :ok | {:error, term()}
+            when context: %{
+                   required(:slot_name) => String.t(),
+                   required(:reused?) => boolean()
                  }
 
   @doc """
@@ -204,6 +234,7 @@ defmodule Replicant.Sink do
 
   @optional_callbacks [
     handle_session_identity: 2,
+    handle_slot_origin: 2,
     checkpoint: 0,
     handle_transaction: 1,
     handle_batch: 1,
@@ -233,6 +264,42 @@ defmodule Replicant.Sink do
     else
       :ok
     end
+  end
+
+  @doc """
+  Notify `module`'s `c:handle_slot_origin/2` of the slot `origin` (R04). A no-op `:ok` when the
+  sink does not implement the callback (so a sink without it is unaffected). Mirrors
+  `accept_session_identity/3`: `:ok` accepts; any other return, raise, throw, or exit is contained
+  as `{:error, :slot_origin_rejected}` — the value-bearing return/reason is NEVER surfaced
+  (Critical Rule 1). The caller halts the pipeline fail-closed on the error.
+  """
+  @spec notify_slot_origin(module(), Replicant.lsn(), map()) ::
+          :ok | {:error, :slot_origin_rejected}
+  def notify_slot_origin(module, origin, context) do
+    if function_exported?(module, :handle_slot_origin, 2) do
+      try do
+        case module.handle_slot_origin(origin, context) do
+          :ok -> :ok
+          _other -> {:error, :slot_origin_rejected}
+        end
+      rescue
+        _ -> {:error, :slot_origin_rejected}
+      catch
+        _kind, _reason -> {:error, :slot_origin_rejected}
+      end
+    else
+      :ok
+    end
+  end
+
+  @doc """
+  True when `module` implements `handle_slot_origin/2` — gates the connect-time slot-origin
+  exposure (R04). A sink without it keeps the prior connect behavior (no `confirmed_flush_lsn`
+  read, unchanged streaming).
+  """
+  @spec supports_slot_origin?(module()) :: boolean()
+  def supports_slot_origin?(module) do
+    function_exported?(module, :handle_slot_origin, 2)
   end
 
   @doc """

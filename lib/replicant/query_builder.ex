@@ -189,6 +189,22 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
+  Query returning a reused slot's `confirmed_flush_lsn` — the origin a go-forward stream resumes
+  at, exposed to append consumers via `handle_slot_origin/2` (R04). `pg_lsn` text ("X/Y"), or NULL
+  on a slot that has never flushed. Runs in the replication connect chain's SIMPLE query protocol
+  (no `$1` bind), so the Identifier-validated slot name is interpolated — the
+  `slot_invalidation_status/2` / `slot_exists/1` precedent (Critical Rule 2).
+  """
+  @spec slot_confirmed_flush(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def slot_confirmed_flush(slot_name) do
+    with :ok <- Identifier.validate(slot_name) do
+      {:ok,
+       "SELECT confirmed_flush_lsn FROM pg_replication_slots " <>
+         "WHERE slot_name = '#{slot_name}' LIMIT 1;"}
+    end
+  end
+
+  @doc """
   DDL creating the lib-owned checkpoint table if absent. `slot_name` is the PK, one
   row per slot; `commit_lsn` is a `bigint` (the `t:Replicant.lsn/0` integer — no
   `pg_lsn` text parse at the boundary). The table name is a validated identifier;

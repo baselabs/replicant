@@ -98,6 +98,19 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
+  describe "slot_confirmed_flush/1 (R04 reused-slot origin)" do
+    test "reads confirmed_flush_lsn from pg_replication_slots for the validated slot" do
+      assert {:ok, sql} = QueryBuilder.slot_confirmed_flush("replicant_orders")
+      assert sql =~ "confirmed_flush_lsn"
+      assert sql =~ "pg_replication_slots"
+      assert sql =~ "slot_name = 'replicant_orders'"
+    end
+
+    test "rejects an invalid slot name (no raw interpolation into SQL)" do
+      assert {:error, :invalid_identifier} = QueryBuilder.slot_confirmed_flush("orders'; DROP")
+    end
+  end
+
   describe "slot_invalidation_status/2" do
     test "PG16 (version < 170000) selects only wal_status + conflicting (invalidation_reason errors on PG16)" do
       assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders", 160_014)
