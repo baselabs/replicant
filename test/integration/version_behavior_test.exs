@@ -114,12 +114,17 @@ defmodule Replicant.Integration.VersionBehaviorTest do
              "PG#{div(version, 10_000)} supports failover slots but the slot was not created " <>
                "with failover=true — the FAILOVER grammar did not reach PG"
     else
-      :telemetry.attach(
-        {__MODULE__, :failover_unsup, slot},
-        [:replicant, :connection, :slot_invalidated],
-        fn _e, _m, meta, pid -> send(pid, {:failover_unsup, meta}) end,
-        self()
-      )
+      handler = {__MODULE__, :failover_unsup, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:replicant, :connection, :slot_invalidated],
+          fn _e, _m, meta, pid -> send(pid, {:failover_unsup, meta}) end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
 
       {:ok, _pid} =
         Replicant.start_link(
@@ -140,8 +145,6 @@ defmodule Replicant.Integration.VersionBehaviorTest do
       # Query by slot_name only: PG<17 has no `failover` column (selecting it would itself error).
       assert slot_present?(ctrl, slot) == [],
              "a failover-unsupported halt must never create the slot"
-
-      :telemetry.detach({__MODULE__, :failover_unsup, slot})
     end
   end
 
