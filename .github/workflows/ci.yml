@@ -146,33 +146,27 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
 
-      - name: Build and inspect unpacked Hex package
+      # Exact package-boundary gate: the built tar's regular-file set must equal the checked-in
+      # manifest (rejects any ignored/untracked glob-matched leak such as README.secret / lib/.env),
+      # with no symlink/special entry, and metadata name/version replicant/<@version>. This replaces
+      # the prior required/forbidden-path greps, which exited 0 while synthetic secret files packaged.
+      - name: Verify the package boundary against the exact manifest
+        run: bash scripts/release/verify_package.sh
+
+      # Build ONE candidate tarball and prove it from a fresh external consumer that touches only
+      # the Hex-checksum-validated extraction — never this checkout or its _build. A missing/corrupt
+      # packaged file is invisible from the checkout; it reds here. The consumer smoke exercises the
+      # R01-R05 public surface semantically (no source greps).
+      - name: Build the candidate and consume it from a fresh project
         run: |
-          package_dir=$(mktemp -d)
-          trap 'rm -rf "$package_dir"' EXIT
-          mix hex.build --unpack --output "$package_dir"
+          mix hex.build --output "$RUNNER_TEMP/replicant.tar"
+          bash scripts/release/verify_package.sh "$RUNNER_TEMP/replicant.tar"
+          bash scripts/release/consume_candidate.sh "$RUNNER_TEMP/replicant.tar"
 
-          for required in lib/replicant/session_identity.ex docs/adr/0007-actual-replication-session-identity.md .formatter.exs mix.exs README.md LICENSE NOTICE CHANGELOG.md usage-rules.md; do
-            test -e "$package_dir/$required" || {
-              echo "::error::Missing package path: $required"
-              exit 1
-            }
-          done
-
-          test ! -e "$package_dir/AGENTS.md" || {
-            echo "::error::Package contains the private contributor-agent contract"
-            exit 1
-          }
-
-          if grep -nH 'AGENTS\.md' "$package_dir/README.md" "$package_dir/usage-rules.md" "$package_dir/CONTRIBUTING.md" "$package_dir/notebooks/getting_started.livemd"; then
-            echo "::error::Published documentation references the excluded AGENTS.md contract"
-            exit 1
-          fi
-
-          if find "$package_dir" -type d \( -name test -o -name .forge -o -name _build -o -name superpowers \) -print -quit | grep -q .; then
-            echo "::error::Package contains test, lifecycle, Forge, or build residue"
-            exit 1
-          fi
-
-          grep -q 'handle_session_identity' "$package_dir/lib/replicant/sink.ex"
-          grep -q 'IDENTIFY_SYSTEM' "$package_dir/lib/replicant/query_builder.ex"
+      # Dry-run the guarded exact-byte uploader: all publish preconditions (digest identity,
+      # Hex-validated metadata, source-commit existence, no colliding tag/release, replace:false)
+      # must pass with NO credential read and NO upload. Publication is R07, human-authorized.
+      - name: Dry-run the guarded release uploader (no publish, no credential)
+        run: |
+          BUILD_DATE=ci bash scripts/release/build_candidate.sh
+          mix run scripts/release/upload_candidate.exs
