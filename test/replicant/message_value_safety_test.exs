@@ -68,6 +68,17 @@ defmodule Replicant.MessageValueSafetyTest do
   end
 
   defp assert_error_message_free(%Error{} = err) do
+    raw =
+      inspect(Map.from_struct(err),
+        limit: :infinity,
+        printable_limit: :infinity,
+        width: :infinity
+      )
+
+    refute_leak(raw, @hostile_prefix, "prefix (raw Error fields)")
+    refute_leak(raw, @secret_content, "content (raw Error fields)")
+    assert err.message == nil
+
     msg = Exception.message(err)
     refute_leak(msg, @hostile_prefix, "prefix (Error.message/1)")
     refute_leak(msg, @secret_content, "content (Error.message/1)")
@@ -77,8 +88,38 @@ defmodule Replicant.MessageValueSafetyTest do
   defp assert_wire_prefix_free(%Error{} = err) do
     rendered = inspect(err, limit: :infinity, printable_limit: :infinity, width: :infinity)
     refute_leak(rendered, @wire_prefix, "wire prefix")
+
+    raw =
+      inspect(Map.from_struct(err),
+        limit: :infinity,
+        printable_limit: :infinity,
+        width: :infinity
+      )
+
+    refute_leak(raw, @wire_prefix, "wire prefix (raw Error fields)")
+    assert err.message == nil
+
     refute_leak(Exception.message(err), @wire_prefix, "wire prefix (Error.message/1)")
     err
+  end
+
+  defp attach_sink_failed_handler do
+    test_pid = self()
+    ref = make_ref()
+    handler_id = {__MODULE__, ref}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:replicant, :sink, :failed],
+        fn event, measurements, metadata, _cfg ->
+          send(test_pid, {:telemetry, ref, event, measurements, metadata})
+        end,
+        nil
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    ref
   end
 
   # Build a raw pgoutput 'M' frame: flags::8, lsn::64, prefix NUL-terminated, length::32, content.
@@ -238,6 +279,7 @@ defmodule Replicant.MessageValueSafetyTest do
           {"a transaction sink non-:ok RETURN carrying message bytes", TransactionBadReturnSink}
         ] do
       test "#{label} halts value-free with :sink_failed" do
+        ref = attach_sink_failed_handler()
         asm = Assembler.new(unquote(sink))
 
         {:ok, asm} =
@@ -259,6 +301,13 @@ defmodule Replicant.MessageValueSafetyTest do
 
         assert_value_free(err)
         assert_error_message_free(err)
+
+        assert_receive {:telemetry, ^ref, [:replicant, :sink, :failed], measurements, metadata},
+                       500
+
+        assert metadata == %{reason: :sink_failed}
+        assert_value_free(measurements)
+        assert_value_free(metadata)
       end
     end
   end
