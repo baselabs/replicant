@@ -412,6 +412,63 @@ defmodule Replicant.CrashInjectionTest do
     :telemetry.detach({__MODULE__, {:too_slow, slot}})
   end
 
+  # R01 (live): an UNKNOWN checkpoint (a raising `sink.checkpoint/0` → read fault, read as
+  # checkpoint_lsn 0 with checkpoint_state :fault) combined with an ABSENT slot must halt
+  # fail-closed and NEVER create a fresh slot. The §14.15 streaming fail-open (resume-from-0,
+  # the idempotent sink dedups the re-stream) is safe only when the slot is PRESENT — a resume
+  # clamps to the slot's confirmed_flush_lsn. With the slot ABSENT there is nothing to resume:
+  # a fresh slot begins at its own creation LSN and silently skips every txn between the
+  # (unknown) real checkpoint and now — unrecoverable loss. The unit test proves the connect
+  # DECISION emits no CREATE_REPLICATION_SLOT; this drives it end-to-end against live PG and
+  # proves the structural halt AND that no slot exists on the server afterwards.
+  test "unknown checkpoint + absent slot halts :data_gap and creates no slot", %{
+    ctrl: ctrl,
+    slot: slot
+  } do
+    # Precondition on the server: the slot is absent (setup dropped it).
+    assert slot_count(ctrl, slot) == 0
+
+    :telemetry.attach(
+      {__MODULE__, :cp_unknown},
+      [:replicant, :connection, :slot_invalidated],
+      fn _e, _m, meta, pid ->
+        if meta[:reason] == :checkpoint_unknown, do: send(pid, :checkpoint_unknown)
+      end,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, :cp_unknown}) end)
+
+    # Start the pipeline with a sink whose checkpoint/0 RAISES → checkpoint_state :fault. Do
+    # NOT wait for :slot_active (it never fires — the pipeline halts at the connect decision
+    # before streaming), so this starts directly rather than via `start_pipeline/2`.
+    {:ok, _} =
+      Replicant.start_link(
+        connection: PG16.pg_opts(),
+        slot_name: slot,
+        publication: "orders_pub",
+        sink: Replicant.Test.RaisingCheckpointLedgerSink,
+        go_forward_only: true
+      )
+
+    # Structural fail-closed halt, distinct value-free reason (never a create-slot query).
+    assert_receive :checkpoint_unknown, 15_000
+
+    # The pipeline tore down permanently (fail-closed — not a reconnect livelock)...
+    PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 400)
+
+    # ...and — the load-bearing R01 assertion — NO replication slot was created on the server
+    # for the unknown checkpoint: CREATE_REPLICATION_SLOT was never emitted.
+    assert slot_count(ctrl, slot) == 0
+  end
+
+  # Count of server-side replication slots named `slot` (0 = never created / already dropped).
+  defp slot_count(c, slot) do
+    Postgrex.query!(c, "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1", [slot]).rows
+    |> hd()
+    |> hd()
+  end
+
   # Poll `reader.(acc)` `n` times at 40ms, folding into `acc`.
   defp sample(0, acc, _reader), do: acc
 

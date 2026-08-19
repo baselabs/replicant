@@ -175,6 +175,30 @@ defmodule Replicant.Test.FailOpenLedgerSink do
   def handle_transaction(txn), do: LedgerSink.handle_transaction(txn)
 end
 
+defmodule Replicant.Test.RaisingCheckpointLedgerSink do
+  @moduledoc """
+  A `LedgerSink` whose `checkpoint/0` RAISES — the spec §14.15 checkpoint-read-FAULT
+  condition (as distinct from `FailOpenLedgerSink`, which reports `{:ok, nil}` = a
+  genuine empty checkpoint). The Connection's `read_checkpoint/1` wraps the sink read in
+  a value-free rescue, so a raise resolves to checkpoint_state `:fault` (checkpoint_lsn 0).
+
+  Used by the R01 live probe to prove that an UNKNOWN checkpoint (read fault) combined
+  with an ABSENT replication slot halts fail-closed and NEVER creates a fresh slot — a
+  fresh slot would begin at its own creation LSN and silently skip the WAL between the
+  (unknown) real checkpoint and now. `handle_transaction/1` delegates to `LedgerSink` but
+  is never reached: the pipeline halts at the connect decision, before streaming.
+  """
+  @behaviour Replicant.Sink
+
+  alias Replicant.Test.LedgerSink
+
+  @impl true
+  def checkpoint, do: raise("checkpoint read fault (R01 live probe)")
+
+  @impl true
+  def handle_transaction(txn), do: LedgerSink.handle_transaction(txn)
+end
+
 defmodule Replicant.Test.PauseGate do
   @moduledoc """
   Test-only coordination gate for `Replicant.Test.PausingLedgerSink`. Holds the pid
