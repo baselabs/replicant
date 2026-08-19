@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Telemetry metadata and measurements are now validated by a closed key set AND a per-key
+  value-shape contract, not key-closure alone (value-free hardening, Critical Rule 1).**
+  `Replicant.Telemetry` previously checked only that metadata keys were on the value-free
+  allowlist; a row/column value smuggled into an allowlisted key with the wrong shape (a
+  string where an LSN/count/duration belongs) would still ship downstream, and measurements
+  (the `:telemetry` event's 2nd argument) were not validated at all. Every permitted key now
+  carries a type contract — LSNs are a non-negative integer or nil, counts and durations are
+  non-negative integers, `transactional` is a boolean, `table`/`slot_name` are strings,
+  `reason`/`error_class`/`kind` are atoms; measurement `duration`/`byte_size`/`change_count`
+  are non-negative integers and `lag` is a signed integer (WAL-byte arithmetic). An off-list
+  key or a wrong-shape value raises rather than emitting, and the raised error renders only
+  the offending key and the value's TYPE — never the value itself, so the guard can never
+  leak the bytes it exists to keep out. No emission site changed: all current events pass.
+  Covered by red-first mutation tripwires (a string in each numeric/boolean field, a non-atom
+  reason, an off-list measurement key, and a value-free-error assertion) plus the full live
+  PostgreSQL suite.
+
 ### Fixed
 
 - **An unknown checkpoint with an absent replication slot now halts fail-closed instead of
