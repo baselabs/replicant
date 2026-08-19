@@ -1520,6 +1520,8 @@ defmodule Replicant.Connection do
 
   # Fail-closed halt when the database cannot supply a valid origin or the consumer vetoes it.
   # Both reasons are structural and value-free; the database value and sink reason are discarded.
+  # Stay idle while the asynchronous supervisor teardown lands: returning :disconnect here would
+  # let auto-reconnect re-enter the same terminal fault and eventually obscure this halt reason.
   defp halt_slot_origin(state, reason)
        when reason in [:slot_origin_unavailable, :slot_origin_rejected] do
     Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
@@ -1527,7 +1529,7 @@ defmodule Replicant.Connection do
     })
 
     Replicant.Supervisor.halt(state.slot_name, {:slot_origin, reason})
-    {:disconnect, reason}
+    {:noreply, state}
   end
 
   # The CREATE_REPLICATION_SLOT result's consistent_point (row 2 of `[slot, cp, snap, plugin]`;
@@ -1546,10 +1548,21 @@ defmodule Replicant.Connection do
   defp parse_confirmed_flush(_rows), do: {:error, :slot_origin_unavailable}
 
   defp parse_slot_origin(lsn) do
-    {:ok, Replicant.lsn_from_string(lsn)}
+    with [upper, lower] <- String.split(lsn, "/", parts: 2),
+         true <- valid_lsn_component?(upper),
+         true <- valid_lsn_component?(lower) do
+      {:ok, Replicant.lsn_from_string(lsn)}
+    else
+      _ -> {:error, :slot_origin_unavailable}
+    end
   rescue
     _ -> {:error, :slot_origin_unavailable}
   end
+
+  defp valid_lsn_component?(component) when byte_size(component) in 1..8,
+    do: String.match?(component, ~r/\A[0-9A-Fa-f]+\z/)
+
+  defp valid_lsn_component?(_component), do: false
 
   # Definitive checkpoint read for the connect decision. Distinguishes a durable value
   # (:present) from a genuine first-run/empty (:empty) from a read fault (:fault).

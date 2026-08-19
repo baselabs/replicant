@@ -978,25 +978,39 @@ defmodule Replicant.ConnectionTest do
       result = [%Postgrex.Result{rows: [["conn_test", nil, nil, "pgoutput"]]}]
       st = state(step: :create_slot, sink: OriginSink)
 
-      assert {:disconnect, :slot_origin_unavailable} = Connection.handle_result(result, st)
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
       assert_received {:origin_unavailable, %{reason: :slot_origin_unavailable}}
       refute_receive {:slot_origin, _, _}
     end
 
+    test "signed CREATE consistent_point components halt as unavailable" do
+      for lsn <- ["0/+1", "-1/0"] do
+        result = [%Postgrex.Result{rows: [["conn_test", lsn, nil, "pgoutput"]]}]
+        st = state(step: :create_slot, sink: OriginSink)
+
+        assert {:noreply, ^st} = Connection.handle_result(result, st)
+        refute_receive {:slot_origin, _, _}
+      end
+    end
+
     test "TRIPWIRE: a vetoing sink halts fail-closed (never proceeds to stream)" do
-      :telemetry.attach(
-        {__MODULE__, :origin_new},
-        [:replicant, :connection, :slot_invalidated],
-        fn _e, _m, meta, pid -> send(pid, {:origin_new, meta}) end,
-        self()
-      )
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:replicant, :connection, :slot_invalidated],
+          fn _e, _m, meta, pid -> send(pid, {:origin_new, meta}) end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
 
       result = [%Postgrex.Result{rows: [["conn_test", "0/16E3778", nil, "pgoutput"]]}]
       st = state(step: :create_slot, sink: RejectOriginSink)
 
-      assert {:disconnect, :slot_origin_rejected} = Connection.handle_result(result, st)
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
       assert_received {:origin_new, %{reason: :slot_origin_rejected}}
-      :telemetry.detach({__MODULE__, :origin_new})
     end
 
     test "a sink WITHOUT the callback is byte-identical: streams, no origin notification" do
@@ -1057,7 +1071,7 @@ defmodule Replicant.ConnectionTest do
       result = [%Postgrex.Result{rows: [[nil]]}]
       st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
 
-      assert {:disconnect, :slot_origin_unavailable} = Connection.handle_result(result, st)
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
       refute_receive {:slot_origin, _, _}
     end
 
@@ -1065,7 +1079,7 @@ defmodule Replicant.ConnectionTest do
       result = [%Postgrex.Result{rows: []}]
       st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
 
-      assert {:disconnect, :slot_origin_unavailable} = Connection.handle_result(result, st)
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
       refute_receive {:slot_origin, _, _}
     end
 
@@ -1073,24 +1087,38 @@ defmodule Replicant.ConnectionTest do
       result = [%Postgrex.Result{rows: [["not-an-lsn"]]}]
       st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
 
-      assert {:disconnect, :slot_origin_unavailable} = Connection.handle_result(result, st)
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
       refute_receive {:slot_origin, _, _}
     end
 
+    test "signed confirmed_flush_lsn components halt as unavailable" do
+      for lsn <- ["0/+1", "-1/0"] do
+        result = [%Postgrex.Result{rows: [[lsn]]}]
+        st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: OriginSink)
+
+        assert {:noreply, ^st} = Connection.handle_result(result, st)
+        refute_receive {:slot_origin, _, _}
+      end
+    end
+
     test "TRIPWIRE: a vetoing sink halts fail-closed on the reused-slot origin read" do
-      :telemetry.attach(
-        {__MODULE__, :origin_reused},
-        [:replicant, :connection, :slot_invalidated],
-        fn _e, _m, meta, pid -> send(pid, {:origin_reused, meta}) end,
-        self()
-      )
+      handler = {__MODULE__, make_ref()}
+
+      :ok =
+        :telemetry.attach(
+          handler,
+          [:replicant, :connection, :slot_invalidated],
+          fn _e, _m, meta, pid -> send(pid, {:origin_reused, meta}) end,
+          self()
+        )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
 
       result = [%Postgrex.Result{rows: [["0/16E3778"]]}]
       st = state(step: :read_slot_origin, checkpoint_lsn: 0x100, sink: RejectOriginSink)
 
-      assert {:disconnect, :slot_origin_rejected} = Connection.handle_result(result, st)
+      assert {:noreply, ^st} = Connection.handle_result(result, st)
       assert_received {:origin_reused, %{reason: :slot_origin_rejected}}
-      :telemetry.detach({__MODULE__, :origin_reused})
     end
   end
 
