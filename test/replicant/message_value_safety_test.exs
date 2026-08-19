@@ -13,8 +13,10 @@ defmodule Replicant.MessageValueSafetyTest do
   Non-vacuity: each surface's guard is RED-capable by mutating the exact scrub it protects
   (documented per-test). The mutations were exercised RED-before-green during the R03 build:
 
-    * decode scrub — `Error.decode_failure/1` leaking `Exception.message/1` into `:shape`.
-    * sink-fault scrub — `Assembler.deliver_message/2`'s `_other` clause leaking `inspect(reason)`.
+    * decode scrub — `Error.decode_failure/1` leaking `Exception.message/1` into `:shape`,
+      exercised separately before prefix framing and after content framing.
+    * sink-fault scrub — both `Assembler.deliver_message/2` and transaction delivery leaking
+      caught exceptions, throws/exits, or bad return reasons.
     * before-Begin halt — interpolating `prefix` into the static `shape:` string.
     * telemetry — asserted the handler actually fired, so an absent-bytes assertion is not
       vacuously true over an event that never arrived.
@@ -32,20 +34,28 @@ defmodule Replicant.MessageValueSafetyTest do
   # invalid-UTF-8 byte (\xff) so a leak that renders as a raw bitstring (not a printable string)
   # is exercised too — that is the realistic shape of a leaked row/secret byte.
   @hostile_prefix "HOSTILE_PREFIX_\x00\xffcafebabe"
+  @wire_prefix "HOSTILE_WIRE_PREFIX_cafebabe"
   @secret_content "SECRET_CONTENT_deadbeef_\x00row-bytes"
 
   # A leaked sentinel can surface TWO ways depending on the leak vector: (a) as a printable
   # substring when the leaked value is a valid-UTF-8 binary that `inspect` quotes, or (b) as a
   # comma-separated DECIMAL byte-list when the leaked value is a non-UTF-8 binary that `inspect`
   # renders as `<<72, 79, 83, ...>>`. A substring-only check misses (b) — the exact byte-level
-  # evasion this project has been bitten by before. `width: :infinity` keeps the byte-list on one
-  # line so the decimal signature stays contiguous.
+  # evasion this project has been bitten by before. Exception formatters may insert line breaks
+  # before the term reaches this helper, so the byte signature permits arbitrary whitespace.
   defp refute_leak(rendered, sentinel, label) do
     ascii = sentinel |> :binary.bin_to_list() |> Enum.filter(&(&1 in 32..126)) |> List.to_string()
     refute rendered =~ ascii, "#{label} leaked (printable form) into: #{rendered}"
 
-    byte_sig = sentinel |> :binary.bin_to_list() |> Enum.join(", ")
-    refute rendered =~ byte_sig, "#{label} leaked (byte-list form) into: #{rendered}"
+    byte_pattern =
+      sentinel
+      |> :binary.bin_to_list()
+      |> Enum.map_join("\\s*,\\s*", &Integer.to_string/1)
+      |> Regex.compile!()
+
+    refute Regex.match?(byte_pattern, rendered),
+           "#{label} leaked (byte-list form) into: #{rendered}"
+
     rendered
   end
 
@@ -64,6 +74,13 @@ defmodule Replicant.MessageValueSafetyTest do
     err
   end
 
+  defp assert_wire_prefix_free(%Error{} = err) do
+    rendered = inspect(err, limit: :infinity, printable_limit: :infinity, width: :infinity)
+    refute_leak(rendered, @wire_prefix, "wire prefix")
+    refute_leak(Exception.message(err), @wire_prefix, "wire prefix (Error.message/1)")
+    err
+  end
+
   # Build a raw pgoutput 'M' frame: flags::8, lsn::64, prefix NUL-terminated, length::32, content.
   defp message_frame(flags, prefix, content, declared_length) do
     <<"M", flags::8, 0::64>> <>
@@ -71,17 +88,30 @@ defmodule Replicant.MessageValueSafetyTest do
   end
 
   describe "decode boundary (Decoder.decode/1)" do
-    test "a malformed 'M' frame (content shorter than declared length) is value-free" do
-      # declared_length > actual content → the binary match in decode_message_impl raises a
-      # MatchError whose term embeds the raw remaining bytes (prefix + content). decode/1 must
-      # scrub it to a structural reason, keeping only the exception MODULE name.
+    test "a malformed 'M' frame without a prefix terminator cannot leak prefix bytes" do
+      # No NUL appears after the fixed header, so the two-element split match fails while the
+      # MatchError still contains the complete attacker-controlled prefix. This specifically
+      # protects the prefix side of the decode boundary; a frame that reaches the length match
+      # has already split the prefix out of the failing term.
       # MUTATION that proves this RED: `Error.decode_failure/1` set `shape: Exception.message(exception)`.
-      frame = message_frame(0, @hostile_prefix, @secret_content, 9_999)
+      frame = <<"M", 0, 0::64>> <> @wire_prefix <> <<0xFF>>
 
       assert {:error, %Error{reason: :decode_failure} = err} = Decoder.decode(frame)
+      assert_wire_prefix_free(err)
       assert err.shape == "MatchError"
+    end
+
+    test "a malformed 'M' frame with truncated content cannot leak content bytes" do
+      # declared_length > actual content → the length/content match raises after prefix framing;
+      # its MatchError contains the raw content bytes. decode/1 must retain only the exception
+      # module name, never the failed match term.
+      # MUTATION that proves this RED: `Error.decode_failure/1` set `shape: Exception.message(exception)`.
+      frame = message_frame(0, @wire_prefix, @secret_content, 9_999)
+
+      assert {:error, %Error{reason: :decode_failure} = err} = Decoder.decode(frame)
       assert_value_free(err)
       assert_error_message_free(err)
+      assert err.shape == "MatchError"
     end
 
     test "a well-formed hostile-prefix 'M' frame decodes to a struct WITHOUT surfacing bytes in any error" do
@@ -157,6 +187,75 @@ defmodule Replicant.MessageValueSafetyTest do
 
         assert {:halt, %Error{reason: :sink_failed} = err, _asm} =
                  Assembler.handle_message(asm, msg)
+
+        assert_value_free(err)
+        assert_error_message_free(err)
+      end
+    end
+  end
+
+  describe "transactional-message sink failure surfaces (Commit → handle_transaction/1)" do
+    defmodule TransactionRaiseSink do
+      @moduledoc false
+      @behaviour Replicant.Sink
+
+      def handle_transaction(%{messages: [%{prefix: p, content: c}]}),
+        do: raise("transaction sink boom prefix=#{p} content=#{c}")
+    end
+
+    defmodule TransactionThrowSink do
+      @moduledoc false
+      @behaviour Replicant.Sink
+
+      def handle_transaction(%{messages: [%{prefix: p, content: c}]}),
+        do: throw({:transaction_evil, p, c})
+    end
+
+    defmodule TransactionExitSink do
+      @moduledoc false
+      @behaviour Replicant.Sink
+
+      def handle_transaction(%{messages: [%{prefix: p, content: c}]}),
+        do: exit({:transaction_evil_exit, p, c})
+    end
+
+    defmodule TransactionBadReturnSink do
+      @moduledoc false
+      @behaviour Replicant.Sink
+
+      def handle_transaction(%{messages: [%{prefix: p, content: c}]}),
+        do: {:error, {:transaction_leak, p, c}}
+    end
+
+    # RED mutations exercised independently at the transaction boundary:
+    #   * `{:sink_raised, e}` passed `Exception.message(e)` as the error shape;
+    #   * `{:sink_caught, _kind, reason}` passed `inspect(reason)` as the error shape;
+    #   * `{:error, reason}` passed `inspect(reason)` as the error shape.
+    for {label, sink} <- [
+          {"a transaction sink RAISE carrying message bytes", TransactionRaiseSink},
+          {"a transaction sink THROW carrying message bytes", TransactionThrowSink},
+          {"a transaction sink EXIT carrying message bytes", TransactionExitSink},
+          {"a transaction sink non-:ok RETURN carrying message bytes", TransactionBadReturnSink}
+        ] do
+      test "#{label} halts value-free with :sink_failed" do
+        asm = Assembler.new(unquote(sink))
+
+        {:ok, asm} =
+          Assembler.handle_message(asm, %Replicant.Decoder.Messages.Begin{
+            final_lsn: 100,
+            xid: 1
+          })
+
+        {:ok, asm} =
+          Assembler.handle_message(asm, %Message{
+            transactional?: true,
+            lsn: 100,
+            prefix: @hostile_prefix,
+            content: @secret_content
+          })
+
+        assert {:halt, %Error{reason: :sink_failed} = err, _asm} =
+                 Assembler.handle_message(asm, %Replicant.Decoder.Messages.Commit{lsn: 100})
 
         assert_value_free(err)
         assert_error_message_free(err)
