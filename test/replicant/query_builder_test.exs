@@ -114,7 +114,20 @@ defmodule Replicant.QueryBuilderTest do
   end
 
   describe "slot_invalidation_status/2" do
-    test "PG16 (version < 170000) selects only wal_status + conflicting (invalidation_reason errors on PG16)" do
+    test "PG15 (version < 160000) selects ONLY wal_status (conflicting errors on PG15)" do
+      # `conflicting` was added in PG16; on PG15 `SELECT ... conflicting` errors
+      # `column \"conflicting\" does not exist` (probe-confirmed). PG15's sole invalidation
+      # signal is `wal_status = 'lost'`.
+      assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders", 150_019)
+      assert sql =~ "wal_status"
+      refute sql =~ "conflicting"
+      refute sql =~ "invalidation_reason"
+      refute sql =~ "synced"
+      assert sql =~ "pg_replication_slots"
+      assert sql =~ "slot_name = 'replicant_orders'"
+    end
+
+    test "PG16 (160000 <= version < 170000) selects wal_status + conflicting (invalidation_reason errors on PG16)" do
       assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders", 160_014)
       assert sql =~ "wal_status"
       assert sql =~ "conflicting"
