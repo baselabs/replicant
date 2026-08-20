@@ -146,27 +146,10 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
 
-      # Exact package-boundary gate: the built tar's regular-file set must equal the checked-in
-      # manifest (rejects any ignored/untracked glob-matched leak such as README.secret / lib/.env),
-      # with no symlink/special entry, and metadata name/version replicant/<@version>. This replaces
-      # the prior required/forbidden-path greps, which exited 0 while synthetic secret files packaged.
-      - name: Verify the package boundary against the exact manifest
-        run: bash scripts/release/verify_package.sh
-
-      # Build ONE candidate tarball and prove it from a fresh external consumer that touches only
-      # the Hex-checksum-validated extraction — never this checkout or its _build. A missing/corrupt
-      # packaged file is invisible from the checkout; it reds here. The consumer smoke exercises the
-      # R01-R05 public surface semantically (no source greps).
-      - name: Build the candidate and consume it from a fresh project
-        run: |
-          mix hex.build --output "$RUNNER_TEMP/replicant.tar"
-          bash scripts/release/verify_package.sh "$RUNNER_TEMP/replicant.tar"
-          bash scripts/release/consume_candidate.sh "$RUNNER_TEMP/replicant.tar"
-
-      # Dry-run the guarded exact-byte uploader: all publish preconditions (digest identity,
-      # Hex-validated metadata, source-commit existence, no colliding tag/release, replace:false)
-      # must pass with NO credential read and NO upload. Publication is R07, human-authorized.
-      - name: Dry-run the guarded release uploader (no publish, no credential)
-        run: |
-          BUILD_DATE=ci bash scripts/release/build_candidate.sh
-          mix run scripts/release/upload_candidate.exs
+      # Build throwaway bytes from the exact commit and run the complete package workflow without
+      # retaining a candidate: exact manifest, Hex validation, artifact-derived audit/compile/docs,
+      # fresh-consumer provenance + semantic smoke, immutable witness, strict collision checks, and
+      # credential-free exact-byte uploader dry-run. The real candidate is minted once, from merged
+      # main, after this review set and all matrix rows settle.
+      - name: Prove the complete package workflow without minting a candidate
+        run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check

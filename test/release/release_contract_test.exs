@@ -55,4 +55,11 @@ defmodule Replicant.ReleaseContractTest do
     assert Mix.Project.config()[:docs][:source_ref] == "v#{version()}",
            "docs source_ref must be v#{version()} so HexDocs source links resolve to the release tag"
   end
+
+  test "exact-byte uploader uses Hex's authenticated API wrapper and never the raw client" do
+    body = File.read!(Path.expand("../../scripts/release/upload_candidate.exs", __DIR__))
+
+    assert body =~ "Hex.API.Release.publish"
+    refute body =~ ":mix_hex_api_release.publish"
+  end
 end

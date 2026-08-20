@@ -105,12 +105,12 @@ missing="$(LC_ALL=C comm -23 "$expected_sorted" "$actual" || true)"
 status=0
 if [[ -n "$extra" ]]; then
   echo "::error::package contains files NOT in the manifest (boundary leak):" >&2
-  echo "$extra" | sed 's|^|  + |' >&2
+  printf '  + %s\n' "${extra//$'\n'/$'\n  + '}" >&2
   status=1
 fi
 if [[ -n "$missing" ]]; then
   echo "::error::package is MISSING files listed in the manifest:" >&2
-  echo "$missing" | sed 's|^|  - |' >&2
+  printf '  - %s\n' "${missing//$'\n'/$'\n  - '}" >&2
   status=1
 fi
 if [[ $status -ne 0 ]]; then
