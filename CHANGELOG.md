@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Release authorization tests no longer touch retained package evidence.** The wrong-token
+  tripwire now runs a copied publisher inside a unique temporary release layout with a sentinel
+  credential loader, so an interrupted test cannot leave a forged receipt behind or race a real
+  candidate mint. A structural regression test prevents the fixture from returning to the
+  repository's retained-artifact directory.
+
 - **Incremental keyed snapshots now halt after bounded contention instead of retrying forever.**
   A keyed drop-set-cap breach previously emitted `:chunk_retried`, reloaded durable progress, and
   repeated without an attempt counter; a continuously contended table could therefore keep a

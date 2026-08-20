@@ -103,4 +103,11 @@ defmodule Replicant.ReleaseContractTest do
     refute manifest =~ ~r/  replicant-#{Regex.escape(version())}\.tar$/m,
            "the candidate has no published digest until exact retained bytes are uploaded"
   end
+
+  test "publish authorization tests never write retained package evidence" do
+    source = File.read!(Path.expand("publish_candidate_test.exs", __DIR__))
+
+    refute source =~
+             ~r/Path\.join\(\[@repo_root,\s*"\.kimosabe",\s*"artifacts"/
+  end
 end
