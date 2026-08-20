@@ -4,6 +4,7 @@ Mix.ensure_application!(:hex)
 
 Code.require_file("package_identity.exs", __DIR__)
 Code.require_file("package_witness.exs", __DIR__)
+Code.require_file("package_checksum.exs", __DIR__)
 
 defmodule Replicant.UploadCandidate do
   @moduledoc false
@@ -107,7 +108,11 @@ defmodule Replicant.UploadCandidate do
 
     case Hex.API.Release.publish("hexpm", File.read!(tar), [key: key], fn _ -> nil end, false) do
       {:ok, {status, _, _}} when status in 200..299 ->
-        IO.puts("upload_candidate: published replicant #{version} from exact witnessed bytes")
+        Replicant.PackageChecksum.verify!(version, digest, key)
+
+        IO.puts(
+          "upload_candidate: published replicant #{version}; Hex checksum matches exact witnessed bytes"
+        )
 
       {:ok, {status, _, _}} ->
         abort("publish failed with HTTP #{status}")
