@@ -1,6 +1,8 @@
 defmodule Replicant.PackageWitness do
   @moduledoc false
 
+  import Bitwise, only: [band: 2]
+
   @zero String.duplicate("0", 40)
 
   def create(repo, ref, source_commit, receipt_path) do
@@ -24,13 +26,18 @@ defmodule Replicant.PackageWitness do
 
   def verify(repo, ref, artifact_path, receipt_path) do
     receipt = File.read!(receipt_path)
+    artifact = if artifact_path, do: File.read!(artifact_path), else: nil
 
+    verify_content(repo, ref, artifact, receipt)
+  end
+
+  def verify_content(repo, ref, artifact, receipt) do
     with {:ok, witnessed} <- git_output(repo, ["show", "#{ref}:candidate-receipt.txt"]),
          :ok <- exact_receipt(witnessed, receipt),
          {:ok, parent} <- git_output(repo, ["rev-parse", "#{ref}^"]),
          {:ok, commit} <- receipt_value(receipt, "source_commit", ~r/^[0-9a-f]{40}$/),
          :ok <- exact_parent(String.trim(parent), commit),
-         :ok <- verify_artifact(artifact_path, receipt) do
+         :ok <- verify_artifact(artifact, receipt) do
       :ok
     end
   end
@@ -91,6 +98,27 @@ defmodule Replicant.PackageWitness do
 
   def receipt_source_commit(receipt_path) do
     receipt_path |> File.read!() |> receipt_value("source_commit", ~r/^[0-9a-f]{40}$/)
+  end
+
+  def receipt_source_commit_content(receipt) do
+    receipt_value(receipt, "source_commit", ~r/^[0-9a-f]{40}$/)
+  end
+
+  def read_immutable(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :regular, mode: mode}} ->
+        if band(mode, 0o222) == 0 do
+          File.read(path)
+        else
+          {:error, "uploader input must be read-only: #{path}"}
+        end
+
+      {:ok, _stat} ->
+        {:error, "uploader input must be a regular file: #{path}"}
+
+      {:error, _reason} ->
+        {:error, "uploader input is missing or unreadable: #{path}"}
+    end
   end
 
   defp create_commit(repo, source_commit, receipt_path, _receipt) do
@@ -160,13 +188,11 @@ defmodule Replicant.PackageWitness do
 
   defp verify_artifact(nil, _receipt), do: :ok
 
-  defp verify_artifact(path, receipt) do
+  defp verify_artifact(bytes, receipt) do
     with {:ok, recorded} <- receipt_value(receipt, "sha256", ~r/^[0-9a-f]{64}$/) do
-      cond do
-        not File.regular?(path) -> {:error, "candidate artifact missing or non-regular"}
-        sha256(File.read!(path)) == recorded -> :ok
-        true -> {:error, "candidate artifact digest does not match witnessed receipt"}
-      end
+      if sha256(bytes) == recorded,
+        do: :ok,
+        else: {:error, "candidate artifact digest does not match witnessed receipt"}
     end
   end
 

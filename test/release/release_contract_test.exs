@@ -62,6 +62,7 @@ defmodule Replicant.ReleaseContractTest do
 
     assert body =~ "Hex.API.Release.publish"
     refute body =~ ":mix_hex_api_release.publish"
+    refute body =~ "File.read!(tar)"
     refute builder =~ ~r/upload_candidate\.exs" --\s/
   end
 end

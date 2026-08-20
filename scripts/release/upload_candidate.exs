@@ -26,16 +26,23 @@ defmodule Replicant.UploadCandidate do
     witness_ref = opts[:witness_ref] || "refs/attestations/packages/replicant/#{version}"
     publish? = opts[:publish] || false
 
-    with :ok <- regular_file(tar),
-         :ok <- regular_file(receipt),
-         :ok <- Replicant.PackageWitness.verify(@repo_root, witness_ref, tar, receipt),
-         {:ok, source_commit} <- Replicant.PackageWitness.receipt_source_commit(receipt),
-         :ok <- check_metadata(tar, version),
+    with {:ok, tar_bytes} <- Replicant.PackageWitness.read_immutable(tar),
+         {:ok, receipt_bytes} <- Replicant.PackageWitness.read_immutable(receipt),
+         :ok <-
+           Replicant.PackageWitness.verify_content(
+             @repo_root,
+             witness_ref,
+             tar_bytes,
+             receipt_bytes
+           ),
+         {:ok, source_commit} <-
+           Replicant.PackageWitness.receipt_source_commit_content(receipt_bytes),
+         :ok <- check_metadata(tar_bytes, version),
          :ok <- check_identity(version, source_commit, publish?) do
       if publish? do
-        publish(version, tar)
+        publish(version, tar_bytes)
       else
-        bytes = File.stat!(tar).size
+        bytes = byte_size(tar_bytes)
 
         IO.puts("""
         upload_candidate: DRY-RUN — all guards passed, nothing uploaded.
@@ -59,18 +66,14 @@ defmodule Replicant.UploadCandidate do
     end
   end
 
-  defp regular_file(path) do
-    if File.regular?(path), do: :ok, else: {:error, "required regular file missing: #{path}"}
-  end
-
-  defp check_metadata(tar, version) do
+  defp check_metadata(tar_bytes, version) do
     dest =
       Path.join(System.tmp_dir!(), "replicant-upload-meta-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(dest)
 
     try do
-      case :mix_hex_tarball.unpack(File.read!(tar), String.to_charlist(dest)) do
+      case :mix_hex_tarball.unpack(tar_bytes, String.to_charlist(dest)) do
         {:ok, meta} ->
           metadata = Map.new(meta[:metadata] || %{})
           name = metadata["name"] || metadata[:name]
@@ -96,8 +99,8 @@ defmodule Replicant.UploadCandidate do
   defp check_identity(version, _source_commit, false),
     do: Replicant.PackageIdentity.check_candidate(version)
 
-  defp publish(version, tar) do
-    digest = sha256(File.read!(tar))
+  defp publish(version, tar_bytes) do
+    digest = sha256(tar_bytes)
     expected = "#{version}:#{digest}"
 
     unless System.get_env("REPLICANT_PUBLISH_AUTHORIZED") == expected do
@@ -106,7 +109,7 @@ defmodule Replicant.UploadCandidate do
 
     key = System.get_env("HEX_API_KEY") || abort("HEX_API_KEY not set")
 
-    case Hex.API.Release.publish("hexpm", File.read!(tar), [key: key], fn _ -> nil end, false) do
+    case Hex.API.Release.publish("hexpm", tar_bytes, [key: key], fn _ -> nil end, false) do
       {:ok, {status, _, _}} when status in 200..299 ->
         Replicant.PackageChecksum.verify!(version, digest, key)
 

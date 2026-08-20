@@ -69,6 +69,20 @@ defmodule Replicant.PackageWitnessTest do
     assert message =~ backup
   end
 
+  test "uploader inputs must be read-only regular files, never symlinks", ctx do
+    link = Path.join(ctx.root, "artifact-link.tar")
+    File.ln_s!(ctx.artifact, link)
+
+    assert {:error, message} = PackageWitness.read_immutable(link)
+    assert message =~ "regular file"
+
+    assert {:error, message} = PackageWitness.read_immutable(ctx.artifact)
+    assert message =~ "read-only"
+
+    File.chmod!(ctx.artifact, 0o444)
+    assert {:ok, "synthetic artifact bytes"} = PackageWitness.read_immutable(ctx.artifact)
+  end
+
   defp git!(root, args) do
     {output, 0} = System.cmd("git", args, cd: root)
     String.trim(output)
