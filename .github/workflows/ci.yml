@@ -128,6 +128,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+          # Published check mode verifies the local tag and its ancestry against main.
+          fetch-depth: 0
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
           otp-version: ${{ env.OTP_VERSION }}
@@ -148,7 +150,8 @@ jobs:
 
       # Build throwaway bytes from the exact commit and run the complete package workflow without
       # retaining a candidate: exact manifest, Hex validation, artifact-derived audit/compile/docs,
-      # fresh-consumer provenance + semantic smoke, immutable witness, strict collision checks, and
+      # fresh-consumer provenance + semantic smoke, immutable witness, free-or-coherent published
+      # identity checks, and
       # credential-free exact-byte uploader dry-run. The real candidate is minted once, from merged
       # main, after this review set and all matrix rows settle.
       - name: Prove the complete package workflow without minting a candidate

@@ -27,10 +27,82 @@ defmodule Replicant.PackageIdentity do
     end
   end
 
+  def check_build(version, source_commit, published_digest, runner \\ &run/2) do
+    tag = "v#{version}"
+
+    case local_tag_state(tag, runner) do
+      :absent -> check_candidate(version, runner)
+      :present -> check_published_build(version, tag, source_commit, published_digest, runner)
+      {:error, _message} = error -> error
+    end
+  end
+
   def verify_candidate!(version), do: check_candidate(version) |> unwrap!()
 
   def verify_publish!(version, source_commit),
     do: check_publish(version, source_commit) |> unwrap!()
+
+  def verify_build!(version, source_commit, published_digest),
+    do: check_build(version, source_commit, published_digest) |> unwrap!()
+
+  defp check_published_build(version, tag, source_commit, published_digest, runner) do
+    with :ok <- valid_published_digest(published_digest),
+         {:ok, tag_commit} <- local_tag_commit(tag, runner),
+         :ok <- matching_remote_tag(tag, tag_commit, runner),
+         :ok <- ancestor(tag, tag_commit, source_commit, runner),
+         :ok <- published_github(tag, tag_commit, runner),
+         :ok <- published_hex(version, published_digest, runner) do
+      :ok
+    end
+  end
+
+  defp valid_published_digest(digest) when is_binary(digest) do
+    if Regex.match?(~r/\A[0-9a-f]{64}\z/, digest),
+      do: :ok,
+      else: {:error, "published package digest is missing or invalid"}
+  end
+
+  defp valid_published_digest(_digest),
+    do: {:error, "published package digest is missing or invalid"}
+
+  defp local_tag_state(tag, runner) do
+    case runner.("git", ["rev-parse", "-q", "--verify", "refs/tags/#{tag}"]) do
+      {_, 1} ->
+        :absent
+
+      {_, 0} ->
+        :present
+
+      {output, status} ->
+        {:error, "local tag check failed (exit #{status}): #{structural(output)}"}
+    end
+  end
+
+  defp local_tag_commit(tag, runner) do
+    case runner.("git", ["rev-parse", "refs/tags/#{tag}^{}"]) do
+      {output, 0} ->
+        case String.trim(output) do
+          "" -> {:error, "local tag #{tag} returned no commit"}
+          commit -> {:ok, commit}
+        end
+
+      {output, status} ->
+        {:error, "local tag #{tag} is unavailable (exit #{status}): #{structural(output)}"}
+    end
+  end
+
+  defp ancestor(tag, tag_commit, source_commit, runner) do
+    case runner.("git", ["merge-base", "--is-ancestor", tag_commit, source_commit]) do
+      {_, 0} ->
+        :ok
+
+      {_, 1} ->
+        {:error, "published tag #{tag} is not an ancestor of current source"}
+
+      {output, status} ->
+        {:error, "tag ancestry check failed (exit #{status}): #{structural(output)}"}
+    end
+  end
 
   defp absent_local_tag(tag, runner) do
     case runner.("git", ["rev-parse", "-q", "--verify", "refs/tags/#{tag}"]) do
@@ -137,6 +209,77 @@ defmodule Replicant.PackageIdentity do
       {output, exit_status} ->
         {:error, "#{label} check failed (exit #{exit_status}): #{structural(output)}"}
     end
+  end
+
+  defp published_github(tag, tag_commit, runner) do
+    with {:ok, metadata} <- fetch_json(@github_release_url <> tag, "GitHub release", runner) do
+      cond do
+        metadata["tag_name"] != tag ->
+          {:error, "GitHub release tag does not match #{tag}"}
+
+        metadata["target_commitish"] != tag_commit ->
+          {:error, "GitHub release target does not match the published tag commit"}
+
+        metadata["draft"] != false ->
+          {:error, "GitHub release is still a draft"}
+
+        metadata["prerelease"] != false ->
+          {:error, "GitHub release is marked as a prerelease"}
+
+        true ->
+          :ok
+      end
+    end
+  end
+
+  defp published_hex(version, published_digest, runner) do
+    with {:ok, metadata} <- fetch_json(@hex_release_url <> version, "Hex release", runner) do
+      cond do
+        metadata["version"] != version ->
+          {:error, "Hex release version does not match #{version}"}
+
+        metadata["checksum"] != published_digest ->
+          {:error, "Hex release checksum does not match the tracked published digest"}
+
+        metadata["has_docs"] != true ->
+          {:error, "Hex release documentation is unavailable"}
+
+        true ->
+          :ok
+      end
+    end
+  end
+
+  defp fetch_json(url, label, runner) do
+    args = [
+      "--silent",
+      "--show-error",
+      "--fail",
+      "--connect-timeout",
+      "10",
+      "--max-time",
+      "30",
+      url
+    ]
+
+    case runner.("curl", args) do
+      {body, 0} ->
+        decode_json(body, label)
+
+      {output, exit_status} ->
+        {:error, "#{label} check failed (exit #{exit_status}): #{structural(output)}"}
+    end
+  end
+
+  defp decode_json(body, label) do
+    case :json.decode(body) do
+      metadata when is_map(metadata) -> {:ok, metadata}
+      _other -> {:error, "#{label} returned an invalid metadata shape"}
+    end
+  rescue
+    _error -> {:error, "#{label} returned invalid JSON"}
+  catch
+    _kind, _reason -> {:error, "#{label} returned invalid JSON"}
   end
 
   @doc false

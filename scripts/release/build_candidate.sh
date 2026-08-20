@@ -25,6 +25,12 @@ sha256_of() {
 commit="$(git rev-parse HEAD)"
 version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
 [[ -n "$version" ]] || die "could not read package version"
+published_manifest="$repo_root/scripts/release/published_packages.sha256"
+[[ -r "$published_manifest" ]] || die "published package digest manifest is unavailable"
+published_digest="$(awk -v artifact="replicant-$version.tar" '$2 == artifact {print $1}' "$published_manifest")"
+if [[ -n "$published_digest" && ! "$published_digest" =~ ^[0-9a-f]{64}$ ]]; then
+  die "published package digest manifest has an invalid or duplicate entry for $version"
+fi
 
 if [[ "$mode" == "mint" ]]; then
   [[ "$(git branch --show-current)" == "main" ]] || die "candidate mint is allowed only on main"
@@ -37,8 +43,14 @@ if [[ "$mode" == "mint" ]]; then
   fi
 fi
 
-elixir -r "$repo_root/scripts/release/package_identity.exs" \
-  -e 'Replicant.PackageIdentity.verify_candidate!(hd(System.argv()))' -- "$version"
+if [[ "$mode" == "mint" ]]; then
+  elixir -r "$repo_root/scripts/release/package_identity.exs" \
+    -e 'Replicant.PackageIdentity.verify_candidate!(hd(System.argv()))' -- "$version"
+else
+  elixir -r "$repo_root/scripts/release/package_identity.exs" \
+    -e 'Replicant.PackageIdentity.verify_build!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2))' -- \
+    "$version" "$commit" "$published_digest"
+fi
 
 build_tree="$(mktemp -d "${TMPDIR:-/tmp}/replicant-package.XXXXXX")"
 witness_ref=""
@@ -158,8 +170,14 @@ witness_oid="$(elixir -r "$repo_root/scripts/release/package_witness.exs" \
 )"
 witness_owned=1
 
-mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" \
-  --artifact "$primary" --receipt "$receipt" --witness-ref "$witness_ref"
+upload_args=(--artifact "$primary" --receipt "$receipt" --witness-ref "$witness_ref")
+if [[ "$mode" == "check" ]]; then
+  upload_args+=(--published-check)
+  if [[ -n "$published_digest" ]]; then
+    upload_args+=(--published-digest "$published_digest")
+  fi
+fi
+mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" "${upload_args[@]}"
 
 mint_complete=1
 

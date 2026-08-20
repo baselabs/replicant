@@ -14,15 +14,32 @@ defmodule Replicant.UploadCandidate do
   def run(argv) do
     {opts, rest, invalid} =
       OptionParser.parse(argv,
-        strict: [publish: :boolean, artifact: :string, receipt: :string, witness_ref: :string]
+        strict: [
+          publish: :boolean,
+          artifact: :string,
+          witness_ref: :string,
+          receipt: :string,
+          published_check: :boolean,
+          published_digest: :string
+        ]
       )
 
     if rest != [] or invalid != [], do: abort("invalid arguments")
 
     publish? = opts[:publish] || false
+    published_check? = opts[:published_check] || false
+    published_digest = opts[:published_digest]
 
-    if publish? and Enum.any?([:artifact, :receipt, :witness_ref], &Keyword.has_key?(opts, &1)) do
+    if publish? and
+         Enum.any?(
+           [:artifact, :receipt, :witness_ref, :published_check, :published_digest],
+           &Keyword.has_key?(opts, &1)
+         ) do
       abort("publish mode does not accept path or witness overrides")
+    end
+
+    if not published_check? and Keyword.has_key?(opts, :published_digest) do
+      abort("published digest requires published-check mode")
     end
 
     version = read_version()
@@ -43,7 +60,14 @@ defmodule Replicant.UploadCandidate do
          {:ok, source_commit} <-
            Replicant.PackageWitness.receipt_source_commit_content(receipt_bytes),
          :ok <- check_metadata(tar_bytes, version),
-         :ok <- check_identity(version, source_commit, publish?) do
+         :ok <-
+           check_identity(
+             version,
+             source_commit,
+             publish?,
+             published_check?,
+             published_digest
+           ) do
       if publish? do
         publish(version, tar_bytes)
       else
@@ -98,10 +122,13 @@ defmodule Replicant.UploadCandidate do
     end
   end
 
-  defp check_identity(version, source_commit, true),
+  defp check_identity(version, source_commit, true, false, nil),
     do: Replicant.PackageIdentity.check_publish(version, source_commit)
 
-  defp check_identity(version, _source_commit, false),
+  defp check_identity(version, source_commit, false, true, published_digest),
+    do: Replicant.PackageIdentity.check_build(version, source_commit, published_digest)
+
+  defp check_identity(version, _source_commit, false, false, nil),
     do: Replicant.PackageIdentity.check_candidate(version)
 
   defp publish(version, tar_bytes) do

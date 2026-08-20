@@ -1,27 +1,30 @@
 defmodule Replicant.ReleaseContractTest do
   # Release identity is a public contract: the package version, the CHANGELOG's cut
-  # release section, and the doc source-ref tag must agree, and the candidate must
-  # supersede the last published version. Drift here is quiet until publication or a
+  # release section, and the doc source-ref tag must agree, and the release must
+  # supersede the preceding version. Drift here is quiet until publication or a
   # downstream resolution, so it is gated in the cold suite (no live substrate needed).
   use ExUnit.Case, async: true
 
   @changelog Path.expand("../../CHANGELOG.md", __DIR__)
   @mixfile Path.expand("../../mix.exs", __DIR__)
+  @workflow Path.expand("../../.github/workflows/ci.yml", __DIR__)
+  @builder Path.expand("../../scripts/release/build_candidate.sh", __DIR__)
+  @uploader Path.expand("../../scripts/release/upload_candidate.exs", __DIR__)
+  @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
 
-  # The last version published to Hex that this candidate supersedes. Bumped as part of
-  # cutting each release; a candidate that fails to advance past it reds here rather than
-  # re-minting an already-published version.
-  @last_published "1.1.0"
+  # The preceding release. Bumped as part of cutting each release; a version that fails
+  # to advance past it reds here rather than re-minting an already-published version.
+  @previous_release "1.1.0"
 
   defp version, do: Mix.Project.config()[:version]
 
-  test "candidate version advances past the last published release" do
-    assert Version.compare(version(), @last_published) == :gt,
-           "mix.exs version #{version()} must be strictly greater than the last published " <>
-             "#{@last_published}; a re-minted published version is a hard stop"
+  test "package version advances past the preceding release" do
+    assert Version.compare(version(), @previous_release) == :gt,
+           "mix.exs version #{version()} must be strictly greater than the preceding " <>
+             "release #{@previous_release}; a re-minted published version is a hard stop"
   end
 
-  test "CHANGELOG cuts a dated release section for the candidate as the newest release" do
+  test "CHANGELOG cuts a dated section for the package version as the newest release" do
     body = File.read!(@changelog)
     v = version()
 
@@ -39,25 +42,25 @@ defmodule Replicant.ReleaseContractTest do
            "the candidate section must be newer than the section beneath it"
   end
 
-  test "candidate changelog has one group for each change type" do
-    [_, after_candidate] =
+  test "current release changelog has one group for each change type" do
+    [_, after_release] =
       File.read!(@changelog) |> String.split("## [#{version()}]", parts: 2)
 
-    [candidate | _] = String.split(after_candidate, ~r/^## \[/m)
+    [release | _] = String.split(after_release, ~r/^## \[/m)
 
-    headings = Regex.scan(~r/^### (.+)$/m, candidate) |> Enum.map(fn [_, heading] -> heading end)
+    headings = Regex.scan(~r/^### (.+)$/m, release) |> Enum.map(fn [_, heading] -> heading end)
 
     assert headings == Enum.uniq(headings),
-           "the candidate changelog repeats a change-type heading: #{inspect(headings)}"
+           "the current release changelog repeats a change-type heading: #{inspect(headings)}"
   end
 
-  test "CHANGELOG comparison links bind the candidate to the last published tag" do
+  test "CHANGELOG comparison links bind the release to the preceding tag" do
     body = File.read!(@changelog)
     v = version()
 
     assert body =~
-             ~r{^\[#{Regex.escape(v)}\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(@last_published)}\.\.\.v#{Regex.escape(v)}$}m,
-           "missing/incorrect `[#{v}]:` comparison link to v#{@last_published}...v#{v}"
+             ~r{^\[#{Regex.escape(v)}\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(@previous_release)}\.\.\.v#{Regex.escape(v)}$}m,
+           "missing/incorrect `[#{v}]:` comparison link to v#{@previous_release}...v#{v}"
 
     assert body =~
              ~r{^\[Unreleased\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(v)}\.\.\.HEAD$}m,
@@ -75,5 +78,26 @@ defmodule Replicant.ReleaseContractTest do
     refute body =~ "mix hex.publish"
     assert body =~ "scripts/release/upload_candidate.exs"
     assert body =~ ~S(git push origin v#{@version})
+  end
+
+  test "post-release package checks fetch tags without weakening mint identity" do
+    workflow = File.read!(@workflow)
+    builder = File.read!(@builder)
+    uploader = File.read!(@uploader)
+    [_, release_job] = String.split(workflow, "  release-artifact:", parts: 2)
+
+    assert release_job =~ "fetch-depth: 0"
+    assert builder =~ "--published-check"
+    assert uploader =~ "Replicant.PackageIdentity.check_candidate(version)"
+
+    assert uploader =~
+             "Replicant.PackageIdentity.check_build(version, source_commit, published_digest)"
+  end
+
+  test "published package digest manifest binds this release" do
+    manifest = File.read!(@published_digests)
+
+    assert manifest =~
+             ~r/^ab4b5820d282c62d548d8cb4c4d80edb8009bb1d3f4929becd571fb454e7d77b  replicant-#{Regex.escape(version())}\.tar$/m
   end
 end

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Post-release package CI now accepts only a coherent published identity.** The throwaway
+  package workflow previously required the current version's tag, GitHub release, and Hex release
+  to be absent, so the first documentation commit after a successful publication made `main` CI
+  fail. Check mode now admits either a wholly free namespace or a fully published local/remote
+  tag plus GitHub and Hex release, with the published tag required to be an ancestor of the
+  checked source. The GitHub target and release state and Hex version, tracked package checksum,
+  and documentation availability must all match. Candidate minting still requires complete
+  absence; partial publication and an unrelated tag remain fail-closed.
+
 ## [1.2.0] - 2026-08-19
 
 ### Added
