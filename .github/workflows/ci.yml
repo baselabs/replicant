@@ -146,33 +146,10 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
 
-      - name: Build and inspect unpacked Hex package
-        run: |
-          package_dir=$(mktemp -d)
-          trap 'rm -rf "$package_dir"' EXIT
-          mix hex.build --unpack --output "$package_dir"
-
-          for required in lib/replicant/session_identity.ex docs/adr/0007-actual-replication-session-identity.md .formatter.exs mix.exs README.md LICENSE NOTICE CHANGELOG.md usage-rules.md; do
-            test -e "$package_dir/$required" || {
-              echo "::error::Missing package path: $required"
-              exit 1
-            }
-          done
-
-          test ! -e "$package_dir/AGENTS.md" || {
-            echo "::error::Package contains the private contributor-agent contract"
-            exit 1
-          }
-
-          if grep -nH 'AGENTS\.md' "$package_dir/README.md" "$package_dir/usage-rules.md" "$package_dir/CONTRIBUTING.md" "$package_dir/notebooks/getting_started.livemd"; then
-            echo "::error::Published documentation references the excluded AGENTS.md contract"
-            exit 1
-          fi
-
-          if find "$package_dir" -type d \( -name test -o -name .forge -o -name _build -o -name superpowers \) -print -quit | grep -q .; then
-            echo "::error::Package contains test, lifecycle, Forge, or build residue"
-            exit 1
-          fi
-
-          grep -q 'handle_session_identity' "$package_dir/lib/replicant/sink.ex"
-          grep -q 'IDENTIFY_SYSTEM' "$package_dir/lib/replicant/query_builder.ex"
+      # Build throwaway bytes from the exact commit and run the complete package workflow without
+      # retaining a candidate: exact manifest, Hex validation, artifact-derived audit/compile/docs,
+      # fresh-consumer provenance + semantic smoke, immutable witness, strict collision checks, and
+      # credential-free exact-byte uploader dry-run. The real candidate is minted once, from merged
+      # main, after this review set and all matrix rows settle.
+      - name: Prove the complete package workflow without minting a candidate
+        run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-19
+
 ### Added
 
 - **Proven support for PostgreSQL 15, 16, 17, and 18, with version-gated capabilities.** The CI
@@ -49,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalidation_reason, synced`), and `classify_slot_status/1` handles the PG15 single-column row
   (`wal_status = 'lost'` is PG15's sole invalidation signal). Proven red-first at the unit level and
   verified against live PostgreSQL 15/16/17/18.
+
+- **An unknown checkpoint with an absent replication slot now halts fail-closed instead of
+  silently creating a fresh slot (data-integrity, fail-closed).** In sink-owned mode a
+  checkpoint read fault (`sink.checkpoint/0` raising or erroring) reads as `checkpoint_lsn 0`
+  with `checkpoint_state: :fault`. The §14.15 streaming fail-open (resume-from-0, the
+  idempotent sink dedups the re-stream) is safe only when the slot is **present** — a resume
+  clamps to the slot's server-side `confirmed_flush_lsn`, so nothing is skipped. With the slot
+  **absent** there is nothing to resume: the connect path previously treated the fault-as-0 as
+  a genuine empty first run and created a fresh `CREATE_REPLICATION_SLOT`, which begins
+  streaming at its own creation LSN and silently skips every transaction between the (unknown)
+  real checkpoint and now — an unrecoverable data gap. That path now halts fail-closed in the
+  `:data_gap` family with a distinct, value-free telemetry reason
+  (`[:replicant, :connection, :slot_invalidated]`, `reason: :checkpoint_unknown`) and never
+  emits `CREATE_REPLICATION_SLOT`, including in incremental-snapshot mode when its separate
+  progress token is empty. A genuinely **empty** checkpoint (`checkpoint_state: :empty` — a real
+  first activation / go-forward) still creates the slot as before. Covered by red-first
+  connect-decision unit tests across plain and incremental modes and a live PostgreSQL fault probe
+  (raising-checkpoint sink, absent slot → structural halt, zero slots created on the server).
 
 ### Security
 
@@ -95,26 +115,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `%{lsn: lsn}`, unique per non-transactional WAL record; `ordinal` is a transactional-message
   field and is absent here) so the replay is a durable no-op, agreeing with `README.md` and
   ADR-0001; the `handle_message/2` docstring states the same.
-
-### Fixed
-
-- **An unknown checkpoint with an absent replication slot now halts fail-closed instead of
-  silently creating a fresh slot (data-integrity, fail-closed).** In sink-owned mode a
-  checkpoint read fault (`sink.checkpoint/0` raising or erroring) reads as `checkpoint_lsn 0`
-  with `checkpoint_state: :fault`. The §14.15 streaming fail-open (resume-from-0, the
-  idempotent sink dedups the re-stream) is safe only when the slot is **present** — a resume
-  clamps to the slot's server-side `confirmed_flush_lsn`, so nothing is skipped. With the slot
-  **absent** there is nothing to resume: the connect path previously treated the fault-as-0 as
-  a genuine empty first run and created a fresh `CREATE_REPLICATION_SLOT`, which begins
-  streaming at its own creation LSN and silently skips every transaction between the (unknown)
-  real checkpoint and now — an unrecoverable data gap. That path now halts fail-closed in the
-  `:data_gap` family with a distinct, value-free telemetry reason
-  (`[:replicant, :connection, :slot_invalidated]`, `reason: :checkpoint_unknown`) and never
-  emits `CREATE_REPLICATION_SLOT`, including in incremental-snapshot mode when its separate
-  progress token is empty. A genuinely **empty** checkpoint (`checkpoint_state: :empty` — a real
-  first activation / go-forward) still creates the slot as before. Covered by red-first
-  connect-decision unit tests across plain and incremental modes and a live PostgreSQL fault probe
-  (raising-checkpoint sink, absent slot → structural halt, zero slots created on the server).
 
 ## [1.1.0] - 2026-08-13
 
@@ -558,7 +558,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/baselabs/replicant/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/baselabs/replicant/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/baselabs/replicant/compare/v0.3.1...v1.0.0
 [0.3.1]: https://github.com/baselabs/replicant/compare/v0.3.0...v0.3.1

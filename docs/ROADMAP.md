@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-13 · **Release:** `v1.1.0` (tagged) · **Branch:** `main`
+**Updated:** 2026-08-19 · **Latest published:** `v1.1.0` (tagged) · **Candidate:** `1.2.0` (built, unpublished) · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,8 +15,14 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.1.0 is published and tagged** `v1.1.0` (a post-1.0 hardening patch —
-  see CHANGELOG `[1.1.0]`; 1.0.0 shipped at `v1.0.0`).
+- **`replicant` 1.1.0 is the latest published release**, tagged `v1.1.0` (a post-1.0
+  hardening patch — see CHANGELOG `[1.1.0]`; 1.0.0 shipped at `v1.0.0`).
+- **`replicant` 1.2.0 is a built, verified release candidate — not yet published or
+  tagged.** It carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed
+  telemetry shapes, logical-message value-safety, the `handle_slot_origin/2` callback,
+  and proven PostgreSQL 15–18 support); see CHANGELOG `[1.2.0]`. Publication and tagging
+  require separate explicit human authorization naming the exact version and artifact
+  digest.
 - **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
   Its current `main` at `197fca18594a4dbb20e57bc065ef78f30133ae5c` now consumes
   Replicant `>= 1.0.0 and < 2.0.0-0`, locks 1.1.0, and independently tests exact
