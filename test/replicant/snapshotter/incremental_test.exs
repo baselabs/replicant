@@ -5,6 +5,19 @@ defmodule Replicant.Snapshotter.IncrementalTest do
   alias Replicant.SnapshotProgress
   alias Replicant.Snapshotter.Incremental, as: Inc
 
+  test "pre-first-chunk reload classifies both sink and store pending markers as fresh discovery" do
+    marker = Replicant.SnapshotProgress.pending_store_token()
+
+    assert :fresh = Inc.classify_durable_progress(:backfill_pending, :sink_owned)
+    assert :fresh = Inc.classify_durable_progress(marker, :lib)
+
+    assert {:error, :snapshot_progress_invalid} =
+             Inc.classify_durable_progress(marker, :sink_owned)
+
+    assert {:error, :snapshot_progress_invalid} =
+             Inc.classify_durable_progress(:backfill_pending, :lib)
+  end
+
   test "parse_pk_rows/3 builds table_refs (full column list + type names) and sorts PK-less tables LAST" do
     pk_rows = [
       ["public", "orders", "public.orders", ["id"], [~s("id")]]

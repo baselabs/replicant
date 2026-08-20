@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-20 · **Latest published:** `v1.2.1` (tagged) · **Candidate:** none · **Branch:** `main`
+**Updated:** 2026-08-20 · **Latest published:** `v1.2.1` (tagged) · **Candidate:** `1.2.2` (unpublished) · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -21,6 +21,9 @@ through later releases:
   carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed telemetry shapes,
   logical-message value-safety, the `handle_slot_origin/2` callback, and proven PostgreSQL
   15–18 support); 1.0.0 shipped at `v1.0.0`.
+- **`replicant` 1.2.2 is the prepared, unpublished patch candidate.** It closes the
+  incremental-backfill restart gap before the first chunk commits by adding an explicit durable
+  pending state and resuming discovery from the live slot origin; see CHANGELOG `[1.2.2]`.
 - **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
   Its current `main` at `3600ebff44cd203a4db720cca1e7446af54fbbf8` consumes
   Replicant `>= 1.0.0 and < 2.0.0-0`, so 1.2.1 is admitted; its committed lock remains

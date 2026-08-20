@@ -93,6 +93,7 @@ defmodule Replicant.Connection do
           | :create_slot
           | :create_export_slot
           | :create_incremental_slot
+          | :read_backfill_origin
           | :read_slot_origin
           | :snapshotting
           | :streaming
@@ -465,10 +466,32 @@ defmodule Replicant.Connection do
         %{step: :create_incremental_slot} = state
       ) do
     floor = Replicant.lsn_from_string(consistent_point)
-    Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
-    Telemetry.event([:replicant, :snapshot, :started], %{}, %{commit_lsn: floor})
-    state = %{state | backfill_floor: floor}
-    start_streaming_with_backfill(state, nil)
+
+    case persist_backfill_pending(state) do
+      :ok ->
+        Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
+        Telemetry.event([:replicant, :snapshot, :started], %{}, %{commit_lsn: floor})
+        state = %{state | backfill_floor: floor}
+        start_streaming_with_backfill(state, nil)
+
+      {:error, _reason} ->
+        halt_snapshot(state, :snapshot_progress_invalid)
+    end
+  end
+
+  def handle_result(
+        [%Postgrex.Result{rows: rows}],
+        %{step: :read_backfill_origin} = state
+      ) do
+    case parse_confirmed_flush(rows) do
+      {:ok, confirmed_flush} ->
+        floor = max(state.checkpoint_lsn, confirmed_flush)
+        Telemetry.event([:replicant, :snapshot, :resumed], %{}, %{slot_name: state.slot_name})
+        start_streaming_with_backfill(%{state | backfill_floor: floor}, nil)
+
+      {:error, _reason} ->
+        halt_snapshot(state, :snapshot_origin_unavailable)
+    end
   end
 
   # A reused (present) logical slot's origin read (R04): PostgreSQL starts at the greater of the
@@ -864,9 +887,14 @@ defmodule Replicant.Connection do
   # Classify a progress-token read for the §8 matrix. A decode failure / store fault
   # classifies as :fault (fail-closed halt :snapshot_progress_invalid) — NEVER :none (which
   # would silently restart the backfill over a possibly-populated mirror = data corruption).
-  @spec classify_progress({:ok, binary() | nil} | {:error, term()}) ::
-          :none | :complete | {:in_flight, Replicant.SnapshotProgress.t()} | :fault
+  @spec classify_progress({:ok, binary() | nil | :backfill_pending} | {:error, term()}) ::
+          :none
+          | :backfill_pending
+          | :complete
+          | {:in_flight, Replicant.SnapshotProgress.t()}
+          | :fault
   def classify_progress({:ok, nil}), do: :none
+  def classify_progress({:ok, :backfill_pending}), do: :backfill_pending
 
   def classify_progress({:ok, token}) when is_binary(token) do
     case Replicant.SnapshotProgress.decode(token) do
@@ -1286,9 +1314,16 @@ defmodule Replicant.Connection do
   # behind a value-free rescue — a raise/throw becomes {:error, :snapshot_progress_read_fault},
   # which classify_progress maps to :fault (fail-closed halt), never :none. `@doc false def` (not
   # `defp`) so the sink-mode value-free boundary is unit-tested directly, like its siblings.
-  @spec read_progress(map()) :: {:ok, binary() | nil} | {:error, term()}
-  def read_progress(%{checkpoint_store: store, slot_name: slot}) when is_list(store),
-    do: Replicant.CheckpointStore.read_progress(Replicant.CheckpointStore.via(slot))
+  @spec read_progress(map()) ::
+          {:ok, binary() | nil | :backfill_pending} | {:error, term()}
+  def read_progress(%{checkpoint_store: store, slot_name: slot}) when is_list(store) do
+    pending = Replicant.SnapshotProgress.pending_store_token()
+
+    case Replicant.CheckpointStore.read_progress(Replicant.CheckpointStore.via(slot)) do
+      {:ok, ^pending} -> {:ok, :backfill_pending}
+      other -> other
+    end
+  end
 
   def read_progress(%{sink: sink}) do
     sink.snapshot_progress()
@@ -1395,7 +1430,7 @@ defmodule Replicant.Connection do
 
   defp begin_absent_slot(%{snapshot: s} = state) when is_list(s) do
     case classify_progress(read_progress(state)) do
-      :none ->
+      classification when classification in [:none, :backfill_pending] ->
         {:ok, sql} = QueryBuilder.create_durable_slot(state.slot_name, state.failover)
         {:query, sql, %{state | step: :create_incremental_slot}}
 
@@ -1462,6 +1497,9 @@ defmodule Replicant.Connection do
         state = %{state | backfill_floor: sp.floor_lsn}
         start_streaming_with_backfill(state, sp)
 
+      :backfill_pending ->
+        read_backfill_origin(state)
+
       :none when state.checkpoint_state == :present ->
         Telemetry.event([:replicant, :connection, :slot_active], %{}, %{})
         start_streaming(state)
@@ -1500,6 +1538,28 @@ defmodule Replicant.Connection do
     Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: reason})
     Replicant.Supervisor.halt(state.slot_name, {:snapshot, reason})
     {:disconnect, reason}
+  end
+
+  # A sink-owned adapter persists its own `:backfill_pending` state before
+  # Replicant creates the slot. Lib mode needs the same durable third state in
+  # its progress table, written after slot creation and before either the reader
+  # or stream can commit. A first real chunk replaces this marker atomically.
+  defp persist_backfill_pending(%{checkpoint_store: store, slot_name: slot})
+       when is_list(store) do
+    Replicant.CheckpointStore.write_progress(
+      Replicant.CheckpointStore.via(slot),
+      Replicant.SnapshotProgress.pending_store_token()
+    )
+  end
+
+  defp persist_backfill_pending(_state), do: :ok
+
+  # Reused incremental slot with an armed backfill but no first chunk token:
+  # read the same effective origin PostgreSQL will stream from, then rediscover
+  # the publication and restart a fresh reader at that floor.
+  defp read_backfill_origin(state) do
+    {:ok, sql} = QueryBuilder.slot_confirmed_flush(state.slot_name)
+    {:query, sql, %{state | step: :read_backfill_origin}}
   end
 
   # ---- R04 slot-origin exposure (go-forward append consumers) ----

@@ -10,9 +10,9 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.2.1 is the latest release published on Hex and tagged `v1.2.1`. It bounds keyed
-> incremental-snapshot contention after three discarded attempts and includes the
-> post-publication package-identity correction (see CHANGELOG `[1.2.1]`).
+> **Status:** 1.2.1 is the latest release published on Hex and tagged `v1.2.1`.
+> 1.2.2 is the prepared, unpublished release candidate; it closes the incremental-backfill
+> crash window before the first chunk commits (see CHANGELOG `[1.2.2]`).
 > Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
@@ -236,6 +236,12 @@ mode gives effect-once chunks, lib mode dup ≤ 1 chunk (never loss). Keyed drop
 the PK-less whole-table fallback both halt `:snapshot_table_contended` after three
 contention-discarded attempts; reconnects do not consume that reader-local budget.
 `snapshot: true` remains the point-in-time option and is untouched.
+
+A sink-owned adapter that durably arms the attempt before the first chunk returns
+`{:ok, :backfill_pending}` from `snapshot_progress/0`. If the process dies after slot creation but
+before a chunk token commits, the restarted pipeline reads the live slot origin and starts a fresh
+reader at the safe floor instead of abandoning the backfill for stream-only delivery. Lib mode
+persists and consumes the equivalent marker internally.
 
 **Lib-owned checkpoint (non-transactional sinks).** Pass a `:checkpoint_store`
 (`[connection: <postgrex opts>, table: "replicant_checkpoints"]`) to flip the pipeline

@@ -31,6 +31,16 @@ defmodule Replicant.ConnectionTest do
     def handle_transaction(_txn), do: {:ok, 0}
   end
 
+  defmodule PendingProgressSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def snapshot_progress, do: {:ok, :backfill_pending}
+    @impl true
+    def handle_snapshot(_rows, _context), do: :ok
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+  end
+
   defmodule IdentitySink do
     @behaviour Replicant.Sink
     @key {__MODULE__, :test_pid}
@@ -792,6 +802,55 @@ defmodule Replicant.ConnectionTest do
                )
 
       assert sql =~ "CREATE_REPLICATION_SLOT"
+    end
+
+    test "an absent slot with pending backfill state still creates the incremental slot" do
+      assert {:query, sql, %{step: :create_incremental_slot}} =
+               Connection.handle_result(
+                 [%Postgrex.Result{rows: []}],
+                 state(
+                   step: :invalidation_check,
+                   checkpoint_lsn: 0,
+                   checkpoint_state: :empty,
+                   snapshot: [mode: :incremental],
+                   sink: PendingProgressSink
+                 )
+               )
+
+      assert sql =~ "CREATE_REPLICATION_SLOT"
+    end
+
+    test "a present slot with pending backfill state reads its origin before restarting the reader" do
+      assert {:query, sql, new_state} =
+               Connection.handle_result(
+                 [%Postgrex.Result{rows: [["reserved", false]]}],
+                 state(
+                   step: :invalidation_check,
+                   checkpoint_lsn: 0x100,
+                   checkpoint_state: :present,
+                   snapshot: [mode: :incremental],
+                   sink: PendingProgressSink
+                 )
+               )
+
+      assert sql =~ "confirmed_flush_lsn"
+      assert new_state.step == :read_backfill_origin
+    end
+
+    test "a missing or malformed pending-backfill origin halts fail-closed" do
+      for rows <- [[], [[nil]], [[""]], [["not-an-lsn"]], [["0/1", "extra"]]] do
+        assert {:disconnect, :snapshot_origin_unavailable} =
+                 Connection.handle_result(
+                   [%Postgrex.Result{rows: rows}],
+                   state(
+                     step: :read_backfill_origin,
+                     checkpoint_lsn: 0x100,
+                     checkpoint_state: :present,
+                     snapshot: [mode: :incremental],
+                     sink: PendingProgressSink
+                   )
+                 )
+      end
     end
 
     test "a valid slot streams from the durable checkpoint LSN" do
@@ -1900,6 +1959,9 @@ defmodule Replicant.ConnectionTest do
                )
 
       assert :none = Replicant.Connection.classify_progress({:ok, nil})
+
+      assert :backfill_pending =
+               Replicant.Connection.classify_progress({:ok, :backfill_pending})
 
       assert :fault =
                Replicant.Connection.classify_progress(

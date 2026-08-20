@@ -12,6 +12,7 @@ defmodule Replicant.SnapshotProgress do
   """
 
   @version 1
+  @pending_store_token "replicant:backfill-pending:1"
 
   @type table_ref :: %{
           schema: String.t(),
@@ -31,6 +32,16 @@ defmodule Replicant.SnapshotProgress do
         }
 
   defstruct floor_lsn: 0, pending: [], current: nil, bound: nil, done: [], complete?: false
+
+  @doc false
+  @spec pending_store_token() :: String.t()
+  def pending_store_token, do: @pending_store_token
+
+  @doc false
+  @spec pending?(term()) :: boolean()
+  def pending?(:backfill_pending), do: true
+  def pending?(@pending_store_token), do: true
+  def pending?(_other), do: false
 
   @doc "A fresh token over the discovered publication tables (spec §6.2)."
   @spec new([table_ref()], Replicant.lsn()) :: t()

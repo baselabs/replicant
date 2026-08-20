@@ -3,6 +3,13 @@ defmodule Replicant.SnapshotProgressTest do
 
   alias Replicant.SnapshotProgress, as: SP
 
+  test "the armed-before-first-chunk markers are recognized without decoding them as tokens" do
+    assert SP.pending?(:backfill_pending)
+    assert SP.pending?(SP.pending_store_token())
+    refute SP.pending?(nil)
+    refute SP.pending?(SP.encode(SP.new([], 1)))
+  end
+
   defp tables do
     [
       %{

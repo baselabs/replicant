@@ -18,7 +18,7 @@ defmodule Replicant.Sink do
   | `c:sink_kind/0` | no | `:state_mirror` (default) or `:append_log` |
   | `c:handle_snapshot/2` | no | persist a snapshot batch; redo-safe reset on `first_for_table?` |
   | `c:handle_snapshot_complete/1` | no | snapshot handoff commit; persist `checkpoint := snapshot_lsn` |
-  | `c:snapshot_progress/0` | in incremental-snapshot mode | most recent persisted `context.progress` resume token (`nil` = no backfill in progress / never started) |
+  | `c:snapshot_progress/0` | in incremental-snapshot mode | most recent persisted `context.progress` resume token (`nil` = no backfill; `:backfill_pending` = armed before the first chunk) |
 
   Every callback is an `@optional_callback`, so any sink compiles clean under
   `--warnings-as-errors` regardless of which it implements — the behaviour imposes no
@@ -227,12 +227,16 @@ defmodule Replicant.Sink do
 
   @doc """
   Optional (REQUIRED for sink-owned incremental snapshot — `Config` gates on it).
-  Return the most recent `context.progress` token persisted atomically with a chunk
-  (`nil` = no backfill in progress / never started). Read ONCE at pipeline start
-  for resume. A read fault halts fail-closed — the resume decision is not
-  dedup-recoverable (spec §6.1/§8).
+  Return the most recent `context.progress` token persisted atomically with a chunk.
+  `nil` means no backfill is active. `:backfill_pending` means the sink durably
+  armed a backfill but no chunk token has committed yet; on a reused slot Replicant
+  reads the live slot origin and restarts discovery instead of silently selecting
+  stream-only mode. Read at pipeline start and again when a contention/reconnect window
+  requires the reader to reload durable progress. A read fault halts fail-closed — the
+  resume decision is not dedup-recoverable (spec §6.1/§8).
   """
-  @callback snapshot_progress() :: {:ok, binary() | nil} | {:error, term()}
+  @callback snapshot_progress() ::
+              {:ok, binary() | nil | :backfill_pending} | {:error, term()}
 
   @optional_callbacks [
     handle_session_identity: 2,

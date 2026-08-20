@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-08-20
+
+### Fixed
+
+- **Incremental backfills no longer disappear after a crash before the first chunk commits.**
+  Sink-owned adapters may return `{:ok, :backfill_pending}` from `snapshot_progress/0` after
+  durably arming a backfill and before any opaque chunk token exists. Lib mode persists an
+  equivalent private marker immediately after slot creation and before starting either the
+  reader or stream. When a restarted pipeline finds that state with a live slot, Replicant reads
+  the slot's `confirmed_flush_lsn`, chooses the greater of it and the durable checkpoint as the
+  new floor, re-discovers the publication, and resumes the reader instead of incorrectly selecting
+  stream-only mode. The same pending-state classification now covers reader-local contention
+  reloads before the first chunk. Live PostgreSQL crash tests kill the connection synchronously
+  after slot creation but before reader startup in both sink-owned and lib modes, then prove the
+  backfill resumes and converges row-for-row.
+
 ## [1.2.1] - 2026-08-20
 
 ### Fixed
@@ -594,7 +610,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/baselabs/replicant/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/baselabs/replicant/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/baselabs/replicant/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/baselabs/replicant/compare/v1.0.0...v1.1.0

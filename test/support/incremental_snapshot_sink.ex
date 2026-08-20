@@ -190,6 +190,7 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   @impl true
   def snapshot_progress do
     case :ets.lookup(@mirror_table, :progress) do
+      [{:progress, :backfill_pending}] -> {:ok, :backfill_pending}
       [{:progress, token}] -> {:ok, token}
       [] -> {:ok, nil}
     end
@@ -203,6 +204,13 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
     :ets.delete_all_objects(@mirror_table)
     :ets.delete_all_objects(@ledger_table)
     :ets.delete_all_objects(@control_table)
+    :ok
+  end
+
+  @doc "Persists the sink-owned armed-before-first-chunk state used by restart tests."
+  @spec set_backfill_pending() :: :ok
+  def set_backfill_pending do
+    :ets.insert(@mirror_table, {:progress, :backfill_pending})
     :ok
   end
 

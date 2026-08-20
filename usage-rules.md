@@ -89,8 +89,10 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `handle_snapshot/2` (same `first_for_table?` redo-safety obligation; `handle_snapshot_complete/1`
   is NOT used — completion rides a dedicated final `handle_snapshot/2` call). A **sink-owned**
   incremental sink must ALSO implement `snapshot_progress/0` (return the opaque `ctx.progress`
-  token it persisted atomically with each chunk); **lib mode** carries progress in the checkpoint
-  store, so only `handle_snapshot/2` is required. A concurrent write to a backfilling row wins over
+  token it persisted atomically with each chunk, or `:backfill_pending` after durably arming the
+  backfill but before the first chunk); **lib mode** carries progress in the checkpoint store, so
+  only `handle_snapshot/2` is required. A pending restart reads the live slot origin and resumes
+  discovery instead of silently selecting stream-only delivery. A concurrent write to a backfilling row wins over
   its stale chunk row (collision-corrected). Keyed drop-cap contention and PK-less whole-table
   contention both halt `:snapshot_table_contended` after three discarded attempts; reconnects do
   not consume that reader-local budget.

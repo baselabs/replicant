@@ -55,6 +55,91 @@ defmodule Replicant.IncrementalSnapshotTest do
   end
 
   # ---------------------------------------------------------------------------
+  # Restart before the first chunk — the armed/pending lifecycle gap.
+  # ---------------------------------------------------------------------------
+  @tag timeout: 120_000
+  test "slot-created crash before the first chunk resumes the pending backfill instead of abandoning it",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_pending", "incpending_pub", 2_000)
+      IncrementalSnapshotSink.set_backfill_pending()
+
+      test_pid = self()
+      crash_handler = {__MODULE__, :crash_before_reader, make_ref()}
+
+      :telemetry.attach(
+        crash_handler,
+        [:replicant, :connection, :slot_active],
+        fn _event, _measurements, _metadata, _config ->
+          :telemetry.detach(crash_handler)
+          send(test_pid, {:crashed_before_reader, self()})
+          Process.exit(self(), :kill)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(crash_handler) end)
+
+      start_incremental(slot, "incpending_pub", chunk_rows: 100, max_pending_chunks: 2)
+
+      assert_received {:crashed_before_reader, crashed_connection}
+      refute Process.alive?(crashed_connection)
+
+      wait_backfill_complete(8_000)
+      assert chunk_count() > 0
+      wait_converged(ctrl, "inc_pending")
+    end
+  end
+
+  @tag timeout: 120_000
+  test "lib mode persists pending state before the first chunk and resumes after the same crash",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_lib_pending", "inclibpending_pub", 2_000)
+      cp = "cp_" <> String.replace(slot, "-", "_")
+      prog = "prog_" <> String.replace(slot, "-", "_")
+      Postgrex.query!(ctrl, "DROP TABLE IF EXISTS #{cp}", [])
+      Postgrex.query!(ctrl, "DROP TABLE IF EXISTS #{prog}", [])
+
+      test_pid = self()
+      crash_handler = {__MODULE__, :crash_lib_before_reader, make_ref()}
+
+      :telemetry.attach(
+        crash_handler,
+        [:replicant, :connection, :slot_active],
+        fn _event, _measurements, _metadata, _config ->
+          :telemetry.detach(crash_handler)
+          send(test_pid, {:crashed_lib_before_reader, self()})
+          Process.exit(self(), :kill)
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(crash_handler) end)
+
+      start_incremental_lib(
+        slot,
+        "inclibpending_pub",
+        cp,
+        prog,
+        chunk_rows: 100,
+        max_pending_chunks: 2
+      )
+
+      assert_received {:crashed_lib_before_reader, crashed_connection}
+      refute Process.alive?(crashed_connection)
+
+      wait_backfill_complete(8_000)
+
+      assert [[token]] =
+               Postgrex.query!(ctrl, "SELECT token FROM #{prog} WHERE slot_name = $1", [slot]).rows
+
+      assert {:ok, %{complete?: true}} = Replicant.SnapshotProgress.decode(token)
+      wait_converged(ctrl, "inc_lib_pending")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # Test 1 — resume marquee (RED-able), sink-owned effect-once.
   # ---------------------------------------------------------------------------
   @tag timeout: 120_000

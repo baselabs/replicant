@@ -84,7 +84,10 @@ defmodule Replicant do
   from a durable slot while a linked reader backfills in PK-ordered keyset chunks through
   `handle_snapshot/2`, resuming from the last applied chunk after a crash/halt/reconnect
   (sink-owned mode requires `snapshot_progress/0`; lib mode carries progress in the
-  checkpoint store). Both are mutually exclusive with `go_forward_only: true`.
+  checkpoint store). A sink-owned adapter returns `{:ok, :backfill_pending}` after it
+  durably arms a backfill but before the first chunk token exists; Replicant then resumes
+  discovery from the live slot origin after a pre-chunk crash. Both snapshot modes are
+  mutually exclusive with `go_forward_only: true`.
 
   Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` includes
   `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`,

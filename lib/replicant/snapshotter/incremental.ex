@@ -466,12 +466,10 @@ defmodule Replicant.Snapshotter.Incremental do
   defp reload_and_continue(db, args, chunk_rows, standby?, keyed_attempts) do
     sp =
       case read_durable_progress(args) do
-        {:ok, nil} ->
-          discover(db, args)
-
-        {:ok, token} ->
-          case SnapshotProgress.decode(token) do
-            {:ok, decoded} -> reconcile_resume(discover(db, args), decoded)
+        {:ok, progress} ->
+          case classify_durable_progress(progress, args.mode) do
+            :fresh -> discover(db, args)
+            {:resume, decoded} -> reconcile_resume(discover(db, args), decoded)
             {:error, reason} -> throw({:halt, reason})
           end
 
@@ -488,6 +486,27 @@ defmodule Replicant.Snapshotter.Incremental do
     do: Replicant.CheckpointStore.read_progress(Replicant.CheckpointStore.via(args.slot_name))
 
   defp read_durable_progress(%{sink: sink}), do: sink.snapshot_progress()
+
+  @doc false
+  @spec classify_durable_progress(term(), :lib | :sink_owned) ::
+          :fresh | {:resume, SnapshotProgress.t()} | {:error, :snapshot_progress_invalid}
+  def classify_durable_progress(nil, _mode), do: :fresh
+  def classify_durable_progress(:backfill_pending, :sink_owned), do: :fresh
+
+  def classify_durable_progress(progress, :lib) do
+    if progress == SnapshotProgress.pending_store_token(),
+      do: :fresh,
+      else: decode_progress(progress)
+  end
+
+  def classify_durable_progress(progress, :sink_owned), do: decode_progress(progress)
+
+  defp decode_progress(progress) do
+    case SnapshotProgress.decode(progress) do
+      {:ok, decoded} -> {:resume, decoded}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   # Completion (spec §6.3): a dedicated EMPTY final call, at-least-once until :complete
   # is durable — delivered through the same window path (hw = 0 closes immediately). A
