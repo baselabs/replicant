@@ -11,6 +11,7 @@ defmodule Replicant.ReleaseContractTest do
   @builder Path.expand("../../scripts/release/build_candidate.sh", __DIR__)
   @uploader Path.expand("../../scripts/release/upload_candidate.exs", __DIR__)
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
+  @published_digest "14b37f92a5ea54f43a756ee492c41beceae874cd244470d331fa82af64d46285"
 
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
@@ -94,14 +95,10 @@ defmodule Replicant.ReleaseContractTest do
              "Replicant.PackageIdentity.check_build(version, source_commit, published_digest)"
   end
 
-  test "published package digest manifest does not pre-authorize this candidate" do
+  test "published package digest manifest binds this release" do
     manifest = File.read!(@published_digests)
 
-    assert manifest =~
-             "ab4b5820d282c62d548d8cb4c4d80edb8009bb1d3f4929becd571fb454e7d77b  replicant-1.2.0.tar"
-
-    refute manifest =~ ~r/  replicant-#{Regex.escape(version())}\.tar$/m,
-           "the candidate has no published digest until exact retained bytes are uploaded"
+    assert manifest =~ "#{@published_digest}  replicant-#{version()}.tar"
   end
 
   test "publish authorization tests never write retained package evidence" do

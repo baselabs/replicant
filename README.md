@@ -10,10 +10,9 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.2.0 is the latest release published on Hex and HexDocs (tagged `v1.2.0`).
-> 1.2.1 is the prepared, unpublished release candidate; it bounds keyed incremental-snapshot
-> contention after three discarded attempts and includes the post-publication package-identity
-> correction (see CHANGELOG `[1.2.1]`).
+> **Status:** 1.2.1 is the latest release published on Hex and tagged `v1.2.1`. It bounds keyed
+> incremental-snapshot contention after three discarded attempts and includes the
+> post-publication package-identity correction (see CHANGELOG `[1.2.1]`).
 > Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot

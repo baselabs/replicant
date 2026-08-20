@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-20 · **Latest published:** `v1.2.0` (tagged) · **Candidate:** `1.2.1` (unpublished) · **Branch:** `main`
+**Updated:** 2026-08-20 · **Latest published:** `v1.2.1` (tagged) · **Candidate:** none · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,18 +15,17 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.2.0 is the latest published release**, on Hex and HexDocs and tagged
-  `v1.2.0`. It carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed
-  telemetry shapes, logical-message value-safety, the `handle_slot_origin/2` callback,
-  and proven PostgreSQL 15–18 support); see CHANGELOG `[1.2.0]`. Version 1.1.0 remains
-  the preceding post-1.0 hardening release; 1.0.0 shipped at `v1.0.0`.
-- **`replicant` 1.2.1 is the prepared, unpublished patch candidate.** It bounds keyed
-  incremental-snapshot contention after three discarded attempts and carries the
-  post-publication package-identity correction; see CHANGELOG `[1.2.1]`.
+- **`replicant` 1.2.1 is the latest published release**, on Hex and tagged `v1.2.1`. It
+  bounds keyed incremental-snapshot contention after three discarded attempts and carries
+  the post-publication package-identity correction; see CHANGELOG `[1.2.1]`. Version 1.2.0
+  carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed telemetry shapes,
+  logical-message value-safety, the `handle_slot_origin/2` callback, and proven PostgreSQL
+  15–18 support); 1.0.0 shipped at `v1.0.0`.
 - **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
   Its current `main` at `3600ebff44cd203a4db720cca1e7446af54fbbf8` consumes
-  Replicant `>= 1.0.0 and < 2.0.0-0`, so 1.2.0 is admitted; its committed lock remains
-  1.1.0 and its compatibility lanes cover exact 1.0.0 plus the latest compatible release.
+  Replicant `>= 1.0.0 and < 2.0.0-0`, so 1.2.1 is admitted; its committed lock remains
+  1.1.0 and its compatibility lanes cover exact 1.0.0 plus the latest compatible release;
+  the declared range admits 1.2.1.
   AshReplicant's own 1.0 publication
   remains governed by its release roadmap and explicit publish authorization.
 
