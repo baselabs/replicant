@@ -4,7 +4,7 @@ Mix.ensure_application!(:hex)
 
 Code.require_file("package_identity.exs", __DIR__)
 Code.require_file("package_witness.exs", __DIR__)
-Code.require_file("package_checksum.exs", __DIR__)
+Code.require_file("package_publisher.exs", __DIR__)
 
 defmodule Replicant.UploadCandidate do
   @moduledoc false
@@ -100,32 +100,16 @@ defmodule Replicant.UploadCandidate do
     do: Replicant.PackageIdentity.check_candidate(version)
 
   defp publish(version, tar_bytes) do
-    digest = sha256(tar_bytes)
-    expected = "#{version}:#{digest}"
-
-    unless System.get_env("REPLICANT_PUBLISH_AUTHORIZED") == expected do
-      abort("--publish requires exact version:digest authorization for the witnessed artifact")
-    end
-
-    key = System.get_env("HEX_API_KEY") || abort("HEX_API_KEY not set")
-
-    case Hex.API.Release.publish("hexpm", tar_bytes, [key: key], fn _ -> nil end, false) do
-      {:ok, {status, _, _}} when status in 200..299 ->
-        Replicant.PackageChecksum.verify!(version, digest, key)
-
+    case Replicant.PackagePublisher.publish(version, tar_bytes) do
+      {:ok, _digest} ->
         IO.puts(
           "upload_candidate: published replicant #{version}; Hex checksum matches exact witnessed bytes"
         )
 
-      {:ok, {status, _, _}} ->
-        abort("publish failed with HTTP #{status}")
-
-      {:error, _reason} ->
-        abort("publish failed before a successful HTTP response")
+      {:error, message} ->
+        abort(message)
     end
   end
-
-  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 
   defp abort(message) do
     IO.puts(:stderr, "::error::upload_candidate: #{message}")

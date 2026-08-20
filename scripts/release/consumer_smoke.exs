@@ -8,7 +8,7 @@ scratch = System.get_env("SMOKE_SCRATCH") || raise "SMOKE_SCRATCH not set"
 
 path = Replicant |> :code.which() |> to_string()
 
-unless String.starts_with?(path, scratch) do
+unless String.starts_with?(path, scratch <> "/") do
   raise "provenance: Replicant loaded from #{path}, not under scratch #{scratch} — the consumer is not running the extracted artifact"
 end
 

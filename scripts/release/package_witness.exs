@@ -74,26 +74,20 @@ defmodule Replicant.PackageWitness do
   def retain_copies!(source, destinations) do
     bytes = File.read!(source)
 
-    Enum.each(destinations, fn destination ->
+    Enum.reduce(destinations, [], fn destination, created ->
       File.mkdir_p!(Path.dirname(destination))
 
-      case File.open(destination, [:write, :binary, :exclusive]) do
-        {:ok, io} ->
-          try do
-            IO.binwrite(io, bytes)
-          after
-            File.close(io)
-          end
-
-          File.chmod!(destination, 0o444)
-
-        {:error, :eexist} ->
-          raise "refusing to overwrite retained package copy: #{destination}"
-
-        {:error, reason} ->
-          raise "could not retain package copy #{destination}: #{inspect(reason)}"
+      try do
+        retain_copy!(destination, bytes)
+        [destination | created]
+      rescue
+        error ->
+          remove_created(created)
+          reraise error, __STACKTRACE__
       end
     end)
+
+    :ok
   end
 
   def receipt_source_commit(receipt_path) do
@@ -152,6 +146,38 @@ defmodule Replicant.PackageWitness do
       end
     after
       File.rm_rf!(scratch)
+    end
+  end
+
+  defp remove_created(paths) do
+    Enum.each(paths, fn path ->
+      File.chmod(path, 0o600)
+      File.rm(path)
+    end)
+  end
+
+  defp retain_copy!(destination, bytes) do
+    case File.open(destination, [:write, :binary, :exclusive]) do
+      {:ok, io} ->
+        try do
+          try do
+            :ok = IO.binwrite(io, bytes)
+          after
+            File.close(io)
+          end
+
+          File.chmod!(destination, 0o444)
+        rescue
+          error ->
+            remove_created([destination])
+            reraise error, __STACKTRACE__
+        end
+
+      {:error, :eexist} ->
+        raise "refusing to overwrite retained package copy: #{destination}"
+
+      {:error, reason} ->
+        raise "could not retain package copy #{destination}: #{inspect(reason)}"
     end
   end
 

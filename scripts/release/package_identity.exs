@@ -113,6 +113,10 @@ defmodule Replicant.PackageIdentity do
     args = [
       "--silent",
       "--show-error",
+      "--connect-timeout",
+      "10",
+      "--max-time",
+      "30",
       "--output",
       "/dev/null",
       "--write-out",
@@ -135,10 +139,26 @@ defmodule Replicant.PackageIdentity do
     end
   end
 
-  defp run(command, args) do
+  @doc false
+  def run(command, args, timeout_ms \\ 30_000) do
     case System.find_executable(command) do
-      nil -> {"required command unavailable", 127}
-      executable -> System.cmd(executable, args, cd: @repo_root, stderr_to_stdout: true)
+      nil ->
+        {"required command unavailable", 127}
+
+      executable ->
+        task =
+          Task.async(fn ->
+            System.cmd(executable, args, cd: @repo_root, stderr_to_stdout: true)
+          end)
+
+        case Task.yield(task, timeout_ms) do
+          {:ok, result} ->
+            result
+
+          nil ->
+            Task.shutdown(task, :brutal_kill)
+            {"command timed out", 124}
+        end
     end
   end
 

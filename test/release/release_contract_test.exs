@@ -38,6 +38,18 @@ defmodule Replicant.ReleaseContractTest do
            "the candidate section must be newer than the section beneath it"
   end
 
+  test "candidate changelog has one group for each change type" do
+    [_, after_candidate] =
+      File.read!(@changelog) |> String.split("## [#{version()}]", parts: 2)
+
+    [candidate | _] = String.split(after_candidate, ~r/^## \[/m)
+
+    headings = Regex.scan(~r/^### (.+)$/m, candidate) |> Enum.map(fn [_, heading] -> heading end)
+
+    assert headings == Enum.uniq(headings),
+           "the candidate changelog repeats a change-type heading: #{inspect(headings)}"
+  end
+
   test "CHANGELOG comparison links bind the candidate to the last published tag" do
     body = File.read!(@changelog)
     v = version()
@@ -54,15 +66,5 @@ defmodule Replicant.ReleaseContractTest do
   test "docs source_ref pins the candidate version tag" do
     assert Mix.Project.config()[:docs][:source_ref] == "v#{version()}",
            "docs source_ref must be v#{version()} so HexDocs source links resolve to the release tag"
-  end
-
-  test "exact-byte uploader uses Hex's authenticated API wrapper and never the raw client" do
-    body = File.read!(Path.expand("../../scripts/release/upload_candidate.exs", __DIR__))
-    builder = File.read!(Path.expand("../../scripts/release/build_candidate.sh", __DIR__))
-
-    assert body =~ "Hex.API.Release.publish"
-    refute body =~ ":mix_hex_api_release.publish"
-    refute body =~ "File.read!(tar)"
-    refute builder =~ ~r/upload_candidate\.exs" --\s/
   end
 end

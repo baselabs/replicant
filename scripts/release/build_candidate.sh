@@ -42,11 +42,40 @@ elixir -r "$repo_root/scripts/release/package_identity.exs" \
 
 build_tree="$(mktemp -d "${TMPDIR:-/tmp}/replicant-package.XXXXXX")"
 witness_ref=""
+primary=""
+by_digest=""
+backup=""
+receipt=""
+artifacts_retained=0
+receipt_retained=0
+witness_owned=0
+mint_complete=0
 cleanup() {
+  status=$?
+  trap - EXIT
+
   if [[ "$mode" == "check" && -n "$witness_ref" ]]; then
     git update-ref -d "$witness_ref" >/dev/null 2>&1 || true
+  elif [[ "$mode" == "mint" && $mint_complete -eq 0 ]]; then
+    if [[ $witness_owned -eq 1 ]]; then
+      git update-ref -d "$witness_ref" >/dev/null 2>&1 || true
+    fi
+
+    if [[ $receipt_retained -eq 1 ]]; then
+      chmod u+w "$receipt" >/dev/null 2>&1 || true
+      rm -f -- "$receipt"
+    fi
+
+    if [[ $artifacts_retained -eq 1 ]]; then
+      for target in "$primary" "$by_digest" "$backup"; do
+        chmod u+w "$target" >/dev/null 2>&1 || true
+        rm -f -- "$target"
+      done
+    fi
   fi
+
   rm -rf "$build_tree"
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -85,10 +114,6 @@ if git show-ref --verify --quiet "$witness_ref"; then
   die "package witness already exists: $witness_ref"
 fi
 
-elixir -r "$repo_root/scripts/release/package_witness.exs" \
-  -e 'Replicant.PackageWitness.retain_copies!(hd(System.argv()), tl(System.argv()))' -- \
-  "$staged_tar" "$primary" "$by_digest" "$backup"
-
 receipt_tmp="$build_tree/receipt.txt"
 {
   echo "Replicant package candidate receipt"
@@ -109,18 +134,27 @@ receipt_tmp="$build_tree/receipt.txt"
 
 elixir -r "$repo_root/scripts/release/package_witness.exs" \
   -e 'Replicant.PackageWitness.retain_copies!(hd(System.argv()), tl(System.argv()))' -- \
+  "$staged_tar" "$primary" "$by_digest" "$backup"
+artifacts_retained=1
+
+elixir -r "$repo_root/scripts/release/package_witness.exs" \
+  -e 'Replicant.PackageWitness.retain_copies!(hd(System.argv()), tl(System.argv()))' -- \
   "$receipt_tmp" "$receipt"
+receipt_retained=1
 
 elixir -r "$repo_root/scripts/release/package_witness.exs" \
   -e 'Replicant.PackageWitness.verify_copies!(tl(System.argv()), hd(System.argv()))' -- \
   "$digest" "$primary" "$by_digest" "$backup"
 
+witness_owned=1
 elixir -r "$repo_root/scripts/release/package_witness.exs" \
   -e 'Replicant.PackageWitness.create!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2), Enum.at(System.argv(), 3))' -- \
   "$repo_root" "$witness_ref" "$commit" "$receipt"
 
 mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" \
   --artifact "$primary" --receipt "$receipt" --witness-ref "$witness_ref"
+
+mint_complete=1
 
 if [[ "$mode" == "check" ]]; then
   log "CHECK PASS — throwaway package built, audited, documented, consumed, and uploader dry-run verified"

@@ -17,6 +17,9 @@ defmodule Replicant.PackageIdentityTest do
         {"", 2}
 
       "curl", args when is_list(args) ->
+        assert "--connect-timeout" in args
+        assert "--max-time" in args
+
         assert List.last(args) in [
                  "https://api.github.com/repos/baselabs/replicant/releases/tags/v1.2.0",
                  "https://hex.pm/api/packages/replicant/releases/1.2.0"
@@ -72,5 +75,14 @@ defmodule Replicant.PackageIdentityTest do
 
     assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
     assert message =~ "remote tag v1.2.0 resolves to"
+  end
+
+  test "command execution has a hard deadline" do
+    started = System.monotonic_time(:millisecond)
+
+    assert {"command timed out", 124} =
+             PackageIdentity.run("sh", ["-c", "sleep 1"], 25)
+
+    assert System.monotonic_time(:millisecond) - started < 500
   end
 end

@@ -13,17 +13,17 @@ defmodule Replicant.PackageWitnessTest do
       )
 
     File.mkdir_p!(root)
-    System.cmd("git", ["init", "-q"], cd: root)
-    System.cmd("git", ["config", "user.email", "test@example.invalid"], cd: root)
-    System.cmd("git", ["config", "user.name", "Replicant Test"], cd: root)
+    git!(root, ["init", "-q"])
+    git!(root, ["config", "user.email", "test@example.invalid"])
+    git!(root, ["config", "user.name", "Replicant Test"])
 
     File.write!(Path.join(root, "source"), "one\n")
-    System.cmd("git", ["add", "source"], cd: root)
-    System.cmd("git", ["commit", "-q", "-m", "one"], cd: root)
+    git!(root, ["add", "source"])
+    git!(root, ["commit", "-q", "-m", "one"])
     first = git!(root, ["rev-parse", "HEAD"])
 
     File.write!(Path.join(root, "source"), "two\n")
-    System.cmd("git", ["commit", "-q", "-am", "two"], cd: root)
+    git!(root, ["commit", "-q", "-am", "two"])
     second = git!(root, ["rev-parse", "HEAD"])
 
     artifact = Path.join(root, "artifact.tar")
@@ -67,6 +67,31 @@ defmodule Replicant.PackageWitnessTest do
 
     assert message =~ "retained copy digest mismatch"
     assert message =~ backup
+  end
+
+  test "retained copies refuse to overwrite an existing destination", ctx do
+    fresh = Path.join(ctx.root, "fresh.tar")
+    destination = Path.join(ctx.root, "retained.tar")
+    File.write!(destination, "existing")
+
+    assert_raise RuntimeError, ~r/refusing to overwrite retained package copy/, fn ->
+      PackageWitness.retain_copies!(ctx.artifact, [fresh, destination])
+    end
+
+    refute File.exists?(fresh)
+    assert File.read!(destination) == "existing"
+  end
+
+  test "witness creation rejects a receipt for a different source commit", ctx do
+    File.write!(ctx.receipt, receipt_body(ctx.second, ctx.digest))
+
+    assert {:error, "receipt source commit does not match witness parent"} =
+             PackageWitness.create(
+               ctx.root,
+               "refs/attestations/packages/replicant/1.2.0",
+               ctx.first,
+               ctx.receipt
+             )
   end
 
   test "uploader inputs must be read-only regular files, never symlinks", ctx do

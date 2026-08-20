@@ -13,11 +13,22 @@ File.rm_rf!(dest)
 File.mkdir_p!(dest)
 
 case :mix_hex_tarball.unpack(bin, String.to_charlist(dest)) do
-  {:ok, meta} ->
-    checksum = meta |> Map.get(:outer_checksum, "") |> Base.encode16(case: :lower)
-    IO.puts("unpack_validated: OK — Hex checksum validated, extracted to #{dest} (outer_checksum #{checksum})")
+  {:ok, %{outer_checksum: checksum}} when is_binary(checksum) and byte_size(checksum) > 0 ->
+    encoded = Base.encode16(checksum, case: :lower)
+
+    IO.puts(
+      "unpack_validated: OK — Hex checksum validated, extracted to #{dest} (outer_checksum #{encoded})"
+    )
+
+  {:ok, _meta} ->
+    IO.puts(:stderr, "::error::unpack_validated: Hex validation returned no outer checksum")
+    System.halt(1)
 
   {:error, reason} ->
-    IO.puts(:stderr, "::error::unpack_validated: Hex checksum validation FAILED: #{inspect(reason)}")
+    IO.puts(
+      :stderr,
+      "::error::unpack_validated: Hex checksum validation FAILED: #{inspect(reason)}"
+    )
+
     System.halt(1)
 end
