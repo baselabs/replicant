@@ -3,6 +3,7 @@ defmodule Replicant.PublishCandidateTest do
 
   @repo_root Path.expand("../..", __DIR__)
   @script Path.join(@repo_root, "scripts/release/publish_candidate.sh")
+  @loader Path.join(@repo_root, "scripts/release/credential_loader.sh")
 
   test "wrapper rejects wrong authorization before reading the project credential" do
     {output, status} =
@@ -35,5 +36,24 @@ defmodule Replicant.PublishCandidateTest do
 
     assert status == 1
     assert output =~ "publish mode does not accept path or witness overrides"
+  end
+
+  test "credential loader replaces an inherited key from a file without a final newline" do
+    env_file =
+      Path.join(System.tmp_dir!(), "replicant-credential-#{System.unique_integer([:positive])}")
+
+    File.write!(env_file, "HEX_API_KEY=file-key", [:binary])
+    on_exit(fn -> File.rm(env_file) end)
+
+    command = ~S'''
+      source "$1"
+      export HEX_API_KEY=ambient-key
+      replicant_load_hex_api_key "$2"
+      test "$HEX_API_KEY" = file-key
+    '''
+
+    {_output, status} = System.cmd("bash", ["-c", command, "bash", @loader, env_file])
+
+    assert status == 0
   end
 end

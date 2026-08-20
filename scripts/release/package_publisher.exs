@@ -34,6 +34,7 @@ defmodule Replicant.PackagePublisher do
       {:ok, {status, _, _}} when status in 200..299 ->
         case apply(checksum, :verify!, [version, digest]) do
           :ok -> {:ok, digest}
+          {:error, message} when is_binary(message) -> {:error, message}
           _ -> {:error, "published release checksum verification failed"}
         end
 

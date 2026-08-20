@@ -23,6 +23,10 @@ defmodule Replicant.PackagePublisherTest do
     def publish(_repository, _bytes, _auth, _progress, false), do: {:error, :closed}
   end
 
+  defmodule MismatchChecksum do
+    def verify!("1.2.0", _digest), do: {:error, "published checksum mismatch"}
+  end
+
   test "publishes the exact authorized bytes through the public Hex wrapper and verifies checksum" do
     bytes = "exact witnessed package bytes"
     digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
@@ -87,5 +91,22 @@ defmodule Replicant.PackagePublisherTest do
 
     assert message =~ "may have accepted"
     assert message =~ "before retry"
+  end
+
+  test "a confirmed checksum mismatch is reported as definite and never invites retry" do
+    bytes = "exact witnessed package bytes"
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    env = fn
+      "REPLICANT_PUBLISH_AUTHORIZED" -> "1.2.0:#{digest}"
+      "HEX_API_KEY" -> "test-key"
+    end
+
+    assert {:error, "published checksum mismatch"} =
+             PackagePublisher.publish("1.2.0", bytes,
+               env: env,
+               release_api: ReleaseAPI,
+               checksum: MismatchChecksum
+             )
   end
 end
