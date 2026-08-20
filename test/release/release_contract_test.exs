@@ -58,8 +58,10 @@ defmodule Replicant.ReleaseContractTest do
 
   test "exact-byte uploader uses Hex's authenticated API wrapper and never the raw client" do
     body = File.read!(Path.expand("../../scripts/release/upload_candidate.exs", __DIR__))
+    builder = File.read!(Path.expand("../../scripts/release/build_candidate.sh", __DIR__))
 
     assert body =~ "Hex.API.Release.publish"
     refute body =~ ":mix_hex_api_release.publish"
+    refute builder =~ ~r/upload_candidate\.exs" --\s/
   end
 end

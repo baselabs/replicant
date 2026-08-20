@@ -119,7 +119,7 @@ elixir -r "$repo_root/scripts/release/package_witness.exs" \
   -e 'Replicant.PackageWitness.create!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2), Enum.at(System.argv(), 3))' -- \
   "$repo_root" "$witness_ref" "$commit" "$receipt"
 
-mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" -- \
+mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" \
   --artifact "$primary" --receipt "$receipt" --witness-ref "$witness_ref"
 
 if [[ "$mode" == "check" ]]; then
