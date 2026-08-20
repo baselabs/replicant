@@ -10,17 +10,26 @@ defmodule Replicant.PackageWitness do
 
     with :ok <- receipt_commit_matches(receipt, source_commit),
          :ok <- commit_exists(repo, source_commit),
-         {:ok, witness} <- create_commit(repo, source_commit, receipt_path, receipt),
-         :ok <- create_ref(repo, ref, witness),
-         :ok <- verify(repo, ref, nil, receipt_path) do
-      :ok
+         {:ok, witness} <- create_commit(repo, source_commit, receipt_path, receipt) do
+      create_ref_and_verify(repo, ref, witness, receipt_path)
     end
   end
 
   def create!(repo, ref, source_commit, receipt_path) do
     case create(repo, ref, source_commit, receipt_path) do
-      :ok -> :ok
+      {:ok, witness} -> witness
       {:error, message} -> raise message
+    end
+  end
+
+  @doc false
+  def delete_ref(repo, ref, expected_witness) do
+    case System.cmd("git", ["update-ref", "-d", ref, expected_witness],
+           cd: repo,
+           stderr_to_stdout: true
+         ) do
+      {_, 0} -> :ok
+      {_, _} -> {:error, "package witness moved; refusing cleanup"}
     end
   end
 
@@ -75,9 +84,8 @@ defmodule Replicant.PackageWitness do
     bytes = File.read!(source)
 
     Enum.reduce(destinations, [], fn destination, created ->
-      File.mkdir_p!(Path.dirname(destination))
-
       try do
+        File.mkdir_p!(Path.dirname(destination))
         retain_copy!(destination, bytes)
         [destination | created]
       rescue
@@ -185,6 +193,19 @@ defmodule Replicant.PackageWitness do
     case System.cmd("git", ["update-ref", ref, witness, @zero], cd: repo, stderr_to_stdout: true) do
       {_, 0} -> :ok
       {_, _} -> {:error, "package witness ref already exists or could not be created: #{ref}"}
+    end
+  end
+
+  defp create_ref_and_verify(repo, ref, witness, receipt_path) do
+    with :ok <- create_ref(repo, ref, witness) do
+      case verify(repo, ref, nil, receipt_path) do
+        :ok ->
+          {:ok, witness}
+
+        {:error, _message} = error ->
+          delete_ref(repo, ref, witness)
+          error
+      end
     end
   end
 

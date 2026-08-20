@@ -46,7 +46,7 @@ defmodule Replicant.PackageWitnessTest do
 
   test "witness binds the exact receipt and source commit", ctx do
     ref = "refs/attestations/packages/replicant/1.2.0"
-    assert :ok == PackageWitness.create(ctx.root, ref, ctx.first, ctx.receipt)
+    assert {:ok, _witness} = PackageWitness.create(ctx.root, ref, ctx.first, ctx.receipt)
     assert :ok == PackageWitness.verify(ctx.root, ref, ctx.artifact, ctx.receipt)
 
     File.write!(ctx.receipt, receipt_body(ctx.second, ctx.digest))
@@ -80,6 +80,34 @@ defmodule Replicant.PackageWitnessTest do
 
     refute File.exists?(fresh)
     assert File.read!(destination) == "existing"
+  end
+
+  test "a later destination directory failure removes earlier copies", ctx do
+    fresh = Path.join(ctx.root, "fresh.tar")
+    blocked_parent = Path.join(ctx.root, "blocked-parent")
+    File.write!(blocked_parent, "not a directory")
+
+    assert_raise File.Error, fn ->
+      PackageWitness.retain_copies!(ctx.artifact, [
+        fresh,
+        Path.join(blocked_parent, "retained.tar")
+      ])
+    end
+
+    refute File.exists?(fresh)
+    assert File.read!(blocked_parent) == "not a directory"
+  end
+
+  test "witness deletion requires the exact object still at the ref", ctx do
+    ref = "refs/attestations/packages/replicant/1.2.0"
+    assert {:ok, first_witness} = PackageWitness.create(ctx.root, ref, ctx.first, ctx.receipt)
+
+    git!(ctx.root, ["update-ref", ref, ctx.second, first_witness])
+
+    assert {:error, "package witness moved; refusing cleanup"} =
+             PackageWitness.delete_ref(ctx.root, ref, first_witness)
+
+    assert git!(ctx.root, ["rev-parse", ref]) == ctx.second
   end
 
   test "witness creation rejects a receipt for a different source commit", ctx do

@@ -42,6 +42,7 @@ elixir -r "$repo_root/scripts/release/package_identity.exs" \
 
 build_tree="$(mktemp -d "${TMPDIR:-/tmp}/replicant-package.XXXXXX")"
 witness_ref=""
+witness_oid=""
 primary=""
 by_digest=""
 backup=""
@@ -54,13 +55,11 @@ cleanup() {
   status=$?
   trap - EXIT
 
-  if [[ "$mode" == "check" && -n "$witness_ref" ]]; then
-    git update-ref -d "$witness_ref" >/dev/null 2>&1 || true
-  elif [[ "$mode" == "mint" && $mint_complete -eq 0 ]]; then
-    if [[ $witness_owned -eq 1 ]]; then
-      git update-ref -d "$witness_ref" >/dev/null 2>&1 || true
-    fi
+  if [[ $witness_owned -eq 1 && ( "$mode" == "check" || $mint_complete -eq 0 ) ]]; then
+    git update-ref -d "$witness_ref" "$witness_oid" >/dev/null 2>&1 || true
+  fi
 
+  if [[ "$mode" == "mint" && $mint_complete -eq 0 ]]; then
     if [[ $receipt_retained -eq 1 ]]; then
       chmod u+w "$receipt" >/dev/null 2>&1 || true
       rm -f -- "$receipt"
@@ -146,10 +145,11 @@ elixir -r "$repo_root/scripts/release/package_witness.exs" \
   -e 'Replicant.PackageWitness.verify_copies!(tl(System.argv()), hd(System.argv()))' -- \
   "$digest" "$primary" "$by_digest" "$backup"
 
-witness_owned=1
-elixir -r "$repo_root/scripts/release/package_witness.exs" \
-  -e 'Replicant.PackageWitness.create!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2), Enum.at(System.argv(), 3))' -- \
+witness_oid="$(elixir -r "$repo_root/scripts/release/package_witness.exs" \
+  -e 'IO.puts(Replicant.PackageWitness.create!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2), Enum.at(System.argv(), 3)))' -- \
   "$repo_root" "$witness_ref" "$commit" "$receipt"
+)"
+witness_owned=1
 
 mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" \
   --artifact "$primary" --receipt "$receipt" --witness-ref "$witness_ref"

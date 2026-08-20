@@ -17,8 +17,8 @@ defmodule Replicant.PackageIdentityTest do
         {"", 2}
 
       "curl", args when is_list(args) ->
-        assert "--connect-timeout" in args
-        assert "--max-time" in args
+        assert Enum.chunk_every(args, 2, 1, :discard) |> Enum.member?(["--connect-timeout", "10"])
+        assert Enum.chunk_every(args, 2, 1, :discard) |> Enum.member?(["--max-time", "30"])
 
         assert List.last(args) in [
                  "https://api.github.com/repos/baselabs/replicant/releases/tags/v1.2.0",
