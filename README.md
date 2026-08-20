@@ -233,8 +233,10 @@ consistency-bracketed by read-only LSN watermarks and collision-corrected agains
 stream (a concurrent write to a backfilling row wins; the stale chunk row is dropped). Progress
 is durable per chunk, so a crash, halt, or reconnect **resumes from the last applied chunk**
 rather than restarting. Chunks arrive through the same `handle_snapshot/2` callback; sink-owned
-mode gives effect-once chunks, lib mode dup ≤ 1 chunk (never loss). PK-less tables fall back to a
-bounded whole-table redo. `snapshot: true` remains the point-in-time option and is untouched.
+mode gives effect-once chunks, lib mode dup ≤ 1 chunk (never loss). Keyed drop-cap contention and
+the PK-less whole-table fallback both halt `:snapshot_table_contended` after three
+contention-discarded attempts; reconnects do not consume that reader-local budget.
+`snapshot: true` remains the point-in-time option and is untouched.
 
 **Lib-owned checkpoint (non-transactional sinks).** Pass a `:checkpoint_store`
 (`[connection: <postgrex opts>, table: "replicant_checkpoints"]`) to flip the pipeline

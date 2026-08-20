@@ -13,9 +13,10 @@ defmodule Replicant.Snapshotter.Incremental do
   a dedicated empty final chunk with `complete?: true`, re-delivered until the
   `:complete` token is durable (spec §6.3).
 
-  PK-less tables (spec §6.4): whole-table unit inside one REPEATABLE READ txn,
-  provisional streamed batches; contention ⇒ redo with `first?: true` on the attempt's
-  FIRST batch; 3 attempts ⇒ halt `:snapshot_table_contended`.
+  Contention is reader-local and bounded for both table forms. A keyed drop-cap
+  discard reloads durable progress; a PK-less table redoes its whole REPEATABLE READ
+  unit with `first?: true` on the attempt's FIRST batch. Three contention-discarded
+  attempts halt `:snapshot_table_contended`; reconnect resets never consume the budget.
 
   ## Resume is re-discovered, never token-trusted (Critical Rule 2)
 
@@ -348,7 +349,7 @@ defmodule Replicant.Snapshotter.Incremental do
 
   # ---- the chunk loop ----
 
-  defp loop(db, args, sp, chunk_rows, standby?) do
+  defp loop(db, args, sp, chunk_rows, standby?, keyed_attempts \\ %{}) do
     case SnapshotProgress.next(sp) do
       :complete ->
         deliver_completion(db, args, sp, chunk_rows, standby?)
@@ -357,11 +358,11 @@ defmodule Replicant.Snapshotter.Incremental do
         run_keyless_table(db, args, sp, table, standby?, 1)
 
       {:table, table, bound, sp} ->
-        run_chunk(db, args, sp, table, bound, chunk_rows, standby?)
+        run_chunk(db, args, sp, table, bound, chunk_rows, standby?, keyed_attempts)
     end
   end
 
-  defp run_chunk(db, args, sp, table, bound, chunk_rows, standby?) do
+  defp run_chunk(db, args, sp, table, bound, chunk_rows, standby?, keyed_attempts) do
     fresh_table? = is_nil(bound) and args.resume == nil
 
     # Capture the window GENERATION so the FINAL-chunk barrier below can reject a stale one (a
@@ -425,32 +426,44 @@ defmodule Replicant.Snapshotter.Incremental do
       })
     end
 
-    loop(db, args, sp, chunk_rows, standby?)
+    keyed_attempts =
+      if done?,
+        do: Map.delete(keyed_attempts, table.qualified),
+        else: keyed_attempts
+
+    loop(db, args, sp, chunk_rows, standby?, keyed_attempts)
   catch
-    # A reconnect (:window_reset) OR a keyed drop-cap contention discard (:table_discarded) both
-    # re-read from durable progress: the discarded chunks were never applied (removed while pending),
-    # so re-fetching them is loss-free convergence, never a halt, never an attempt count (spec §4).
+    # Both signals re-read durable progress because discarded chunks were never applied. A reconnect
+    # preserves the keyed contention budget; a contention discard consumes one of the same three
+    # reader-local attempts that bound the PK-less path.
     :window_reset ->
-      reload_and_continue(db, args, chunk_rows, standby?)
+      {:retry, keyed_attempts} =
+        keyed_retry_decision(keyed_attempts, table.qualified, :window_reset)
+
+      reload_and_continue(db, args, chunk_rows, standby?, keyed_attempts)
 
     :table_discarded ->
-      # Emit `:chunk_retried` on the keyed drop-cap-breach re-read — spec §9 defines the event for
-      # BOTH triggers ("drop-set-cap breach / PK-less redo — no silent re-read loops"); the keyless
-      # redo already emits it (run_keyless_table), the keyed breach must too, or a keyed contention
-      # loop is invisible. NOT on :window_reset (a reconnect is not a contention retry, §6.4).
-      Telemetry.event([:replicant, :snapshot, :chunk_retried], %{}, %{
-        table: table.qualified,
-        reason: :snapshot_table_contended
-      })
+      case keyed_retry_decision(keyed_attempts, table.qualified, :table_discarded) do
+        {:retry, keyed_attempts} ->
+          # Emit only when another keyed attempt will actually run. A reconnect does not consume
+          # contention budget and the exhausted third discard emits :failed instead.
+          Telemetry.event([:replicant, :snapshot, :chunk_retried], %{}, %{
+            table: table.qualified,
+            reason: :snapshot_table_contended
+          })
 
-      reload_and_continue(db, args, chunk_rows, standby?)
+          reload_and_continue(db, args, chunk_rows, standby?, keyed_attempts)
+
+        :halt ->
+          halt_contended(args, table)
+      end
   end
 
   # An in-process reconnect reset the window: re-read DURABLE progress, RE-DISCOVER table
   # metadata, and continue — applied chunks are never re-read (monotone forward progress,
   # spec §4). Re-discovery here closes the same token-injection vector as the initial
   # resume (the durable token is equally attacker-writable).
-  defp reload_and_continue(db, args, chunk_rows, standby?) do
+  defp reload_and_continue(db, args, chunk_rows, standby?, keyed_attempts) do
     sp =
       case read_durable_progress(args) do
         {:ok, nil} ->
@@ -466,7 +479,7 @@ defmodule Replicant.Snapshotter.Incremental do
           throw({:halt, :snapshot_failed})
       end
 
-    loop(db, args, sp, chunk_rows, standby?)
+    loop(db, args, sp, chunk_rows, standby?, keyed_attempts)
   catch
     {:halt, reason} -> {:error, reason}
   end
@@ -509,7 +522,7 @@ defmodule Replicant.Snapshotter.Incremental do
 
     :ok
   catch
-    :window_reset -> reload_and_continue(db, args, chunk_rows, standby?)
+    :window_reset -> reload_and_continue(db, args, chunk_rows, standby?, %{})
   end
 
   defp deliver(args, chunk) do
@@ -530,6 +543,21 @@ defmodule Replicant.Snapshotter.Incremental do
   def reset_guard({:ok, _epoch}), do: :ok
   def reset_guard({:error, :window_reset}), do: throw(:window_reset)
   def reset_guard({:error, :table_discarded}), do: throw(:table_discarded)
+
+  @doc false
+  @spec keyed_retry_decision(map(), String.t(), :window_reset | :table_discarded) ::
+          {:retry, map()} | :halt
+  def keyed_retry_decision(attempts, _qualified, :window_reset), do: {:retry, attempts}
+
+  def keyed_retry_decision(attempts, qualified, :table_discarded) do
+    attempt = Map.get(attempts, qualified, 1)
+
+    if attempt >= @max_table_attempts do
+      :halt
+    else
+      {:retry, Map.put(attempts, qualified, attempt + 1)}
+    end
+  end
 
   # Open a KEYLESS table's tracking window and RETURN the window GENERATION (epoch) the reader now
   # operates under — threaded to `finish_snapshot_table/3`'s stale-generation barrier so a reconnect
@@ -555,13 +583,7 @@ defmodule Replicant.Snapshotter.Incremental do
   # halts :snapshot_table_contended (spec §6.4).
   defp run_keyless_table(_db, args, _sp, table, _standby?, attempt)
        when attempt > @max_table_attempts do
-    Telemetry.event([:replicant, :snapshot, :failed], %{}, %{
-      reason: :snapshot_table_contended,
-      table: table.qualified
-    })
-
-    Replicant.Supervisor.halt(args.slot_name, {:snapshot, :snapshot_table_contended})
-    :ok
+    halt_contended(args, table)
   end
 
   defp run_keyless_table(db, args, sp, table, standby?, attempt) do
@@ -635,6 +657,16 @@ defmodule Replicant.Snapshotter.Incremental do
     # spec §6.4). :chunk_retried fires at the top of each attempt > 1.
     :table_discarded -> run_keyless_table(db, args, sp, table, standby?, attempt + 1)
     :window_reset -> run_keyless_table(db, args, sp, table, standby?, attempt)
+  end
+
+  defp halt_contended(args, table) do
+    Telemetry.event([:replicant, :snapshot, :failed], %{}, %{
+      reason: :snapshot_table_contended,
+      table: table.qualified
+    })
+
+    Replicant.Supervisor.halt(args.slot_name, {:snapshot, :snapshot_table_contended})
+    :ok
   end
 
   @doc false

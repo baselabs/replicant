@@ -91,7 +91,9 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   incremental sink must ALSO implement `snapshot_progress/0` (return the opaque `ctx.progress`
   token it persisted atomically with each chunk); **lib mode** carries progress in the checkpoint
   store, so only `handle_snapshot/2` is required. A concurrent write to a backfilling row wins over
-  its stale chunk row (collision-corrected); PK-less tables fall back to a bounded whole-table redo.
+  its stale chunk row (collision-corrected). Keyed drop-cap contention and PK-less whole-table
+  contention both halt `:snapshot_table_contended` after three discarded attempts; reconnects do
+  not consume that reader-local budget.
 - **`Replicant.Decoder`** — `decode/1` wraps the vendored `pgoutput` byte
   parser; catches and redacts any raise into a value-free `Replicant.Error`.
 - **`Replicant.Assembler`** — groups decoded messages into

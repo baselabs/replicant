@@ -352,6 +352,31 @@ defmodule Replicant.IncrementalSnapshotTest do
     end
   end
 
+  @tag timeout: 120_000
+  test "keyed drop-cap contention: three attempts then halt :snapshot_table_contended",
+       %{ctrl: ctrl, slot: slot} do
+    if PG16.enabled?() do
+      setup_int_table(ctrl, "inc_keyed_c", "inckeyedc_pub", 10_000)
+
+      failed = attach_snapshot_failed(slot)
+      retried = attach_snapshot_retried(slot)
+
+      # chunk_rows: 1 makes the keyed drop-set cap 10. Each writer transaction changes 20
+      # distinct primary keys while a window is open, deterministically breaching that cap.
+      start_incremental(slot, "inckeyedc_pub", chunk_rows: 1, max_pending_chunks: 2)
+
+      {writer, go} =
+        start_writer(fn w, n -> update_keyed_band(w, n, "inc_keyed_c", 20) end)
+
+      assert_receive {:snapshot_failed, :snapshot_table_contended}, 60_000
+      assert_receive {:snapshot_retried, "public.inc_keyed_c"}, 5_000
+
+      stop_writer(writer, go)
+      detach(failed)
+      detach(retried)
+    end
+  end
+
   # ---------------------------------------------------------------------------
   # Test 8 (§12.7) — completion is delivered at-least-once until durable.
   # ---------------------------------------------------------------------------
@@ -738,6 +763,10 @@ defmodule Replicant.IncrementalSnapshotTest do
 
   defp update_random_wide(w, n, table, base) do
     Postgrex.query!(w, "UPDATE #{table} SET note=$2 WHERE id=$1", [:rand.uniform(base), "v#{n}"])
+  end
+
+  defp update_keyed_band(w, n, table, width) do
+    Postgrex.query!(w, "UPDATE #{table} SET note=$1 WHERE id BETWEEN 1 AND $2", ["v#{n}", width])
   end
 
   # UPDATE a random row every iteration; DELETE a random row every 4th. A DELETE carries its PK only

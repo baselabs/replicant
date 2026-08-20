@@ -355,6 +355,24 @@ defmodule Replicant.Snapshotter.IncrementalTest do
     assert catch_throw(Inc.reset_guard({:error, :table_discarded})) == :table_discarded
   end
 
+  test "keyed_retry_decision/3 bounds table contention without charging reconnects" do
+    table = "public.orders"
+
+    assert {:retry, %{^table => 2}} =
+             Inc.keyed_retry_decision(%{}, table, :table_discarded)
+
+    assert {:retry, %{^table => 3} = attempts} =
+             Inc.keyed_retry_decision(%{table => 2}, table, :table_discarded)
+
+    assert {:retry, ^attempts} = Inc.keyed_retry_decision(attempts, table, :window_reset)
+    assert :halt = Inc.keyed_retry_decision(attempts, table, :table_discarded)
+
+    # A different table owns an independent budget; the qualified identifier is
+    # structural metadata and no row value enters this state.
+    assert {:retry, %{"public.customers" => 2, ^table => 3}} =
+             Inc.keyed_retry_decision(attempts, "public.customers", :table_discarded)
+  end
+
   test "keyless_batch_progress/1 carries the IN-PROGRESS token, NOT finish_table (data-gap fix)" do
     # A token with ONE in-progress keyless table: current set, no bound, nothing done.
     table = %{

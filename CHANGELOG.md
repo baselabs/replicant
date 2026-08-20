@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Incremental keyed snapshots now halt after bounded contention instead of retrying forever.**
+  A keyed drop-set-cap breach previously emitted `:chunk_retried`, reloaded durable progress, and
+  repeated without an attempt counter; a continuously contended table could therefore keep a
+  pipeline alive forever without durable progress or a terminal signal. Keyed and PK-less tables
+  now share the same three-contention-attempt contract and halt value-free as
+  `:snapshot_table_contended` after exhaustion. Reconnect-driven window resets do not consume the
+  reader-local budget. Covered by a red-first retry-state tripwire and a live PostgreSQL keyed
+  drop-cap exhaustion test.
+
 - **Post-release package CI now accepts only a coherent published identity.** The throwaway
   package workflow previously required the current version's tag, GitHub release, and Hex release
   to be absent, so the first documentation commit after a successful publication made `main` CI
