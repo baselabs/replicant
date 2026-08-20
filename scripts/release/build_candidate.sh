@@ -53,10 +53,14 @@ witness_owned=0
 mint_complete=0
 cleanup() {
   status=$?
+  cleanup_failed=0
   trap - EXIT
 
   if [[ $witness_owned -eq 1 && ( "$mode" == "check" || $mint_complete -eq 0 ) ]]; then
-    git update-ref -d "$witness_ref" "$witness_oid" >/dev/null 2>&1 || true
+    if ! git update-ref -d "$witness_ref" "$witness_oid" >/dev/null 2>&1; then
+      echo "::error::build_candidate: package witness cleanup failed" >&2
+      cleanup_failed=1
+    fi
   fi
 
   if [[ "$mode" == "mint" && $mint_complete -eq 0 ]]; then
@@ -74,6 +78,9 @@ cleanup() {
   fi
 
   rm -rf "$build_tree"
+  if [[ $status -eq 0 && $cleanup_failed -eq 1 ]]; then
+    status=1
+  fi
   exit "$status"
 }
 trap cleanup EXIT

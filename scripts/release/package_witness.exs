@@ -203,8 +203,10 @@ defmodule Replicant.PackageWitness do
           {:ok, witness}
 
         {:error, _message} = error ->
-          delete_ref(repo, ref, witness)
-          error
+          case delete_ref(repo, ref, witness) do
+            :ok -> error
+            {:error, _cleanup} -> {:error, "package witness verification and cleanup failed"}
+          end
       end
     end
   end
