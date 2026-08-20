@@ -6,6 +6,7 @@ defmodule Replicant.ReleaseContractTest do
   use ExUnit.Case, async: true
 
   @changelog Path.expand("../../CHANGELOG.md", __DIR__)
+  @mixfile Path.expand("../../mix.exs", __DIR__)
 
   # The last version published to Hex that this candidate supersedes. Bumped as part of
   # cutting each release; a candidate that fails to advance past it reds here rather than
@@ -66,5 +67,13 @@ defmodule Replicant.ReleaseContractTest do
   test "docs source_ref pins the candidate version tag" do
     assert Mix.Project.config()[:docs][:source_ref] == "v#{version()}",
            "docs source_ref must be v#{version()} so HexDocs source links resolve to the release tag"
+  end
+
+  test "shipped release guidance preserves the witnessed package bytes" do
+    body = File.read!(@mixfile)
+
+    refute body =~ "mix hex.publish"
+    assert body =~ "scripts/release/upload_candidate.exs"
+    assert body =~ ~S(git push origin v#{@version})
   end
 end

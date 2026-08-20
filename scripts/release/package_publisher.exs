@@ -12,18 +12,17 @@ defmodule Replicant.PackagePublisher do
     release_api = Keyword.get(opts, :release_api, Hex.API.Release)
     checksum = Keyword.get(opts, :checksum, Replicant.PackageChecksum)
     authorization = env.("REPLICANT_PUBLISH_AUTHORIZED")
-    key = env.("HEX_API_KEY")
 
-    cond do
-      authorization != expected ->
-        {:error,
-         "--publish requires exact version:digest authorization for the witnessed artifact"}
+    if authorization != expected do
+      {:error, "--publish requires exact version:digest authorization for the witnessed artifact"}
+    else
+      case env.("HEX_API_KEY") do
+        key when key in [nil, ""] ->
+          {:error, "HEX_API_KEY not set"}
 
-      key in [nil, ""] ->
-        {:error, "HEX_API_KEY not set"}
-
-      true ->
-        publish_exact(release_api, checksum, version, tar_bytes, digest, key)
+        key ->
+          publish_exact(release_api, checksum, version, tar_bytes, digest, key)
+      end
     end
   end
 
@@ -33,7 +32,7 @@ defmodule Replicant.PackagePublisher do
 
     case response do
       {:ok, {status, _, _}} when status in 200..299 ->
-        case apply(checksum, :verify!, [version, digest, key]) do
+        case apply(checksum, :verify!, [version, digest]) do
           :ok -> {:ok, digest}
           _ -> {:error, "published release checksum verification failed"}
         end
@@ -42,10 +41,13 @@ defmodule Replicant.PackagePublisher do
         {:error, "publish failed with HTTP #{status}"}
 
       {:error, _reason} ->
-        {:error, "publish failed before a successful HTTP response"}
+        {:error,
+         "publish response was ambiguous; Hex may have accepted the bytes — verify public state before retry"}
     end
   rescue
-    _error -> {:error, "published release checksum verification failed"}
+    _error ->
+      {:error,
+       "publish or checksum verification raised; Hex may have accepted the bytes — verify public state before retry"}
   end
 
   defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)

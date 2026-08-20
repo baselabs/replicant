@@ -8,7 +8,7 @@
 # resolves under the scratch tree. A missing/corrupt packaged file is invisible from the checkout;
 # it is caught here.
 #
-# Usage: consume_candidate.sh [TARBALL] [VERIFICATION_RECEIPT]
+# Usage: consume_candidate.sh [TARBALL] [VERIFICATION_RECEIPT] [EXPECTED_SHA256]
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -18,6 +18,7 @@ die() { echo "::error::consume_candidate: $*" >&2; exit 1; }
 version="$(grep -oE '@version "[^"]+"' "$repo_root/mix.exs" | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
 tarball="${1:-$repo_root/.kimosabe/artifacts/replicant-$version.tar}"
 verification_receipt="${2:-}"
+expected_digest="${3:-}"
 [[ -f "$tarball" ]] || die "candidate tarball not found: $tarball (build it first with build_candidate.sh)"
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/replicant-consume.XXXXXX")"
@@ -31,6 +32,13 @@ sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
   else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
+
+if [[ -n "$expected_digest" ]]; then
+  [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || die "expected digest must be 64 lowercase hex characters"
+  actual_digest="$(sha256_of "$tarball")"
+  [[ "$actual_digest" == "$expected_digest" ]] || \
+    die "candidate digest mismatch: expected $expected_digest, got $actual_digest"
+fi
 
 # --- 1. Hex-checksum-validated unpack of the EXACT retained tar (no rebuild). ----------------
 ( cd "$repo_root" && mix run --no-start scripts/release/unpack_validated.exs "$tarball" "$src" ) >&2

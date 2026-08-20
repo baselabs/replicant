@@ -85,8 +85,10 @@ defmodule Replicant.MixProject do
   defp docs do
     [
       main: "Replicant",
-      # HexDocs source links resolve against the v#{@version} tag, created at the
-      # publish step (git tag v#{@version} && git push --tags before mix hex.publish).
+      # HexDocs source links resolve against the exact v#{@version} tag. Release
+      # publication uses `git push origin v#{@version}` for only that tag, then uploads
+      # the witnessed bytes through scripts/release/upload_candidate.exs; never rebuild
+      # them at publish time.
       source_ref: "v#{@version}",
       source_url: @source_url,
       extras: [

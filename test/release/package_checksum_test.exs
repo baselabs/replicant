@@ -7,6 +7,13 @@ defmodule Replicant.PackageChecksumTest do
 
   @digest String.duplicate("a", 64)
 
+  defmodule ReleaseAPI do
+    def get("hexpm", "replicant", "1.2.0", opts) do
+      send(self(), {:release_get, opts})
+      {:ok, {200, [], %{"checksum" => String.duplicate("a", 64)}}}
+    end
+  end
+
   test "accepts only the exact checksum returned for the published release" do
     assert :ok ==
              PackageChecksum.classify({:ok, {200, [], %{"checksum" => @digest}}}, @digest)
@@ -24,5 +31,16 @@ defmodule Replicant.PackageChecksumTest do
     assert {:error, _} = PackageChecksum.classify({:ok, {200, [], %{}}}, @digest)
     assert {:error, _} = PackageChecksum.classify({:ok, {503, [], %{}}}, @digest)
     assert {:error, _} = PackageChecksum.classify({:error, :timeout}, @digest)
+  end
+
+  test "release checksum verification uses the public unauthenticated endpoint" do
+    assert :ok ==
+             PackageChecksum.verify!("1.2.0", @digest,
+               attempts: 1,
+               release_api: ReleaseAPI,
+               sleeper: fn _ -> flunk("single-attempt verification must not sleep") end
+             )
+
+    assert_received {:release_get, []}
   end
 end

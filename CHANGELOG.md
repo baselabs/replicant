@@ -104,6 +104,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the structural reason atom. No production behavior changed (the boundary already held); each
   assertion is proven non-vacuous by a documented mutation of the exact scrub it guards.
 
+- **Release publication preserves the exact reviewed package bytes and minimizes credential
+  exposure.** The guarded R07 path rejects artifact/receipt/witness overrides in publish mode,
+  validates the exact version-and-digest authorization before reading `HEX_API_KEY`, uploads the
+  immutable candidate without rebuilding, verifies Hex's checksum through the unauthenticated
+  public release endpoint, and requires the refetched tarball to match the witnessed SHA-256
+  before its fresh-consumer smoke. Shipped source guidance names the exact-tag push and guarded
+  uploader rather than the rebuilding `mix hex.publish` task.
+
 ### Changed
 
 - **Retry-guidance for retryable non-transactional messages is reconciled to idempotency, not a

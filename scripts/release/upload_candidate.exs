@@ -19,12 +19,17 @@ defmodule Replicant.UploadCandidate do
 
     if rest != [] or invalid != [], do: abort("invalid arguments")
 
+    publish? = opts[:publish] || false
+
+    if publish? and Enum.any?([:artifact, :receipt, :witness_ref], &Keyword.has_key?(opts, &1)) do
+      abort("publish mode does not accept path or witness overrides")
+    end
+
     version = read_version()
     artifacts = Path.join([@repo_root, ".kimosabe", "artifacts"])
     tar = opts[:artifact] || Path.join(artifacts, "replicant-#{version}.tar")
     receipt = opts[:receipt] || Path.join(artifacts, "replicant-#{version}-receipt.txt")
     witness_ref = opts[:witness_ref] || "refs/attestations/packages/replicant/#{version}"
-    publish? = opts[:publish] || false
 
     with {:ok, tar_bytes} <- Replicant.PackageWitness.read_immutable(tar),
          {:ok, receipt_bytes} <- Replicant.PackageWitness.read_immutable(receipt),

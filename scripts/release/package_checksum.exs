@@ -17,11 +17,15 @@ defmodule Replicant.PackageChecksum do
   def classify({:error, _reason}, _expected),
     do: {:error, "published release checksum read failed"}
 
-  def verify!(version, expected, key, attempts \\ 5) do
+  def verify!(version, expected, opts \\ []) do
+    attempts = Keyword.get(opts, :attempts, 5)
+    release_api = Keyword.get(opts, :release_api, Hex.API.Release)
+    sleeper = Keyword.get(opts, :sleeper, &Process.sleep/1)
+
     result =
       1..attempts
       |> Enum.reduce_while(nil, fn attempt, _last ->
-        response = apply(Hex.API.Release, :get, ["hexpm", "replicant", version, [key: key]])
+        response = apply(release_api, :get, ["hexpm", "replicant", version, []])
 
         case classify(response, expected) do
           :ok ->
@@ -31,7 +35,7 @@ defmodule Replicant.PackageChecksum do
             {:halt, error}
 
           {:error, _} = error ->
-            Process.sleep(1_000)
+            sleeper.(1_000)
             {:cont, error}
         end
       end)

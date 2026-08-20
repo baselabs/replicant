@@ -98,7 +98,7 @@ lock_digest="$(sha256_of "$build_tree/mix.lock")"
 verification="$build_tree/verification.txt"
 
 EXPECTED_VERSION="$version" bash "$repo_root/scripts/release/verify_package.sh" "$staged_tar" >&2
-bash "$repo_root/scripts/release/consume_candidate.sh" "$staged_tar" "$verification" >&2
+bash "$repo_root/scripts/release/consume_candidate.sh" "$staged_tar" "$verification" "$digest" >&2
 
 if [[ "$mode" == "check" ]]; then
   artifacts_dir="$build_tree/artifacts"
