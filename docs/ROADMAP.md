@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-19 · **Latest published:** `v1.1.0` (tagged) · **Candidate:** `1.2.0` (built, unpublished) · **Branch:** `main`
+**Updated:** 2026-08-19 · **Latest published:** `v1.2.0` (tagged) · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,18 +15,16 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.1.0 is the latest published release**, tagged `v1.1.0` (a post-1.0
-  hardening patch — see CHANGELOG `[1.1.0]`; 1.0.0 shipped at `v1.0.0`).
-- **`replicant` 1.2.0 is a built, verified release candidate — not yet published or
-  tagged.** It carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed
+- **`replicant` 1.2.0 is the latest published release**, on Hex and HexDocs and tagged
+  `v1.2.0`. It carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed
   telemetry shapes, logical-message value-safety, the `handle_slot_origin/2` callback,
-  and proven PostgreSQL 15–18 support); see CHANGELOG `[1.2.0]`. Publication and tagging
-  require separate explicit human authorization naming the exact version and artifact
-  digest.
+  and proven PostgreSQL 15–18 support); see CHANGELOG `[1.2.0]`. Version 1.1.0 remains
+  the preceding post-1.0 hardening release; 1.0.0 shipped at `v1.0.0`.
 - **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
-  Its current `main` at `197fca18594a4dbb20e57bc065ef78f30133ae5c` now consumes
-  Replicant `>= 1.0.0 and < 2.0.0-0`, locks 1.1.0, and independently tests exact
-  1.0.0 plus the latest compatible release. AshReplicant's own 1.0 publication
+  Its current `main` at `3600ebff44cd203a4db720cca1e7446af54fbbf8` consumes
+  Replicant `>= 1.0.0 and < 2.0.0-0`, so 1.2.0 is admitted; its committed lock remains
+  1.1.0 and its compatibility lanes cover exact 1.0.0 plus the latest compatible release.
+  AshReplicant's own 1.0 publication
   remains governed by its release roadmap and explicit publish authorization.
 
 ## Sequencing (user directive, 2026-07-05) — ✅ FULLY EXECUTED
@@ -147,7 +145,7 @@ migration); the slug is the slice join key.
 | ID | What | Acceptance | Depends | Why |
 |---|---|---|---|---|
 | D1 | **Stale install constraint** — README + getting-started Livebook ship `{:replicant, "~> 0.2"}`, which resolves `< 0.3.0` and locks users out of every 0.3 feature (and 1.0). slug:d1-install-constraint | `README.md` + `notebooks/getting_started.livemd` show `~> 1.0`; grep finds no `~> 0.2` / `~> 0.1.0` install reference | — | Currency — the most-copied snippet |
-| D2 | **Coordinate the Replicant/AshReplicant major contract** — Replicant 1.0 must expose authoritative actual-session identity before checkpoint lookup, and AshReplicant must not admit a 0.3 install that lacks it. slug:d2-ash-replicant-coord | Replicant's fetched package exposes `SessionIdentity` and `handle_session_identity/2`, the live callback reports system/database identity from the exact replication connection before checkpoint lookup, AshReplicant requires Replicant `>= 1.0.0 and < 2.0.0-0` and tests exact 1.0.0/current 1.1.0/latest compatible; Replicant releases first, while AshReplicant publication remains blocked on its own completed release roadmap and explicit authorization | D1 | Release coordination — a 1.0 that orphans its consumer or permits an unsafe downgrade |
+| D2 | **Coordinate the Replicant/AshReplicant major contract** — Replicant 1.0 must expose authoritative actual-session identity before checkpoint lookup, and AshReplicant must not admit a 0.3 install that lacks it. slug:d2-ash-replicant-coord | Replicant's fetched package exposes `SessionIdentity` and `handle_session_identity/2`, the live callback reports system/database identity from the exact replication connection before checkpoint lookup, AshReplicant requires Replicant `>= 1.0.0 and < 2.0.0-0` and tests exact 1.0.0/its committed lock/latest compatible; Replicant releases first, while AshReplicant publication remains blocked on its own completed release roadmap and explicit authorization | D1 | Release coordination — a 1.0 that orphans its consumer or permits an unsafe downgrade |
 | D3 | **Release hygiene** — toolchain/CI skew, a previously red format gate, an unenforced audit alias, and a vulnerable Postgrex floor cannot ship in 1.0. slug:d3-release-hygiene | `.tool-versions` pins Elixir 1.20.3-otp-29 / Erlang 29.0.3; CI matches it; format, audits, and gate red-probes pass; Postgrex is at least 0.22.4; actions and database images use immutable revisions | — | A red gate and an unpatched dependency cannot ship 1.0 |
 | D4 | **`:batch` type trapdoor** — `Replicant.Config.t` lists `optional(:batch)` but `fetch_batch/3` rejects a top-level `:batch` with `:config_invalid` (it is derived). slug:d4-batch-type-trapdoor | The public type no longer advertises a key the user cannot set; dialyzer + compile clean | — | Freeze the type honestly |
 | D5 | **v1 snapshot casting divergence** — `snapshot: true` runs `SELECT *` and zips raw Postgrex-decoded values (no cast), so a `timestamp` arrives as `NaiveDateTime` from the snapshot and `DateTime` from the stream; the incremental path was fixed (`::text` + `cast_record`) but v1 was never back-ported. slug:d5-snapshot-casting | A red-first convergence test proves a typed column delivers the SAME runtime type from v1 snapshot and the stream; v1 routes values through the shared `Casting.Types.cast_record/2` (or v1 is explicitly deprecated); value-free boundary intact | — | Convergence correctness (Critical Rule 1 boundary preserved) |
@@ -157,7 +155,7 @@ migration); the slug is the slice join key.
 | D9 | **Three vendored public functions unspecced** — `Casting.Types.cast_record/2` (the central casting contract), `Casting.ArrayParser.parse/1`, `Decoder.OidDatabase.name_for_type_id/1`. slug:d9-vendored-specs | All three carry `@spec`; the frozen public surface is fully specced; dialyzer clean | — | Freeze the contract |
 | D10 | **Named-ctrl-conn cascade masked the integration suite** — every integration module started a NAMED Postgrex pool in `setup` and never stopped it; ExUnit's `async: false` one-process model then made test 2+ fail with `{:already_started, _}`, silently masking ~half the suite (the full run was 66/31). Found while verifying D5. slug:d10-named-conn-cascade | `PG16.named_conn/2` centralizes per-test isolation (start unlink + register on_exit stop); all 23 named-pool sites route through it; the full integration suite is 66/0 (was 66/31) | D5 | A masked integration suite is not 1.0-grade correctness evidence |
 
-### Status (2026-08-13 closeout)
+### Status (updated 2026-08-19; 1.0 closeout 2026-08-13)
 
 **All Replicant-side requirements across the ten rows shipped in 1.0.0** (`v1.0.0`):
 D1 (install constraint), D4–D10 closed in the hardening run, and the two 2026-08-13
@@ -167,10 +165,14 @@ ADR-0007) and D3 (release hygiene: `.tool-versions` pins Elixir 1.20.3-otp-29 / 
 CI matches and uses immutable action/image revisions, `mix audit` is a gate, postgrex floors at
 `~> 0.22.4`) — both verified against the fetched package. D2's consumer-side source coordination
 is now complete
-at AshReplicant `197fca18594a4dbb20e57bc065ef78f30133ae5c`: exact 1.0.0, locked 1.1.0,
-and latest-compatible CI all pass; the generated sink rejects actual-session identity drift
+at AshReplicant `3600ebff44cd203a4db720cca1e7446af54fbbf8`: exact 1.0.0 and
+latest-compatible lanes are defined, the committed lock remains 1.1.0, and the broad
+requirement admits 1.2.0; the generated sink rejects actual-session identity drift
 before checkpoint lookup. AshReplicant publication remains a separate release action.
-**1.1.0** (`v1.1.0`) is the current Replicant release and a post-1.0 hardening patch:
+**1.2.0** (`v1.2.0`) is the current Replicant release: it adds the fail-closed
+unknown-checkpoint/absent-slot halt, typed telemetry shapes, logical-message value-safety,
+the `handle_slot_origin/2` callback, and proven PostgreSQL 15–18 support (see CHANGELOG
+`[1.2.0]`). **1.1.0** (`v1.1.0`) remains the preceding post-1.0 hardening patch:
 float-array casting accepts all valid PostgreSQL text forms, post-halt snapshot-window calls
 return `{:error, :window_reset}`, and snapshot reader connection options use library-wins
 merging (see CHANGELOG `[1.1.0]`).
