@@ -6,10 +6,30 @@ defmodule Replicant.PublishCandidateTest do
   @loader Path.join(@repo_root, "scripts/release/credential_loader.sh")
 
   test "wrapper rejects wrong authorization before reading the project credential" do
+    version = Mix.Project.config()[:version]
+
+    receipt =
+      Path.join([@repo_root, ".kimosabe", "artifacts", "replicant-#{version}-receipt.txt"])
+
+    File.mkdir_p!(Path.dirname(receipt))
+
+    created? =
+      case File.open(receipt, [:write, :exclusive]) do
+        {:ok, io} ->
+          IO.binwrite(io, "sha256: #{String.duplicate("0", 64)}\n")
+          File.close(io)
+          true
+
+        {:error, :eexist} ->
+          false
+      end
+
+    if created?, do: on_exit(fn -> File.rm!(receipt) end)
+
     {output, status} =
       System.cmd("bash", [@script],
         cd: @repo_root,
-        env: [{"REPLICANT_PUBLISH_AUTHORIZED", "1.2.0:wrong"}],
+        env: [{"REPLICANT_PUBLISH_AUTHORIZED", "#{version}:wrong"}],
         stderr_to_stdout: true
       )
 

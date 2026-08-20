@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-08-20
+
 ### Fixed
 
 - **Incremental keyed snapshots now halt after bounded contention instead of retrying forever.**
@@ -586,7 +588,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/baselabs/replicant/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/baselabs/replicant/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/baselabs/replicant/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/baselabs/replicant/compare/v0.3.1...v1.0.0

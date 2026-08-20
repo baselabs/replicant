@@ -14,7 +14,7 @@ defmodule Replicant.ReleaseContractTest do
 
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.1.0"
+  @previous_release "1.2.0"
 
   defp version, do: Mix.Project.config()[:version]
 
@@ -94,10 +94,13 @@ defmodule Replicant.ReleaseContractTest do
              "Replicant.PackageIdentity.check_build(version, source_commit, published_digest)"
   end
 
-  test "published package digest manifest binds this release" do
+  test "published package digest manifest does not pre-authorize this candidate" do
     manifest = File.read!(@published_digests)
 
     assert manifest =~
-             ~r/^ab4b5820d282c62d548d8cb4c4d80edb8009bb1d3f4929becd571fb454e7d77b  replicant-#{Regex.escape(version())}\.tar$/m
+             "ab4b5820d282c62d548d8cb4c4d80edb8009bb1d3f4929becd571fb454e7d77b  replicant-1.2.0.tar"
+
+    refute manifest =~ ~r/  replicant-#{Regex.escape(version())}\.tar$/m,
+           "the candidate has no published digest until exact retained bytes are uploaded"
   end
 end
