@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-20 · **Latest published:** `v1.2.2` (tagged) · **Candidate:** none · **Branch:** `main`
+**Updated:** 2026-08-21 · **Latest published:** `v1.2.3` (tagged) · **Candidate:** none · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,20 +15,21 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.2.2 is the latest published release**, on Hex and tagged `v1.2.2`. It
+- **`replicant` 1.2.3 is the latest published release**, on Hex and tagged `v1.2.3`. It
+  keeps append-log acknowledgements bound to the durable delivered checkpoint while preserving
+  filtered-WAL idle advancement for state mirrors; see CHANGELOG `[1.2.3]`. Version 1.2.2
   closes the incremental-backfill restart gap before the first chunk commits by adding an
-  explicit durable pending state and resuming discovery from the live slot origin; see
-  CHANGELOG `[1.2.2]`. Version 1.2.1 bounds keyed incremental-snapshot contention after
+  explicit durable pending state and resuming discovery from the live slot origin. Version
+  1.2.1 bounds keyed incremental-snapshot contention after
   three discarded attempts and carries the post-publication package-identity correction.
   Version 1.2.0
   carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed telemetry shapes,
   logical-message value-safety, the `handle_slot_origin/2` callback, and proven PostgreSQL
   15–18 support); 1.0.0 shipped at `v1.0.0`.
 - **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
-  Its current `main` at `3600ebff44cd203a4db720cca1e7446af54fbbf8` consumes
-  Replicant `>= 1.0.0 and < 2.0.0-0`, so 1.2.2 is admitted; its committed lock remains
-  1.1.0 and its compatibility lanes cover exact 1.0.0 plus the latest compatible release;
-  the declared range admits 1.2.2.
+  Its current `main` at `e4072fb95975c9588914d9aefe99ce1fa0098dfb` consumes
+  Replicant `>= 1.2.2 and < 2.0.0-0`; its committed lock is 1.2.2 and the declared range admits
+  1.2.3. Its compatibility lanes cover the minimum and latest compatible Replicant releases.
   AshReplicant's own 1.0 publication
   remains governed by its release roadmap and explicit publish authorization.
 
@@ -176,11 +177,12 @@ ADR-0007) and D3 (release hygiene: `.tool-versions` pins Elixir 1.20.3-otp-29 / 
 CI matches and uses immutable action/image revisions, `mix audit` is a gate, postgrex floors at
 `~> 0.22.4`) — both verified against the fetched package. D2's consumer-side source coordination
 is now complete
-at AshReplicant `3600ebff44cd203a4db720cca1e7446af54fbbf8`: exact 1.0.0 and
-latest-compatible lanes are defined, the committed lock remains 1.1.0, and the broad
-requirement admits 1.2.2; the generated sink rejects actual-session identity drift
+at AshReplicant `e4072fb95975c9588914d9aefe99ce1fa0098dfb`: minimum and
+latest-compatible lanes are defined, the committed lock is 1.2.2, and the broad
+requirement admits 1.2.3; the generated sink rejects actual-session identity drift
 before checkpoint lookup. AshReplicant publication remains a separate release action.
-**1.2.2** (`v1.2.2`) is the current published Replicant release: it closes the pre-first-chunk
+**1.2.3** (`v1.2.3`) is the current published Replicant release: it keeps append-log
+acknowledgements bound to durable delivery. **1.2.2** (`v1.2.2`) closes the pre-first-chunk
 incremental-backfill restart gap. **1.2.1** (`v1.2.1`) bounds keyed snapshot contention and
 hardens post-publication package identity. **1.2.0** (`v1.2.0`) added the fail-closed
 unknown-checkpoint/absent-slot halt, typed telemetry shapes, logical-message value-safety,
