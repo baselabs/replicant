@@ -83,7 +83,10 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   (`:slot_origin_rejected`) — a veto for an origin that gapped past the consumer's last appended
   LSN, instead of silently skipping WAL. A missing/NULL/malformed database origin halts before the
   callback with `:slot_origin_unavailable`; origin `0` is never fabricated. A sink without the
-  callback is unaffected (no extra query).
+  callback is unaffected (no extra query). An `:append_log` sink does not perform the generic
+  filtered-WAL idle advance, so a reused origin ahead of its checkpoint is a real gap. Publish a
+  normal heartbeat transaction on a quiet append publication to advance the checkpoint and release
+  retained WAL.
 - **Incremental snapshot** (`snapshot: [mode: :incremental]`) — a resumable, chunked backfill
   for large tables, interleaved with the live stream. Chunks arrive through the SAME
   `handle_snapshot/2` (same `first_for_table?` redo-safety obligation; `handle_snapshot_complete/1`
@@ -102,7 +105,8 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `Replicant.Transaction`s by `commit_lsn`.
 - **`Replicant.Connection`** — the `Postgrex.ReplicationConnection` that owns
   the replication slot: actual-session identity before checkpoint lookup,
-  ack-after-checkpoint keepalive replies, async ack,
+  ack-after-checkpoint keepalive replies (state mirrors may idle-advance over
+  filtered WAL; append logs never do), async ack,
   slot-invalidation fail-closed halt, the bounded in-flight window, and the
   replication-command-error watchdog (below).
 - **`Replicant.AssemblerServer`** — the serial process that applies the sink

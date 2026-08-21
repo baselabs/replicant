@@ -4,6 +4,20 @@ defmodule Replicant.IdleAckTest do
 
   alias Replicant.Test.{LedgerSink, PG16}
 
+  defmodule AppendLedgerSink do
+    @moduledoc false
+    @behaviour Replicant.Sink
+
+    @impl true
+    def checkpoint, do: LedgerSink.checkpoint()
+
+    @impl true
+    def handle_transaction(txn), do: LedgerSink.handle_transaction(txn)
+
+    @impl true
+    def sink_kind, do: :append_log
+  end
+
   # Spec A1 §3.1 live marquee: an IDLE keepalive on a busy-but-FILTERED publication
   # advances the slot to `wal_end` so WAL is not pinned indefinitely by a quiet
   # (published-change-free) source. The busy-but-filtered load is 400 INSERTs into an
@@ -107,6 +121,37 @@ defmodule Replicant.IdleAckTest do
     end
   end
 
+  @tag timeout: 120_000
+  test "an append sink retains filtered WAL until a published heartbeat advances its checkpoint",
+       %{
+         ctrl: ctrl,
+         slot: slot
+       } do
+    if PG16.enabled?() do
+      start_pipeline(slot, AppendLedgerSink)
+      insert(ctrl, 1, "a")
+      PG16.wait_until(fn -> count(ctrl, "sink_orders") == 1 end)
+
+      confirmed0 = confirmed_flush(ctrl, slot)
+
+      for i <- 1..400,
+          do: Postgrex.query!(ctrl, "INSERT INTO idle_noise (v) VALUES ($1)", ["n#{i}"])
+
+      Postgrex.query!(ctrl, "SELECT pg_switch_wal()", [])
+      Process.sleep(1_500)
+
+      assert confirmed_flush(ctrl, slot) == confirmed0
+
+      # A normal published transaction is the append slot's heartbeat: it is
+      # delivered durably, then advances the slot through the ordinary commit
+      # acknowledgement path.
+      insert(ctrl, 2, "heartbeat")
+      PG16.wait_until(fn -> count(ctrl, "sink_orders") == 2 end, 400)
+      PG16.wait_until(fn -> confirmed_flush(ctrl, slot) > confirmed0 end, 400)
+      assert confirmed_flush(ctrl, slot) > confirmed0
+    end
+  end
+
   defp reset_schema(c) do
     Postgrex.query!(c, "DROP PUBLICATION IF EXISTS orders_pub", [])
 
@@ -130,7 +175,7 @@ defmodule Replicant.IdleAckTest do
     Postgrex.query!(c, "CREATE PUBLICATION orders_pub FOR TABLE orders", [])
   end
 
-  defp start_pipeline(slot) do
+  defp start_pipeline(slot, sink \\ LedgerSink) do
     :telemetry.attach(
       {__MODULE__, {:active, slot}},
       [:replicant, :connection, :slot_active],
@@ -143,7 +188,7 @@ defmodule Replicant.IdleAckTest do
         connection: PG16.pg_opts(),
         slot_name: slot,
         publication: "orders_pub",
-        sink: LedgerSink,
+        sink: sink,
         go_forward_only: true
       )
 

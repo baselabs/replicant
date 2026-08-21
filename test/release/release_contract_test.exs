@@ -13,8 +13,7 @@ defmodule Replicant.ReleaseContractTest do
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.2.1"
-  @published_digest "cb4bd4d0f2992d67a667b4cc1c366946723e3ea94b0ea06013fc221e8d3e9713"
+  @previous_release "1.2.2"
 
   defp version, do: Mix.Project.config()[:version]
 
@@ -94,11 +93,15 @@ defmodule Replicant.ReleaseContractTest do
              "Replicant.PackageIdentity.check_build(version, source_commit, published_digest)"
   end
 
-  test "published package digest manifest binds the current release bytes" do
+  test "published package digest manifest does not pre-authorize this candidate" do
     manifest = File.read!(@published_digests)
 
     assert manifest =~
-             "#{@published_digest}  replicant-#{version()}.tar"
+             "cb4bd4d0f2992d67a667b4cc1c366946723e3ea94b0ea06013fc221e8d3e9713  " <>
+               "replicant-1.2.2.tar"
+
+    refute manifest =~ ~r/  replicant-#{Regex.escape(version())}\.tar$/m,
+           "the candidate has no published digest until exact retained bytes are uploaded"
   end
 
   test "publish authorization tests never write retained package evidence" do

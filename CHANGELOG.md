@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-08-21
+
+### Fixed
+
+- **Append-log sinks no longer acknowledge filtered WAL beyond their durable checkpoint.**
+  The generic idle keepalive advance made a reused slot's legitimate filtered-WAL advance
+  indistinguishable from an out-of-band `pg_replication_slot_advance`, so an audit append sink
+  could not detect a silent gap on reconnect. `sink_kind: :append_log` now always acknowledges
+  only the durable checkpoint; state-mirror sinks retain the existing idle advance. A quiet append
+  publication on a busy cluster must publish a normal heartbeat transaction to advance its
+  checkpoint and release retained WAL.
+
 ## [1.2.2] - 2026-08-20
 
 ### Fixed
@@ -610,7 +622,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/baselabs/replicant/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/baselabs/replicant/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/baselabs/replicant/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/baselabs/replicant/compare/v1.1.0...v1.2.0

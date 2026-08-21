@@ -115,6 +115,19 @@ defmodule Replicant.ConnectionTest do
     def handle_slot_origin(_origin, _context), do: {:error, {:gap, "must not leak"}}
   end
 
+  defmodule AppendLogSink do
+    @behaviour Replicant.Sink
+
+    @impl true
+    def checkpoint, do: {:ok, 0x100}
+
+    @impl true
+    def handle_transaction(_txn), do: {:ok, 0}
+
+    @impl true
+    def sink_kind, do: :append_log
+  end
+
   defp state(overrides) do
     # The A6 watchdog stores its mutable count and its budget together in ONE struct field
     # (`command_error: %{count, max_retries}`), so accept the two LOGICAL overrides the watchdog
@@ -198,6 +211,35 @@ defmodule Replicant.ConnectionTest do
 
       Connection.handle_data(<<?k, 0x9999::64, 0::64, 1::8>>, st)
       assert_received {:advanced, %{commit_lsn: 0x9999, kind: :idle}}
+    end
+
+    test "an append sink never idle-advances beyond its durable checkpoint" do
+      st =
+        state(
+          sink: AppendLogSink,
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000
+        )
+
+      {:noreply, [ack], new_state} = Connection.handle_data(<<?k, 0x9999::64, 0::64, 1::8>>, st)
+      <<?r, _write::64, flush::64, _apply::64, _clock::64, 0>> = IO.iodata_to_binary(ack)
+      assert flush == 0x1000
+      assert new_state.checkpoint_lsn == 0x1000
+    end
+
+    test "an idle append sink sends nothing when no keepalive reply was requested" do
+      st =
+        state(
+          sink: AppendLogSink,
+          checkpoint_lsn: 0x1000,
+          received_lsn: 0x1000,
+          in_txn: false,
+          last_commit_lsn: 0x1000
+        )
+
+      assert {:noreply, ^st} = Connection.handle_data(<<?k, 0x9999::64, 0::64, 0::8>>, st)
     end
 
     test "IDLE + no reply requested: VOLUNTEERS a status update acking wal_end (A1)" do

@@ -83,6 +83,12 @@ shipped specs' §3 non-goal tables, (C) ecosystem/adoption-layer candidates
 
 ### A. Code-probe gaps (not previously in any spec)
 
+> **Current A1 amendment (2026-08-21):** filtered-WAL idle advance applies only to
+> `:state_mirror` sinks. An `:append_log` sink acknowledges only its durable delivered
+> checkpoint; a quiet append publication uses an ordinary published heartbeat transaction
+> to advance that checkpoint and release retained WAL. The A1 row below is the historical
+> closeout record from before Replicant exposed sink kinds.
+
 | # | Item | Unlocks | Evidence | Status |
 |---|---|---|---|---|
 | A1 | **Idle-slot heartbeat / ack-advance** | Prevents indefinite WAL pinning on a quiet publication in a busy cluster — the #1 real-world logical-replication incident class. Ack `wal_end` on keepalive when zero txns are in flight (safe: filtered WAL carries nothing for the publication); today every keepalive acks the checkpointed LSN unconditionally. Touches the exactly-once ack seam → full brainstorm→spec rigor despite small size. | [connection.ex:6-9](../lib/replicant/connection.ex) ("never the received `wal_end`"); README delegates WAL-lag to ops monitoring | ✅ **CLOSED-OUT 2026-07-11 = 100/100** (`/review-autopilot --fix`, 8 lenses + cross-vendor Codex + fresh-context grader; grader-concurred zero-open). Full lifecycle brainstorm→spec→plan→exec→review, 9 commits `abcf22f..34a208d`; **final battery VERIFIED green: 518 tests/0 failures live PG16, dialyzer 0, credo 1266/0, compile --force --warnings-as-errors + format clean, tree clean**; gate-log `20260711-041642-idle-ack-closeout-fix-34a208d0de`. Idle predicate `not in_txn and open_streams empty and checkpoint_lsn ≥ last_commit_lsn` (transaction-boundary; the approved `received_lsn ≤ checkpoint_lsn` was CAUGHT broken at plan-time — 48-byte tail gap). **Closeout fixed 2 should-fix + spec-doc: CV1/CV2 (`9dd1ec5`) — the single `in_txn` boolean under-counted proto-v2 CONCURRENT + savepoint streamed txns → `open_streams` xid-keyed MapSet (StreamAbort closes only on whole-txn abort); CV1 was a CROSS-VENDOR (Codex) UNIQUE catch, missed by all 5 same-family lenses (not constructible loss — §3.2 commit-boundary backstop — but the primary invariant was wrong). A2 (`34a208d`) idle-advance telemetry tagged `kind: :idle`.** Every task RED-before-GREEN; 3 live marquees each tamper-proven non-vacuous; 0 tier escalations. **Standby marquee UNRUN (no substrate) — named coverage gap (spec §3.5).** |

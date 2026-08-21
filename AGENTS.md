@@ -50,6 +50,11 @@ inherits this effect-once dedup; a **non-transactional** message routes to
 `handle_message/2` and is **at-least-once** (no dedup key, duplicates possible
 on reconnect) — state each guarantee honestly.
 
+An idle state mirror may acknowledge filtered WAL beyond its checkpoint; an
+`append_log` sink must not. The append slot stays at the durable delivered
+frontier so its reconnect origin can expose an out-of-band advance. A normal
+published heartbeat releases WAL for a quiet append publication.
+
 **4. Unchanged TOAST is a sentinel, not a value.** An UPDATE that does not touch
 a TOASTed column sends a sentinel. `%Change{}` surfaces it as a first-class
 `unchanged: [col]` list; the sentinel never appears in `record`. Sinks must

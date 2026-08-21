@@ -10,9 +10,9 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.2.2 is the latest release published on Hex and tagged `v1.2.2`.
-> It closes the incremental-backfill crash window before the first chunk commits
-> (see CHANGELOG `[1.2.2]`).
+> **Status:** 1.2.3 is the latest release published on Hex and tagged `v1.2.3`.
+> It keeps append-log acknowledgements bound to the durable delivered frontier
+> (see CHANGELOG `[1.2.3]`).
 > Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
@@ -79,9 +79,11 @@ lib/checkpoint-store mode, which adds `Replicant.CheckpointStore` as the first c
 - **`Replicant.Connection`** (`Postgrex.ReplicationConnection`) owns the
   replication slot and the socket. It answers a keepalive with the **last
   durably-checkpointed LSN** while a published transaction is in flight (never
-  advancing the slot past un-persisted data); when the pipeline is idle it
+  advancing the slot past un-persisted data). An idle **state-mirror** pipeline
   advances the slot to the server WAL position so a quiet-but-filtered
-  publication does not pin WAL. It decodes each WAL message behind the
+  publication does not pin WAL; an `:append_log` pipeline deliberately retains
+  the durable checkpoint so a reused origin ahead of it remains a detectable
+  gap. It decodes each WAL message behind the
   value-free boundary and forwards it to the assembler — it never runs the sink,
   so it is always free to answer keepalives. It advances the ack asynchronously
   when the sink signals a durable commit, and halts fail-closed on slot
@@ -92,7 +94,8 @@ lib/checkpoint-store mode, which adds `Replicant.CheckpointStore` as the first c
   sink write fault.
 
 Because the ack reports the durable checkpoint while a transaction is in flight
-(advancing over filtered WAL only when idle, which carries no publication data),
+(advancing over filtered WAL only for an idle state mirror, where it carries no
+publication data),
 a crash between dispatch and persist re-delivers from the durable `confirmed_flush`
 and the idempotent sink dedups — the exactly-once seam that `walex`'s
 fire-and-forget `wal_end + 1` ack does not have.
@@ -432,6 +435,12 @@ end
 implement the callback is unaffected: no extra query, unchanged streaming. If PostgreSQL cannot
 supply a valid logical-slot origin, Replicant halts before the callback and streaming with
 `:slot_origin_unavailable`; it never reports a fabricated zero origin.
+
+An `:append_log` sink never uses the filtered-WAL idle advance. This is what
+makes `origin > durable checkpoint` unambiguously an out-of-band gap instead of
+a legitimate keepalive side effect. On a quiet append publication in a busy
+cluster, publish a normal heartbeat transaction (a row or admitted logical
+message) to advance the durable checkpoint and release retained WAL.
 
 ## Development
 

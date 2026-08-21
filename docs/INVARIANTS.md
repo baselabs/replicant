@@ -39,7 +39,11 @@ guarantee is stated **per mode**, never as a naked exactly-once:
   snapshot chunks → at-least-once, duplicate-bounded**: no dedup key, so duplicates are possible on
   reconnect. State this guarantee honestly to your consumers; do not claim effect-once for these.
 
-The slot ack advances only after the sink durably commits (ack-after-checkpoint). (Governing ADR:
+The slot ack advances only after the sink durably commits (ack-after-checkpoint). An idle
+state-mirror may advance over WAL proven to carry no change for its publication; an
+`append_log` sink does not, because preserving `confirmed_flush_lsn <= durable checkpoint`
+is what makes an out-of-band slot advance detectable at its origin callback. A quiet append
+publication uses a normal published heartbeat to release retained WAL. (Governing ADR:
 [0004](adr/0004-commit-lsn-transaction-watermark.md).)
 
 **Sink-side admission for an Ash sink — `ash_onetime`.** The idempotency obligation above is the

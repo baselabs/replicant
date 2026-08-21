@@ -7,9 +7,11 @@ defmodule Replicant.Connection do
       while any published transaction is in flight — never advancing the slot past
       un-persisted publication data (walex's fire-and-forget `wal_end+1` is the
       at-most-once bug this fixes). When IDLE (no open transaction and the checkpoint
-      caught up), it advances the slot to the keepalive `wal_end` so a quiet-but-filtered
-      publication stops pinning WAL (spec A1) — the intervening WAL carries nothing for
-      the publication;
+      caught up), a `:state_mirror` sink advances the slot to the keepalive `wal_end`
+      so a quiet-but-filtered publication stops pinning WAL (spec A1) — the intervening
+      WAL carries nothing for the publication. An `:append_log` sink never performs
+      that filtered-WAL advance: it acknowledges only its durable checkpoint and uses
+      an ordinary published heartbeat transaction to release retained WAL;
     * decodes each XLogData payload behind Plan 1's value-free boundary and forwards
       the decoded message to `Replicant.AssemblerServer` — it never applies the sink,
       so it is always free to answer keepalives;
@@ -589,8 +591,8 @@ defmodule Replicant.Connection do
   end
 
   # Primary keepalive (spec A1 §3.1): forward the frontier in incremental mode, then dispatch to
-  # keepalive_ack/3 — idle-advance the slot to wal_end, else reply with the durable checkpoint
-  # (never the received wal_end).
+  # keepalive_ack/3 — idle-advance a state mirror to wal_end, while an append log and every
+  # non-idle sink reply only with the durable checkpoint (never the received wal_end).
   def handle_data(<<?k, wal_end::64, _clock::64, reply::8>>, state) do
     # Whenever the pipeline is in incremental MODE (incremental?/1 stays true for the whole
     # pipeline lifetime, not only during an active backfill), forward the keepalive frontier so
@@ -719,15 +721,16 @@ defmodule Replicant.Connection do
     <<?r, lsn::64, lsn::64, lsn::64, clock::64, 0>>
   end
 
-  # On a keepalive: when IDLE (no open transaction AND every received commit durable) and the
-  # server WAL end is ahead of our durable checkpoint, advance the slot to `wal_end` (spec A1
-  # §3.1). The intervening WAL is provably empty for this publication (idle ⟹ no in-flight
-  # published change), so this releases WAL pinned on a quiet publication WITHOUT ever acking
-  # past un-persisted publication data. Fires regardless of the reply-request flag so a
-  # busy-but-filtered source releases WAL promptly. When NOT idle, behavior is unchanged:
-  # reply==1 acks the durable checkpoint, reply==0 sends nothing.
+  # On a keepalive: when a STATE MIRROR is IDLE (no open transaction AND every received commit
+  # durable) and the server WAL end is ahead of our durable checkpoint, advance the slot to
+  # `wal_end` (spec A1 §3.1). The intervening WAL is provably empty for this publication
+  # (idle ⟹ no in-flight published change), so this releases WAL pinned on a quiet publication
+  # WITHOUT ever acking past un-persisted publication data. Append logs deliberately skip this
+  # optimization: only a delivered append/heartbeat may advance their durable checkpoint. When
+  # not eligible, reply==1 acks the durable checkpoint and reply==0 sends nothing.
   defp keepalive_ack(wal_end, reply, state) do
-    if idle?(state) and wal_end > state.checkpoint_lsn do
+    if idle?(state) and wal_end > state.checkpoint_lsn and
+         Replicant.Sink.sink_kind(state.sink) != :append_log do
       if reply == 1 do
         # `kind: :idle` distinguishes an idle WAL-skip advance (over filtered WAL, `commit_lsn` is
         # the acked wal_end, not a committed txn) from a durable-commit advance (which omits `kind`).
