@@ -269,6 +269,32 @@ jobs:
           [ "$touched" = "1" ] \
             || { echo "::error::unchanged-TOAST update lost the payload or the note"; docker compose logs pipeline; exit 1; }
 
+      - name: Restart resume — zero duplicate effects
+        # The durability proof: restart the pipeline mid-life, deliver a NEW
+        # transaction, and assert it lands while the receipts for prior rows
+        # are unchanged — the durable checkpoint made the resume effect-once
+        # (a re-delivery would double the receipt count).
+        run: |
+          before=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            -tAc "SELECT count(*) FROM cdc_receipts")
+          docker compose restart pipeline
+          docker compose exec -T source-pg psql -U postgres -d example_src \
+            -c "INSERT INTO orders (id, note) VALUES (3, 'after restart')"
+          resumed=""
+          for _ in $(seq 1 30); do
+            resumed=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+              -tAc "SELECT count(*) FROM orders WHERE id = 3 AND note = 'after restart'" 2>/dev/null)
+            [ "$resumed" = "1" ] && break
+            sleep 2
+          done
+          [ "$resumed" = "1" ] \
+            || { echo "::error::post-restart row never arrived"; docker compose logs pipeline; exit 1; }
+          after=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            -tAc "SELECT count(*) FROM cdc_receipts")
+          expected=$((before + 1))
+          [ "$after" = "$expected" ] \
+            || { echo "::error::expected $expected receipts after resume (had $before), got $after"; docker compose logs pipeline; exit 1; }
+
       - name: Teardown
         if: always()
         run: docker compose down -v --remove-orphans

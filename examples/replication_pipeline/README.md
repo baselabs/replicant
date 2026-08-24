@@ -39,6 +39,21 @@ docker compose exec dest-pg psql -U postgres -d example_dst \
 
 Teardown: `docker compose down -v`.
 
+### Prove the durability
+
+```bash
+docker compose restart pipeline                     # kill/restart mid-life
+docker compose exec source-pg psql -U postgres -d example_src \
+  -e "INSERT INTO orders (id, note) VALUES (3, 'after restart')"
+docker compose exec dest-pg psql -U postgres -d example_dst \
+  -e "SELECT id, note FROM orders ORDER BY id;      -- all rows, ids 1..3
+      SELECT count(*) FROM cdc_receipts;"           -- no re-delivery of prior rows
+```
+
+The durable checkpoint row made that resume gap-free and effect-once: the
+post-restart row arrives, and the receipts for prior transactions are
+unchanged — a re-delivery would have doubled them.
+
 ## What each piece teaches
 
 | Piece | The lesson |
