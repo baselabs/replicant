@@ -11,6 +11,10 @@ defmodule ReplicationPipeline.Application do
 
   @impl true
   def start(_type, _args) do
+    # Attach BEFORE the pipeline starts so an early fail-closed halt is
+    # logged rather than silently tearing the pipeline down.
+    :ok = ReplicationPipeline.TelemetryLog.attach()
+
     children = [
       {Postgrex, dest_opts()},
       # Replicant exposes start_link/1 without a child_spec/1, so the child is

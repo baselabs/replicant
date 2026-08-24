@@ -73,6 +73,17 @@ services:
         condition: service_healthy
       dest-pg:
         condition: service_healthy
+    # A fail-closed halt leaves the BEAM node up (ADR-0006), so "running" is
+    # not "delivering": the rpc liveness check fails (container -> unhealthy
+    # in `docker compose ps`) when the pipeline child is gone. Plain compose
+    # does NOT auto-restart unhealthy services — the operator restarts with
+    # intent, preserving the fail-closed posture.
+    healthcheck:
+      test: ["CMD", "/app/bin/replication_pipeline", "rpc", "ReplicationPipeline.Health.healthy?()"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 20s
     restart: unless-stopped
 
 volumes:
