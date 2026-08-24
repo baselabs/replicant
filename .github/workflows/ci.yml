@@ -208,6 +208,23 @@ jobs:
       - name: Build and start the stack
         run: docker compose up -d --build
 
+      # The pipeline creates its slot a few seconds after boot; an insert
+      # committed BEFORE the slot exists is go-forward-correct but never
+      # streamed (the slot's start point is past it). Gate the first insert
+      # on the slot existing AND being actively streamed — on a layer-cached
+      # build this race is real, and without this gate it is a false red.
+      - name: Wait for the pipeline's slot (created and active)
+        run: |
+          ready=""
+          for _ in $(seq 1 30); do
+            active=$(docker compose exec -T source-pg psql -U postgres -d example_src \
+              -tAc "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'replicant_example' AND active" 2>/dev/null)
+            [ "$active" = "1" ] && ready=1 && break
+            sleep 2
+          done
+          [ "${ready:-0}" = "1" ] \
+            || { echo "::error::pipeline never created/activated its slot"; docker compose logs pipeline; exit 1; }
+
       - name: Assert the substrate is the expected major (PG18)
         run: |
           got=$(docker compose exec -T source-pg psql -U postgres -d example_src \
