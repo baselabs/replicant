@@ -44,6 +44,25 @@ mix audit                         # Dependency + Hex advisory audit
 mix quality
 ```
 
+### The reference example
+
+[`examples/replication_pipeline`](examples/replication_pipeline/README.md) is a
+separate nested Mix project (it path-depends on this library), so it has its
+own gates — run them from its directory:
+
+```bash
+cd examples/replication_pipeline
+mix format --check-formatted && mix compile --warnings-as-errors \
+  && mix credo --strict && mix dialyzer
+docker compose up -d --build       # the full stack (source → pipeline → dest)
+```
+
+CI runs exactly this as the `reference-example` job — the public sink API's
+end-to-end canary — so a change to the sink surface that compiles clean here
+can still red there. The repo-root `.dockerignore` is a whitelist (the
+example's build context is the repo root); extend it only by adding a
+specific `!path`.
+
 4. Update `CHANGELOG.md` under `[Unreleased]`.
 5. Open a Pull Request against `main`.
 

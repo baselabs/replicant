@@ -185,8 +185,10 @@ aware), a value-free receipts ledger, session-identity binding, and a durable
 commit-LSN checkpoint. It is a **go-forward change replicator** — pre-existing
 source rows are not backfilled; `snapshot: true` is the one-flag alternative
 (demonstrated interactively in the Livebook tour above). The `reference-example`
-CI job builds the stack every push and proves delivery, TOAST-sentinel survival,
-and restart-resume with zero duplicate effects — the public sink API's canary.
+CI job runs the example's own static gates (format, compile-warnings, credo,
+dialyzer), then builds the stack every push and proves delivery, TOAST-sentinel
+survival, and restart-resume with zero duplicate effects — the public sink
+API's canary.
 
 ## Usage
 

@@ -25,9 +25,16 @@ cd examples/replication_pipeline
 docker compose up -d --build          # source + destination + pipeline
 ```
 
-First boot is a full OTP-release build — a few minutes. Watch it flow:
+First boot is a full OTP-release build — a few minutes. The pipeline creates
+its replication slot a few seconds after boot; an insert committed BEFORE the
+slot exists is never streamed (go-forward starts at the slot's creation
+point), so confirm the slot is active first:
 
 ```bash
+docker compose exec source-pg psql -U postgres -d example_src \
+  -c "SELECT slot_name, active FROM pg_replication_slots"
+# one row, active = t — ready
+
 # write a row on the source
 docker compose exec source-pg psql -U postgres -d example_src \
   -c "INSERT INTO orders (id, note) VALUES (1, 'hello')"
