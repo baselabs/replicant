@@ -6,6 +6,12 @@ defmodule ReplicationPipeline.Health do
   `:ok` iff a pipeline child is present under `Replicant.Supervisor`; a
   missing child raises, so the rpc (and therefore the compose healthcheck)
   exits non-zero and `docker compose ps` shows the halt.
+
+  The predicate is PRESENCE, not progress: every halt path that matters
+  removes the child, but a present-yet-stalled pipeline (e.g. a reconnect
+  loop against an unreachable source, which the library retries forever by
+  design) still reports healthy. Delivery lag is a metrics question
+  (`[:replicant, :checkpoint, :advanced]`), not a liveness one.
   """
 
   @spec healthy?() :: :ok

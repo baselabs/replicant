@@ -48,7 +48,7 @@ defmodule ReplicationPipeline.Sink do
            []
          ) do
       {:ok, %Postgrex.Result{rows: []}} ->
-        bind_identity!(identity)
+        bind_identity(identity)
 
       {:ok, %Postgrex.Result{rows: [[stored_id, stored_db]]}} ->
         if stored_id == identity.system_identifier and stored_db == identity.database do
@@ -62,7 +62,7 @@ defmodule ReplicationPipeline.Sink do
     end
   end
 
-  defp bind_identity!(identity) do
+  defp bind_identity(identity) do
     case Postgrex.query(
            @dest,
            """
@@ -72,7 +72,7 @@ defmodule ReplicationPipeline.Sink do
            """,
            [slot_name(), identity.system_identifier, identity.database]
          ) do
-      {:ok, _result} -> verify_identity!(identity)
+      {:ok, _result} -> verify_identity(identity)
       {:error, _reason} = error -> error
     end
   end
@@ -80,14 +80,16 @@ defmodule ReplicationPipeline.Sink do
   # Bind, then VERIFY: a racing first connect with a different identity wins
   # the INSERT (ours hits DO NOTHING) — re-read and compare so the loser does
   # not silently accept itself.
-  defp verify_identity!(identity) do
+  defp verify_identity(identity) do
     case Postgrex.query(
            @dest,
            "SELECT system_identifier, database FROM pipeline_checkpoint WHERE id = 1",
            []
          ) do
       {:ok, %Postgrex.Result{rows: [[stored_id, stored_db]]}} ->
-        identity_matches?(stored_id, stored_db, identity)
+        if identity_matches?(stored_id, stored_db, identity),
+          do: :ok,
+          else: {:error, :session_identity_rejected}
 
       {:error, _reason} = error ->
         error
@@ -95,9 +97,7 @@ defmodule ReplicationPipeline.Sink do
   end
 
   defp identity_matches?(stored_id, stored_db, identity) do
-    if stored_id == identity.system_identifier and stored_db == identity.database,
-      do: :ok,
-      else: {:error, :session_identity_rejected}
+    stored_id == identity.system_identifier and stored_db == identity.database
   end
 
   @impl true

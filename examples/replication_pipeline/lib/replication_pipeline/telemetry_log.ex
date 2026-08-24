@@ -1,9 +1,15 @@
 defmodule ReplicationPipeline.TelemetryLog do
   @moduledoc """
-  Value-free telemetry logger on replicant's ACTUAL halt-signal and lifecycle
-  events (the allowlisted metadata is structural — LSNs, names, counts,
-  reason classes; never a row value, Critical Rule 1). Attached before the
-  pipeline starts so an early halt is still visible.
+  Value-free telemetry logger on replicant's halt-signal and lifecycle events
+  (the allowlisted metadata is structural — LSNs, names, counts, reason
+  classes; never a row value, Critical Rule 1). Attached before the pipeline
+  starts so an early halt is still visible.
+
+  The halt-signal list is COMPLETE ACROSS CONFIGURATIONS — every event the
+  library emits on a fail-closed halt path — so a copy of this logger into a
+  snapshot-enabled or spill-enabled pipeline misses nothing. Some signals
+  cannot fire under THIS example's configuration (no lib checkpoint store, no
+  snapshot, no spill): they are listed anyway for the copy-paste path.
   """
 
   require Logger
@@ -15,7 +21,8 @@ defmodule ReplicationPipeline.TelemetryLog do
     [:replicant, :checkpoint_store, :failed],
     [:replicant, :schema_change, :halted],
     [:replicant, :stream, :spill_exhausted],
-    [:replicant, :sink, :failed]
+    [:replicant, :sink, :failed],
+    [:replicant, :snapshot, :failed]
   ]
 
   @lifecycle [

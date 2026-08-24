@@ -77,7 +77,9 @@ services:
     # not "delivering": the rpc liveness check fails (container -> unhealthy
     # in `docker compose ps`) when the pipeline child is gone. Plain compose
     # does NOT auto-restart unhealthy services — the operator restarts with
-    # intent, preserving the fail-closed posture.
+    # intent, preserving the fail-closed posture. Known tradeoff: each probe
+    # boots a short-lived peer VM (rpc), so keep the interval modest and the
+    # timeout generous relative to peer-boot cost on a loaded host.
     healthcheck:
       test: ["CMD", "/app/bin/replication_pipeline", "rpc", "ReplicationPipeline.Health.healthy?()"]
       interval: 10s

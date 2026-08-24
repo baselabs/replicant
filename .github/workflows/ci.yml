@@ -185,11 +185,13 @@ jobs:
       - name: Cache example deps and build
         uses: actions/cache@caa296126883cff596d87d893582f9db880ef25 # v5
         with:
+          # The example sets no dialyzer plt_local_path — its PLTs land under
+          # _build/dev, so caching _build covers them.
           path: |
             examples/replication_pipeline/deps
             examples/replication_pipeline/_build
-            examples/replication_pipeline/priv/plts
           key: example-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('examples/replication_pipeline/mix.lock') }}
+          restore-keys: example-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       # Static gates for the example project: the "sink API canary" catches
       # static contract drift too — a wrong callback shape or type is red here
