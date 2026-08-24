@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-21 · **Latest published:** `v1.2.3` (tagged) · **Candidate:** none · **Branch:** `main`
+**Updated:** 2026-08-24 · **Latest published:** `v1.2.4` (tagged) · **Candidate:** none · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,7 +15,12 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.2.3 is the latest published release**, on Hex and tagged `v1.2.3`. It
+- **`replicant` 1.2.4 is the latest published release**, on Hex and tagged `v1.2.4`. It
+  is a docs/examples release with no library API change: the docker-compose reference
+  example (`examples/replication_pipeline` — a Postgres→Postgres bridge with an effect-once
+  sink, receipts ledger, session-identity binding, and liveness healthcheck) plus its
+  `reference-example` CI canary, with the examples' READMEs shipped in the Hex package;
+  see CHANGELOG `[1.2.4]`. Version 1.2.3
   keeps append-log acknowledgements bound to the durable delivered checkpoint while preserving
   filtered-WAL idle advancement for state mirrors; see CHANGELOG `[1.2.3]`. Version 1.2.2
   closes the incremental-backfill restart gap before the first chunk commits by adding an
