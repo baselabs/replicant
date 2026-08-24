@@ -175,6 +175,19 @@ is executed against live PostgreSQL 15/16/17/18 on every CI run
 (`test/integration/livebook_getting_started_test.exs`), so it never drifts from the
 library.
 
+## Reference example (docker)
+
+[`examples/replication_pipeline`](examples/replication_pipeline/README.md) is the deployment
+shape consumers actually build, as one `docker compose up`: a Postgres source
+(`wal_level=logical` + publication) → replicant as an OTP release in one container
+→ a Postgres destination, with an idempotent upsert-by-PK replica (unchanged-TOAST
+aware), a value-free receipts ledger, session-identity binding, and a durable
+commit-LSN checkpoint. It is a **go-forward change replicator** — pre-existing
+source rows are not backfilled; `snapshot: true` is the one-flag alternative
+(demonstrated interactively in the Livebook tour above). The `reference-example`
+CI job builds the stack every push and proves delivery, TOAST-sentinel survival,
+and restart-resume with zero duplicate effects — the public sink API's canary.
+
 ## Usage
 
 Start a pipeline against a standby with `Replicant.start_link/1`, pointing it at

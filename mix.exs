@@ -72,7 +72,7 @@ defmodule Replicant.MixProject do
     [
       maintainers: ["rjpalermo"],
       files:
-        ~w(lib notebooks docs/INVARIANTS.md docs/ROADMAP.md docs/adr .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md),
+        ~w(lib notebooks docs/INVARIANTS.md docs/ROADMAP.md docs/adr .formatter.exs mix.exs README* LICENSE* CHANGELOG* NOTICE usage-rules.md CONTRIBUTING.md examples/README.md examples/replication_pipeline/README.md),
       licenses: ["MIT"],
       links: %{
         "GitHub" => @source_url,
@@ -104,6 +104,8 @@ defmodule Replicant.MixProject do
         "docs/adr/0006-fail-closed-supervision.md",
         "docs/adr/0007-actual-replication-session-identity.md",
         "notebooks/getting_started.livemd",
+        "examples/README.md",
+        "examples/replication_pipeline/README.md",
         "usage-rules.md",
         "CHANGELOG.md",
         "CONTRIBUTING.md",
@@ -122,7 +124,12 @@ defmodule Replicant.MixProject do
           "docs/adr/0006-fail-closed-supervision.md",
           "docs/adr/0007-actual-replication-session-identity.md"
         ],
-        Guides: ["notebooks/getting_started.livemd", "usage-rules.md"],
+        Guides: [
+          "notebooks/getting_started.livemd",
+          "examples/README.md",
+          "examples/replication_pipeline/README.md",
+          "usage-rules.md"
+        ],
         Project: ["CONTRIBUTING.md", "LICENSE", "NOTICE", "docs/ROADMAP.md"]
       ],
       groups_for_modules: [

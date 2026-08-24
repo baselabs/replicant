@@ -121,6 +121,14 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
 - **PG17+ failover tests** (`test/integration/pg17_failover_test.exs`, tagged `:pg17`): run
   against a PG17 or PG18 server; auto-excluded (skipped, never vacuously passed) when the
   server is < 17.
+- **Reference example** (`examples/replication_pipeline`, CI job `reference-example`): a
+  docker-compose stack (source PG18 → replicant OTP release container → dest PG18) that is
+  the public sink API's canary — the job runs the example's own static gates (format,
+  compile-warnings, credo --strict, dialyzer) then builds the stack and proves delivery,
+  TOAST-sentinel survival, and restart-resume with zero duplicate effects. The repo-root
+  `.dockerignore` is a WHITELIST (containment, not size): the build context is the repo
+  root, so anything not explicitly allowed — `.env`, crash dumps, lifecycle artifacts —
+  must never ride it; extend it only by adding a specific `!path`.
 - **TDD:** write the test first.
 
 ## Docs & lifecycle-artifact policy
@@ -128,7 +136,9 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
 - **Tracked repository-only:** `AGENTS.md` (the contributor/agent contract; excluded from Hex).
 - **Tracked and Hex-published:** `README.md`, `CHANGELOG.md`,
   `CONTRIBUTING.md`, `usage-rules.md`, `LICENSE`, `NOTICE`, `docs/INVARIANTS.md`,
-  `docs/ROADMAP.md`, and accepted decisions under `docs/adr/`.
+  `docs/ROADMAP.md`, accepted decisions under `docs/adr/`, and the examples'
+  READMEs (`examples/README.md`, `examples/replication_pipeline/README.md`).
+  The example CODE under `examples/` is tracked repository-only.
 - **Never tracked:** all brainstorm specs, plans, exec notes, reviews, and
   handoffs under `docs/superpowers/`, which is gitignored. Do not move those
   lifecycle artifacts into tracked documentation paths.
