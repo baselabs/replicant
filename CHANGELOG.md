@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/replication_pipeline` — a runnable docker-compose reference stack** (source
+  Postgres 18, digest-pinned → replicant as an OTP release in one container → destination
+  Postgres 18): an idempotent upsert-by-PK replica with unchanged-TOAST-aware updates and a
+  durable commit-LSN checkpoint, started go-forward-only. A new `reference-example` CI job
+  builds the stack each push and proves insert, TOAST-sentinel survival, and checkpoint
+  advance — the public sink API's end-to-end canary. The repo root gained a whitelist
+  `.dockerignore` so the example's repo-root build context cannot carry secrets, crash dumps,
+  or untracked artifacts.
+
 ## [1.2.3] - 2026-08-21
 
 ### Fixed

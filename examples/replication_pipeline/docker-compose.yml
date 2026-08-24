@@ -1,0 +1,74 @@
+# The reference stack: Postgres source → replicant pipeline (one OTP release,
+# one container) → Postgres destination, with a durable commit-LSN checkpoint.
+# Throwaway local-example values throughout; ports bind to 127.0.0.1 ONLY.
+#
+#   docker compose up -d --build     # source + destination + pipeline
+#   docker compose logs -f pipeline  # watch it stream
+#   docker compose down -v           # teardown + wipe volumes
+#
+# Images are digest-pinned (the same digests the library's CI matrix pins) — a
+# moved tag cannot silently change the tested substrate.
+
+name: replicant-example
+
+services:
+  source-pg:
+    image: postgres:18@sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941
+    # wal_level=logical is the load-bearing flag (a `services:` block in CI
+    # cannot pass it); max_wal_senders/max_replication_slots mirror AGENTS.md.
+    command:
+      ["-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: example_src
+    volumes:
+      - ./docker/source-init:/docker-entrypoint-initdb.d:ro
+    # TCP-forced pg_isready: the socket form answers "accepting connections"
+    # during the entrypoint's init-SQL phase (its temp server is socket-only),
+    # so only -h 127.0.0.1 proves the init scripts finished and the real
+    # server is listening — probe-verified 2026-08-24 against postgres:18.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    ports:
+      - "127.0.0.1:15432:5432"
+
+  dest-pg:
+    image: postgres:18@sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+      POSTGRES_DB: example_dst
+    volumes:
+      - ./priv/schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+    ports:
+      - "127.0.0.1:15433:5432"
+
+  pipeline:
+    # Path dep on replicant: the build context is the repo root.
+    build:
+      context: ../..
+      dockerfile: examples/replication_pipeline/Dockerfile
+    environment:
+      SOURCE_HOST: source-pg
+      SOURCE_PORT: "5432"
+      SOURCE_USER: replicant_reader
+      SOURCE_DB: example_src
+      DEST_HOST: dest-pg
+      DEST_PORT: "5432"
+      DEST_USER: postgres
+      DEST_DB: example_dst
+      REPLICANT_SLOT_NAME: replicant_example
+      REPLICANT_PUBLICATION: example_pub
+    depends_on:
+      source-pg:
+        condition: service_healthy
+      dest-pg:
+        condition: service_healthy
+    restart: unless-stopped

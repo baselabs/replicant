@@ -1,0 +1,152 @@
+defmodule ReplicationPipeline.Sink do
+  @moduledoc """
+  The example's transactional sink: the orders replica and the commit-LSN
+  watermark are written in ONE destination transaction (effect-once, Critical
+  Rule 3 — the `commit_lsn <= checkpoint` skip below IS the dedup; duplicates
+  cannot reach this code twice for the same transaction).
+
+  Delivery is at-least-once; the watermark skip + PK upsert make the EFFECTS
+  exactly-once.
+
+  Record values arrive ALREADY TYPED — the Assembler casts tuple data through
+  `Replicant.Casting.Types.cast_record/2` (int4 → integer, timestamptz →
+  DateTime, text → binary), so they pass to Postgrex as parameters unchanged.
+  """
+
+  @behaviour Replicant.Sink
+
+  @dest ReplicationPipeline.Dest
+
+  # Column knowledge for the one published table. The sink knows its
+  # destination schema; this list IS that knowledge.
+  @orders_columns ["id", "note", "payload", "updated_at"]
+  @orders_pk ["id"]
+
+  @impl true
+  def checkpoint do
+    case Postgrex.query(@dest, "SELECT commit_lsn FROM pipeline_checkpoint WHERE id = 1", []) do
+      {:ok, %Postgrex.Result{rows: [[lsn]]}} -> {:ok, lsn}
+      {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @impl true
+  def handle_transaction(%Replicant.Transaction{commit_lsn: lsn} = txn) do
+    case Postgrex.transaction(@dest, fn conn ->
+           watermark = lock_watermark!(conn)
+
+           if lsn <= watermark do
+             {:skip, watermark}
+           else
+             Enum.each(txn.changes, &apply_change!(conn, &1))
+             put_watermark!(conn, lsn)
+             {:committed, lsn}
+           end
+         end) do
+      {:ok, {:skip, watermark}} -> {:ok, watermark}
+      {:ok, {:committed, lsn}} -> {:ok, lsn}
+      # Postgrex errors are structural but their DETAIL can echo key values
+      # (e.g. a constraint violation names the key); the library's delivery
+      # boundary scrubs the returned term before any log or telemetry.
+      {:error, %Postgrex.Error{} = error} -> {:error, error}
+      {:error, _other} = error -> error
+    end
+  end
+
+  # Locked FOR UPDATE so concurrent deliveries serialize on the watermark row
+  # once it exists; an absent row (first delivery) locks nothing, which is
+  # safe because the library delivers one transaction at a time per pipeline.
+  defp lock_watermark!(conn) do
+    {:ok, %Postgrex.Result{rows: rows}} =
+      Postgrex.query(
+        conn,
+        "SELECT commit_lsn FROM pipeline_checkpoint WHERE id = 1 FOR UPDATE",
+        []
+      )
+
+    case rows do
+      [[lsn]] -> lsn
+      [] -> 0
+    end
+  end
+
+  defp put_watermark!(conn, lsn) do
+    {:ok, %Postgrex.Result{command: :insert}} =
+      Postgrex.query(
+        conn,
+        """
+        INSERT INTO pipeline_checkpoint (id, slot_name, commit_lsn, updated_at)
+        VALUES (1, $1, $2, now())
+        ON CONFLICT (id) DO UPDATE
+        SET commit_lsn = EXCLUDED.commit_lsn, updated_at = now()
+        """,
+        [slot_name(), lsn]
+      )
+
+    :ok
+  end
+
+  defp apply_change!(conn, %Replicant.Change{table: "orders"} = change) do
+    case change.op do
+      :insert -> upsert!(conn, change)
+      :update -> upsert!(conn, change)
+      :delete -> delete!(conn, change)
+    end
+  end
+
+  # The publication carries only `orders`; anything else is a configuration
+  # drift the example refuses to apply silently.
+  defp apply_change!(_conn, %Replicant.Change{table: table}) do
+    raise ArgumentError, "unexpected table in example publication: #{inspect(table)}"
+  end
+
+  # Upsert by PK. An UPDATE that did not touch a TOASTed column sends a
+  # sentinel that NEVER appears in `record` — the column is absent from BOTH
+  # the SET clause AND the INSERT column list (a `Map.fetch!` on it would
+  # crash), so the destination value survives (Critical Rule 4).
+  defp upsert!(conn, %Replicant.Change{record: record, unchanged: unchanged}) do
+    insert_cols = Enum.reject(@orders_columns, &(&1 in unchanged))
+
+    set_cols = Enum.reject(insert_cols, &(&1 in @orders_pk))
+
+    placeholders = Enum.map_join(1..length(insert_cols), ", ", &"$#{&1}")
+
+    on_conflict =
+      case set_cols do
+        [] ->
+          # Every non-PK column is an unchanged-TOAST sentinel: conflict on the
+          # PK alone and touch nothing.
+          "ON CONFLICT (id) DO NOTHING"
+
+        _ ->
+          "ON CONFLICT (id) DO UPDATE SET " <>
+            Enum.map_join(set_cols, ", ", &"#{&1} = EXCLUDED.#{&1}")
+      end
+
+    sql =
+      "INSERT INTO orders (#{Enum.join(insert_cols, ", ")}) VALUES (#{placeholders}) " <>
+        on_conflict
+
+    params = Enum.map(insert_cols, &Map.fetch!(record, &1))
+
+    {:ok, %Postgrex.Result{command: :insert}} = Postgrex.query(conn, sql, params)
+    :ok
+  end
+
+  # Under the default replica identity, a DELETE carries ONLY `old_record`
+  # (key columns); `record` is nil for deletes. A replica identity so weak
+  # that even the key is absent halts rather than deleting by guesswork.
+  defp delete!(conn, %Replicant.Change{old_record: old_record}) when is_map(old_record) do
+    {:ok, %Postgrex.Result{command: :delete}} =
+      Postgrex.query(conn, "DELETE FROM orders WHERE id = $1", [Map.fetch!(old_record, "id")])
+
+    :ok
+  end
+
+  defp delete!(_conn, %Replicant.Change{table: table}) do
+    raise ArgumentError, "delete without a key-bearing old_record: #{inspect(table)}"
+  end
+
+  defp slot_name, do: System.fetch_env!("REPLICANT_SLOT_NAME")
+end

@@ -156,3 +156,83 @@ jobs:
       # main, after this review set and all matrix rows settle.
       - name: Prove the complete package workflow without minting a candidate
         run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check
+
+  # The REFERENCE EXAMPLE (examples/replication_pipeline): a docker stack
+  # (source PG → replicant release container → destination PG) that is the
+  # public sink API's canary — if replicant breaks its consumer surface, the
+  # release build, or the substrate wiring, this end-to-end run goes red.
+  # Images are the same digest-pinned postgres:18 the matrix pins; the repo-root
+  # .dockerignore whitelist is the containment barrier for the build context.
+  reference-example:
+    name: Reference example (docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: examples/replication_pipeline
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Build and start the stack
+        run: docker compose up -d --build
+
+      - name: Assert the substrate is the expected major (PG18)
+        run: |
+          got=$(docker compose exec -T source-pg psql -U postgres -d example_src \
+            -tAc "SELECT current_setting('server_version_num')")
+          echo "server_version_num=$got"
+          test "$(( got / 10000 ))" = "18" \
+            || { echo "::error::expected PG18"; exit 1; }
+
+      - name: Deliver one transaction — replica + checkpoint
+        run: |
+          docker compose exec -T source-pg psql -U postgres -d example_src \
+            -c "INSERT INTO orders (id, note) VALUES (1, 'hello')"
+          n=""
+          for _ in $(seq 1 30); do
+            n=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+              -tAc "SELECT count(*) FROM orders" 2>/dev/null)
+            [ "$n" = "1" ] && break
+            sleep 2
+          done
+          [ "$n" = "1" ] \
+            || { echo "::error::row never materialized at the destination"; docker compose logs pipeline; exit 1; }
+          # The checkpoint row advanced to the transaction's commit LSN.
+          docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            -tAc "SELECT commit_lsn FROM pipeline_checkpoint WHERE id = 1" | grep -q . \
+            || { echo "::error::checkpoint never persisted"; docker compose logs pipeline; exit 1; }
+
+      - name: Unchanged-TOAST sentinel — the untouched column survives the update
+        # `payload` is STORAGE EXTERNAL in the source schema, so this UPDATE
+        # (touching only `note`) sends the sentinel for `payload`. A sink that
+        # wrote the sentinel — or crashed on the omitted column — fails here:
+        # the note must be updated AND the destination payload byte-identical.
+        run: |
+          docker compose exec -T source-pg psql -U postgres -d example_src \
+            -c "INSERT INTO orders (id, note, payload) VALUES (2, 'toast-row', repeat('t', 4096))"
+          ok=""
+          for _ in $(seq 1 30); do
+            ok=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+              -tAc "SELECT count(*) FROM orders WHERE id = 2 AND length(payload) = 4096" 2>/dev/null)
+            [ "$ok" = "1" ] && break
+            sleep 2
+          done
+          [ "$ok" = "1" ] \
+            || { echo "::error::TOASTed row never materialized"; docker compose logs pipeline; exit 1; }
+          docker compose exec -T source-pg psql -U postgres -d example_src \
+            -c "UPDATE orders SET note = 'touched' WHERE id = 2"
+          touched=""
+          for _ in $(seq 1 30); do
+            touched=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+              -tAc "SELECT count(*) FROM orders WHERE id = 2 AND note = 'touched' AND length(payload) = 4096" 2>/dev/null)
+            [ "$touched" = "1" ] && break
+            sleep 2
+          done
+          [ "$touched" = "1" ] \
+            || { echo "::error::unchanged-TOAST update lost the payload or the note"; docker compose logs pipeline; exit 1; }
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v --remove-orphans

@@ -1,0 +1,24 @@
+# CONTAINMENT, not size (Critical Rule 1 + credential hygiene): the example's
+# Docker build context is the REPO ROOT, and .gitignore does NOT gate a Docker
+# build. This working tree holds `.env` (secrets) and `erl_crash.dump` (an
+# Erlang heap dump that can contain decoded row values) — a size-motivated
+# ignore list would let them ride the context into image layers.
+#
+# Whitelist form: deny EVERYTHING, re-allow only the paths the example's
+# Dockerfile COPYs. A future untracked file (a crash dump, a .env.local, a
+# lifecycle artifact) is excluded by construction.
+
+*
+
+!mix.exs
+!README.md
+!LICENSE
+!NOTICE
+!lib
+!lib/**
+!examples/replication_pipeline/mix.exs
+!examples/replication_pipeline/mix.lock
+!examples/replication_pipeline/config
+!examples/replication_pipeline/config/**
+!examples/replication_pipeline/lib
+!examples/replication_pipeline/lib/**
