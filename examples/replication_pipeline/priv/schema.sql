@@ -1,7 +1,7 @@
--- Destination schema: the replica table and the single-row checkpoint the
--- skeleton's sink writes, plus the value-free receipts table (columns are
--- exactly commit_lsn/schema/table/op — Critical Rule 1: there is deliberately
--- NO value-bearing column). The skeleton's sink does not write receipts.
+-- Destination schema: the replica table, the value-free receipts ledger
+-- (one row per delivered change; columns are exactly commit_lsn/schema/
+-- table/op — Critical Rule 1: there is deliberately NO value-bearing column),
+-- and the single-row checkpoint.
 
 CREATE TABLE orders (
   id         int          NOT NULL PRIMARY KEY,

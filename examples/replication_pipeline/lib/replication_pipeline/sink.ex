@@ -1,12 +1,14 @@
 defmodule ReplicationPipeline.Sink do
   @moduledoc """
-  The example's transactional sink: the orders replica and the commit-LSN
-  watermark are written in ONE destination transaction (effect-once, Critical
-  Rule 3 — the `commit_lsn <= checkpoint` skip below IS the dedup; duplicates
-  cannot reach this code twice for the same transaction).
+  The example's transactional sink: the orders replica, a value-free receipts
+  row per change, and the commit-LSN watermark are written in ONE destination
+  transaction (effect-once, Critical Rule 3 — the `commit_lsn <= checkpoint`
+  skip below IS the dedup; duplicates cannot reach this code twice for the
+  same transaction).
 
   Delivery is at-least-once; the watermark skip + PK upsert make the EFFECTS
-  exactly-once.
+  exactly-once — the receipts ledger shows it: a receipt exists iff its
+  transaction took effect.
 
   Record values arrive ALREADY TYPED — the Assembler casts tuple data through
   `Replicant.Casting.Types.cast_record/2` (int4 → integer, timestamptz →
@@ -32,14 +34,23 @@ defmodule ReplicationPipeline.Sink do
   end
 
   @impl true
-  def handle_transaction(%Replicant.Transaction{commit_lsn: lsn} = txn) do
+  def handle_transaction(%Replicant.Transaction{commit_lsn: lsn, changes: changes}) do
     case Postgrex.transaction(@dest, fn conn ->
            watermark = lock_watermark!(conn)
 
            if lsn <= watermark do
              {:skip, watermark}
            else
-             Enum.each(txn.changes, &apply_change!(conn, &1))
+             # SINGLE pass over changes: a spilled transaction's `changes` is a
+             # single-pass disk-backed Reader (Replicant.Transaction) — apply
+             # and collect the receipt row in one iteration.
+             receipts =
+               Enum.map(changes, fn change ->
+                 apply_change!(conn, change)
+                 {change.schema, change.table, Atom.to_string(change.op)}
+               end)
+
+             put_receipts!(conn, lsn, receipts)
              put_watermark!(conn, lsn)
              {:committed, lsn}
            end
@@ -82,6 +93,29 @@ defmodule ReplicationPipeline.Sink do
         SET commit_lsn = EXCLUDED.commit_lsn, updated_at = now()
         """,
         [slot_name(), lsn]
+      )
+
+    :ok
+  end
+
+  # One value-free receipt PER CHANGE, written in the same destination
+  # transaction as the data — a receipt exists iff its transaction took
+  # effect (exactly-once at TRANSACTION granularity: the watermark skip above
+  # suppresses every receipt of a re-delivered transaction together).
+  defp put_receipts!(conn, lsn, receipts) do
+    {:ok, %Postgrex.Result{command: :insert}} =
+      Postgrex.query(
+        conn,
+        """
+        INSERT INTO cdc_receipts (commit_lsn, schema_name, table_name, op)
+        SELECT * FROM unnest($1::bigint[], $2::text[], $3::text[], $4::text[])
+        """,
+        [
+          List.duplicate(lsn, length(receipts)),
+          for({s, _, _} <- receipts, do: s),
+          for({_, t, _} <- receipts, do: t),
+          for({_, _, o} <- receipts, do: o)
+        ]
       )
 
     :ok

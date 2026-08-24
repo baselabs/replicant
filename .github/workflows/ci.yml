@@ -199,10 +199,16 @@ jobs:
           done
           [ "$n" = "1" ] \
             || { echo "::error::row never materialized at the destination"; docker compose logs pipeline; exit 1; }
-          # The checkpoint row advanced to the transaction's commit LSN.
+          # The checkpoint row advanced to the transaction's commit LSN, and
+          # the value-free receipts ledger recorded the delivery — exactly one
+          # receipt per delivered change, none for a skipped re-delivery.
           docker compose exec -T dest-pg psql -U postgres -d example_dst \
             -tAc "SELECT commit_lsn FROM pipeline_checkpoint WHERE id = 1" | grep -q . \
             || { echo "::error::checkpoint never persisted"; docker compose logs pipeline; exit 1; }
+          docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            -tAc "SELECT count(*) FROM cdc_receipts WHERE table_name = 'orders' AND op = 'insert'" \
+            | grep -qx "1" \
+            || { echo "::error::expected exactly 1 insert receipt"; docker compose logs pipeline; exit 1; }
 
       - name: Unchanged-TOAST sentinel — the untouched column survives the update
         # `payload` is STORAGE EXTERNAL in the source schema, so this UPDATE
