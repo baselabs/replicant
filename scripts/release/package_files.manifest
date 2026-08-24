@@ -13,6 +13,8 @@ docs/adr/0004-commit-lsn-transaction-watermark.md
 docs/adr/0005-spill-is-ephemeral-scratch.md
 docs/adr/0006-fail-closed-supervision.md
 docs/adr/0007-actual-replication-session-identity.md
+examples/README.md
+examples/replication_pipeline/README.md
 docs/adr/README.md
 lib/replicant.ex
 lib/replicant/application.ex
