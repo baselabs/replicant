@@ -45,6 +45,7 @@ Teardown: `docker compose down -v`.
 | --- | --- |
 | `ReplicationPipeline.Sink` | at-least-once delivery made effect-once by the commit-LSN watermark: data + checkpoint in ONE destination transaction, and the `commit_lsn <= checkpoint` skip IS the dedup (Critical Rule 3) |
 | `ReplicationPipeline.Sink` (receipts) | the value-free `cdc_receipts` ledger (commit_lsn/schema/table/op, never a value) exists exactly when its transaction took effect — re-delivery is skipped whole |
+| `ReplicationPipeline.Sink` (session identity) | the first connect BINDS the source's `{system_identifier, database}` into the checkpoint row; every later connect COMPARES — a rebuilt source container HALTS the pipeline instead of silently resuming a different database (ADR-0007) |
 | `ReplicationPipeline.Sink` (upsert) | unchanged-TOAST columns are OMITTED from the upsert SET — the sentinel never appears in `record` (Critical Rule 4) |
 | `docker-compose.yml` (source flags) | `wal_level=logical` is the load-bearing flag; the publication is the operator's SQL and a missing one fails closed |
 

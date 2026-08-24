@@ -21,8 +21,6 @@ services:
     environment:
       POSTGRES_HOST_AUTH_METHOD: trust
       POSTGRES_DB: example_src
-    volumes:
-      - ./docker/source-init:/docker-entrypoint-initdb.d:ro
     # TCP-forced pg_isready: the socket form answers "accepting connections"
     # during the entrypoint's init-SQL phase (its temp server is socket-only),
     # so only -h 127.0.0.1 proves the init scripts finished and the real
@@ -34,6 +32,9 @@ services:
       retries: 40
     ports:
       - "127.0.0.1:15432:5432"
+    volumes:
+      - source-data:/var/lib/postgresql
+      - ./docker/source-init:/docker-entrypoint-initdb.d:ro
 
   dest-pg:
     image: postgres:18@sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941
@@ -41,6 +42,7 @@ services:
       POSTGRES_HOST_AUTH_METHOD: trust
       POSTGRES_DB: example_dst
     volumes:
+      - dest-data:/var/lib/postgresql
       - ./priv/schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
@@ -72,3 +74,7 @@ services:
       dest-pg:
         condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  source-data:
+  dest-data:

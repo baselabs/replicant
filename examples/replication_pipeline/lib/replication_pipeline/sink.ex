@@ -33,6 +33,50 @@ defmodule ReplicationPipeline.Sink do
     end
   end
 
+  # Session identity (ADR-0007): this callback runs on every connect BEFORE
+  # checkpoint/0, with the identity read by IDENTIFY_SYSTEM on the exact
+  # replication connection. First boot BINDS {system_identifier, database}
+  # into the checkpoint row (a NULL commit_lsn = bound, nothing delivered);
+  # every later connect COMPARES — a mismatching source (e.g. a rebuilt
+  # source container = new system_identifier) rejects and the pipeline halts
+  # fail-closed instead of silently resuming against a different database.
+  @impl true
+  def handle_session_identity(%Replicant.SessionIdentity{} = identity, _context) do
+    case Postgrex.query(
+           @dest,
+           "SELECT system_identifier, database FROM pipeline_checkpoint WHERE id = 1",
+           []
+         ) do
+      {:ok, %Postgrex.Result{rows: []}} ->
+        bind_identity!(identity)
+
+      {:ok, %Postgrex.Result{rows: [[stored_id, stored_db]]}} ->
+        if stored_id == identity.system_identifier and stored_db == identity.database do
+          :ok
+        else
+          {:error, :session_identity_rejected}
+        end
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp bind_identity!(identity) do
+    case Postgrex.query(
+           @dest,
+           """
+           INSERT INTO pipeline_checkpoint (id, slot_name, system_identifier, database, commit_lsn, updated_at)
+           VALUES (1, $1, $2, $3, NULL, now())
+           ON CONFLICT (id) DO NOTHING
+           """,
+           [slot_name(), identity.system_identifier, identity.database]
+         ) do
+      {:ok, _result} -> :ok
+      {:error, _reason} = error -> error
+    end
+  end
+
   @impl true
   def handle_transaction(%Replicant.Transaction{commit_lsn: lsn, changes: changes}) do
     case Postgrex.transaction(@dest, fn conn ->
@@ -66,8 +110,9 @@ defmodule ReplicationPipeline.Sink do
   end
 
   # Locked FOR UPDATE so concurrent deliveries serialize on the watermark row
-  # once it exists; an absent row (first delivery) locks nothing, which is
-  # safe because the library delivers one transaction at a time per pipeline.
+  # once it exists; an absent OR NULL watermark (identity bound, nothing
+  # delivered yet) means 0. Safe because the library delivers one transaction
+  # at a time per pipeline.
   defp lock_watermark!(conn) do
     {:ok, %Postgrex.Result{rows: rows}} =
       Postgrex.query(
@@ -77,7 +122,8 @@ defmodule ReplicationPipeline.Sink do
       )
 
     case rows do
-      [[lsn]] -> lsn
+      [[lsn]] when is_integer(lsn) -> lsn
+      [_unbound_or_absent] -> 0
       [] -> 0
     end
   end

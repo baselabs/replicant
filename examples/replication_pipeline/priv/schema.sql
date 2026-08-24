@@ -23,6 +23,7 @@ CREATE TABLE pipeline_checkpoint (
   slot_name         text    NOT NULL,
   system_identifier text,
   database          text,
-  commit_lsn        bigint  NOT NULL,
+  -- NULL = the session identity is bound but nothing has been delivered yet.
+  commit_lsn        bigint,
   updated_at        timestamptz NOT NULL DEFAULT now()
 );
