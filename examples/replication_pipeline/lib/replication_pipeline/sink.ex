@@ -72,53 +72,37 @@ defmodule ReplicationPipeline.Sink do
            """,
            [slot_name(), identity.system_identifier, identity.database]
          ) do
-      {:ok, _result} ->
-        # Bind, then VERIFY: a racing first connect with a different identity
-        # wins the INSERT (ours hits DO NOTHING) — re-read and compare so the
-        # loser does not silently accept itself.
-        case Postgrex.query(
-               @dest,
-               "SELECT system_identifier, database FROM pipeline_checkpoint WHERE id = 1",
-               []
-             ) do
-          {:ok, %Postgrex.Result{rows: [[stored_id, stored_db]]}} ->
-            if stored_id == identity.system_identifier and stored_db == identity.database,
-              do: :ok,
-              else: {:error, :session_identity_rejected}
+      {:ok, _result} -> verify_identity!(identity)
+      {:error, _reason} = error -> error
+    end
+  end
 
-          {:error, _reason} = error ->
-            error
-        end
+  # Bind, then VERIFY: a racing first connect with a different identity wins
+  # the INSERT (ours hits DO NOTHING) — re-read and compare so the loser does
+  # not silently accept itself.
+  defp verify_identity!(identity) do
+    case Postgrex.query(
+           @dest,
+           "SELECT system_identifier, database FROM pipeline_checkpoint WHERE id = 1",
+           []
+         ) do
+      {:ok, %Postgrex.Result{rows: [[stored_id, stored_db]]}} ->
+        identity_matches?(stored_id, stored_db, identity)
 
       {:error, _reason} = error ->
         error
     end
   end
 
+  defp identity_matches?(stored_id, stored_db, identity) do
+    if stored_id == identity.system_identifier and stored_db == identity.database,
+      do: :ok,
+      else: {:error, :session_identity_rejected}
+  end
+
   @impl true
   def handle_transaction(%Replicant.Transaction{commit_lsn: lsn, changes: changes}) do
-    case Postgrex.transaction(@dest, fn conn ->
-           watermark = lock_watermark!(conn)
-
-           if lsn <= watermark do
-             {:skip, watermark}
-           else
-             # SINGLE pass over changes: a spilled transaction's `changes` is a
-             # single-pass disk-backed Reader (Replicant.Transaction) — apply
-             # and collect the receipt row in one iteration. The accumulator is
-             # METADATA ONLY ({schema, table, op} — never a value), so a spilled
-             # transaction's memory bound is this small tuple list, not the txn.
-             receipts =
-               Enum.map(changes, fn change ->
-                 apply_change!(conn, change)
-                 {change.schema, change.table, Atom.to_string(change.op)}
-               end)
-
-             put_receipts!(conn, lsn, receipts)
-             put_watermark!(conn, lsn)
-             {:committed, lsn}
-           end
-         end) do
+    case Postgrex.transaction(@dest, &deliver!(&1, lsn, changes)) do
       {:ok, {:skip, watermark}} -> {:ok, watermark}
       {:ok, {:committed, lsn}} -> {:ok, lsn}
       # Postgrex errors are structural but their DETAIL can echo key values
@@ -127,6 +111,33 @@ defmodule ReplicationPipeline.Sink do
       {:error, %Postgrex.Error{} = error} -> {:error, error}
       {:error, _other} = error -> error
     end
+  end
+
+  defp deliver!(conn, lsn, changes) do
+    watermark = lock_watermark!(conn)
+
+    if lsn <= watermark do
+      {:skip, watermark}
+    else
+      {:committed, apply_and_receipt!(conn, lsn, changes)}
+    end
+  end
+
+  # SINGLE pass over changes: a spilled transaction's `changes` is a
+  # single-pass disk-backed Reader (Replicant.Transaction) — apply and collect
+  # the receipt row in one iteration. The accumulator is METADATA ONLY
+  # ({schema, table, op} — never a value), so a spilled transaction's memory
+  # bound is this small tuple list, not the txn.
+  defp apply_and_receipt!(conn, lsn, changes) do
+    receipts =
+      Enum.map(changes, fn change ->
+        apply_change!(conn, change)
+        {change.schema, change.table, Atom.to_string(change.op)}
+      end)
+
+    put_receipts!(conn, lsn, receipts)
+    put_watermark!(conn, lsn)
+    lsn
   end
 
   # Locked FOR UPDATE so concurrent deliveries serialize on the watermark row

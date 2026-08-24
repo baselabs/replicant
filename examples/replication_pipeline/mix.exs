@@ -27,7 +27,10 @@ defmodule ReplicationPipeline.MixProject do
       # The CDC engine, from THIS checkout (the example is part of its repo).
       {:replicant, path: "../.."},
       # Destination client (mirrors the library's own floor).
-      {:postgrex, "~> 0.22.4"}
+      {:postgrex, "~> 0.22.4"},
+      # Static gates (same tooling as the library itself; dev/test only).
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]
   end
 end
