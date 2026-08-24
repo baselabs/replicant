@@ -72,8 +72,26 @@ defmodule ReplicationPipeline.Sink do
            """,
            [slot_name(), identity.system_identifier, identity.database]
          ) do
-      {:ok, _result} -> :ok
-      {:error, _reason} = error -> error
+      {:ok, _result} ->
+        # Bind, then VERIFY: a racing first connect with a different identity
+        # wins the INSERT (ours hits DO NOTHING) — re-read and compare so the
+        # loser does not silently accept itself.
+        case Postgrex.query(
+               @dest,
+               "SELECT system_identifier, database FROM pipeline_checkpoint WHERE id = 1",
+               []
+             ) do
+          {:ok, %Postgrex.Result{rows: [[stored_id, stored_db]]}} ->
+            if stored_id == identity.system_identifier and stored_db == identity.database,
+              do: :ok,
+              else: {:error, :session_identity_rejected}
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      {:error, _reason} = error ->
+        error
     end
   end
 
@@ -87,7 +105,9 @@ defmodule ReplicationPipeline.Sink do
            else
              # SINGLE pass over changes: a spilled transaction's `changes` is a
              # single-pass disk-backed Reader (Replicant.Transaction) — apply
-             # and collect the receipt row in one iteration.
+             # and collect the receipt row in one iteration. The accumulator is
+             # METADATA ONLY ({schema, table, op} — never a value), so a spilled
+             # transaction's memory bound is this small tuple list, not the txn.
              receipts =
                Enum.map(changes, fn change ->
                  apply_change!(conn, change)
