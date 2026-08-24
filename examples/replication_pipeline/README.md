@@ -44,15 +44,15 @@ Teardown: `docker compose down -v`.
 ```bash
 docker compose restart pipeline                     # kill/restart mid-life
 docker compose exec source-pg psql -U postgres -d example_src \
-  -e "INSERT INTO orders (id, note) VALUES (3, 'after restart')"
+  -c "INSERT INTO orders (id, note) VALUES (3, 'after restart')"
 docker compose exec dest-pg psql -U postgres -d example_dst \
-  -e "SELECT id, note FROM orders ORDER BY id;      -- all rows, ids 1..3
-      SELECT count(*) FROM cdc_receipts;"           -- no re-delivery of prior rows
+  -c "SELECT id, note FROM orders ORDER BY id" \
+  -c "SELECT count(*) FROM cdc_receipts"            # no re-delivery of prior rows
 ```
 
 The durable checkpoint row made that resume gap-free and effect-once: the
-post-restart row arrives, and the receipts for prior transactions are
-unchanged — a re-delivery would have doubled them.
+post-restart row arrives alongside the earlier ones, and the receipts for
+prior transactions are unchanged — a re-delivery would have doubled them.
 
 ## What each piece teaches
 
@@ -69,6 +69,9 @@ extend the sink per table — the seam is the point, not the schema.
 
 ## CI
 
-The `reference-example` CI job builds this stack and drives the sequence above
-— insert, replica + checkpoint assertions — so the example can never silently
-rot out of sync with replicant's public sink API.
+The `reference-example` CI job builds this stack every push and drives the
+full sequence: the example's own static gates (format, compile-warnings,
+credo --strict, dialyzer), then insert → replica + receipts + checkpoint
+assertions, TOAST-sentinel survival, and restart-resume with zero duplicate
+receipts — so the example can never silently rot out of sync with
+replicant's public sink API.

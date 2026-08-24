@@ -13,6 +13,7 @@ release in one container → Postgres destination, with an idempotent
 orders replica and a durable commit-LSN checkpoint. See
 [replication_pipeline/README.md](replication_pipeline/README.md).
 
-The feature tour (snapshot/backfill, unchanged-TOAST sentinel, logical-decoding
-messages — interactively) lives in the repo's
-[getting-started Livebook](../notebooks/getting_started.livemd), not here.
+The interactive feature tour (snapshot/backfill, logical-decoding messages) lives
+in the repo's [getting-started Livebook](../notebooks/getting_started.livemd);
+the unchanged-TOAST sentinel is exercised right here — the stack's CI canary
+forces the sentinel and asserts the destination value survives.
