@@ -31,12 +31,14 @@ through later releases:
   carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed telemetry shapes,
   logical-message value-safety, the `handle_slot_origin/2` callback, and proven PostgreSQL
   15–18 support); 1.0.0 shipped at `v1.0.0`.
-- **`ash_replicant` 0.4.0 is published and tagged** `v0.4.0` at `d4e9457`.
-  Its current `main` at `e4072fb95975c9588914d9aefe99ce1fa0098dfb` consumes
-  Replicant `>= 1.2.2 and < 2.0.0-0`; its committed lock is 1.2.2 and the declared range admits
-  1.2.3. Its compatibility lanes cover the minimum and latest compatible Replicant releases.
-  AshReplicant's own 1.0 publication
-  remains governed by its release roadmap and explicit publish authorization.
+- **AshReplicant compatibility — OBSERVED, September 21, 2026:** `rg -n`/`sed` reads of
+  the owner's `mix.exs`, `mix.lock`, and `CHANGELOG.md` show source version 1.2.0,
+  declared Replicant range `>= 1.2.3 and < 2.0.0-0`, and committed Replicant lock 1.2.3.
+  This supersedes the earlier 0.4.0/current-lock-1.2.2 snapshot and pending-1.0 wording;
+  it does not establish current registry publication or rerun consumer acceptance.
+  [AshReplicant's coordination ADR](https://github.com/baselabs/ash_replicant/blob/main/docs/adr/0005-replicant-coordination.md)
+  owns the current compatibility floor, fetched-artifact proof, and dependency-first
+  release order. Replicant remains independently usable through its public sink contract.
 
 ## Sequencing (user directive, 2026-07-05) — ✅ FULLY EXECUTED
 
