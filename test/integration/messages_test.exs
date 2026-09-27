@@ -593,7 +593,11 @@ defmodule Replicant.MessagesTest do
       if PG16.enabled?() do
         # Lower logical_decoding_work_mem so a large streamed txn SPILLS to disk; the message
         # payload is small (stays resident) but rides %Transaction.messages on delivery.
-        Postgrex.query!(ctrl, "ALTER ROLE postgres SET logical_decoding_work_mem = '64kB'", [])
+        Postgrex.query!(
+          ctrl,
+          "ALTER ROLE CURRENT_USER SET logical_decoding_work_mem = '64kB'",
+          []
+        )
 
         spill_dir =
           Path.join(
@@ -614,7 +618,7 @@ defmodule Replicant.MessagesTest do
           # RESET the role-level work_mem so it doesn't bleed into subsequent integration tests
           # under a shared live PG run (precedent: streaming_spill_test.exs:33).
           {:ok, c} = Postgrex.start_link(PG16.pg_opts())
-          Postgrex.query!(c, "ALTER ROLE postgres RESET logical_decoding_work_mem", [])
+          Postgrex.query!(c, "ALTER ROLE CURRENT_USER RESET logical_decoding_work_mem", [])
           File.rm_rf(spill_dir)
         end)
 

@@ -112,6 +112,10 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
   then `export REPLICANT_TEST_URL="postgres://postgres@localhost:<PORT>/postgres"`. Run the
   whole matrix locally by spinning all four and running `mix test` against each URL in turn.
+  A shared server works too: a non-superuser role with `LOGIN REPLICATION CREATEDB`, its own
+  test database, and `GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal()` in that database
+  (the idle-ack tests force a WAL switch). Tests set `logical_decoding_work_mem` on
+  `CURRENT_USER`, so they never alter another role.
 - **Version-behavior tests** (`test/integration/version_behavior_test.exs`, tagged
   `:integration`): run against whatever major `REPLICANT_TEST_URL` points at and branch on
   the live version — proving failover is created on PG17+ and rejected on PG<17, and that the

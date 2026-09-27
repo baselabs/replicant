@@ -14,13 +14,13 @@ defmodule Replicant.StreamingTest do
     slot = "rep_st_#{System.unique_integer([:positive])}"
     reset_schema(ctrl)
     drop_slot(ctrl, slot)
-    Postgrex.query!(ctrl, "ALTER ROLE postgres SET logical_decoding_work_mem = '64kB'", [])
+    Postgrex.query!(ctrl, "ALTER ROLE CURRENT_USER SET logical_decoding_work_mem = '64kB'", [])
 
     on_exit(fn ->
       Replicant.stop(slot)
       PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 400)
       {:ok, c} = Postgrex.start_link(PG16.pg_opts())
-      Postgrex.query!(c, "ALTER ROLE postgres RESET logical_decoding_work_mem", [])
+      Postgrex.query!(c, "ALTER ROLE CURRENT_USER RESET logical_decoding_work_mem", [])
       drop_slot(c, slot)
     end)
 
