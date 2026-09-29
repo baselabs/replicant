@@ -78,8 +78,8 @@ defmodule Replicant.Decoder.ConformanceTest do
                 name: "foo",
                 replica_identity: :default,
                 columns: [
-                  %Column{flags: [], name: "bar", type: "text", type_modifier: 4_294_967_295},
-                  %Column{flags: [:key], name: "id", type: "int4", type_modifier: 4_294_967_295}
+                  %Column{flags: [], name: "bar", type: "text", type_modifier: -1},
+                  %Column{flags: [:key], name: "id", type: "int4", type_modifier: -1}
                 ]
               }} =
                Decoder.decode(
@@ -95,7 +95,7 @@ defmodule Replicant.Decoder.ConformanceTest do
                 name: "temp",
                 replica_identity: :default,
                 columns: [
-                  %Column{flags: [], name: "test", type: "numeric", type_modifier: 4_294_967_295}
+                  %Column{flags: [], name: "test", type: "numeric", type_modifier: -1}
                 ]
               }} =
                Decoder.decode(

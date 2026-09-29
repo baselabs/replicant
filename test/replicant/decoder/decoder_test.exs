@@ -56,6 +56,47 @@ defmodule Replicant.Decoder.DecoderTest do
     end
   end
 
+  describe "decode/1 malformed-frame strictness (1.3.0)" do
+    # Every case below must land in the value-free boundary — never a silently
+    # mis-parsed message, and never the offending bytes in the error.
+    test "a Truncate whose relation-id bytes are not a multiple of 4 is a scrubbed error" do
+      bytes = <<"T", 1::integer-32, 0::integer-8, "abc">>
+      {:error, err} = Decoder.decode(bytes)
+      assert err.reason == :decode_failure
+      refute inspect(err) <> Exception.message(err) =~ "abc"
+    end
+
+    test "a Truncate whose declared relation count disagrees with its id list is a scrubbed error" do
+      # Declares 2 relations but carries a single id — previously produced a 1-element
+      # list against number_of_relations: 2 with no signal.
+      bytes = <<"T", 2::integer-32, 0::integer-8, 1::integer-32>>
+      {:error, err} = Decoder.decode(bytes)
+      assert err.reason == :decode_failure
+    end
+
+    test "a Type message without the trailing NUL is a scrubbed error (never a truncated name)" do
+      bytes = <<"Y", 21::integer-32, "public\0", "incompletename">>
+      {:error, err} = Decoder.decode(bytes)
+      assert err.reason == :decode_failure
+      refute inspect(err) <> Exception.message(err) =~ "incompletename"
+    end
+  end
+
+  describe "decode/1 Relation atttypmod signedness (1.3.0)" do
+    test "a Relation column type_modifier decodes SIGNED (-1 stays -1, not 4294967295)" do
+      # PG sends atttypmod as int32 SIGNED; -1 is the ubiquitous "no modifier" marker.
+      cols = <<1::integer-8, "c", 0, 21::integer-32, -1::integer-signed-32>>
+
+      bytes =
+        <<"R", 7::integer-32, "public", 0, "t", 0, "d", 1::integer-16, cols::binary>>
+
+      assert {:ok,
+              %Messages.Relation{
+                columns: [%Messages.Relation.Column{name: "c", type_modifier: -1}]
+              }} = Decoder.decode(bytes)
+    end
+  end
+
   describe "streaming message structs (spec §5)" do
     alias Replicant.Decoder.Messages.{
       Insert,

@@ -4,6 +4,7 @@ defmodule Replicant.AssemblerServerTest do
   alias Replicant.AssemblerServer
   alias Replicant.Decoder.Messages.{Begin, Commit, Insert, Relation}
   alias Replicant.Decoder.Messages.Relation.Column
+  alias Replicant.Snapshotter.Incremental
   alias Replicant.Test.RecordingSink
 
   defp col(name, type, flags),
@@ -186,6 +187,47 @@ defmodule Replicant.AssemblerServerTest do
     assert AssemblerServer.deliver_snapshot_chunk(pid, chunk) == {:error, :window_reset}
 
     assert AssemblerServer.finish_snapshot_table(pid, "public.t", 1) == {:error, :window_reset}
+  end
+
+  test "reader calls with NO seated window (window: nil) reply {:error, :snapshot_window_missing}, never a FunctionClauseError" do
+    # 1.3.0: the window drops to nil at completion-apply and NOTHING re-seats it
+    # (the reset cast requires an existing window; only init/1 seats one) — the state
+    # is permanent. A {:error, :window_reset} reply would make the reader hot-spin
+    # (budget-free retry against a state that can never change — review P1); the
+    # DISTINCT :snapshot_window_missing reply is UNRECOGNIZED by reset_guard/1, so it
+    # raises into the reader's value-free boundary and halts :snapshot_failed —
+    # terminating and observable, instead of the pre-1.3.0 crash-restart.
+    pid = start("srv_window_nil", RecordingSink)
+
+    :sys.replace_state(pid, fn st -> %{st | halted: false, window: nil} end)
+
+    assert AssemblerServer.open_snapshot_window(pid, "public.t") ==
+             {:error, :snapshot_window_missing}
+
+    chunk = %{qualified: "public.t", first?: true, complete?: true}
+
+    assert AssemblerServer.deliver_snapshot_chunk(pid, chunk) ==
+             {:error, :snapshot_window_missing}
+
+    assert AssemblerServer.finish_snapshot_table(pid, "public.t", 1) ==
+             {:error, :snapshot_window_missing}
+
+    assert Process.alive?(pid)
+  end
+
+  test "the reader routes :snapshot_window_missing to a raise (terminating halt), not a budget-free retry" do
+    # reset_guard recognizes ONLY :window_reset (budget-free retry) and
+    # :table_discarded (contention) — the unrecognized reply MUST raise into the
+    # reader's value-free boundary (:snapshot_failed halt). Goes RED if someone
+    # "helpfully" widens reset_guard to swallow the missing-window reply. The call
+    # rides apply/3 on purpose: it is deliberately type-invalid, and the compile-time
+    # type checker would otherwise flag exactly the invalidity being pinned.
+    unrecognized = {:error, :snapshot_window_missing}
+
+    assert_raise FunctionClauseError, fn ->
+      # credo:disable-for-next-line
+      apply(Incremental, :reset_guard, [unrecognized])
+    end
   end
 
   test "sink-owned init builds a :sink_owned assembler" do

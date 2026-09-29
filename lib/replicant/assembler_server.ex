@@ -341,6 +341,28 @@ defmodule Replicant.AssemblerServer do
       ),
       do: {:reply, {:error, :window_reset}, state}
 
+  # 1.3.0: NO incremental window is seated (`window: nil` — it dropped at
+  # completion-apply and NOTHING re-seats it: the reset cast requires an existing
+  # window, and only init/1 seats one, so nil is permanent for this process).
+  # Reply a DISTINCT reason (NOT :window_reset — the reader treats that one as a
+  # budget-free retry and would hot-spin against a state that can never change;
+  # review P1): reset_guard/1 matches only :window_reset | :table_discarded, so an
+  # unrecognized reply RAISES into the reader's value-free boundary and the
+  # pipeline halts :snapshot_failed — terminating and observable, instead of the
+  # pre-1.3.0 FunctionClauseError crash-restart of live streaming state.
+  def handle_call({:open_snapshot_window, _qualified}, _from, %{window: nil} = state),
+    do: {:reply, {:error, :snapshot_window_missing}, state}
+
+  def handle_call({:deliver_snapshot_chunk, _chunk}, _from, %{window: nil} = state),
+    do: {:reply, {:error, :snapshot_window_missing}, state}
+
+  def handle_call(
+        {:finish_snapshot_table, _qualified, _reader_epoch},
+        _from,
+        %{window: nil} = state
+      ),
+      do: {:reply, {:error, :snapshot_window_missing}, state}
+
   def handle_call({:open_snapshot_window, qualified}, from, %{window: %{} = w} = state) do
     cond do
       Replicant.SnapshotWindow.discarded?(w, qualified) ->

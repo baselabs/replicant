@@ -443,7 +443,7 @@ defmodule Replicant.Connection do
         [%Postgrex.Result{rows: [[_slot, consistent_point, snapshot_name, _plugin]]}],
         %{step: :create_export_slot} = state
       ) do
-    cp = Replicant.lsn_from_string(consistent_point)
+    {:ok, cp} = Replicant.lsn_from_string(consistent_point)
 
     Replicant.Snapshotter.start(%{
       snapshot_name: snapshot_name,
@@ -467,7 +467,7 @@ defmodule Replicant.Connection do
         [%Postgrex.Result{rows: [[_slot, consistent_point, _snap_name, _plugin]]}],
         %{step: :create_incremental_slot} = state
       ) do
-    floor = Replicant.lsn_from_string(consistent_point)
+    {:ok, floor} = Replicant.lsn_from_string(consistent_point)
 
     case persist_backfill_pending(state) do
       :ok ->
@@ -623,11 +623,19 @@ defmodule Replicant.Connection do
 
   @impl true
   # Async ack: the AssemblerServer durably committed a txn ending at `lsn`.
-  # Advance monotonically and report the new flush position.
+  # Advance monotonically and report the new flush position. The in-memory advance
+  # and the telemetry are UNCONDITIONAL; the standby-status-update buffer is emitted
+  # only while streaming — a sink_committed racing a reconnect lands in a simple-query
+  # phase, where handing Postgrex a raw buffer is unspecified behavior (1.3.0). The
+  # next keepalive in :streaming reports the advanced position.
   def handle_info({:sink_committed, lsn}, state) when is_integer(lsn) do
     checkpoint = max(state.checkpoint_lsn, lsn)
     Telemetry.event([:replicant, :checkpoint, :advanced], %{}, %{commit_lsn: checkpoint})
-    {:noreply, [encode_status_update(checkpoint)], %{state | checkpoint_lsn: checkpoint}}
+    state = %{state | checkpoint_lsn: checkpoint}
+
+    if state.step == :streaming,
+      do: {:noreply, [encode_status_update(checkpoint)], state},
+      else: {:noreply, [], state}
   end
 
   # Snapshot finished durably (checkpoint := consistent_point): seed the checkpoint and
@@ -1625,13 +1633,12 @@ defmodule Replicant.Connection do
   defp parse_slot_origin(lsn) do
     with [upper, lower] <- String.split(lsn, "/", parts: 2),
          true <- valid_lsn_component?(upper),
-         true <- valid_lsn_component?(lower) do
-      {:ok, Replicant.lsn_from_string(lsn)}
+         true <- valid_lsn_component?(lower),
+         {:ok, lsn_int} <- Replicant.lsn_from_string(lsn) do
+      {:ok, lsn_int}
     else
       _ -> {:error, :slot_origin_unavailable}
     end
-  rescue
-    _ -> {:error, :slot_origin_unavailable}
   end
 
   defp valid_lsn_component?(component) when byte_size(component) in 1..8,

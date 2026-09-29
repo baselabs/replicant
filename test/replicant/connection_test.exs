@@ -402,6 +402,31 @@ defmodule Replicant.ConnectionTest do
       <<?r, _w::64, flush::64, _a::64, _c::64, 0>> = IO.iodata_to_binary(ack)
       assert flush == 0x100
     end
+
+    # 1.3.0 — a sink_committed racing a reconnect lands while the connection is in a
+    # simple-query phase; handing Postgrex a raw standby-status-update buffer there is
+    # unspecified behavior. The in-memory advance (and telemetry) stays unconditional;
+    # only the buffer waits for :streaming.
+    test "outside :streaming the checkpoint advances, telemetry fires, and NO status-update buffer is emitted" do
+      :telemetry.attach(
+        "test_sink_committed_outside_streaming",
+        [:replicant, :checkpoint, :advanced],
+        fn _e, _m, meta, _c -> send(self(), {:checkpoint_advanced, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach("test_sink_committed_outside_streaming") end)
+
+      {:noreply, replies, new_state} =
+        Connection.handle_info(
+          {:sink_committed, 0x200},
+          state(checkpoint_lsn: 0x100, step: :identity_check)
+        )
+
+      assert replies == []
+      assert new_state.checkpoint_lsn == 0x200
+      assert_received {:checkpoint_advanced, %{commit_lsn: 0x200}}
+    end
   end
 
   # ---- XLogData decode-and-forward ----

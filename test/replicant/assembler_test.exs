@@ -100,7 +100,7 @@ defmodule Replicant.AssemblerTest do
       name: name,
       type: type,
       flags: flags,
-      type_modifier: 4_294_967_295
+      type_modifier: -1
     }
 
   setup do

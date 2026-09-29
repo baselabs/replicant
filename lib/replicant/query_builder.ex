@@ -33,13 +33,16 @@ defmodule Replicant.QueryBuilder do
 
   `opts[:streaming]`, when truthy, selects `proto_version '2', streaming 'on'` (spec §5).
   `opts[:messages]`, when truthy, adds `messages 'true'` (spec §6, A2). Absent or falsy (the
-  default) emits the byte-for-byte v1 command.
+  default) emits the byte-for-byte v1 command. An `opts[:start_lsn]` that is not a
+  non-negative integer returns `{:error, :invalid_start_lsn}` (1.3.0) — a tagged error
+  like every other builder failure, never a raise.
   """
   @spec start_replication(String.t(), [String.t()], keyword()) ::
-          {:ok, String.t()} | {:error, :invalid_identifier}
+          {:ok, String.t()} | {:error, :invalid_identifier} | {:error, :invalid_start_lsn}
   def start_replication(slot_name, publications, opts \\ []) when is_list(publications) do
     with :ok <- Identifier.validate(slot_name),
-         :ok <- validate_all(publications) do
+         :ok <- validate_all(publications),
+         :ok <- validate_start_lsn(Keyword.get(opts, :start_lsn, 0)) do
       start_lsn = Keyword.get(opts, :start_lsn, 0)
       lsn_literal = Replicant.lsn_to_string(start_lsn)
 
@@ -71,6 +74,11 @@ defmodule Replicant.QueryBuilder do
       end
     end)
   end
+
+  # start_lsn must be a t:Replicant.lsn/0 (non_neg_integer) — 1.3.0: tagged error
+  # instead of a FunctionClauseError out of lsn_to_string/1.
+  defp validate_start_lsn(lsn) when is_integer(lsn) and lsn >= 0, do: :ok
+  defp validate_start_lsn(_), do: {:error, :invalid_start_lsn}
 
   @doc """
   Replication command to create a durable logical slot with NO exported snapshot. `failover?:

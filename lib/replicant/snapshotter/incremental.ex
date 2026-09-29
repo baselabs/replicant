@@ -667,8 +667,16 @@ defmodule Replicant.Snapshotter.Incremental do
         reset_guard(AssemblerServer.finish_snapshot_table(server(args), table.qualified, epoch))
         loop(db, args, sp_after, Keyword.fetch!(args.snapshot, :chunk_rows), standby?)
 
-      {:error, _} ->
-        run_keyless_table(db, args, sp, table, standby?, attempt + 1)
+      {:error, fault} ->
+        # 1.3.0 — an {:error, _} from Postgrex.transaction is NEVER table contention:
+        # genuine contention travels as a :table_discarded THROW (reset_guard, caught
+        # below), and the transaction fun only ever returns {:ok, _}. Every error
+        # return is a connection/I-O fault, so re-raise it into the reader's
+        # value-free boundary (:snapshot_failed) instead of consuming a contention
+        # attempt and halting :snapshot_table_contended — which sent operators
+        # hunting write contention when the fault was I/O (review P2: naming one
+        # struct left the rest of the fault family mislabeled).
+        raise fault
     end
   catch
     # A CONTENTION discard redoes the whole table AND counts toward the @max_table_attempts halt;
@@ -722,7 +730,8 @@ defmodule Replicant.Snapshotter.Incremental do
 
   defp watermark(db, standby?) do
     [[lsn_str]] = Postgrex.query!(db, QueryBuilder.watermark_lsn(standby?), []).rows
-    Replicant.lsn_from_string(lsn_str)
+    {:ok, lsn} = Replicant.lsn_from_string(lsn_str)
+    lsn
   end
 
   defp server(args), do: AssemblerServer.via(args.slot_name)

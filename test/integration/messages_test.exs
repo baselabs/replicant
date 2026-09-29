@@ -434,7 +434,7 @@ defmodule Replicant.MessagesTest do
             []
           )
 
-        msg_lsn = Replicant.lsn_from_string(msg_lsn_str)
+        {:ok, msg_lsn} = Replicant.lsn_from_string(msg_lsn_str)
 
         # Wait for the sink to enter the paused window (the message was RECEIVED but not acked).
         assert_receive {:message_paused, ^msg_lsn, "idle_probe"}, 10_000
@@ -887,8 +887,12 @@ defmodule Replicant.MessagesTest do
            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
            [slot]
          ).rows do
-      [[lsn]] when is_binary(lsn) -> Replicant.lsn_from_string(lsn)
-      _ -> 0
+      [[lsn]] when is_binary(lsn) ->
+        {:ok, lsn_int} = Replicant.lsn_from_string(lsn)
+        lsn_int
+
+      _ ->
+        0
     end
   end
 

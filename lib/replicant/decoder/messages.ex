@@ -64,7 +64,7 @@ defmodule Replicant.Decoder.Messages do
               flags: [atom()] | nil,
               name: String.t() | nil,
               type: String.t() | nil,
-              type_modifier: non_neg_integer() | nil
+              type_modifier: integer() | nil
             }
     end
   end

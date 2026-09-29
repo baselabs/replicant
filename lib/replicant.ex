@@ -59,11 +59,32 @@ defmodule Replicant do
   Parse a Postgres `pg_lsn` display string (`"0/16E3778"`) into the uint64 LSN —
   the inverse of `lsn_to_string/1`. The two hex halves are `file`/`offset`;
   `String.to_integer/2` accepts either case (Postgres renders uppercase).
+
+  Returns `{:ok, lsn}` or the value-free `{:error, :invalid_lsn}` (1.3.0: a public
+  API never raises, so a caller's input can never reach a crash report — Critical
+  Rule 1; each half must fit 32 bits).
   """
-  @spec lsn_from_string(String.t()) :: lsn()
+  @spec lsn_from_string(String.t()) :: {:ok, lsn()} | {:error, :invalid_lsn}
   def lsn_from_string(string) when is_binary(string) do
-    [file, offset] = String.split(string, "/", parts: 2)
-    Bitwise.bsl(String.to_integer(file, 16), 32) + String.to_integer(offset, 16)
+    case String.split(string, "/", parts: 2) do
+      [file, offset] ->
+        with {:ok, file_int} <- hex_u32(file),
+             {:ok, offset_int} <- hex_u32(offset) do
+          {:ok, Bitwise.bsl(file_int, 32) + offset_int}
+        else
+          _ -> {:error, :invalid_lsn}
+        end
+
+      _ ->
+        {:error, :invalid_lsn}
+    end
+  end
+
+  defp hex_u32(component) do
+    case Integer.parse(component, 16) do
+      {value, ""} when value >= 0 and value <= 0xFFFFFFFF -> {:ok, value}
+      _ -> {:error, :invalid_lsn}
+    end
   end
 
   @doc """

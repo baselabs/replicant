@@ -18,12 +18,32 @@ defmodule ReplicantTest do
 
   describe "lsn_from_string/1" do
     test "inverts lsn_to_string/1 (pg_lsn display form ↔ uint64)" do
-      assert Replicant.lsn_from_string("0/16E3778") == 0x16E3778
-      assert Replicant.lsn_from_string("1/0") == 0x100000000
-      assert Replicant.lsn_from_string("0/0") == 0
+      assert {:ok, 0x16E3778} = Replicant.lsn_from_string("0/16E3778")
+      assert {:ok, 0x100000000} = Replicant.lsn_from_string("1/0")
+      assert {:ok, 0} = Replicant.lsn_from_string("0/0")
 
       for lsn <- [0, 0x16E3778, 0x100000000, 0xFFFFFFFFFF, 0xABCDEF12] do
-        assert lsn |> Replicant.lsn_to_string() |> Replicant.lsn_from_string() == lsn
+        assert {:ok, ^lsn} = lsn |> Replicant.lsn_to_string() |> Replicant.lsn_from_string()
+      end
+    end
+
+    # 1.3.0 — a PUBLIC function must never raise with the caller's input embedded in
+    # the exception message (a crash report is a log surface; Critical Rule 1). Every
+    # invalid shape — including file/offset halves that exceed 32 bits — returns the
+    # value-free tagged error instead.
+    test "invalid input returns {:error, :invalid_lsn} — never a raise" do
+      for bad <- [
+            "garbage",
+            "",
+            "0/",
+            "/1",
+            "0/ZZ",
+            "0/0/0",
+            "0/-1",
+            "100000000/0",
+            "0/100000000"
+          ] do
+        assert {:error, :invalid_lsn} = Replicant.lsn_from_string(bad)
       end
     end
   end

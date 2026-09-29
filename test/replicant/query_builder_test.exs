@@ -32,6 +32,16 @@ defmodule Replicant.QueryBuilderTest do
                QueryBuilder.start_replication("x; DROP", ["ok_pub"], [])
     end
 
+    # 1.3.0 — a non-integer or negative start_lsn is a tagged error like every other
+    # builder failure, not a FunctionClauseError out of lsn_to_string/1.
+    test "rejects an invalid start_lsn with {:error, :invalid_start_lsn}" do
+      assert {:error, :invalid_start_lsn} =
+               QueryBuilder.start_replication("ok_slot", ["ok_pub"], start_lsn: -1)
+
+      assert {:error, :invalid_start_lsn} =
+               QueryBuilder.start_replication("ok_slot", ["ok_pub"], start_lsn: "0/0")
+    end
+
     test "messages: true adds the messages 'true' option (A2, after Task 2 carry-forward)" do
       {:ok, sql} = QueryBuilder.start_replication("s", ["p"], start_lsn: 0, messages: true)
       assert sql =~ "messages 'true'"

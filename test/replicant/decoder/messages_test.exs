@@ -18,7 +18,7 @@ defmodule Replicant.Decoder.MessagesTest do
       name: "id",
       type: "int4",
       flags: [:key],
-      type_modifier: 4_294_967_295
+      type_modifier: -1
     }
 
     rel = %Messages.Relation{

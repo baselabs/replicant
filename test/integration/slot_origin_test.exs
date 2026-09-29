@@ -133,7 +133,8 @@ defmodule Replicant.SlotOriginIntegrationTest do
     %Postgrex.Result{rows: [[lsn]]} =
       Postgrex.query!(conn, "SELECT pg_current_wal_lsn()::text", [])
 
-    Replicant.lsn_from_string(lsn)
+    {:ok, lsn} = Replicant.lsn_from_string(lsn)
+    lsn
   end
 
   defp confirmed_flush(conn, slot) do
@@ -144,7 +145,12 @@ defmodule Replicant.SlotOriginIntegrationTest do
         [slot]
       )
 
-    if lsn, do: Replicant.lsn_from_string(lsn), else: 0
+    if lsn do
+      {:ok, lsn_int} = Replicant.lsn_from_string(lsn)
+      lsn_int
+    else
+      0
+    end
   end
 
   defp connection_pid(slot) do

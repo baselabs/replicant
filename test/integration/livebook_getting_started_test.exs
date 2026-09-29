@@ -101,6 +101,31 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
       # Logical-decoding message: a non-transactional message reached handle_message/2.
       assert summary.nontxn_message == {"lb_heartbeat", "tick"},
              "expected the non-txn message {\"lb_heartbeat\", \"tick\"}; got #{inspect(summary.nontxn_message)}"
+
+      # --- Casting layer (1.3.0, ADR-0008), observed against the live server ---
+      # Multidimensional arrays nest element-wise (only int[]/float[] recursed before).
+      assert summary.multidim_numeric == [
+               [Decimal.new("1.5"), Decimal.new(2)],
+               [Decimal.new(3), nil]
+             ],
+             "numeric[][] should nest with NULL -> nil; got #{inspect(summary.multidim_numeric)}"
+
+      assert summary.multidim_bool == [[true, false]],
+             "boolean[][] should leave no uncast t/f strings; got #{inspect(summary.multidim_bool)}"
+
+      assert [[%DateTime{}, %DateTime{}]] = summary.tz_nested
+
+      # Money is locale-honest: the value 1234.56 renders "$1,234.56" under the
+      # grouped locales and "$1234.56" under C — BOTH parse to the same Decimal, so
+      # the exact equality is deterministic on every CI major (a non-C locale form
+      # like "1.234,56" would deliver the raw string instead — the unit suite pins that).
+      assert Decimal.equal?(summary.money_value, Decimal.new("1234.56")),
+             "money should cast to Decimal 1234.56 under the CI locales; got #{inspect(summary.money_value)}"
+
+      # timetz delivers the raw, lossless string — fraction AND offset intact (the
+      # old truncation delivered "04:05:06").
+      assert summary.timetz_raw == "04:05:06.789-08",
+             "timetz should deliver the verbatim server form; got #{inspect(summary.timetz_raw)}"
     end
   end
 

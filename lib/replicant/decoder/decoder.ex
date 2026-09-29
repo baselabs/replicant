@@ -223,6 +223,14 @@ defmodule Replicant.Decoder do
   defp decode_message_impl(
          <<"T", number_of_relations::integer-32, options::integer-8, column_ids::binary>>
        ) do
+    # 1.3.0 strictness: every truncated relation id is exactly 4 bytes, so the list
+    # length is number_of_relations * 4. A malformed frame raises into the decode/1
+    # boundary (scrubbed, value-free) instead of silently yielding a short relation
+    # list against the declared count.
+    unless byte_size(column_ids) == number_of_relations * 4 do
+      raise ArgumentError, "malformed Truncate: relation-id byte length"
+    end
+
     truncated_relations =
       for relation_id_bin <- column_ids |> :binary.bin_to_list() |> Enum.chunk_every(4),
           do: relation_id_bin |> :binary.list_to_bin() |> :binary.decode_unsigned()
@@ -244,7 +252,18 @@ defmodule Replicant.Decoder do
 
   defp decode_message_impl(<<"Y", data_type_id::integer-32, namespace_and_name::binary>>) do
     [namespace, name_with_null] = :binary.split(namespace_and_name, <<0>>)
-    name = String.slice(name_with_null, 0..-2//1)
+
+    # 1.3.0 strictness: the type name is NUL-terminated. The old silent slice dropped
+    # the LAST character when the terminator was missing; a malformed frame now raises
+    # a value-free error into the decode/1 boundary (explicit raise, not a MatchError
+    # whose message would embed the raw bytes — same treatment as the Truncate check).
+    name_size = byte_size(name_with_null) - 1
+
+    unless name_size >= 0 and binary_part(name_with_null, name_size, 1) == <<0>> do
+      raise ArgumentError, "malformed Type message: missing NUL terminator"
+    end
+
+    name = binary_part(name_with_null, 0, name_size)
 
     %Type{
       id: data_type_id,
@@ -297,7 +316,9 @@ defmodule Replicant.Decoder do
   defp decode_columns(<<>>, accumulator), do: Enum.reverse(accumulator)
 
   defp decode_columns(<<flags::integer-8, rest::binary>>, accumulator) do
-    [name | [<<data_type_id::integer-32, type_modifier::integer-32, columns::binary>>]] =
+    # atttypmod is int32 SIGNED on the wire (1.3.0): -1 is the ubiquitous "no
+    # modifier" marker and previously surfaced as 4294967295.
+    [name | [<<data_type_id::integer-32, type_modifier::integer-signed-32, columns::binary>>]] =
       String.split(rest, <<0>>, parts: 2)
 
     decoded_flags =

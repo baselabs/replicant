@@ -52,7 +52,7 @@ defmodule Replicant.Change do
             name: String.t() | nil,
             type: String.t() | nil,
             flags: [atom()],
-            type_modifier: non_neg_integer() | nil
+            type_modifier: integer() | nil
           }
 
     defstruct [:name, :type, :type_modifier, flags: []]

@@ -202,8 +202,12 @@ defmodule Replicant.IdleAckTest do
            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
            [slot]
          ).rows do
-      [[lsn]] when is_binary(lsn) -> Replicant.lsn_from_string(lsn)
-      _ -> 0
+      [[lsn]] when is_binary(lsn) ->
+        {:ok, lsn_int} = Replicant.lsn_from_string(lsn)
+        lsn_int
+
+      _ ->
+        0
     end
   end
 

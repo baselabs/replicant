@@ -14,7 +14,7 @@ defmodule Replicant.SchemaChangeTest do
   end
 
   defp col(name, type, flags \\ []) do
-    %Messages.Relation.Column{name: name, type: type, flags: flags, type_modifier: 4_294_967_295}
+    %Messages.Relation.Column{name: name, type: type, flags: flags, type_modifier: -1}
   end
 
   describe "classify/2 — additive" do

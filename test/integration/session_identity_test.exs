@@ -114,11 +114,13 @@ defmodule Replicant.SessionIdentityIntegrationTest do
         []
       )
 
+    {:ok, current_lsn_int} = Replicant.lsn_from_string(current_lsn)
+
     %SessionIdentity{
       system_identifier: system_identifier,
       database: database,
       timeline_id: timeline_id,
-      current_lsn: Replicant.lsn_from_string(current_lsn)
+      current_lsn: current_lsn_int
     }
   end
 
