@@ -13,6 +13,7 @@ docs/adr/0004-commit-lsn-transaction-watermark.md
 docs/adr/0005-spill-is-ephemeral-scratch.md
 docs/adr/0006-fail-closed-supervision.md
 docs/adr/0007-actual-replication-session-identity.md
+docs/adr/0008-casting-lenient-value-preserving-fallback.md
 examples/README.md
 examples/replication_pipeline/README.md
 docs/adr/README.md
