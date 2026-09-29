@@ -7,21 +7,41 @@ replication (`pgoutput`). It delivers *committed* row changes to a pluggable
 **sink** with **zero data loss** — the replication slot advances only after your
 sink has durably persisted the transaction.
 
-This notebook takes you from an empty database to a live pipeline you can watch,
-then tours the signature guarantees and two of the beyond-the-basics features.
-Everything below runs against a real Postgres; nothing is faked.
+This notebook is the full tour. By the end you will have **built and watched** a
+live pipeline, and proven on a real Postgres that:
 
-### The sink contract
+1. committed changes flow to a sink as decoded `%Replicant.Change{}` structs,
+2. the **unchanged-TOAST sentinel** tells your sink which columns to leave alone,
+3. delivery is **exactly-once** at transaction granularity (append-only ledger proof),
+4. a **snapshot backfill** bootstraps a populated table gap-free,
+5. **logical-decoding messages** reach `handle_message/2`,
+6. the **casting layer** delivers what you'd expect — nested multidimensional
+   arrays, locale-honest `money`, lossless `timetz`.
 
-A sink is a module implementing `Replicant.Sink`. The callbacks that matter
-first:
+Everything runs against a real Postgres; nothing is faked. The same assertions
+run in Replicant's CI against this notebook, so it cannot silently drift.
 
-- `handle_session_identity/2` (optional for generic sinks) — accept the actual
-  PostgreSQL system/database identity before any checkpoint is read.
-- `checkpoint/0` — the last durably-persisted commit LSN (your resume point **and**
-  the dedup watermark). `nil` means "never persisted anything".
-- `handle_transaction/1` — persist a whole `%Replicant.Transaction{}` **and** its
-  checkpoint atomically, then return `{:ok, commit_lsn}`.
+## The sink contract (all eleven callbacks)
+
+A sink is a module implementing `Replicant.Sink`. The full surface, so nothing
+surprises you later:
+
+| Callback | Required? | What it does |
+| --- | --- | --- |
+| `handle_transaction/1` | always | persist one committed `%Transaction{}` durably, return `{:ok, commit_lsn}` |
+| `checkpoint/0` | sink-owned modes | your durable resume point and dedup watermark (`nil` = fresh) |
+| `handle_snapshot/2` | snapshot modes | upsert a backfill batch; clear the table when `first_for_table?` |
+| `handle_snapshot_complete/1` | point-in-time snapshot | persist the handoff checkpoint |
+| `snapshot_progress/0` | sink-owned incremental | return your opaque progress token (or `:backfill_pending`) |
+| `handle_batch/1` | `batch_delivery` mode | persist a whole batch of transactions atomically |
+| `handle_message/2` | `messages: true` | a **non-transactional** logical-decoding message (at-least-once) |
+| `handle_session_identity/2` | source-bound sinks | accept/reject the actual replication-session identity |
+| `handle_slot_origin/2` | append sinks | veto a go-forward origin that gapped past your log |
+| `sink_kind/0` | append sinks | declare `:append_log` ack behavior (default: state mirror) |
+| `handle_schema_change/2` | optional | accept/veto **destructive** DDL at your migration window |
+
+This notebook exercises the first five plus the message callback; the rest are
+one config option away (see the toolbox at the end).
 
 ### The five critical rules (from `docs/INVARIANTS.md`)
 
@@ -37,7 +57,7 @@ first:
 
 ```elixir
 Mix.install([
-  {:replicant, "~> 1.0"},
+  {:replicant, "~> 1.3"},
   {:kino, "~> 0.14"}
 ])
 ```
@@ -238,7 +258,7 @@ end
 
 ddl = [
   "DROP PUBLICATION IF EXISTS lb_pub",
-  "DROP TABLE IF EXISTS lb_orders, lb_sink_orders, lb_sink_cp, lb_sink_calls",
+  "DROP TABLE IF EXISTS lb_orders, lb_sink_orders, lb_sink_cp, lb_sink_calls, lb_cast",
   "CREATE TABLE lb_orders (id int PRIMARY KEY, item text, qty int, memo text)",
   "ALTER TABLE lb_orders ALTER COLUMN memo SET STORAGE EXTERNAL",
   "CREATE TABLE lb_sink_orders (id int PRIMARY KEY, item text, qty int)",
@@ -257,6 +277,9 @@ for stmt <- ddl, do: Postgrex.query!(sql, stmt, [])
 checkpoint in one database transaction — that atomicity is what makes replay
 effect-once. It also skips any transaction at or below the checkpoint
 (`commit_lsn <= checkpoint`), the transaction-granularity dedup watermark.
+It mirrors only `lb_orders` — the casting demo below adds a second table to
+the same publication and the sink simply ignores it (a real sink switches on
+`change.table`).
 
 ```elixir
 defmodule LbCoreSink do
@@ -321,7 +344,10 @@ defmodule LbCoreSink do
     Postgrex.query!(c, "INSERT INTO lb_sink_calls (lsn, outcome) VALUES ($1, $2)", [lsn, outcome])
   end
 
-  defp apply_change(c, %Change{op: op, record: r}) when op in [:insert, :update] do
+  # Mirror ONLY lb_orders; any other table in the publication is a no-op. A real
+  # sink switches on `change.table` here.
+  defp apply_change(c, %Change{table: "lb_orders", op: op, record: r})
+       when op in [:insert, :update] do
     Postgrex.query!(
       c,
       "INSERT INTO lb_sink_orders (id, item, qty) VALUES ($1, $2, $3) " <>
@@ -332,11 +358,11 @@ defmodule LbCoreSink do
     )
   end
 
-  defp apply_change(c, %Change{op: :delete, old_record: old}) do
+  defp apply_change(c, %Change{table: "lb_orders", op: :delete, old_record: old}) do
     Postgrex.query!(c, "DELETE FROM lb_sink_orders WHERE id = $1", [old["id"]])
   end
 
-  defp apply_change(_c, _change), do: :ok
+  defp apply_change(_c, _other_table_change), do: :ok
 end
 ```
 
@@ -403,12 +429,92 @@ LbCapture.all()
 |> Enum.map(fn ch ->
   %{
     op: ch.op,
+    table: ch.table,
     record: inspect(ch.record),
     old_record: inspect(ch.old_record),
     unchanged: inspect(ch.unchanged)
   }
 end)
 |> Kino.DataTable.new()
+```
+
+## What your sink receives — the casting layer
+
+Every `record` value is cast from Postgres's text output (ADR-0008). The three
+rules worth seeing live: **multidimensional arrays nest**, **money is
+locale-honest**, and **timetz is lossless**. Add a wide table to the same
+publication and stream one row of everything:
+
+```elixir
+cast_ddl = [
+  "DROP TABLE IF EXISTS lb_cast",
+  "CREATE TABLE lb_cast (id int PRIMARY KEY, grid numeric[], flags boolean[], moments timestamptz[], price money, at timetz)",
+  "ALTER PUBLICATION lb_pub ADD TABLE lb_cast"
+]
+
+for stmt <- cast_ddl, do: Postgrex.query!(sql, stmt, [])
+
+LbCapture.reset()
+
+Postgrex.query!(
+  sql,
+  # NOTE: the money and timetz values are inlined SQL literals — Postgrex's
+  # DefaultTypes has no `money` encoder and its `timetz` encoder wants a %Time{}
+  # (lossy), so neither can ride as a bound parameter. (Replicant's own CDC path
+  # never goes through Postgrex types: pgoutput delivers text that replicant casts
+  # itself — that is exactly what this section demonstrates.)
+  "INSERT INTO lb_cast (id, grid, flags, moments, price, at) VALUES ($1, $2, $3, $4, 1234.56::money, '04:05:06.789-08'::timetz)",
+  [
+    100,
+    [[Decimal.new("1.5"), Decimal.new(2)], [Decimal.new(3), nil]],
+    [[true, false]],
+    [
+      [~U[2024-01-15 10:30:00Z], ~U[2024-06-01 12:00:00Z]]
+    ]
+  ]
+)
+
+# The change arrives through the SAME pipeline (lb_cast is now in lb_pub).
+LbDemo.wait_until(fn ->
+  LbCapture.all() |> List.flatten() |> Enum.any?(& &1.record["grid"])
+end)
+
+cast_change =
+  LbCapture.all()
+  |> List.flatten()
+  |> Enum.find(& &1.record["grid"])
+
+%{
+  grid_numeric_2d: inspect(cast_change.record["grid"]),
+  flags_2d: inspect(cast_change.record["flags"]),
+  moments_tz: inspect(cast_change.record["moments"]),
+  price_money: inspect(cast_change.record["price"]),
+  at_timetz: inspect(cast_change.record["at"])
+}
+```
+
+What you just proved, on the live server:
+
+```elixir
+multidim_numeric = cast_change.record["grid"]
+multidim_bool = cast_change.record["flags"]
+tz_nested = cast_change.record["moments"]
+money_value = cast_change.record["price"]
+timetz_raw = cast_change.record["at"]
+
+%{
+  numeric_2d_nests_with_nil:
+    multidim_numeric == [[Decimal.new("1.5"), Decimal.new(2)], [Decimal.new(3), nil]],
+  bool_2d_casts: multidim_bool == [[true, false]],
+  timestamptz_2d_casts: match?([[%DateTime{}, %DateTime{}]], tz_nested),
+  # C/en-US lc_monetary renders "$1,234.56" -> Decimal; any other locale
+  # honestly delivers the ORIGINAL string (never a silently-wrong Decimal).
+  money_is_decimal_or_raw_string:
+    is_struct(money_value, Decimal) or is_binary(money_value),
+  # No Elixir type carries a time WITH its offset - the raw string keeps the
+  # fractional seconds and the offset instead of truncating them.
+  timetz_keeps_fraction_and_offset: timetz_raw == "04:05:06.789-08"
+}
 ```
 
 ## Guarantee 1 — the unchanged-TOAST sentinel
@@ -711,17 +817,21 @@ LbDemo.stop(message_slot)
 ## The rest of the toolbox
 
 The core flow above is most of what you need day to day. The features below are
-each one config option away — see the linked README section for the full contract:
+each one config option away — the README carries each full contract, and the
+[usage rules](https://hexdocs.pm/replicant/usage-rules.html) carry the complete
+telemetry, halt-reason, and casting reference:
 
-| Feature | Turn it on with | README |
+| Feature | Turn it on with | Where to read |
 | --- | --- | --- |
-| In-progress transaction streaming (proto-v2) | `streaming: [max_concurrent_txns: 64]` | [How it streams](https://hexdocs.pm/replicant/readme.html#how-it-streams) |
-| Consumer-side disk spill (oversized txns) | `streaming: [spill: [dir: ..., max_spill_bytes: ...]]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
-| Resumable incremental snapshot | `snapshot: [mode: :incremental, chunk_rows: 1000]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
-| Lib-owned checkpoint (non-transactional sinks) | `checkpoint_store: [connection: ..., table: ...]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
-| Sink-owned atomic batch delivery | `batch_delivery: [max_transactions: 100]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
-| Multi-publication per pipeline | `publication: ["p1", "p2"]` | [Usage](https://hexdocs.pm/replicant/readme.html#usage) |
-| Failover slots (PG17+, HA) | `failover: true` | [Failover slots](https://hexdocs.pm/replicant/readme.html#failover-slots-pg17) |
+| In-progress transaction streaming (proto-v2) | `streaming: [max_concurrent_txns: 64]` | [README — spill & streaming](https://hexdocs.pm/replicant/readme.html#consumer-side-disk-spill-oversized-transactions) |
+| Consumer-side disk spill (oversized txns) | `streaming: [spill: [dir: ..., max_spill_bytes: ...]]` | [README — spill & streaming](https://hexdocs.pm/replicant/readme.html#consumer-side-disk-spill-oversized-transactions) |
+| Resumable incremental snapshot | `snapshot: [mode: :incremental, chunk_rows: 1000]` | [README — snapshots](https://hexdocs.pm/replicant/readme.html#snapshots--backfill) |
+| Lib-owned checkpoint (non-transactional sinks) | `checkpoint_store: [connection: ..., table: ...]` | [README — lib mode](https://hexdocs.pm/replicant/readme.html#usage) |
+| Sink-owned atomic batch delivery | `batch_delivery: [max_transactions: 100]` | [README — batch delivery](https://hexdocs.pm/replicant/readme.html#usage) |
+| Multi-publication per pipeline | `publication: ["p1", "p2"]` | [README — multi-publication](https://hexdocs.pm/replicant/readme.html#usage) |
+| Failover slots (PG17+, HA) | `failover: true` | [README — failover](https://hexdocs.pm/replicant/readme.html#failover-slots-pg17) |
+| Append-log consumers | `sink_kind/0` → `:append_log` + `handle_slot_origin/2` | [README — slot origin](https://hexdocs.pm/replicant/readme.html#slot-origin-for-go-forward-append-consumers) |
+| Destructive-DDL migration window | `handle_schema_change/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
 
 For multitenancy, classification, and Ash resources, use the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter, which is
@@ -737,7 +847,7 @@ only, never a row value — critical rule 1).
 
 | Knob (default) | Bounds | On exhaustion | Telemetry |
 | --- | --- | --- | --- |
-| `max_inflight_lag: 64 * 1024 * 1024` | how far the received WAL frontier may run ahead of the durable checkpoint before the sink is "too slow" | halt fail-closed (sink can't keep up) | — |
+| `max_inflight_lag: 64 * 1024 * 1024` | how far the received WAL frontier may run ahead of the durable checkpoint before the sink is "too slow" | halt fail-closed (sink can't keep up) | rides `[:replicant, :connection, :disconnected]` with `reason: :sink_too_slow` + a signed `lag` measurement |
 | `checkpoint_store: [max_retries: 5, retry_backoff_ms: 1000]` (lib mode) | transient checkpoint-store faults (connect-read + mid-stream write) | halt after N retries; a permanent fault (schema/config) halts at once; `max_retries: 0` = halt-now | `[:replicant, :checkpoint_store, :retrying]` per attempt |
 | `max_command_retries: 5` | a persistent **pre-frame** replication-command error — slot exhaustion, a slot already active for another consumer, a forward-incompatible result — that otherwise reconnects forever | halt after N failed connect cycles; `max_command_retries: 0` = halt-now | `[:replicant, :connection, :command_error_halt]` on halt |
 | `failover: true` (PG17+) | enables an HA failover slot that survives a promoted standby | on PG16 halts `{:config, :failover_unsupported}`; an unpromoted synced slot halts fail-closed | — |
@@ -765,6 +875,14 @@ assert toast_unchanged == ["memo"]
 assert snapshot_mirror_count == 5
 assert nontxn_message == {"lb_heartbeat", "tick"}
 
+assert multidim_numeric == [[Decimal.new("1.5"), Decimal.new(2)], [Decimal.new(3), nil]]
+assert multidim_bool == [[true, false]]
+assert [[%DateTime{}, %DateTime{}]] = tz_nested
+# The value 1234.56 renders "$1,234.56" (grouped) or "$1234.56" (C) — both parse
+# to the same Decimal; a non-C lc_monetary form delivers the raw string instead.
+assert Decimal.equal?(money_value, Decimal.new("1234.56"))
+assert timetz_raw == "04:05:06.789-08"
+
 :all_green
 ```
 
@@ -774,6 +892,11 @@ assert nontxn_message == {"lb_heartbeat", "tick"}
   core_dup_count: core_dup_count,
   toast_unchanged: toast_unchanged,
   snapshot_mirror_count: snapshot_mirror_count,
-  nontxn_message: nontxn_message
+  nontxn_message: nontxn_message,
+  multidim_numeric: multidim_numeric,
+  multidim_bool: multidim_bool,
+  tz_nested: tz_nested,
+  money_value: money_value,
+  timetz_raw: timetz_raw
 }
 ```

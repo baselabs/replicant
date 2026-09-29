@@ -7,6 +7,124 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-28
+
+### Fixed
+
+- **Multidimensional arrays of every casted type now deliver nested terms instead of halting.**
+  Only the `int[]`/`float[]` array clauses recursed into nested lists; a `numeric[][]`,
+  `timestamptz[][]`, `jsonb[][]`, `date[][]`, `time[][]`, `money[][]`, `bytea[][]` or 2-D
+  `bool[][]` column fed a nested list straight into its scalar parser, raised, and halted the
+  pipeline fail-closed on ordinary Postgres data (`:decode_failure`, value-free but a halt).
+  Every array clause now recurses element-wise with the same per-element semantics as its
+  scalar clause (raise-sites stay raise-sites, lenient fallbacks stay lenient; 2-D `bool`
+  leaves no uncast `"t"`/`"f"` strings). Verified against real server array output.
+
+- **`interval[]` is no longer silently corrupted to integers.** The integer-array
+  clause matched an `"_int"` PREFIX, so an `interval[]` column (OID 1187) fell into it
+  and `Integer.parse` truncated each interval to its leading integer ("2 mons 3 days"
+  → `2`) — silently wrong values on ordinary data (live-confirmed). Int arrays now
+  match their exact names (`_int2`/`_int4`/`_int8`), `_interval` and `_timetz` arrays
+  deliver raw-string elements (mirroring their scalar clauses, ADR-0008), and
+  `_int2vector` falls to the raw-literal catch-all.
+
+- **The array-literal parser is quote-aware and strict where Postgres is strict.** Braces
+  inside *quoted* elements were treated as structural, so canonical `array_out` output
+  whose elements contain unbalanced braces mis-framed the nested slice and silently
+  degraded the whole literal to a raw string; consecutive/leading/trailing commas were
+  silently skipped, delivering a wrong-length list. Both now produce a value-free parse
+  error (the cast boundary delivers the raw string), never a silent mis-parse. An
+  unquoted element merely *starting* with `NULL` (`{NULLABLE,NULLs,…}` — a live
+  `array_out` form) is ordinary text: the null marker only fires when a separator or
+  the closing brace follows. Scale pins duration-assert that a 2 MB element parses in
+  well under a second (a broken append chain needs seconds and reds).
+
+- **`money` is locale-honest.** Money output follows the server's `lc_monetary`; the old
+  regex strip turned a `de_DE` `"1.234,56"` into `Decimal 1.23456` — a silent 100x value
+  error. The strict C/en-US shapes (`$1,234.56`, `-$5.00`, `$1234567.89`) still deliver a
+  `Decimal`; anything else delivers the **original string** — never a silently-wrong
+  Decimal, never a raise (scalar and array, at any depth).
+
+- **`timetz` delivers the raw server string** (fractional seconds and offset preserved).
+  The old `String.slice(0..7)` silently dropped both. Same precedent as `interval`:
+  there is no Elixir type for time-with-offset.
+
+- **Relation `type_modifier` decodes as signed int32.** Postgres `atttypmod` is signed and
+  `-1` is the ubiquitous "no modifier" marker; it previously surfaced as `4294967295`
+  (`Replicant.Decoder.Messages.Relation.Column` / `Replicant.Change.Column`, both now
+  typed `integer() | nil`).
+
+- **Malformed-frame decoding is strict instead of silently lossy.** A `TRUNCATE` whose
+  relation-id bytes are not exactly `number_of_relations × 4`, and a `TYPE` message whose
+  name lacks its trailing NUL, previously produced a short relation list / a
+  one-character-short name; both now raise into the value-free decode boundary
+  (`:decode_failure`), never leaking the offending bytes.
+
+- **A connection fault during a PK-less (whole-read) backfill is no longer mislabeled as
+  table contention.** Genuine contention travels as a throw (the discard path) and the
+  transaction body only ever returns `{:ok, _}` — so EVERY `{:error, _}` from
+  `Postgrex.transaction` is a connection/I-O fault and now propagates to the reader's
+  value-free boundary as `:snapshot_failed`, instead of consuming a contention attempt
+  and halting `:snapshot_table_contended` — which sent operators hunting write
+  contention when the fault was I/O.
+
+- **Reader calls with no seated incremental window halt cleanly instead of crashing —
+  or spinning.** A sink reporting in-flight backfill state after the window dropped at
+  completion could crash the AssemblerServer with a `FunctionClauseError` and restart
+  live streaming state. The window is only ever seated at init (nothing re-seats it),
+  so the clauses reply a DISTINCT `{:error, :snapshot_window_missing}` the reader does
+  not recognize — which raises into its value-free boundary and halts
+  `:snapshot_failed`: terminating and observable, never a budget-free retry loop.
+
+- **A `{:sink_committed, lsn}` racing a reconnect no longer hands Postgrex a
+  standby-status buffer outside `:streaming`.** The in-memory checkpoint advance (and
+  telemetry) stay unconditional; the wire buffer waits for streaming, where the next
+  keepalive reports it.
+
+### Changed
+
+- **⚠ `Replicant.lsn_from_string/1` returns `{:ok, lsn} | {:error, :invalid_lsn}`** instead
+  of raising `ArgumentError`/`MatchError` (and, on older runtimes, embedding the caller's
+  input in the message). A public function of a published package must never put a
+  caller's input bytes into a crash report — Critical Rule 1. **Upgrade note:** unwrap the
+  tuple (`{:ok, lsn} = Replicant.lsn_from_string(s)`); each half must fit 32 bits. This is
+  a deliberate public return-shape change shipped in a minor by owner decision (young
+  ecosystem, narrow affected surface, the old shape could embed input on raise) — recorded
+  in [ADR-0008](docs/adr/0008-casting-lenient-value-preserving-fallback.md).
+
+- **`Replicant.QueryBuilder.start_replication/3` rejects an invalid `start_lsn` with
+  `{:error, :invalid_start_lsn}`** instead of a `FunctionClauseError` — a tagged error
+  like every other builder failure.
+
+### Added
+
+- **A complete telemetry reference** (all 30 events with their observed
+  measurements/metadata), **a halt-reason operator table** (every fail-closed halt signal,
+  its cause, and the operator action — including the trap that the sink-lag halt rides
+  `[:replicant, :connection, :disconnected]` with `reason: :sink_too_slow`), and **a value
+  casting contract section**, all in [`usage-rules.md`](usage-rules.md); a "What your sink
+  receives (casting)" section in the README; and
+  [ADR-0008](docs/adr/0008-casting-lenient-value-preserving-fallback.md) recording the
+  casting contract decision.
+
+- **Documentation for the previously undiscoverable public surface**: the `sink_kind/0`
+  callback (state mirror vs `:append_log` ack behavior), the `handle_schema_change/2`
+  migration-window hook, and `checkpoint_store: [progress_table: …]` (the second table
+  lib mode owns under `snapshot: [mode: :incremental]`) — now on README + usage-rules +
+  the getting-started Livebook.
+
+- **The getting-started Livebook is a full tour with a live casting section**: it now
+  demonstrates multidimensional arrays, locale-honest money, and raw `timetz` against the
+  real server, lists all eleven sink callbacks, and its CI test asserts the observed
+  values on every push.
+
+### Performance
+
+- **`Replicant.Decoder.OidDatabase.name_for_type_id/1` is an O(1) compile-time map
+  lookup** (behavior-identical, same public contract) instead of a ~140-clause sequential
+  `case` that every unmapped OID (each enum / user-defined type) walked in full on each
+  Relation message.
+
 ## [1.2.4] - 2026-08-24
 
 ### Added
@@ -638,7 +756,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.2.4...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/baselabs/replicant/compare/v1.2.4...v1.3.0
 [1.2.4]: https://github.com/baselabs/replicant/compare/v1.2.3...v1.2.4
 [1.2.3]: https://github.com/baselabs/replicant/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/baselabs/replicant/compare/v1.2.1...v1.2.2

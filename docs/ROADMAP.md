@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-08-24 · **Latest published:** `v1.2.4` (tagged) · **Candidate:** none · **Branch:** `main`
+**Updated:** 2026-09-28 · **Latest published:** `v1.3.0` (tagged) · **Candidate:** none · **Branch:** `main`
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,7 +15,11 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.2.4 is the latest published release**, on Hex and tagged `v1.2.4`. It
+- **`replicant` 1.3.0 is the latest published release**, on Hex and tagged `v1.3.0` (the
+  1.3.0 remediation release: full multidim-array casting, locale-honest money, lossless
+  timetz, raising-free `lsn_from_string/1`, signed `atttypmod`, decoder strictness, and the
+  complete telemetry/halt/casting reference docs; see CHANGELOG `[1.3.0]` and ADR-0008). Prior:
+  1.2.4 (docs/examples release with no library API change). It
   is a docs/examples release with no library API change: the docker-compose reference
   example (`examples/replication_pipeline` — a Postgres→Postgres bridge with an effect-once
   sink, receipts ledger, session-identity binding, and liveness healthcheck) plus its
@@ -125,7 +129,7 @@ shipped specs' §3 non-goal tables, (C) ecosystem/adoption-layer candidates
 
 | # | Item | Unlocks | Status |
 |---|---|---|---|
-| C1 | A proposed `metrics/0` helper on `Replicant.Telemetry` (`Telemetry.Metrics` definitions) | Oban/Broadway convention — 27 structure-only events exist; every consumer currently hand-authors metric definitions | Open |
+| C1 | A proposed `metrics/0` helper on `Replicant.Telemetry` (`Telemetry.Metrics` definitions) | Oban/Broadway convention — 30 structure-only events exist; every consumer currently hand-authors metric definitions | Open |
 | C2 | Broadway producer adapter | Opens replicant to the dominant Elixir data-pipeline ecosystem | Open |
 
 ### Closed boundaries (cited, not silently dropped)
@@ -188,7 +192,7 @@ at AshReplicant `e4072fb95975c9588914d9aefe99ce1fa0098dfb`: minimum and
 latest-compatible lanes are defined, the committed lock is 1.2.2, and the broad
 requirement admits 1.2.3; the generated sink rejects actual-session identity drift
 before checkpoint lookup. AshReplicant publication remains a separate release action.
-**1.2.3** (`v1.2.3`) is the current published Replicant release: it keeps append-log
+**1.2.3** (`v1.2.3`) kept
 acknowledgements bound to durable delivery. **1.2.2** (`v1.2.2`) closes the pre-first-chunk
 incremental-backfill restart gap. **1.2.1** (`v1.2.1`) bounds keyed snapshot contention and
 hardens post-publication package identity. **1.2.0** (`v1.2.0`) added the fail-closed

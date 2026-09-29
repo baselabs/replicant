@@ -13,8 +13,8 @@ defmodule Replicant.ReleaseContractTest do
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.2.3"
-  @published_digest "6de8426f24ccebdf8973624f07c74cbf904d085ddb1b907b427821f91b3987db"
+  @previous_release "1.2.4"
+  @published_digest "REPLACED-AT-MINT"
 
   defp version, do: Mix.Project.config()[:version]
 

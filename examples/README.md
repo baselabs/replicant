@@ -1,9 +1,12 @@
 # replicant examples
 
 Runnable, minimal consumers that show how to integrate replicant end-to-end.
-They are **not** part of the Hex package and **not** part of the library's test
-suite — the `reference-example` CI job builds and exercises them as the public
-sink API's canary.
+The example **code** is **not** part of the Hex package and **not** part of the
+library's test suite — the `reference-example` CI job builds and exercises them
+as the public sink API's canary. (Their READMEs, including this one, *are*
+shipped in the package as documentation — Hex-only consumers will therefore see
+these docs linking to code that is not in the tarball; clone the repository to
+run an example.)
 
 ## `replication_pipeline/` — the reference stack (docker)
 

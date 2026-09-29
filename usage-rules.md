@@ -20,8 +20,10 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
 - **`Replicant`** — the facade module. `start_link/1` starts a supervised
   streaming pipeline (validates opts, enforces the go-forward guard) and
   `stop/1` tears one down; `t:lsn/0` (a `non_neg_integer` 64-bit LSN,
-  `(file <<< 32) ||| offset`) and `lsn_to_string/1` (uppercase `"file/offset"`
-  hex display, matching Postgres `pg_lsn`).
+  `(file <<< 32) ||| offset`), `lsn_to_string/1` (uppercase `"file/offset"`
+  hex display, matching Postgres `pg_lsn`), and `lsn_from_string/1`
+  (`{:ok, lsn} | {:error, :invalid_lsn}` since 1.3.0 — a public function
+  never raises, so a caller's input can never reach a crash report).
 - **`Replicant.Transaction`** — an assembled, committed transaction: ordered
   changes plus the transaction's single `commit_lsn`, and (when `messages: true`
   is enabled) any **transactional** logical-decoding messages in `messages`
@@ -87,6 +89,19 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   filtered-WAL idle advance, so a reused origin ahead of its checkpoint is a real gap. Publish a
   normal heartbeat transaction on a quiet append publication to advance the checkpoint and release
   retained WAL.
+- **`sink_kind/0`** (optional) — declares how the sink consumes the stream:
+  the default (callback absent) is a **state mirror** (replays/upserts state; the generic
+  idle keepalive may advance the slot over filtered WAL), `:append_log` is a **go-forward
+  append** consumer (never acknowledges past its durable delivered checkpoint, so an
+  out-of-band slot advance is detectable as a gap on reconnect). This is the knob behind
+  the 1.2.3 append-log ack behavior.
+- **`handle_schema_change/2`** (optional) — consulted on a **destructive** schema change
+  (a dropped column, a replica-identity change, a narrowing type change). Default
+  behavior without the callback: additive changes apply automatically, destructive
+  changes halt fail-closed. With it, return `:ok` to accept the change (you are
+  asserting your sink can handle the new shape) or `{:error, reason}` to halt
+  value-free — a migration-window hook for sinks that can adapt their own schema.
+  `context` is value-free.
 - **Incremental snapshot** (`snapshot: [mode: :incremental]`) — a resumable, chunked backfill
   for large tables, interleaved with the live stream. Chunks arrive through the SAME
   `handle_snapshot/2` (same `first_for_table?` redo-safety obligation; `handle_snapshot_complete/1`
@@ -120,7 +135,12 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   is identifier-validated, the connect chain fails closed if any requested pub is
   absent (`:publication_check`), and `messages: true` is the opt-in for
   logical-decoding messages (rejected `:messages_unsupported` if the sink lacks
-  `handle_message/2`).
+  `handle_message/2`). `streaming: [max_concurrent_txns: N]` (default 64) opts into
+  proto-v2 in-progress transaction streaming; its nested `spill: [dir:, max_spill_bytes:]`
+  opts into consumer-side disk spill for oversized streamed transactions.
+  `max_inflight_lag` (default 64 MiB) bounds how far the received WAL frontier may
+  run ahead of the durable checkpoint before the sink is "too slow"
+  (see the halt-reason table below).
 - **`Replicant.Snapshotter`** — reads a consistent snapshot of the publication's
   tables at the `EXPORT_SNAPSHOT` LSN (a `REPEATABLE READ` cursor on a separate
   connection) and pushes `%Change{op: :snapshot}` batches to the sink, behind a
@@ -130,7 +150,11 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   the library writes the checkpoint (`commit_lsn bigint`) to this durable Postgres table
   **after** the sink persists, so a non-transactional sink (files, S3, Kafka, external
   APIs) needs no atomic data+checkpoint unit. Value-free boundary; lazy table create +
-  shape-probe. A store fault is bounded by two `:checkpoint_store` knobs — `max_retries`
+  shape-probe. With `snapshot: [mode: :incremental]` the store ALSO owns a second
+  table — `progress_table` (default `"replicant_snapshot_progress"`, one row per slot)
+  — carrying the opaque, value-free backfill progress token. Both table names are
+  configurable (`checkpoint_store: [table: ..., progress_table: ...]`) and both are
+  created lazily. A store fault is bounded by two `:checkpoint_store` knobs — `max_retries`
   (default 5) and `retry_backoff_ms` (default 1000) — shared by both fault sites: a
   transient connect-read fault paces N fresh reconnects, a transient mid-stream write fault
   retries N (blocking the applier, so dup-bounded-to-one holds), then both **halt
@@ -158,6 +182,108 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   names, counts, durations, error classes — never row values).
 - **`Replicant.Error`** — the typed, value-free error struct raised/returned
   at decode and validation boundaries.
+
+## Value casting — what `record` holds
+
+`%Change{}.record` values are cast from Postgres's text output (ADR-0008 for the
+full contract). The guarantees a sink can rely on:
+
+- **Lenient by default.** A value that fails its type's parse is delivered as the
+  original string, never dropped or raised — EXCEPT a small documented raise-site
+  set (malformed `numeric`, non-hex `bytea`) that scrubs to a value-free
+  `:decode_failure` halt at the decode boundary: genuinely-malformed input is a
+  halt, an unparseable-but-legitimate value is a string.
+- **Multidimensional arrays nest.** Every casted array type (`numeric[][]`,
+  `timestamptz[][]`, `jsonb[][]`, `bool[][]`, …) delivers nested lists with the same
+  per-element semantics as its scalar clause. `NULL` elements are `nil` at any depth
+  (since 1.3.0; before it, only `int[]`/`float[]` recursed and other 2-D arrays
+  halted). `interval[]` and `timetz[]` deliver raw-string elements, mirroring their
+  scalar raw-string clauses (since 1.3.0; `interval[]` previously fell into the
+  integer-array clause and was silently truncated to its leading integer).
+- **`money` is locale-honest.** Money output follows the server's `lc_monetary`.
+  The strict C/en-US shapes (`$1,234.56`, `-$5.00`, `$1234567.89`) deliver a
+  `Decimal`; anything else (e.g. a `de_DE` `"1.234,56"`) delivers the **original
+  string** — never a silently-wrong Decimal, never a raise. Accept
+  `Decimal | String.t()` for money columns, and normalize the string form in your
+  sink if you run a non-C locale (since 1.3.0).
+- **`timetz` delivers the raw server string** (fractional seconds and offset
+  preserved; there is no Elixir type for time-with-offset — same as `interval`).
+  Before 1.3.0 the offset and fraction were silently truncated.
+- **`type_modifier` is a signed int32** (`-1` is Postgres's "no modifier" marker,
+  not `4294967295`).
+
+## Telemetry reference
+
+Every event is value-free by construction: metadata keys are closed to
+`commit_lsn, change_count, byte_size, lag_ms, duration, attempt, max_retries,
+transactional, table, slot_name, reason, error_class, kind`, each with a
+value-shape contract enforced at emission (`Replicant.Telemetry` raises on an
+off-list key or a wrong shape — never ships a row value). All thirty events:
+
+| Event | Fires when | Measurements | Metadata |
+| --- | --- | --- | --- |
+| `[:replicant, :connection, :connected]` | replication connection established (each connect/reconnect) | — | `kind` (`:primary`/recovery kind) |
+| `[:replicant, :connection, :disconnected]` | connection dropped — **also the only signal of the `:sink_too_slow` lag halt** (with `reason: :sink_too_slow` and a signed `lag` measurement in bytes) | `lag` (halt only) | `reason` (halt only) |
+| `[:replicant, :connection, :slot_active]` | the slot is created/owned and streaming begins | — | — |
+| `[:replicant, :connection, :slot_invalidated]` | slot invalidation / fail-closed config rejection | — | `reason` (`:failover_unsupported`, `:publication_missing`, invalidation class) |
+| `[:replicant, :connection, :session_identity_rejected]` | the sink vetoed the replication-session identity | — | `reason: :session_identity_rejected` |
+| `[:replicant, :connection, :command_error_halt]` | the pre-frame command-error watchdog exhausted its budget | — | `attempt`, `max_retries`, `slot_name` |
+| `[:replicant, :checkpoint, :advanced]` | the checkpoint advanced (per txn, async ack, or idle advance) | — | `commit_lsn` (`kind: :idle` on the idle-advance path) |
+| `[:replicant, :checkpoint_store, :read]` | lib mode: checkpoint read at connect | — | `slot_name`, `commit_lsn` (nil on a fresh slot) |
+| `[:replicant, :checkpoint_store, :written]` | lib mode: checkpoint durably written | — | `slot_name`, `commit_lsn` |
+| `[:replicant, :checkpoint_store, :batch_flushed]` | lib mode: a batched checkpoint window flushed | — | `slot_name`, `change_count`, `byte_size` (LSN span) |
+| `[:replicant, :checkpoint_store, :retrying]` | a transient store fault is being retried | — | `slot_name`, `attempt`, `max_retries` |
+| `[:replicant, :checkpoint_store, :failed]` | a store fault halted (retry exhaustion or permanent) | `duration` (mid-stream) | `slot_name`, `reason` |
+| `[:replicant, :transaction, :assembled]` | a committed transaction was assembled for delivery | — | `commit_lsn`, `change_count`, `byte_size` |
+| `[:replicant, :sink, :committed]` | the sink returned `{:ok, lsn}` for a transaction | `duration` | `commit_lsn` |
+| `[:replicant, :sink, :batch_committed]` | `handle_batch/1` committed an atomic batch | `duration` | `commit_lsn`, `change_count`, `reason` |
+| `[:replicant, :sink, :failed]` | the sink returned an error / raised (halt follows) | `duration` | `reason` (`:sink_failed`, `:spill_io_failed`, …) |
+| `[:replicant, :message, :received]` | a logical-decoding message arrived (`messages: true`) | — | `commit_lsn`, `byte_size`, `transactional` |
+| `[:replicant, :schema_change, :additive]` | an additive schema change applied automatically | — | `table`, `kind: :additive` |
+| `[:replicant, :schema_change, :halted]` | a destructive schema change halted (or `handle_schema_change/2` vetoed) | — | `table`, `kind: :destructive` |
+| `[:replicant, :snapshot, :started]` | a snapshot/backfill started (point-in-time or incremental floor) | — | `commit_lsn` |
+| `[:replicant, :snapshot, :resumed]` | an incremental backfill resumed from durable progress | — | `slot_name` |
+| `[:replicant, :snapshot, :table_completed]` | one table finished snapshotting | — | `table`, `change_count` |
+| `[:replicant, :snapshot, :chunk_completed]` | one incremental chunk applied | — | `table`, `change_count` |
+| `[:replicant, :snapshot, :chunk_retried]` | a chunk was discarded for contention and will retry | — | `table`, `reason: :snapshot_table_contended` |
+| `[:replicant, :snapshot, :completed]` | the snapshot finished and handed off to streaming | `duration` | `commit_lsn`, `change_count` |
+| `[:replicant, :snapshot, :failed]` | the snapshot halted (value-free boundary) | — | `reason` (`:snapshot_failed`, `:snapshot_table_contended`, …) |
+| `[:replicant, :stream, :committed]` | a proto-v2 streamed transaction committed | — | `commit_lsn`, `byte_size` (`change_count` on the folded path) |
+| `[:replicant, :stream, :aborted]` | a streamed transaction aborted | — | `reason: :stream_abort` |
+| `[:replicant, :stream, :spilled]` | an oversized streamed transaction's tail spilled to disk | — | `byte_size`, `change_count` |
+| `[:replicant, :stream, :spill_exhausted]` | the disk ceiling was reached (halt follows) | — | `byte_size`, `reason: :spill_exhausted` |
+
+The two-column trap to know: the **lag halt** (`:sink_too_slow`) rides
+`[:replicant, :connection, :disconnected]`, not a dedicated event — alert on
+`reason: :sink_too_slow`, not on the event name alone.
+
+## Halt reasons (operator reference)
+
+Every failure mode halts **fail-closed** — the pipeline stops and stays idle
+rather than dropping data or reconnecting forever. Restart resumes from the
+durable checkpoint (loss = 0; duplicates bounded by the mode's contract).
+
+| Halt signal | Cause | Operator action |
+| --- | --- | --- |
+| `[:replicant, :sink, :failed]` | the sink returned an error or raised | fix the sink/store it writes; restart the pipeline |
+| `:disconnected` + `reason: :sink_too_slow` | received WAL ran `max_inflight_lag` (default 64 MiB) past the durable checkpoint | speed the sink up, batch (`batch_delivery`), or raise the bound |
+| `[:replicant, :connection, :slot_invalidated]` | the slot was invalidated (`wal_status = 'lost'`), a requested publication vanished, or failover config was rejected | recreate the slot (accept the re-stream from its origin — see `handle_slot_origin/2` for append sinks); restore/rename the publication; drop `failover:` on PG<17 |
+| `[:replicant, :connection, :command_error_halt]` | persistent pre-frame command errors (slot exhaustion, slot already active, forward-incompatible result) | free a replication slot / disconnect the other consumer; then restart |
+| `[:replicant, :connection, :session_identity_rejected]` | the sink vetoed the actual replication-session identity | point at the intended source, or update the sink's accepted identity |
+| `:slot_origin_rejected` / `:slot_origin_unavailable` | an append sink vetoed the go-forward origin / the slot's origin state was missing or malformed | reconcile the append log with the origin gap, then restart |
+| `[:replicant, :checkpoint_store, :failed]` | the lib-mode checkpoint store faulted past its retry budget (or a permanent schema/config fault) | restore the store, fix the schema/config; restart |
+| `[:replicant, :schema_change, :halted]` | a destructive schema change (dropped column, replica-identity change, narrowing type) — or `handle_schema_change/2` vetoed | adapt the sink (or implement the callback to accept), then restart |
+| `[:replicant, :snapshot, :failed]` with `:snapshot_table_contended` | a backfilling table stayed hot through three contention attempts | backfill during a quieter window, or shrink `chunk_rows` |
+| `[:replicant, :snapshot, :failed]` (other) | the snapshot reader faulted (incl. connection faults during a backfill) | check source connectivity; restart — the backfill resumes from durable progress |
+| `[:replicant, :stream, :spill_exhausted]` | a spilled transaction exceeded `max_spill_bytes` | free disk / raise `max_spill_bytes` / shrink the oversized transaction |
+| `:decode_failure` | genuinely-malformed WAL/cast input at the value-free boundary | check upstream WAL/plugin integrity — this is never ordinary data |
+| `:slot_synced_unpromoted` | `failover: true` against a standby whose synced slot is not yet promoted | promote the standby (or point at the primary), then restart |
+
+Start-time rejections (no pipeline starts, nothing halts): `:invalid_identifier`,
+`:invalid_sink`, `:config_invalid`, `:conflicting_start_mode`,
+`:go_forward_required`, `:snapshot_unsupported`, `:batch_unsupported`,
+`:messages_unsupported`, `{:config, :failover_unsupported}`, and
+`{:error, :invalid_start_lsn}` from the query builder (1.3.0).
 
 ## Non-negotiable rules
 

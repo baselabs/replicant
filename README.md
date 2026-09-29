@@ -10,9 +10,11 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.2.3 is the latest release published on Hex and tagged `v1.2.3`.
-> It keeps append-log acknowledgements bound to the durable delivered frontier
-> (see CHANGELOG `[1.2.3]`).
+> **Status:** 1.3.0 is the latest release published on Hex and tagged `v1.3.0`.
+> It hardens the value layer every sink receives — multidimensional arrays of every
+> casted type, locale-honest `money`, lossless `timetz`, signed `type_modifier`,
+> a raising-free `lsn_from_string/1`, and stricter malformed-frame decoding
+> (see CHANGELOG `[1.3.0]` and ADR-0008).
 > Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
@@ -35,7 +37,9 @@ Multitenancy, classification, and Ash resources live one layer up, in the
 - **Value-free errors, logs, and telemetry** — every row value is assumed to
   be PII or a secret. Decode failures are caught and scrubbed into a
   `Replicant.Error` that never carries raw WAL bytes; telemetry metadata is
-  allowlisted to LSNs, table names, counts, durations, and error classes.
+  allowlisted to LSNs, table/slot names, counts, durations, booleans, and error
+  classes (the full event and halt-reason reference lives in
+  [`usage-rules.md`](usage-rules.md)).
 - **Identifier-validated SQL** — slot and publication names pass through
   `Replicant.Identifier.validate/1` (a strict Postgres-identifier allowlist)
   before they reach SQL, closing the raw-interpolation surface in the
@@ -47,7 +51,9 @@ Multitenancy, classification, and Ash resources live one layer up, in the
   placeholder.
 - **Fail-closed on destructive schema drift** — a replica-identity change or a
   dropped column is classified `:destructive` and halts, rather than silently
-  emitting incomplete or misattributed rows.
+  emitting incomplete or misattributed rows. A sink that can adapt its own
+  schema implements the optional `handle_schema_change/2` callback to accept or
+  veto destructive changes at the migration window instead of halting.
 - **Actual replication-session identity** — `IDENTIFY_SYSTEM` runs on the exact
   replication connection before checkpoint lookup. A source-aware sink can
   accept or reject `%Replicant.SessionIdentity{}` synchronously on every connect
@@ -69,7 +75,33 @@ Replicant.lsn_to_string(0x16E3778)
 
 Use `Replicant.lsn_to_string/1` for display; LSNs are WAL positions, not row
 data, so they are permitted in telemetry metadata. The exactly-once watermark
-check is plain integer comparison: `txn.commit_lsn <= checkpoint`.
+check is plain integer comparison: `txn.commit_lsn <= checkpoint`. The inverse
+`Replicant.lsn_from_string/1` returns `{:ok, lsn} | {:error, :invalid_lsn}`
+(since 1.3.0 — it never raises, so a caller's input can never reach a crash
+report).
+
+## What your sink receives (casting)
+
+`%Change{}.record` values are cast from Postgres's text output. The full
+contract is [ADR-0008](docs/adr/0008-casting-lenient-value-preserving-fallback.md);
+the three rules that surprise people:
+
+- **Multidimensional arrays nest** — `numeric[][]`, `timestamptz[][]`,
+  `jsonb[][]` and every other casted array type deliver nested lists with the
+  same per-element semantics as their scalar clause (since 1.3.0; `NULL`
+  elements are `nil` at any depth). `interval[]`/`timetz[]` deliver raw-string
+  elements, mirroring their scalar clauses.
+- **`money` is locale-honest** — money output follows the server's
+  `lc_monetary`. The strict C/en-US shapes deliver a `Decimal`; anything else
+  (e.g. `de_DE` `"1.234,56"`) delivers the original string — never a
+  silently-wrong Decimal (since 1.3.0).
+- **`timetz` delivers the raw string** — fractional seconds and offset
+  preserved; there is no Elixir type for time-with-offset (same as `interval`).
+
+Everything else is lenient-by-default: a value that fails its type's parse is
+delivered as the original string; only genuinely-malformed input (a malformed
+`numeric`, non-hex `bytea`) raises into the value-free decode boundary and
+halts `:decode_failure`.
 
 ## How it streams
 
@@ -270,7 +302,10 @@ Kafka, external APIs) needs to implement only `handle_transaction/1`. The guaran
 non-transactional sink cannot dedup). A store outage (connect-read or mid-stream write) is
 bounded: the pipeline retries `max_retries` times (default 5) `retry_backoff_ms` apart
 (default 1000 ms — ~5s of outage tolerated) then halts fail-closed; a permanent fault
-(schema mismatch / invalid config) halts immediately.
+(schema mismatch / invalid config) halts immediately. With `snapshot: [mode:
+:incremental]` the store additionally owns a `progress_table` (default
+`"replicant_snapshot_progress"`) carrying the opaque, value-free backfill progress token
+— both table names are configurable.
 
 **Persistent replication-command errors (`max_command_retries`, default 5).** A replication
 command that fails *before the stream starts* — e.g. `CREATE_REPLICATION_SLOT` when the
@@ -328,9 +363,9 @@ use `checkpoint_store`, and any `handle_transaction/1` implementation is ignored
 Emits `[:replicant, :sink, :batch_committed]` telemetry once per flush.
 
 **Consumer-side disk spill (oversized transactions).** By default a single in-progress streamed
-transaction is bounded by the in-flight window: one larger than `max_inflight_lag` halts
-fail-closed. Opt into **disk spill** to reassemble such a transaction partly on disk and still deliver
-it effect-once:
+transaction is bounded by the in-flight window: one larger than `max_inflight_lag` (default
+64 MiB) halts fail-closed. Opt into **disk spill** to reassemble such a transaction partly on
+disk and still deliver it effect-once:
 
 ```elixir
 Replicant.start_link(
@@ -451,7 +486,8 @@ implement the callback is unaffected: no extra query, unchanged streaming. If Po
 supply a valid logical-slot origin, Replicant halts before the callback and streaming with
 `:slot_origin_unavailable`; it never reports a fabricated zero origin.
 
-An `:append_log` sink never uses the filtered-WAL idle advance. This is what
+An `:append_log` sink — declared by implementing the optional `sink_kind/0`
+callback — never uses the filtered-WAL idle advance. This is what
 makes `origin > durable checkpoint` unambiguously an out-of-band gap instead of
 a legitimate keepalive side effect. On a quiet append publication in a busy
 cluster, publish a normal heartbeat transaction (a row or admitted logical

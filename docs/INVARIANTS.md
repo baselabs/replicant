@@ -10,7 +10,7 @@ library change that violates one is a bug in the library.
 Assume every value is PII or a secret. The library guarantees that **no row value ever reaches an
 error, a log line, a telemetry event, or a crash dump through its own surfaces** — decode faults
 are scrubbed to a value-free `Replicant.Error{reason, shape}`, telemetry metadata is allowlisted
-to LSNs / table names / counts / durations / error-class atoms, and there is no `Logger` or `IO.*`
+to LSNs / table & slot names / counts / durations / booleans / error-class atoms, and there is no `Logger` or `IO.*`
 usage in `lib/`. The sink must uphold the same boundary: do not log `record` values, do not embed
 them in error reasons, do not emit them in telemetry. (Governing ADR:
 [0003](adr/0003-value-free-error-boundary.md).)

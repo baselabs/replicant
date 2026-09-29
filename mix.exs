@@ -1,7 +1,7 @@
 defmodule Replicant.MixProject do
   use Mix.Project
 
-  @version "1.2.4"
+  @version "1.3.0"
   @source_url "https://github.com/baselabs/replicant"
 
   def project do
@@ -103,6 +103,7 @@ defmodule Replicant.MixProject do
         "docs/adr/0005-spill-is-ephemeral-scratch.md",
         "docs/adr/0006-fail-closed-supervision.md",
         "docs/adr/0007-actual-replication-session-identity.md",
+        "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
         "notebooks/getting_started.livemd",
         "examples/README.md",
         "examples/replication_pipeline/README.md",
@@ -122,7 +123,8 @@ defmodule Replicant.MixProject do
           "docs/adr/0004-commit-lsn-transaction-watermark.md",
           "docs/adr/0005-spill-is-ephemeral-scratch.md",
           "docs/adr/0006-fail-closed-supervision.md",
-          "docs/adr/0007-actual-replication-session-identity.md"
+          "docs/adr/0007-actual-replication-session-identity.md",
+          "docs/adr/0008-casting-lenient-value-preserving-fallback.md"
         ],
         Guides: [
           "notebooks/getting_started.livemd",

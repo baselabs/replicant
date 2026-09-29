@@ -21,3 +21,4 @@ security-posture decision), not retroactively for pre-existing history.
 | [0005](0005-spill-is-ephemeral-scratch.md) | Spill is ephemeral non-fsync'd scratch, not a durable WAL | D8 |
 | [0006](0006-fail-closed-supervision.md) | Fail-closed supervision — `:one_for_all` Pipeline + `:temporary` child | D8 |
 | [0007](0007-actual-replication-session-identity.md) | Actual replication-session identity precedes checkpoint lookup | D2 |
+| [0008](0008-casting-lenient-value-preserving-fallback.md) | Casting contract — lenient value-preserving fallback for locale-dependent and unrepresentable types | 1.3.0 |
