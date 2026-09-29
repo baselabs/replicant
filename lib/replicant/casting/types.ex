@@ -15,9 +15,9 @@ defmodule Replicant.Casting.Types do
   Three clauses can still raise on *truly-malformed* input, because they call
   a bang/raising function with no local rescue:
 
-    * `Decimal.new/1` (the `"numeric"`, `"decimal"`, `"money"` scalar clauses
-      and the `"_numeric"`/`"_decimal"`/`"_money"` array clauses) raises
-      `Decimal.Error` on a malformed numeric string.
+    * `Decimal.new/1` (the `"numeric"` and `"decimal"` scalar clauses and the
+      `"_numeric"`/`"_decimal"` array clauses) raises `Decimal.Error` on a
+      malformed numeric string.
     * `Base.decode16!/2` (the `"bytea"` scalar clause and the `"_bytea"` array
       clause) raises `ArgumentError` on non-hex bytea payloads.
     * `DateTime.from_naive!/2` (the `"timestamp"` scalar clause and the
@@ -27,7 +27,13 @@ defmodule Replicant.Casting.Types do
 
   `Jason.decode/1` (the `"jsonb"`/`"json"` scalar and `"_jsonb"`/`"_json"`
   array clauses) does NOT raise — it returns `{:error, _}`, which the
-  surrounding `case` collapses to the lenient fallback.
+  surrounding `case` collapses to the lenient fallback. `money` (1.3.0) is
+  lenient too: it parses only the strict C/en-US shapes and delivers the
+  original string otherwise, because money output is locale-dependent
+  (`lc_monetary`) and a forced `Decimal` is a silently WRONG value under a
+  non-C locale — see ADR-0008. `timetz` (1.3.0) delivers the raw string
+  (no Elixir type carries a time WITH its offset; the old truncation silently
+  dropped fractional seconds and offset).
 
   Because malformed numeric/bytea inputs raise *through* `cast_record/2`, the
   Assembler (Task 13) MUST invoke `cast_record/2` inside a decode boundary —
@@ -37,11 +43,26 @@ defmodule Replicant.Casting.Types do
   fallback already covers ordinary parse-failures; only genuinely-malformed
   input reaches the raising path, and the boundary is the correct place to
   scrub it.
+
+  ## Array clauses (multidimensional, 1.3.0)
+
+  Every casted array type recurses through `cast_array_elements/2`, so a 2-D+
+  literal (`numeric[][]`, `timestamptz[][]`, …) casts element-wise exactly like
+  its scalar clause — including the raise-sites above (which the decode
+  boundary scrubs) and the lenient fallbacks. Only `_int*`/`_float*` recursed
+  before 1.3.0; every other array clause fed a nested LIST into its scalar
+  parser and raised on ordinary Postgres data.
   """
 
   # credo:disable-for-this-file Credo.Check.Refactor.Nesting
 
   alias Replicant.Casting.ArrayParser
+
+  # The strict C/en-US money shape (see the "money" clause and ADR-0008): optional
+  # leading -, optional $, digits with valid ,### grouping (at least one group) or
+  # plain digits, optional fraction. Anything else (a non-C lc_monetary form like
+  # "1.234,56" or "1234,56", parenthesized negatives) delivers the ORIGINAL string.
+  @money_shape ~r/\A-?\$?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?\z/
 
   @doc """
   Casts a PostgreSQL string value to its appropriate Elixir type.
@@ -163,20 +184,21 @@ defmodule Replicant.Casting.Types do
     end
   end
 
-  def cast_record(record, "timetz") when is_binary(record) do
-    # PostgreSQL timetz format includes timezone offset
-    # For now, just parse as regular time
-    case Time.from_iso8601(String.slice(record, 0..7)) do
-      {:ok, time} -> time
-      _ -> record
-    end
-  end
+  # 1.3.0 — timetz delivers the raw server string: there is no Elixir type for
+  # time-WITH-offset, and the old String.slice(0..7) silently dropped both the
+  # fractional seconds and the offset. Same precedent as "interval" (ADR-0008).
+  def cast_record(record, "timetz") when is_binary(record), do: record
 
+  # 1.3.0 — money output is LOCALE-DEPENDENT (lc_monetary). The old regex strip turned
+  # a de_DE "1.234,56" into Decimal 1.23456 — a silent 100x value error. Parse ONLY
+  # the strict C/en-US shapes (@money_shape) and deliver the original string
+  # otherwise (ADR-0008): never a silently-wrong Decimal, never a raise.
   def cast_record(record, "money") when is_binary(record) do
-    # Remove currency symbol and convert to decimal
-    record
-    |> String.replace(~r/[^\d.-]/, "")
-    |> Decimal.new()
+    if Regex.match?(@money_shape, record) do
+      record |> String.replace(~r/[$,]/, "") |> Decimal.new()
+    else
+      record
+    end
   end
 
   def cast_record(record, "bytea") when is_binary(record) do
@@ -235,10 +257,17 @@ defmodule Replicant.Casting.Types do
   def cast_record(record, "txid_snapshot") when is_binary(record), do: record
 
   # Array type casting - integer arrays with support for multidimensional arrays.
+  # EXACT names, not a `<<"_int", _>>` prefix: `_interval` (OID 1187) and
+  # `_int2vector` previously fell into this clause and `Integer.parse` silently
+  # truncated interval text ("2 mons 3 days" -> 2) — corrupted values, worse than
+  # a halt (review P1, live-confirmed). `_interval`/`_timetz` deliver raw-string
+  # elements via the text-like clause below, mirroring their scalar raw-string
+  # clauses (ADR-0008); `_int2vector` falls to the catch-all (raw literal).
   # Lenient (Integer.parse fallback) so a non-integer token returns unchanged rather
   # than raising — matches the scalar "int*" clause. Postgres int output is always
   # well-formed, so the fallback is defensive, not load-bearing.
-  def cast_record(array_string, <<"_int", _::binary>>) when is_binary(array_string) do
+  def cast_record(array_string, column_type)
+      when is_binary(array_string) and column_type in ["_int2", "_int4", "_int8"] do
     case ArrayParser.parse(array_string) do
       {:ok, elements} ->
         cast_array_elements(elements, &cast_int_element/1)
@@ -255,7 +284,8 @@ defmodule Replicant.Casting.Types do
   # so a double precision[]/real[] column with an ordinary whole-valued element would
   # halt the pipeline fail-closed — the array clause mirrors the scalar "float*" clause
   # (Float.parse + the special-value atoms) instead.
-  def cast_record(array_string, <<"_float", _::binary>>) when is_binary(array_string) do
+  def cast_record(array_string, column_type)
+      when is_binary(array_string) and column_type in ["_float4", "_float8"] do
     case ArrayParser.parse(array_string) do
       {:ok, elements} ->
         cast_array_elements(elements, &cast_float_element/1)
@@ -265,87 +295,55 @@ defmodule Replicant.Casting.Types do
     end
   end
 
-  # Array type casting - text/varchar arrays
+  # Array type casting - text-like arrays. `_interval`/`_timetz` deliver their
+  # elements as raw strings at any depth (no faithful Elixir representation —
+  # ADR-0008; the scalar clauses deliver raw strings too).
   def cast_record(array_string, column_type)
-      when is_binary(array_string) and column_type in ["_text", "_varchar"] do
+      when is_binary(array_string) and
+             column_type in ["_text", "_varchar", "_interval", "_timetz"] do
     case ArrayParser.parse(array_string) do
       {:ok, elements} -> elements
       {:error, _} -> array_string
     end
   end
 
-  # Array type casting - boolean arrays
+  # Array type casting - boolean arrays. 1.3.0: recurses (a 2-D literal left
+  # inner "t"/"f" strings uncast before); the snapshot path's full-word
+  # "true"/"false" form is accepted at any depth, mirroring the scalar clause.
   def cast_record(array_string, "_bool") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil -> nil
-          "t" -> true
-          "f" -> false
-          other -> other
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_bool_element/1)
+      {:error, _} -> array_string
     end
   end
 
-  # Array type casting - numeric/decimal arrays
+  # Array type casting - numeric/decimal arrays. 1.3.0: recurses for 2-D+
+  # literals; keeps the scalar clause's raise-site (Decimal.new on malformed)
+  # and its special-value atoms.
   def cast_record(array_string, "_numeric") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil -> nil
-          elem -> Decimal.new(elem)
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_numeric_element/1)
+      {:error, _} -> array_string
     end
   end
 
   def cast_record(array_string, "_decimal"), do: cast_record(array_string, "_numeric")
 
-  # Array type casting - timestamptz arrays
+  # Array type casting - timestamptz arrays. 1.3.0: recurses; lenient per element
+  # (falls back to the original string), mirroring the scalar clause.
   def cast_record(array_string, "_timestamptz") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            case DateTime.from_iso8601(elem) do
-              {:ok, %DateTime{} = dt, _offset} -> dt
-              _ -> elem
-            end
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_timestamptz_element/1)
+      {:error, _} -> array_string
     end
   end
 
-  # Array type casting - timestamp arrays
+  # Array type casting - timestamp arrays. 1.3.0: recurses; keeps the scalar
+  # clause's raise-site (DateTime.from_naive! behind the from_iso8601 guard).
   def cast_record(array_string, "_timestamp") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            case NaiveDateTime.from_iso8601(elem) do
-              {:ok, %NaiveDateTime{} = naive} ->
-                DateTime.from_naive!(naive, "Etc/UTC")
-
-              _ ->
-                elem
-            end
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_timestamp_element/1)
+      {:error, _} -> array_string
     end
   end
 
@@ -357,65 +355,29 @@ defmodule Replicant.Casting.Types do
     end
   end
 
-  # Array type casting - JSONB arrays
+  # Array type casting - JSONB arrays. 1.3.0: recurses; lenient per element.
   def cast_record(array_string, "_jsonb") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            case Jason.decode(elem) do
-              {:ok, json} -> json
-              _ -> elem
-            end
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_json_element/1)
+      {:error, _} -> array_string
     end
   end
 
   def cast_record(array_string, "_json"), do: cast_record(array_string, "_jsonb")
 
-  # Array type casting - date arrays
+  # Array type casting - date arrays. 1.3.0: recurses; lenient per element.
   def cast_record(array_string, "_date") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            case Date.from_iso8601(elem) do
-              {:ok, date} -> date
-              _ -> elem
-            end
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_date_element/1)
+      {:error, _} -> array_string
     end
   end
 
-  # Array type casting - time arrays
+  # Array type casting - time arrays. 1.3.0: recurses; lenient per element.
   def cast_record(array_string, "_time") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            case Time.from_iso8601(elem) do
-              {:ok, time} -> time
-              _ -> elem
-            end
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_time_element/1)
+      {:error, _} -> array_string
     end
   end
 
@@ -441,45 +403,21 @@ defmodule Replicant.Casting.Types do
     end
   end
 
-  # Array type casting - money arrays
+  # Array type casting - money arrays. 1.3.0: recurses; shares the scalar clause's
+  # locale-honest strict shape (Decimal for C/en-US forms, original string otherwise).
   def cast_record(array_string, "_money") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            elem
-            |> String.replace(~r/[^\d.-]/, "")
-            |> Decimal.new()
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_money_element/1)
+      {:error, _} -> array_string
     end
   end
 
-  # Array type casting - bytea arrays
+  # Array type casting - bytea arrays. 1.3.0: recurses; keeps the scalar clause's
+  # raise-site (Base.decode16! on non-hex payloads).
   def cast_record(array_string, "_bytea") when is_binary(array_string) do
     case ArrayParser.parse(array_string) do
-      {:ok, elements} ->
-        Enum.map(elements, fn
-          nil ->
-            nil
-
-          elem ->
-            if String.starts_with?(elem, "\\x") do
-              elem
-              |> String.slice(2..-1//1)
-              |> Base.decode16!(case: :mixed)
-            else
-              elem
-            end
-        end)
-
-      {:error, _} ->
-        array_string
+      {:ok, elements} -> cast_array_elements(elements, &cast_bytea_element/1)
+      {:error, _} -> array_string
     end
   end
 
@@ -526,4 +464,59 @@ defmodule Replicant.Casting.Types do
       :error -> elem
     end
   end
+
+  # Bool element: both pgoutput's "t"/"f" and the snapshot ::text projection's
+  # full-word form, at any depth; anything else passes through unchanged.
+  defp cast_bool_element("t"), do: true
+  defp cast_bool_element("f"), do: false
+  defp cast_bool_element("true"), do: true
+  defp cast_bool_element("false"), do: false
+  defp cast_bool_element(other), do: other
+
+  # Numeric element: keeps the scalar clause's raise-site (Decimal.new on malformed)
+  # plus its special-value atoms.
+  defp cast_numeric_element("NaN"), do: :nan
+  defp cast_numeric_element("Infinity"), do: :infinity
+  defp cast_numeric_element("-Infinity"), do: :neg_infinity
+  defp cast_numeric_element(elem), do: Decimal.new(elem)
+
+  defp cast_timestamptz_element(elem) do
+    case DateTime.from_iso8601(elem) do
+      {:ok, %DateTime{} = dt, _offset} -> dt
+      _ -> elem
+    end
+  end
+
+  defp cast_timestamp_element(elem) do
+    case NaiveDateTime.from_iso8601(elem) do
+      {:ok, %NaiveDateTime{} = naive} -> DateTime.from_naive!(naive, "Etc/UTC")
+      _ -> elem
+    end
+  end
+
+  defp cast_json_element(elem) do
+    case Jason.decode(elem) do
+      {:ok, json} -> json
+      _ -> elem
+    end
+  end
+
+  defp cast_date_element(elem) do
+    case Date.from_iso8601(elem) do
+      {:ok, date} -> date
+      _ -> elem
+    end
+  end
+
+  defp cast_time_element(elem) do
+    case Time.from_iso8601(elem) do
+      {:ok, time} -> time
+      _ -> elem
+    end
+  end
+
+  # money/bytea array elements reuse the scalar clauses directly — they are total
+  # and carry exactly the semantics (strict shape / raise-site) the array needs.
+  defp cast_money_element(elem), do: cast_record(elem, "money")
+  defp cast_bytea_element(elem), do: cast_record(elem, "bytea")
 end
