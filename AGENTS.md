@@ -17,7 +17,12 @@ batched checkpointing, sink-owned atomic batch delivery, `pgoutput` proto-v2
 in-progress-transaction streaming, consumer-side disk spill for oversized
 transactions, PG17+ forward-compat with failover slots, **multi-publication per
 pipeline** (`publication: [p1, p2]` — fail-closed on a missing pub), and
-**logical-decoding messages** (`messages: true` — `pg_logical_emit_message` payloads).
+**logical-decoding messages** (`messages: true` — `pg_logical_emit_message` payloads),
+and the **ADR-0009 plugin decoders** (`decoder: :pglogical | :wal2json`, pre-15 majors)
+with fail-closed divergence handling: a configured keyless wal2json table halts at start
+(`allow_keyless_tables: true` opts into insert-only semantics), and a dropped column
+halts `:destructive` on every decoder (wal2json: at the change for inserts/fixed-width
+columns, else within `schema_check_interval`, default 30s).
 A logical-decoding message's `content` and `prefix` are **user bytes**: Critical Rule
 1 binds — never log them, surface them in an error, or emit them in telemetry.
 
@@ -93,25 +98,43 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
 ## Testing
 
 - **Unit + real-byte conformance tests** (`test/**/*_test.exs`): no live server,
-  no `postgrex` dependency. The decoder conformance suite decodes REAL captured
+  no `postgrex` dependency. The pgoutput conformance suite decodes REAL captured
   `pgoutput` bytes (walex's MIT-licensed capture, inlined and credited) for every
   message type — including the unchanged-TOAST sentinel and all replica-identity
   modes. It never self-signs fixtures. An independent docker-PG16 capture
   (`test/integration/pg16_conformance_test.exs`) corroborates it against a live
-  server.
-- **Supported PostgreSQL versions: 15, 16, 17, 18.** Behavior is version-gated by
+  server. The PLUGIN decoders' conformance suite
+  (`test/replicant/decoder/plugin_conformance_test.exs`) decodes REAL bytes captured
+  from the live 9.6/12 substrate servers (committed under `test/fixtures/`:
+  `wal2json_*.{jsons}`, `pglogical_*.bin`) with the same byte-flip tamper discipline.
+  The decoder-parity marquee (`test/integration/decoder_parity_test.exs`) proves one
+  fixture delivers byte-identically across pgoutput and both plugins; its legs skip
+  (never pass vacuously) on a server lacking the plugin; the 9.6 legs run when
+  `REPLICANT_PG96_URL` is set.
+- **Supported PostgreSQL versions: 9.6, 12, 15, 16, 17, 18.** The 9.6 and 12 rows exist
+  for the plugin decoders (ADR-0009): their images are built by
+  `test/support/pg_old.dockerfile` (digest-pinned `postgres:9.6`/`postgres:12` +
+  pglogical 2.4.8 + wal2json 2.6 + a `wal2json2_4` build for the option-halt test);
+  the rows carry `EXPECTED_PG_MAJOR` 9 and 12. Behavior is version-gated by
   `server_version_num`: the slot-invalidation query selects only the columns that exist on
   the connected major (PG15 → `wal_status`; PG16 → `+ conflicting`; PG17/18 → `+
   invalidation_reason, synced`), and failover slots are created on PG17/18 but structurally
   rejected on PG15/16 (`{:config, :failover_unsupported}` halt — PG15/16 reject the FAILOVER
-  slot option). The CI matrix runs the full suite on all four majors.
+  slot option). The streaming/spill/messages marquees (`:pg14` tag) are excluded on a pre-14
+  primary — proto-v2 streaming and the pgoutput `messages` option are PG14+, and
+  `logical_decoding_work_mem` is PG13+ — and the publication-dependent core integration
+  modules (`:pg10` tag) are excluded on the 9.6 row (`CREATE PUBLICATION` is PG10+; that
+  row's integration coverage is the plugin-decoder legs). The CI matrix runs the full suite
+  on all six majors.
 - **Integration + crash-injection tests** (`test/integration/**`): gate on
   `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
-  unset. **Operator-approved Docker port mappings (never `localhost:5432`): PG15 → 5615,
+  unset. **Operator-approved Docker port mappings (never `localhost:5432`): PG9.6 → 5609,
+PG12 → 5612 (build their images from `test/support/pg_old.dockerfile`),
+PG15 → 5615,
   PG16 → 5599, PG17 → 5617, PG18 → 5618.** Spin any major with
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
   then `export REPLICANT_TEST_URL="postgres://postgres@localhost:<PORT>/postgres"`. Run the
-  whole matrix locally by spinning all four and running `mix test` against each URL in turn.
+  whole matrix locally by spinning all six and running `mix test` against each URL in turn.
   A shared server works too: a non-superuser role with `LOGIN REPLICATION CREATEDB`, its own
   test database, and `GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal()` in that database
   (the idle-ack tests force a WAL switch). Tests set `logical_decoding_work_mem` on

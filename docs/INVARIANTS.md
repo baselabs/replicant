@@ -71,7 +71,10 @@ An UPDATE that does not touch a TOASTed column sends a sentinel, not the value. 
 surfaces it as a first-class `unchanged: [col]` list on `Replicant.Change`; the sentinel never
 appears in `record`. A sink MUST leave those columns untouched on upsert (do not overwrite them
 with NULL or a placeholder). A change of replica identity or a dropped column classifies as
-`:destructive` and halts fail-closed.
+`:destructive` and halts fail-closed — on every decoder: pgoutput/pglogical re-emit relation
+metadata after DDL, and under wal2json the drop is detected at the change (an insert missing a
+cached column, or a fixed-width column missing from an update) or within one
+`schema_check_interval` (default 30s) for the TOASTable-on-update-only case.
 
 ## 5. Stay tenant-blind
 

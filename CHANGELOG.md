@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-30
+
+### Fixed
+
+- **The two documented wal2json divergences are now fail-closed, not silent.**
+  (1) *Keyless tables:* wal2json drops an update/delete on a table with no
+  replica-identity index and `REPLICA IDENTITY ≠ FULL` with only a server-side warning —
+  no wire signal exists. A configured keyless table now **halts at start**
+  (`{:decoder, :table_keyless}`); a genuinely insert-only table opts in with
+  `allow_keyless_tables: true`. (pgoutput already refuses such writes at the server and
+  pglogical delivers them keyless to a runtime halt — both unchanged.)
+  (2) *Dropped columns:* wal2json format 2 cannot re-emit relation metadata after DDL, so
+  a dropped column was invisible until reconnect. Two wire rules now detect it
+  immediately (a cached column missing from an INSERT — inserts carry every live
+  column — or missing from an UPDATE when its type is fixed-width and can never be
+  TOAST-omitted), and a periodic catalog re-read (`schema_check_interval`, default
+  `30_000` ms, wal2json-only) bounds the residual TOASTable-on-update-only case to one
+  interval. Both route through the shipped `:destructive` schema-change halt, matching
+  pgoutput/pglogical semantics.
+- **Empty transactions from a pre-PG15 server are suppressed (never delivered to the sink).**
+  PostgreSQL 15 added the skip-empty-transactions optimization to `pgoutput`; on older
+  majors the walsender still streams `BEGIN`/`COMMIT` pairs for transactions with zero
+  published changes (every DDL/catalog-touching transaction — OBSERVED live on 12.22).
+  Those empty transactions now take the same suppression route the streamed (proto-v2)
+  path already had: no `handle_transaction/1` call, and the empty WAL acks forward for a
+  state-mirror sink while an `:append_log` sink does NOT ack past its durable frontier
+  (Critical Rule 3's append clause — its slot stays at the durable delivered frontier so
+  an out-of-band advance stays detectable). A transaction carrying a logical-decoding
+  message is never treated as empty. On PG15+ servers nothing changes — they already
+  skip empty transactions server-side.
+
+### Added
+
+- **Plugin decoders for PostgreSQL 9.6 to 14 ([ADR-0009](docs/adr/0009-pglogical-wal2json-decoders.md)).**
+  A new top-level `decoder:` option selects the logical-decoding output plugin:
+  `:pgoutput` (the default — byte-identical to 1.3.0), `:pglogical` (the
+  `pglogical_output` binary protocol, pglogical 2.x) or `:wal2json` (JSON format
+  version 2, wal2json ≥ 2.6). The table set is named per decoder (`publication:` /
+  `replication_sets:` / `tables:`); the sink contract, the `commit_lsn` watermark,
+  both checkpoint modes and every existing halt keep their semantics. The supported
+  matrix grows to 9.6, 12, 15, 16, 17, 18; the 9.6/12 images are built from the
+  committed `test/support/pg_old.dockerfile`. New fail-closed halts:
+  `:decoder_protocol_unsupported`, `:decoder_option_unsupported` (pre-flight-probed
+  at connect — a rejected `START_REPLICATION` would otherwise only loop),
+  `:decoder_lsn_missing`, `:decoder_capability_unsupported`,
+  `{:config, :decoder_unsupported_on_server}` (pgoutput before PG 10) and
+  `:decoder_table_missing`. Two plugin behaviors are documented, not hidden: a
+  `REPLICA IDENTITY NOTHING` table's keyless writes never reach the stream (the
+  server refuses them for pgoutput publications; wal2json drops them plugin-side),
+  and a wal2json replica-identity change is detected at the next reconnect.
+  Byte-identical cross-decoder delivery (pgoutput on 15 vs both plugins on 9.6/12)
+  is proven live by `test/integration/decoder_parity_test.exs`; real captured bytes
+  from both plugins joined the conformance suite with tamper tests.
+
 ## [1.3.0] - 2026-09-28
 
 ### Fixed
@@ -756,7 +810,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/baselabs/replicant/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/baselabs/replicant/compare/v1.2.4...v1.3.0
 [1.2.4]: https://github.com/baselabs/replicant/compare/v1.2.3...v1.2.4
 [1.2.3]: https://github.com/baselabs/replicant/compare/v1.2.2...v1.2.3

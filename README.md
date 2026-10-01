@@ -10,11 +10,14 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.3.0 is the latest release published on Hex and tagged `v1.3.0`.
-> It hardens the value layer every sink receives — multidimensional arrays of every
-> casted type, locale-honest `money`, lossless `timetz`, signed `type_modifier`,
-> a raising-free `lsn_from_string/1`, and stricter malformed-frame decoding
-> (see CHANGELOG `[1.3.0]` and ADR-0008).
+> **Status:** 1.4.0 is the current release (candidate bytes bound in the release
+> manifest; see CHANGELOG `[1.4.0]`). It adds the plugin decoders — read a
+> PostgreSQL 9.6 to 14 server through its existing `pglogical` or `wal2json`
+> output plugin with the same sink contract, watermark, and halts
+> (ADR-0009; see CHANGELOG `[1.4.0]`). 1.3.0 hardened the value layer every sink
+> receives — multidimensional arrays of every casted type, locale-honest `money`,
+> lossless `timetz`, signed `type_modifier`, a raising-free `lsn_from_string/1`,
+> and stricter malformed-frame decoding (ADR-0008).
 > Replicant owns
 > the replication slot via `Postgrex.ReplicationConnection`, acks only after the
 > sink durably commits (ack-after-checkpoint), halts fail-closed on slot
@@ -134,15 +137,60 @@ fire-and-forget `wal_end + 1` ack does not have.
 
 ## PostgreSQL version support
 
-Replicant is **tested on PostgreSQL 15, 16, 17, and 18** — the CI matrix runs the full suite
-against all four majors (Docker-only, `wal_level=logical`). Capabilities are gated by the
-server's `server_version_num`, so a single build runs correctly across the range:
+Replicant is **tested on PostgreSQL 9.6, 12, 15, 16, 17, and 18** — the CI matrix runs
+the full suite against all six majors (Docker-only, `wal_level=logical`; the 9.6 and 12
+rows carry the `pglogical` and `wal2json` output plugins for the decoder feature below).
+Capabilities are gated by the server's `server_version_num`, so a single build runs
+correctly across the range:
 
-| Capability | PG15 | PG16 | PG17 | PG18 |
-|---|:---:|:---:|:---:|:---:|
-| Logical streaming, snapshot, checkpoint, exactly-once | ✅ | ✅ | ✅ | ✅ |
-| Slot-invalidation columns queried | `wal_status` | `+ conflicting` | `+ invalidation_reason, synced` | same as 17 |
-| Failover slots (`failover: true`) | ❌ rejected | ❌ rejected | ✅ | ✅ |
+| Capability | PG9.6 | PG12 | PG15 | PG16 | PG17 | PG18 |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Logical streaming, snapshot, checkpoint, exactly-once (decoder plugins) | ✅ `pglogical`/`wal2json` | ✅ all three decoders | ✅ | ✅ | ✅ | ✅ |
+| pgoutput (`decoder: :pgoutput`, the default) | ❌ refused at start | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Slot-invalidation columns queried | none (pre-13 tier) | none (pre-13 tier) | `wal_status` | `+ conflicting` | `+ invalidation_reason, synced` | same as 17 |
+| Failover slots (`failover: true`) | ❌ rejected | ❌ rejected | ❌ rejected | ❌ rejected | ✅ | ✅ |
+
+### Reading pre-15 servers through pglogical or wal2json (ADR-0009)
+
+A server that has no `pgoutput` (9.6) or sits outside the tested 15-18 range (10-14) can
+be read through its existing logical-decoding output plugin instead:
+
+    Replicant.start_link(
+      connection: [hostname: "legacy.internal", ...],
+      slot_name: "replicant_orders",
+      decoder: :wal2json,                      # or :pglogical
+      tables: [{"public", "orders"}],          # wal2json: the table list
+      # replication_sets: ["default"],         # pglogical: the replication sets
+      sink: MySink,
+      go_forward_only: true
+    )
+
+The same `Replicant.Sink` contract, `commit_lsn` watermark, checkpoint modes and halt
+semantics apply; a fixture transaction delivers byte-identically (after LSN, xid and
+timestamp normalization) across pgoutput on 15 and both plugins on 9.6/12 — proven live
+in `test/integration/decoder_parity_test.exs`.
+
+**Keyless tables never stream silently missing updates.** wal2json drops an
+update/delete on a table with no replica-identity index and `REPLICA IDENTITY ≠ FULL`
+with only a server-side warning — no wire signal exists. Replicant therefore halts
+fail-closed at start (`{:decoder, :table_keyless}`) for such a configured table. A
+genuinely insert-only table opts in explicitly:
+
+      decoder: :wal2json,
+      tables: [{"public", "audit_events"}],
+      allow_keyless_tables: true   # insert-only semantics: U/D on keyless tables are
+                                   # invisible to the stream, by your own declaration
+
+**Dropped columns halt fail-closed on every decoder.** pgoutput and pglogical re-emit
+relation metadata after DDL, so a dropped column classifies `:destructive` immediately.
+wal2json cannot re-emit (format 2 carries no relation messages), so Replicant splits the
+ambiguous wire absence two ways: an INSERT missing a cached column, or an UPDATE missing
+a fixed-width column (int/float/bool/date/time/timestamp/interval/uuid — never stored
+out-of-line), is a drop and halts immediately; the remaining case (a dropped TOASTable
+column on an update-only table, wire-identical to the unchanged-TOAST sentinel) is
+bounded by a periodic catalog re-read — `schema_check_interval` (default `30_000` ms,
+wal2json-only) — which routes the subset relation through the same destructive
+classification. See `usage-rules.md` for the full halt table.
 
 The slot-invalidation query selects only the columns that exist on the connected major
 (`conflicting` was added in PG16, `invalidation_reason`/`synced` in PG17), so it never errors

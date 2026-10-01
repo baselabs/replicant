@@ -77,7 +77,9 @@ docker run -d --name replicant_pg16 -e POSTGRES_HOST_AUTH_METHOD=trust \
 ```
 
 Point the input below at it (it defaults to `REPLICANT_TEST_URL`, then to the local
-container above):
+container above). This notebook tours the default `pgoutput` decoder (PostgreSQL
+15-18); a pre-15 server that carries the `pglogical` or `wal2json` output plugin is
+read the same way via `decoder:` — see the feature table at the end.
 
 ```elixir
 default_url = System.get_env("REPLICANT_TEST_URL") || "postgres://postgres@localhost:5599/postgres"
@@ -832,6 +834,17 @@ telemetry, halt-reason, and casting reference:
 | Failover slots (PG17+, HA) | `failover: true` | [README — failover](https://hexdocs.pm/replicant/readme.html#failover-slots-pg17) |
 | Append-log consumers | `sink_kind/0` → `:append_log` + `handle_slot_origin/2` | [README — slot origin](https://hexdocs.pm/replicant/readme.html#slot-origin-for-go-forward-append-consumers) |
 | Destructive-DDL migration window | `handle_schema_change/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
+| Plugin decoders for PostgreSQL 9.6-14 | `decoder: :pglogical` + `replication_sets:` / `decoder: :wal2json` + `tables:` | [README — plugin decoders](https://hexdocs.pm/replicant/readme.html#reading-pre-15-servers-through-pglogical-or-wal2json-adr-0009) |
+| Keyless-table insert-only streams (wal2json) | `allow_keyless_tables: true` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
+| wal2json dropped-column guard interval | `schema_check_interval: 30_000` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
+
+Under the plugin decoders the two historically-silent divergences are fail-closed now:
+a wal2json table without a replica-identity key **refuses to start** (its updates/deletes
+would be dropped plugin-side with no wire signal — declare `allow_keyless_tables: true`
+only for a genuinely insert-only table), and a dropped column halts `:destructive` on
+every decoder — immediately on pgoutput/pglogical (relation re-emit after DDL), at the
+change under wal2json for inserts and fixed-width columns, and otherwise within one
+`schema_check_interval`.
 
 For multitenancy, classification, and Ash resources, use the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter, which is

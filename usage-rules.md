@@ -93,8 +93,11 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   the default (callback absent) is a **state mirror** (replays/upserts state; the generic
   idle keepalive may advance the slot over filtered WAL), `:append_log` is a **go-forward
   append** consumer (never acknowledges past its durable delivered checkpoint, so an
-  out-of-band slot advance is detectable as a gap on reconnect). This is the knob behind
-  the 1.2.3 append-log ack behavior.
+  out-of-band slot advance is detectable as a gap on reconnect). The same split governs
+  **empty transactions** (`BEGIN`/`COMMIT` with zero published changes, still streamed by
+  pre-PG15 servers; PG15+ skips them server-side): they are never delivered to the sink —
+  a state mirror's slot acks over the proven-empty WAL, an append log retains it. This is
+  the knob behind the 1.2.3 append-log ack behavior.
 - **`handle_schema_change/2`** (optional) — consulted on a **destructive** schema change
   (a dropped column, a replica-identity change, a narrowing type change). Default
   behavior without the callback: additive changes apply automatically, destructive
@@ -277,13 +280,58 @@ durable checkpoint (loss = 0; duplicates bounded by the mode's contract).
 | `[:replicant, :snapshot, :failed]` (other) | the snapshot reader faulted (incl. connection faults during a backfill) | check source connectivity; restart — the backfill resumes from durable progress |
 | `[:replicant, :stream, :spill_exhausted]` | a spilled transaction exceeded `max_spill_bytes` | free disk / raise `max_spill_bytes` / shrink the oversized transaction |
 | `:decode_failure` | genuinely-malformed WAL/cast input at the value-free boundary | check upstream WAL/plugin integrity — this is never ordinary data |
+| `:decoder_protocol_unsupported` | the pglogical startup message reported a protocol range outside what the decoder negotiates (protocol 1) | mismatched pglogical build; pin pglogical 2.x, then restart |
+| `:decoder_lsn_missing` | a wal2json commit document arrived without a commit LSN (`include-lsn` carries it on every supported build) | upstream/plugin integrity — never ordinary data |
+| `[:replicant, :connection, :slot_invalidated]` + `reason: :decoder_option_unsupported` | the installed `pglogical_output`/`wal2json` build rejects a requested option (pre-flight-probed at connect, ADR-0009) | upgrade the output plugin to a build carrying the option (`wal2json` ≥ 2.6 for `numeric-data-types-as-string`), then restart |
+| `:decoder_unsupported_on_server` | `decoder: :pgoutput` against a pre-10 server (no `pgoutput`, no publications) | use `decoder: :pglogical` or `decoder: :wal2json` (ADR-0009), or upgrade the server |
+| `:decoder_table_missing` | a table configured for the `:wal2json` decoder (or discovered in a `:pglogical` replication set) does not exist on the server at connect | create the table / fix the configured table list, then restart |
+| `{:decoder, :table_keyless}` | a table configured for the `:wal2json` decoder has no replica-identity index and `REPLICA IDENTITY ≠ FULL` at connect — its updates/deletes would be silently dropped plugin-side | add a PK/identity index, set `REPLICA IDENTITY FULL`, or — for a genuinely insert-only table — set `allow_keyless_tables: true` |
+| `:schema_change` `:destructive` under wal2json | a configured table's column was dropped server-side: detected at the change (insert, or a fixed-width column on update) or within `schema_check_interval` (a TOASTable column on an update-only table) | restore or migrate the sink schema, then restart |
 | `:slot_synced_unpromoted` | `failover: true` against a standby whose synced slot is not yet promoted | promote the standby (or point at the primary), then restart |
 
 Start-time rejections (no pipeline starts, nothing halts): `:invalid_identifier`,
 `:invalid_sink`, `:config_invalid`, `:conflicting_start_mode`,
 `:go_forward_required`, `:snapshot_unsupported`, `:batch_unsupported`,
-`:messages_unsupported`, `{:config, :failover_unsupported}`, and
+`:messages_unsupported`, `:decoder_capability_unsupported` (a configured capability
+the chosen decoder cannot express — `streaming:`/`failover:` off pgoutput, `messages:`
+on pglogical — ADR-0009), `{:config, :failover_unsupported}`, and
 `{:error, :invalid_start_lsn}` from the query builder (1.3.0).
+
+## Decoder selection (ADR-0009)
+
+`decoder:` selects the logical-decoding output plugin: `:pgoutput` (the default,
+PostgreSQL 15-18, byte-identical to 1.3.0; the plugin matrix also runs it on 12), `:pglogical` (the `pglogical_output`
+binary protocol, pglogical 2.x, PostgreSQL 9.6-14) or `:wal2json` (JSON format
+version 2, wal2json ≥ 2.6, PostgreSQL 9.6-14). The sink contract, the `commit_lsn`
+watermark, both checkpoint modes and every halt keep their semantics across decoders.
+The table set is named per decoder — `publication:` for pgoutput,
+`replication_sets:` for pglogical, `tables: [{schema, table}]` for wal2json — and the
+wrong key for the chosen decoder is rejected at start. The plugin differences that
+remain are all fail-closed, none silent (OBSERVED from the plugins' sources):
+
+- **Keyless tables.** An update/delete on a table with no replica-identity index and
+  `REPLICA IDENTITY ≠ FULL` never reaches any stream (pgoutput publications refuse the
+  write outright with 55000; pglogical refuses such tables in update-carrying
+  replication sets; wal2json filters them plugin-side with only a server WARNING). A
+  wal2json pipeline therefore **halts at start** (`{:decoder, :table_keyless}`) for a
+  configured keyless table; a genuinely insert-only table declares
+  `allow_keyless_tables: true` (wal2json-only) to accept that U/D on such tables are
+  invisible to the stream.
+- **Dropped columns.** pgoutput and pglogical re-emit relation metadata after DDL, so
+  the drop classifies `:destructive` immediately. wal2json format 2 has no relation
+  messages, so Replicant splits the ambiguous absence: a cached column missing from an
+  INSERT (inserts carry every live column) or missing from an UPDATE when its type is
+  fixed-width (int/float/bool/date/time/timestamp/interval/uuid — never stored
+  out-of-line) halts `:destructive` at the change; the residual case (a dropped
+  TOASTable column on an update-only table, wire-identical to the unchanged-TOAST
+  sentinel) is bounded by the periodic catalog re-read `schema_check_interval`
+  (default `30_000` ms, wal2json-only) — detection within one interval, through the
+  same `:destructive` classification.
+- **`type_modifier`** carries pgoutput's raw atttypmod where the plugin's stream
+  expresses it.
+
+Non-transactional messages stay **at-least-once** on every decoder — that is the
+paradigm, not a plugin gap (see invariant 3).
 
 ## Non-negotiable rules
 
