@@ -104,6 +104,7 @@ defmodule Replicant.MixProject do
         "docs/adr/0006-fail-closed-supervision.md",
         "docs/adr/0007-actual-replication-session-identity.md",
         "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
+        "docs/adr/0009-pglogical-wal2json-decoders.md",
         "notebooks/getting_started.livemd",
         "examples/README.md",
         "examples/replication_pipeline/README.md",
@@ -124,7 +125,8 @@ defmodule Replicant.MixProject do
           "docs/adr/0005-spill-is-ephemeral-scratch.md",
           "docs/adr/0006-fail-closed-supervision.md",
           "docs/adr/0007-actual-replication-session-identity.md",
-          "docs/adr/0008-casting-lenient-value-preserving-fallback.md"
+          "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
+          "docs/adr/0009-pglogical-wal2json-decoders.md"
         ],
         Guides: [
           "notebooks/getting_started.livemd",

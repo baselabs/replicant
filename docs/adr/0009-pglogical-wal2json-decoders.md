@@ -254,7 +254,7 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   only on a catalog miss).
 - The test matrix grows by two rows and one image build; the images are the maintainer's
   to keep building as the official base images age.
-- The library gains its first plugin-specific error atoms; `Replicant.Error.reason/0` and
+- The library gains its first plugin-specific error atoms; `t:Replicant.Error.reason/0` and
   the halt-reason table in `usage-rules.md` grow by the six reasons above.
 
 ## Non-goals
