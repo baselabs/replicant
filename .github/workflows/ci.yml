@@ -23,13 +23,18 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # R05 supported-version matrix: PostgreSQL 15, 16, 17, 18. Each row uses the
-      # operator-approved local port mapping (5615/5599/5617/5618) — `localhost:5432` is
-      # never the substrate — and pins the image by manifest-list digest (supply-chain: a
-      # moved tag cannot silently change the tested image). `major` is exported as
-      # EXPECTED_PG_MAJOR so the integration suite fails a row wired to the wrong container.
+      # R05 supported-version matrix: PostgreSQL 9.6, 12, 15, 16, 17, 18. The 15-18
+      # rows use the operator-approved local port mapping (5615/5599/5617/5618) and pin
+      # the image by manifest-list digest (supply-chain: a moved tag cannot silently
+      # change the tested image). The 9.6/12 rows (ADR-0009) BUILD their images from the
+      # committed test/support/pg_old.dockerfile (digest-pinned bases + pglogical 2.4.8 +
+      # wal2json 2.6) and export the plugin-decoder substrate vars. `localhost:5432` is
+      # never the substrate; `major` is exported as EXPECTED_PG_MAJOR so the integration
+      # suite fails a row wired to the wrong container.
       matrix:
         pg:
+          - { major: "9", port: "5609", digest: "sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698", plugins: true }
+          - { major: "12", port: "5612", digest: "sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c", plugins: true }
           - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111" }
           - { major: "16", port: "5599", digest: "sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5" }
           - { major: "17", port: "5617", digest: "sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449" }
@@ -38,6 +43,8 @@ jobs:
       MIX_ENV: test
       REPLICANT_TEST_URL: postgres://postgres@localhost:${{ matrix.pg.port }}/postgres
       EXPECTED_PG_MAJOR: ${{ matrix.pg.major }}
+      # The 9.6 row's own server backs the parity suite's old-major legs
+      REPLICANT_PG96_URL: ${{ matrix.pg.major == '9' && format('postgres://postgres@localhost:{0}/postgres', matrix.pg.port) || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -46,18 +53,38 @@ jobs:
       - name: Start PostgreSQL ${{ matrix.pg.major }} with logical replication
         # A `services:` block cannot pass `-c wal_level=logical` to the container, so run
         # Postgres directly with the flags (mirrors AGENTS.md). Without wal_level=logical the
-        # integration suite would silently skip and CI would be green-but-vacuous.
+        # integration suite would silently skip and CI would be green-but-vacuous. The
+        # 9.6/12 rows build the plugin image from the committed Dockerfile instead of the
+        # stock base (ADR-0009), and bootstrap the pglogical extension + node.
         run: |
+          if [ "${{ matrix.pg.plugins }}" = "true" ]; then
+            docker build -f test/support/pg_old.dockerfile \
+              --build-arg BASE=postgres:${{ matrix.pg.major }}@${{ matrix.pg.digest }} \
+              -t replicant-pg${{ matrix.pg.major }}-plugins:ci .
+            IMAGE=replicant-pg${{ matrix.pg.major }}-plugins:ci
+          else
+            IMAGE=postgres:${{ matrix.pg.major }}@${{ matrix.pg.digest }}
+          fi
           docker run -d --name pg \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p ${{ matrix.pg.port }}:5432 \
-            postgres:${{ matrix.pg.major }}@${{ matrix.pg.digest }} \
-            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
+            "$IMAGE" \
+            -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 \
+            $( [ "${{ matrix.pg.plugins }}" = "true" ] && echo "-c shared_preload_libraries=pglogical" || echo "" )
           for _ in $(seq 1 30); do
             docker exec pg pg_isready -U postgres && break
             sleep 1
           done
           docker exec pg pg_isready -U postgres || { echo "Postgres never became ready"; exit 1; }
+          if [ "${{ matrix.pg.plugins }}" = "true" ]; then
+            # the dsn is registration metadata (replicant's read path never dials it);
+            # in-container the server listens on 5432, not the host-mapped port
+            docker exec pg psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pglogical" \
+              -c "SELECT * FROM pglogical.create_node(node_name := 'ci_src', dsn := 'postgres://postgres@localhost:5432/postgres')"
+            # replication connections from the CI network must pass pg_hba (9.6 rejects
+            # them by default; OBSERVED on the substrate)
+            docker exec pg sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
+          fi
 
       - name: Assert the live server is the expected major (substrate wiring)
         # Fail closed if the started container's version does not match the matrix row — a

@@ -214,6 +214,10 @@ defmodule Replicant.Assembler do
     * `{:ok, t()}` — accumulated, no boundary crossed.
     * `{:transaction, Transaction.t(), lsn(), t()}` — Commit, sink committed.
     * `{:skipped, lsn(), t()}` — Commit but `commit_lsn <= checkpoint` (watermark skip).
+    * `{:skipped_empty, lsn(), t()}` — Commit of an EMPTY transaction (zero changes,
+      zero messages — the pre-PG15 wire behavior, PG15+ skips them server-side).
+      No sink call; the AssemblerServer acks `lsn` for a state mirror but NOT for
+      an `:append_log` sink (its slot stays at the durable frontier, Rule 3).
     * `{:buffered, t()}` — lib+batch: applied to the sink, checkpoint pending (no ack yet).
     * `{:flush, reason, t()}` — lib+batch: the count/span cap tripped; the AssemblerServer must flush.
     * `{:schema_change, SchemaChange.t(), t()}` — additive schema change applied.
@@ -232,6 +236,7 @@ defmodule Replicant.Assembler do
           {:ok, t()}
           | {:transaction, Transaction.t(), lsn(), t()}
           | {:skipped, lsn(), t()}
+          | {:skipped_empty, lsn(), t()}
           | {:schema_change, SchemaChange.t(), t()}
           | {:buffered, t()}
           | {:flush, atom(), t()}
@@ -433,7 +438,20 @@ defmodule Replicant.Assembler do
     if skip?(asm, txn) do
       {:skipped, txn.commit_lsn, reset(asm)}
     else
-      apply_sink(asm, txn)
+      if txn.changes == [] and txn.messages == [] do
+        # EMPTY v1 transaction — zero changes AND zero messages. PG15+ skips these
+        # server-side; a pre-15 pgoutput walsender still streams BEGIN/COMMIT for
+        # catalog-touched transactions with zero published changes (OBSERVED live on
+        # 12.22: every ALTER/DDL txn). The streamed path suppresses these already
+        # (Streaming.deliver_or_skip_stream, parent CV1 spec §7); the v1 path takes the
+        # same route — no sink call, and the WAL acks forward as proven-carries-nothing
+        # for a state mirror (the {:skipped_empty, lsn} return; an :append_log sink
+        # does NOT ack past its durable frontier — Critical Rule 3's append clause).
+        # A message-bearing txn is NOT empty (v1-distinguishable, spec §7.1).
+        __MODULE__.Streaming.suppress_empty_stream_commit(reset(asm), txn.commit_lsn)
+      else
+        apply_sink(asm, txn)
+      end
     end
   end
 

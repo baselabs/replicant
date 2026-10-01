@@ -75,6 +75,57 @@ defmodule Replicant.QueryBuilder do
     end)
   end
 
+  @doc """
+  Plugin-parameterized `START_REPLICATION` (ADR-0009 §2): renders the decoder plugin's
+  ordered option list as `key 'value'` pairs inside the command's parentheses. The
+  slot name and plugin name are `Identifier.validate`d; every option KEY matches
+  `[a-z0-9_.-]+` and every option VALUE matches `[a-zA-Z0-9_.,*()-]*` (the option
+  grammar the three shipped decoders emit — identifier lists, booleans, version
+  numbers), so a quote or semicolon breakout is refused `{:error, :invalid_identifier}`
+  and NEVER interpolated. The `#{@pgoutput}` rendering is byte-identical to
+  `start_replication/3` (pinned by test).
+  """
+  @spec start_replication_for(
+          String.t(),
+          String.t(),
+          [{String.t(), String.t()}],
+          non_neg_integer()
+        ) ::
+          {:ok, String.t()} | {:error, :invalid_identifier} | {:error, :invalid_start_lsn}
+  def start_replication_for(slot_name, plugin, options, start_lsn) do
+    with :ok <- Identifier.validate(slot_name),
+         :ok <- Identifier.validate(plugin),
+         :ok <- validate_start_lsn(start_lsn),
+         :ok <- validate_plugin_options(options) do
+      lsn_literal = Replicant.lsn_to_string(start_lsn)
+      rendered = Enum.map_join(options, ", ", fn {k, v} -> "#{k} '#{v}'" end)
+      {:ok, "START_REPLICATION SLOT #{slot_name} LOGICAL #{lsn_literal} (#{rendered})"}
+    end
+  end
+
+  @plugin_option_key ~r/\A[a-z0-9_.-]+\z/
+  @plugin_option_key_quoted ~r/\A"[a-z0-9_.-]+"\z/
+  @plugin_option_value ~r/\A[a-zA-Z0-9_.,*()-]*\z/
+
+  # A key is either a bare option name or a DOUBLE-QUOTED identifier (pglogical's
+  # dotted `"pglogical.replication_set_names"` — the walsender option grammar's only
+  # spelling for it; OBSERVED from pglogical's own worker). Both forms are validated
+  # so a quote or semicolon breakout can never ride an option into the command.
+  defp plugin_option_key?(key) do
+    Regex.match?(@plugin_option_key, key) or Regex.match?(@plugin_option_key_quoted, key)
+  end
+
+  defp validate_plugin_options(options) when is_list(options) do
+    Enum.reduce_while(options, :ok, fn {k, v}, :ok ->
+      if is_binary(k) and is_binary(v) and plugin_option_key?(k) and
+           Regex.match?(@plugin_option_value, v) do
+        {:cont, :ok}
+      else
+        {:halt, {:error, :invalid_identifier}}
+      end
+    end)
+  end
+
   # start_lsn must be a t:Replicant.lsn/0 (non_neg_integer) — 1.3.0: tagged error
   # instead of a FunctionClauseError out of lsn_to_string/1.
   defp validate_start_lsn(lsn) when is_integer(lsn) and lsn >= 0, do: :ok
@@ -89,9 +140,41 @@ defmodule Replicant.QueryBuilder do
   @spec create_durable_slot(String.t(), boolean()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
   def create_durable_slot(slot_name, failover?) do
-    with :ok <- Identifier.validate(slot_name) do
-      tail = if failover?, do: "(FAILOVER, SNAPSHOT 'nothing')", else: "NOEXPORT_SNAPSHOT"
-      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} #{tail};"}
+    create_durable_slot(slot_name, failover?, @pgoutput)
+  end
+
+  @doc """
+  `create_durable_slot/2` with the decoder's output plugin (ADR-0009 §2). The default
+  `#{@pgoutput}` emits the published 1.3.0 string byte-for-byte; `pglogical_output` and
+  `wal2json` name their plugin. The plugin name passes `Identifier.validate/1` before
+  interpolation exactly like a slot name (Critical Rule 2).
+  """
+  @spec create_durable_slot(String.t(), boolean(), String.t()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_durable_slot(slot_name, failover?, plugin) do
+    create_durable_slot(slot_name, failover?, plugin, 150_000)
+  end
+
+  @doc """
+  `create_durable_slot/3` with the server version: `NOEXPORT_SNAPSHOT` (and the
+  parenthesized snapshot grammar) exist from PG 15 — on 9.6 to 14 the durable-slot
+  form is the bare `CREATE_REPLICATION_SLOT … LOGICAL plugin;` (the server exports a
+  snapshot, which is simply discarded). PG15+ — and an unknown version (0, a
+  directly-constructed state) — emits the published strings unchanged.
+  """
+  @spec create_durable_slot(String.t(), boolean(), String.t(), non_neg_integer()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_durable_slot(slot_name, failover?, plugin, version) do
+    with :ok <- Identifier.validate(slot_name),
+         :ok <- Identifier.validate(plugin) do
+      tail =
+        cond do
+          version > 0 and version < 150_000 -> ""
+          failover? -> " (FAILOVER, SNAPSHOT 'nothing')"
+          true -> " NOEXPORT_SNAPSHOT"
+        end
+
+      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{plugin}#{tail};"}
     end
   end
 
@@ -104,9 +187,36 @@ defmodule Replicant.QueryBuilder do
   @spec create_export_slot(String.t(), boolean()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
   def create_export_slot(slot_name, failover?) do
-    with :ok <- Identifier.validate(slot_name) do
-      tail = if failover?, do: "(FAILOVER, SNAPSHOT 'export')", else: "EXPORT_SNAPSHOT"
-      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{@pgoutput} #{tail};"}
+    create_export_slot(slot_name, failover?, @pgoutput)
+  end
+
+  @doc "`create_export_slot/2` with the decoder's output plugin (see `create_durable_slot/3`)."
+  @spec create_export_slot(String.t(), boolean(), String.t()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_export_slot(slot_name, failover?, plugin) do
+    create_export_slot(slot_name, failover?, plugin, 150_000)
+  end
+
+  @doc """
+  `create_export_slot/3` with the server version: `EXPORT_SNAPSHOT` (and the
+  parenthesized snapshot grammar) exist from PG 15 — on 9.6 to 14 the form is the
+  bare `CREATE_REPLICATION_SLOT … LOGICAL plugin;` (the server exports the snapshot
+  by default; the result row shape is unchanged). The plugin-decoder + `snapshot:
+  true` combination on 9.6/12 rides exactly this pre-15 form.
+  """
+  @spec create_export_slot(String.t(), boolean(), String.t(), non_neg_integer()) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def create_export_slot(slot_name, failover?, plugin, version) do
+    with :ok <- Identifier.validate(slot_name),
+         :ok <- Identifier.validate(plugin) do
+      tail =
+        cond do
+          version < 150_000 -> ""
+          failover? -> " (FAILOVER, SNAPSHOT 'export')"
+          true -> " EXPORT_SNAPSHOT"
+        end
+
+      {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{plugin}#{tail};"}
     end
   end
 
@@ -165,6 +275,135 @@ defmodule Replicant.QueryBuilder do
     end
   end
 
+  # ---- ADR-0009: per-decoder table-set discovery ----
+
+  @doc """
+  The `:publication_check` existence gate for the `:pglogical` decoder: the replication
+  sets that exist in pglogical's own catalog for the validated names. Runs in the
+  replication connect chain's SIMPLE protocol, so the validated names are interpolated
+  exactly as `publication_exists/1` does (Critical Rule 2). A missing set halts
+  fail-closed at connect — pglogical silently streams the intersection otherwise.
+  """
+  @spec replication_set_exists([String.t()]) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def replication_set_exists(sets) when is_list(sets) do
+    with :ok <- validate_all(sets) do
+      names = Enum.map_join(sets, ",", &"'#{&1}'")
+      {:ok, "SELECT set_name FROM pglogical.replication_set WHERE set_name IN (#{names})"}
+    end
+  end
+
+  @doc """
+  The `:pglogical` decoder's table-set discovery (ADR-0009 §2): the DISTINCT tables
+  across the validated replication-set list, from pglogical's own membership catalog
+  (OBSERVED columns: `relid`, `nspname`, `relname`, `set_name` — the names ride the
+  membership row itself, no catalog joins needed). Same row shape as
+  `publication_tables/1` (`schemaname`, `tablename`, qualified).
+  """
+  @spec replication_set_tables([String.t()]) :: {:ok, String.t()} | {:error, :invalid_identifier}
+  def replication_set_tables(sets) when is_list(sets) do
+    with :ok <- validate_all(sets) do
+      names = Enum.map_join(sets, ",", &"'#{&1}'")
+
+      {:ok,
+       "SELECT DISTINCT nspname AS schemaname, relname AS tablename, " <>
+         "format('%I.%I', nspname, relname) AS qualified " <>
+         "FROM pglogical.tables WHERE set_name IN (#{names})"}
+    end
+  end
+
+  @doc """
+  The relation-info catalog read for the `:pglogical` and `:wal2json` decoders
+  (ADR-0009 §5): per configured table, its `pg_class` oid, `relreplident`, and every
+  non-dropped column with type oid + typmod — everything the wire does NOT carry
+  (pglogical relations have no types and no replica identity; wal2json has no relation
+  message at all). Runs in the replication connect chain's SIMPLE protocol; both parts
+  of every pair are `Identifier.validate`d before interpolation. A configured table
+  with no rows here is absent on the server — the caller halts fail-closed. Row shape:
+  `[schemaname, tablename, oid, relreplident, attnum, attname, atttypid, atttypmod]`.
+  """
+  @spec configured_table_info([{String.t(), String.t()}]) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def configured_table_info(tables) when is_list(tables) and tables != [] do
+    if Enum.all?(tables, fn {s, t} -> is_binary(s) and is_binary(t) end) do
+      validate_table_pairs(tables)
+    else
+      {:error, :invalid_identifier}
+    end
+  end
+
+  def configured_table_info(_other), do: {:error, :invalid_identifier}
+
+  defp validate_table_pairs(tables) do
+    tables
+    |> Enum.reduce_while(:ok, fn {schema, table}, :ok ->
+      with :ok <- Identifier.validate(schema),
+           :ok <- Identifier.validate(table) do
+        {:cont, :ok}
+      else
+        {:error, :invalid_identifier} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      :ok -> {:ok, table_info_sql(tables)}
+      err -> err
+    end
+  end
+
+  defp table_info_sql(tables) do
+    values = Enum.map_join(tables, ", ", fn {s, t} -> "('#{s}','#{t}')" end)
+
+    # `identity_key` marks the columns of the table's replica-identity index —
+    # the PK under `d`, the index flagged `indisreplident` under `i`, nothing
+    # under `f`/`n` — the same `:key` flag pgoutput's Relation carries and the
+    # assembler's old-record key projection keys on. (Resolved via pg_index
+    # directly: pg_get_replica_identity_index only exists from PG 10, and this
+    # read also serves the 9.6 substrate.)
+    "SELECT n.nspname, c.relname, c.oid::int, c.relreplident, a.attnum, a.attname, " <>
+      "a.atttypid::int, a.atttypmod::int, " <>
+      "(ri.indexrelid IS NOT NULL AND a.attnum = ANY(ri.indkey)) AS identity_key " <>
+      "FROM (VALUES #{values}) AS t(nsp, rel) " <>
+      "JOIN pg_namespace n ON n.nspname = t.nsp " <>
+      "JOIN pg_class c ON c.relname = t.rel AND c.relnamespace = n.oid " <>
+      "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+      "LEFT JOIN LATERAL (SELECT i.indexrelid, i.indkey FROM pg_index i " <>
+      "WHERE i.indrelid = c.oid AND " <>
+      "(c.relreplident = 'd' AND i.indisprimary OR c.relreplident = 'i' AND i.indisreplident) " <>
+      "LIMIT 1) ri ON true " <>
+      "ORDER BY n.nspname, c.relname, a.attnum"
+  end
+
+  @doc """
+  ADR-0009 §4 — the pre-flight output-plugin option probe, against the pipeline's
+  OWN slot with the decoder's EXACT option list. A build that cannot express an
+  option rejects the call
+  with `invalid_parameter_value` / `feature_not_supported` (OBSERVED: wal2json format
+  bounds use 0A000, an unknown option uses 22023) — the caller halts
+  `:decoder_option_unsupported` instead of feeding the stream-command reconnect loop
+  (postgrex surfaces a rejected START_REPLICATION only as a disconnect, and a rejected
+  or erroring peek on the WALSENDER itself never returns ReadyForQuery). Any OTHER
+  error — pglogical's "produces binary output" (XX000) above all — proves the options
+  PARSED, so the caller proceeds. Option values are validated exactly like
+  `start_replication_for/4`'s; names are `Identifier.validate`d and interpolated (the
+  simple-query protocol cannot bind).
+  """
+  @spec decoder_option_probe(String.t(), [{String.t(), String.t()}]) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def decoder_option_probe(slot_name, options) do
+    with :ok <- Identifier.validate(slot_name),
+         :ok <- validate_plugin_options(options) do
+      pairs =
+        Enum.map_join(options, ", ", fn {k, v} ->
+          # keys may be double-quoted identifiers; strip the quotes for the peek's
+          # text-array form and single-quote the value
+          "'#{String.replace(k, "\"", "")}', '#{v}'"
+        end)
+
+      {:ok,
+       "SELECT count(*) FROM pg_logical_slot_peek_changes('#{slot_name}', NULL, 1, " <>
+         "#{pairs})"}
+    end
+  end
+
   @doc "Query returning the `active` flag for the replication slot."
   @spec slot_exists(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}
   def slot_exists(slot_name) do
@@ -185,6 +424,11 @@ defmodule Replicant.QueryBuilder do
       (`invalidation_reason`/`synced` were added in PG17 and error here).
     * **PG 17+** (`version >= 170000`) — also `invalidation_reason` (Postgres's authoritative
       invalidation field) and `synced` (true on a standby holding a slot synced from the primary).
+    * **PG 9.6 to 12** (`version < 130000`) — NO invalidation column (ADR-0009 §9):
+      `wal_status` and `max_slot_wal_keep_size` arrive in PG13; before that a slot cannot
+      be invalidated by size and the only loss signal is a removed WAL segment, which
+      surfaces as a `START_REPLICATION` failure (the command-error watchdog). The
+      constant `NULL::text` keeps the row-present/absent signal the connect chain keys on.
 
   `wal_status = 'lost'` = WAL removed; `conflicting = true` = standby recovery conflict; any
   non-null `invalidation_reason` = invalidated. All are unrecoverable → fail-closed halt.
@@ -197,7 +441,8 @@ defmodule Replicant.QueryBuilder do
         cond do
           version >= 170_000 -> "wal_status, conflicting, invalidation_reason, synced"
           version >= 160_000 -> "wal_status, conflicting"
-          true -> "wal_status"
+          version >= 130_000 -> "wal_status"
+          true -> "NULL::text"
         end
 
       {:ok,
@@ -340,6 +585,77 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
+  The `table_columns/0` row shape for an EXPLICIT table list (the pglogical/wal2json
+  decoders' snapshot path, ADR-0009 §8): same columns, same `attnum` order, but the
+  table set comes from the caller (`VALUES` — both parts of every pair are
+  `Identifier.validate`d) instead of `pg_publication_tables`.
+  """
+  @spec table_columns_for([{String.t(), String.t()}]) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def table_columns_for(tables) when is_list(tables) and tables != [] do
+    with :ok <- ensure_valid_pairs(tables) do
+      values = table_values(tables)
+
+      {:ok,
+       "SELECT n.nspname AS schemaname, c.relname AS tablename, " <>
+         "format('%I.%I', n.nspname, c.relname) AS qualified, " <>
+         "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
+         "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
+         "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
+         "FROM (VALUES #{values}) AS p0(nsp, rel) " <>
+         "JOIN pg_namespace n ON n.nspname = p0.nsp " <>
+         "JOIN pg_class c ON c.relname = p0.rel AND c.relnamespace = n.oid " <>
+         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+         "GROUP BY n.nspname, c.relname"}
+    end
+  end
+
+  def table_columns_for(_other), do: {:error, :invalid_identifier}
+
+  @doc """
+  The `pk_columns/0` row shape for an EXPLICIT table list (the pglogical/wal2json
+  decoders' incremental path, ADR-0009 §8). Same columns and PK ordering; the table
+  set is the caller's validated list.
+  """
+  @spec pk_columns_for([{String.t(), String.t()}]) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def pk_columns_for(tables) when is_list(tables) and tables != [] do
+    with :ok <- ensure_valid_pairs(tables) do
+      values = table_values(tables)
+
+      {:ok,
+       "SELECT n.nspname AS schemaname, c.relname AS tablename, " <>
+         "format('%I.%I', n.nspname, c.relname) AS qualified, " <>
+         "array_agg(a.attname ORDER BY k.ord) AS pk_raw, " <>
+         "array_agg(quote_ident(a.attname) ORDER BY k.ord) AS pk_quoted " <>
+         "FROM (VALUES #{values}) AS p0(nsp, rel) " <>
+         "JOIN pg_namespace n ON n.nspname = p0.nsp " <>
+         "JOIN pg_class c ON c.relname = p0.rel AND c.relnamespace = n.oid " <>
+         "JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary " <>
+         "JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ord) ON true " <>
+         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum " <>
+         "GROUP BY n.nspname, c.relname"}
+    end
+  end
+
+  def pk_columns_for(_other), do: {:error, :invalid_identifier}
+
+  defp table_values(tables),
+    do: Enum.map_join(tables, ", ", fn {schema, table} -> "('#{schema}','#{table}')" end)
+
+  # :ok-only pair validator (the *_for builders emit their own SQL bodies).
+  defp ensure_valid_pairs(tables) do
+    Enum.reduce_while(tables, :ok, fn {schema, table}, :ok ->
+      with :ok <- Identifier.validate(schema),
+           :ok <- Identifier.validate(table) do
+        {:cont, :ok}
+      else
+        {:error, :invalid_identifier} = err -> {:halt, err}
+      end
+    end)
+  end
+
+  @doc """
   Keyset chunk SELECT (spec §6.6). `col_quoted` (all columns) and `pk_quoted` (the PK
   subset) come from `table_columns/0`/`pk_columns/0` (server-quoted — never validated
   client-side, never raw). `bound_arity` is the number of PK columns in the resume bound:
@@ -415,10 +731,18 @@ defmodule Replicant.QueryBuilder do
   Read-only watermark position (spec §2/§4): `pg_current_wal_lsn()` on a primary,
   `pg_last_wal_replay_lsn()` on a standby (the chunk reader connects to the same host
   as the replication connection, so its snapshot visibility is bounded by replay).
+  The `/3` form is version-gated (ADR-0009 §9): PG 9.6 names the current-LSN function
+  `pg_current_xlog_location` (the `pg_current_wal_lsn` rename landed in PG 10).
   """
-  @spec watermark_lsn(boolean()) :: String.t()
-  def watermark_lsn(true), do: "SELECT pg_last_wal_replay_lsn()::text;"
-  def watermark_lsn(false), do: "SELECT pg_current_wal_lsn()::text;"
+  @spec watermark_lsn(boolean(), non_neg_integer()) :: String.t()
+  def watermark_lsn(in_recovery, version \\ 100_021)
+
+  def watermark_lsn(true, _version), do: "SELECT pg_last_wal_replay_lsn()::text;"
+
+  def watermark_lsn(false, version) when version < 100_000,
+    do: "SELECT pg_current_xlog_location()::text;"
+
+  def watermark_lsn(false, _version), do: "SELECT pg_current_wal_lsn()::text;"
 
   @doc "DDL creating the lib-owned snapshot-progress table if absent (token is an opaque bytea; spec §6.2)."
   @spec progress_ensure_table(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}

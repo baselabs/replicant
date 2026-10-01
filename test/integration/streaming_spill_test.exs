@@ -1,6 +1,11 @@
 defmodule Replicant.StreamingSpillTest do
   use ExUnit.Case, async: false
   @moduletag :integration
+  # Spill rides pgoutput proto-v2 streaming (PG14+) and drives it by setting
+  # logical_decoding_work_mem (PG13+); a pre-14 primary can run neither, so the
+  # module is excluded there via the :pg14 tag in test_helper.exs — an honest
+  # exclusion, never a vacuous pass.
+  @moduletag :pg14
   # Each marquee streams a 20k–40k-row txn through logical decoding + disk spill — genuinely
   # ~15s isolated, and its `Postgrex.transaction(..., timeout: 120_000)` already budgets the DB
   # op at 120s. The ExUnit test timeout was left at the 60s default, so under concurrent machine

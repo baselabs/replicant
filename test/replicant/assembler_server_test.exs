@@ -125,6 +125,51 @@ defmodule Replicant.AssemblerServerTest do
     refute :sys.get_state(pid).halted
   end
 
+  # An append_log-kind sink (Rule 3: its slot stays at the durable delivered frontier
+  # so the reconnect origin can detect an out-of-band advance).
+  defmodule AppendKindSink do
+    @behaviour Replicant.Sink
+    @impl true
+    def checkpoint, do: {:ok, nil}
+    @impl true
+    def handle_transaction(_txn), do: raise("must not be called for an empty txn")
+    @impl true
+    def sink_kind, do: :append_log
+  end
+
+  test "an EMPTY transaction acks for a state mirror (pre-PG15 wire behavior; PG15+ skips them server-side)" do
+    # A pre-15 pgoutput walsender streams BEGIN/COMMIT pairs with zero published
+    # changes (OBSERVED live on 12.22). The empty WAL acks forward for a mirror —
+    # proven-carries-nothing, same release the idle-ack performs on quiet WAL.
+    pid = start("srv_empty_mirror", SkipSink)
+    cast(pid, %Begin{final_lsn: 0x70, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 8}, 20)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x70, end_lsn: 0x70, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    assert_receive {:sink_committed, 0x70}, 1000
+    refute :sys.get_state(pid).halted
+  end
+
+  test "an EMPTY transaction does NOT ack for an :append_log sink (Rule 3's append clause)" do
+    pid = start("srv_empty_append", AppendKindSink)
+    cast(pid, %Begin{final_lsn: 0x80, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 9}, 20)
+
+    cast(
+      pid,
+      %Commit{lsn: 0x80, end_lsn: 0x80, commit_timestamp: ~U[2026-07-04 00:00:00Z], flags: []},
+      8
+    )
+
+    # No durable delivery happened, so the append slot must NOT advance past its
+    # durable frontier (a confirmed_flush at 0x80 would blind the origin callback).
+    refute_receive {:sink_committed, _}, 200
+    refute :sys.get_state(pid).halted
+  end
+
   test "a sink WRITE fault halts fail-closed and sends no ack (spec §6 fail-closed)" do
     pid = start("srv_failwrite", FailWriteSink)
     cast(pid, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
@@ -601,8 +646,10 @@ defmodule Replicant.AssemblerServerTest do
       # The AssemblerServer signals the Connection via a PLAIN send → its handle_info substrate
       # (the same idiom the existing dispatch/3 uses for {:sink_committed, lsn}). Task 10's
       # Connection handles {:spilled_bytes, total} in handle_info. So assert the plain message,
-      # NOT a {:"$gen_cast", ...} wrapper.
-      assert_receive {:spilled_bytes, total} when total > 0
+      # NOT a {:"$gen_cast", ...} wrapper. The 2s budget (not the 100ms default) matches
+      # the sibling spill asserts below: the spill is real file I/O, and a loaded host
+      # pages it out past 100ms without any defect (OBSERVED under load, 2026-09-30).
+      assert_receive {:spilled_bytes, total} when total > 0, 2_000
     end
 
     test "a spilled txn COMMITTING re-casts {:spilled_bytes} with the LOWER total (frees disk bytes; the §4 numerator un-strands after a large spilled txn commits)" do
@@ -647,8 +694,8 @@ defmodule Replicant.AssemblerServerTest do
 
       GenServer.cast(pid, {:message, %Replicant.Decoder.Messages.StreamStop{}, 4, self()})
 
-      # The spill fires → an INCREASE cast.
-      assert_receive {:spilled_bytes, up} when up > 0
+      # The spill fires → an INCREASE cast (2s budget: real file I/O under host load).
+      assert_receive {:spilled_bytes, up} when up > 0, 2_000
 
       # The commit delivers the spilled txn and frees its disk bytes → spilled_total drops → a NET
       # re-cast with the LOWER total (RED before the CV3 fix cast the delta, not the net total —
@@ -659,7 +706,7 @@ defmodule Replicant.AssemblerServerTest do
          8, self()}
       )
 
-      assert_receive {:spilled_bytes, down} when down < up
+      assert_receive {:spilled_bytes, down} when down < up, 2_000
       assert :sys.get_state(pid).asm.spilled_total == down
     end
 
@@ -768,7 +815,11 @@ defmodule Replicant.AssemblerServerTest do
             )
 
       # Force the spill and capture the on-disk file path from xid 100's stream buffer.
-      assert_receive {:spilled_bytes, total} when total > 0
+      # The 2000ms window (not the 100ms default) is load tolerance, not a weaker
+      # assertion: the casts are already in the server's mailbox and the signal MUST
+      # arrive — under a saturated test VM the 100ms window flaked 1-in-5 (OBSERVED
+      # 2026-09-30) while the spill always landed.
+      assert_receive {:spilled_bytes, total} when total > 0, 2_000
       state = :sys.get_state(pid)
       spill_path = state.asm.stream_txns[100].spill.path
       assert File.exists?(spill_path)

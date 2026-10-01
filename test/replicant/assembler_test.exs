@@ -60,6 +60,24 @@ defmodule Replicant.AssemblerTest.ExitCheckpointSink do
 end
 
 defmodule Replicant.AssemblerTest do
+  # One announced relation for the batch-fixture helpers: their filler txns must carry a
+  # REAL change, because an EMPTY commit no longer opens/counts a batch (pre-PG15
+  # empty-transaction suppression — OBSERVED live on 12.22, 2026-09-30).
+  @batch_rel %Replicant.Decoder.Messages.Relation{
+    id: 1,
+    namespace: "public",
+    name: "batch_t",
+    replica_identity: :default,
+    columns: [
+      %Replicant.Decoder.Messages.Relation.Column{
+        name: "id",
+        type: "int4",
+        flags: [:key],
+        type_modifier: -1
+      }
+    ]
+  }
+
   use ExUnit.Case, async: false
 
   alias Replicant.{
@@ -210,7 +228,7 @@ defmodule Replicant.AssemblerTest do
       def handle_transaction(%Replicant.Transaction{} = txn), do: {:ok, txn.commit_lsn}
     end
 
-    alias Replicant.Decoder.Messages.{Begin, Commit}
+    alias Replicant.Decoder.Messages.{Begin, Commit, Message}
 
     test "a committed txn writes the checkpoint via the writer BEFORE returning, and advances the in-memory watermark" do
       parent = self()
@@ -222,7 +240,15 @@ defmodule Replicant.AssemblerTest do
 
       asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
 
+      {:ok, asm} = Assembler.handle_message(asm, @batch_rel)
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      # a real change (an empty commit is suppressed, pre-PG15 wire behavior)
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          %Replicant.Decoder.Messages.Insert{relation_id: 1, tuple_data: {"1"}}
+        )
 
       assert {:transaction, _txn, 100, asm} =
                Assembler.handle_message(asm, %Commit{lsn: 100, commit_timestamp: nil})
@@ -249,6 +275,61 @@ defmodule Replicant.AssemblerTest do
       refute_received {:wrote, _}
     end
 
+    test "an EMPTY v1 transaction (zero changes, zero messages) is suppressed, not delivered (pre-PG15 wire behavior)" do
+      # PG15+ skips empty transactions server-side; a pre-15 pgoutput walsender still streams
+      # BEGIN/COMMIT pairs for catalog-touched transactions with zero published changes
+      # (OBSERVED live on 12.22, 2026-09-30: every ALTER/DDL txn delivered as an empty
+      # transaction). The streamed path already suppresses these (parent CV1, spec §7 —
+      # deliver_or_skip_stream); the v1 path must be v1-INDISTINGUISHABLE from it: no sink
+      # call. {:skipped_empty} (not {:skipped}): the ack is sink-kind-gated at the
+      # AssemblerServer (a state mirror acks/releases the empty WAL; an :append_log
+      # sink retains it at the durable frontier, Rule 3) — asserted at that layer.
+      parent = self()
+
+      writer = fn lsn ->
+        send(parent, {:wrote, lsn})
+        :ok
+      end
+
+      asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 300, xid: 9})
+
+      assert {:skipped_empty, 300, _asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 300, commit_timestamp: nil})
+
+      # no sink call and no checkpoint write for the empty txn
+      refute_received {:wrote, _}
+    end
+
+    test "an empty v1 transaction CARRYING a transactional message still delivers (v1-distinguishable, spec §7.1)" do
+      # The suppression's red line: a message-bearing transaction is NOT empty — the streamed
+      # path's own regression note (a message silently lost by row-count-only suppression)
+      # binds the v1 fix the same way.
+      parent = self()
+
+      writer = fn lsn ->
+        send(parent, {:wrote, lsn})
+        :ok
+      end
+
+      asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
+
+      {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 400, xid: 10})
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          %Message{transactional?: true, lsn: 399, prefix: "p", content: <<1>>}
+        )
+
+      assert {:transaction, txn, 400, _asm} =
+               Assembler.handle_message(asm, %Commit{lsn: 400, commit_timestamp: nil})
+
+      assert [%Message{transactional?: true}] = txn.messages
+      assert_received {:wrote, 400}
+    end
+
     test "a checkpoint-store WRITE fault halts fail-closed (:checkpoint_store_failed), never announcing commit" do
       # Gate the checkpoint-after-persist ORDERING, not just the halt: a regression
       # that emitted [:sink, :committed] and THEN halted would still satisfy the
@@ -258,7 +339,16 @@ defmodule Replicant.AssemblerTest do
       writer = fn _lsn -> {:error, :store_down} end
       asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
 
+      {:ok, asm} = Assembler.handle_message(asm, @batch_rel)
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      # a real change: an EMPTY commit is suppressed before the store write (pre-PG15
+      # empty-txn suppression) and would never reach the fault under test
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          %Replicant.Decoder.Messages.Insert{relation_id: 1, tuple_data: {"1"}}
+        )
 
       assert {:halt, %Replicant.Error{reason: :checkpoint_store_failed}, _asm} =
                Assembler.handle_message(asm, %Commit{lsn: 100, commit_timestamp: nil})
@@ -284,7 +374,14 @@ defmodule Replicant.AssemblerTest do
           slot_name: "rep_slot_x"
         )
 
+      {:ok, asm} = Assembler.handle_message(asm, @batch_rel)
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          %Replicant.Decoder.Messages.Insert{relation_id: 1, tuple_data: {"1"}}
+        )
 
       assert {:halt, %Replicant.Error{reason: :checkpoint_store_failed}, _asm} =
                Assembler.handle_message(asm, %Commit{lsn: 100, commit_timestamp: nil})
@@ -298,7 +395,14 @@ defmodule Replicant.AssemblerTest do
     test "a dead-store writer EXIT is caught value-free and halts :checkpoint_store_failed (not :decode_failure)" do
       writer = fn _lsn -> exit(:noproc) end
       asm = Assembler.new(OkSink, mode: :lib, checkpoint_writer: writer, lib_checkpoint: nil)
+      {:ok, asm} = Assembler.handle_message(asm, @batch_rel)
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 7, xid: 1})
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          %Replicant.Decoder.Messages.Insert{relation_id: 1, tuple_data: {"1"}}
+        )
 
       assert {:halt, %Replicant.Error{reason: :checkpoint_store_failed}, _asm} =
                Assembler.handle_message(asm, %Commit{lsn: 7, commit_timestamp: nil})
@@ -710,21 +814,31 @@ defmodule Replicant.AssemblerTest do
       def handle_transaction(%Replicant.Transaction{} = txn), do: {:ok, txn.commit_lsn}
     end
 
-    alias Replicant.Decoder.Messages.{Begin, Commit}
+    alias Replicant.Decoder.Messages.{Begin, Commit, Insert}
 
     defp batched(writer, policy) do
-      Replicant.Assembler.new(BatchSink,
-        mode: :lib,
-        checkpoint_writer: writer,
-        slot_name: "rep_batch",
-        lib_checkpoint: 0,
-        batch: policy
-      )
+      {:ok, asm} =
+        Replicant.Assembler.new(BatchSink,
+          mode: :lib,
+          checkpoint_writer: writer,
+          slot_name: "rep_batch",
+          lib_checkpoint: 0,
+          batch: policy
+        )
+        |> Replicant.Assembler.handle_message(@batch_rel)
+
+      asm
     end
 
     # Drive one committed txn (Begin(lsn) → Commit(lsn)) through `asm`, returning the result.
+    # Begin(lsn) → one real Insert → Commit(lsn): the txn must carry a change, or the
+    # empty-txn suppression skips it without opening the batch.
     defp commit_txn(asm, lsn) do
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: lsn, xid: lsn})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{relation_id: 1, tuple_data: {"1"}})
+
       Assembler.handle_message(asm, %Commit{lsn: lsn, commit_timestamp: nil})
     end
 
@@ -909,16 +1023,25 @@ defmodule Replicant.AssemblerTest do
       }
     end
 
-    alias Replicant.Decoder.Messages.{Begin, Commit}
+    alias Replicant.Decoder.Messages.{Begin, Commit, Insert}
 
-    # Drive one committed txn (Begin(lsn) → Commit(lsn), no changes) through `asm`.
+    # Drive one committed txn carrying a real change (an empty commit is suppressed
+    # without opening the batch — pre-PG15 empty-txn suppression).
     defp bd_commit(asm, lsn) do
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: lsn, xid: lsn})
+
+      {:ok, asm} =
+        Assembler.handle_message(asm, %Insert{relation_id: 1, tuple_data: {"1"}})
+
       Assembler.handle_message(asm, %Commit{lsn: lsn, commit_timestamp: nil})
     end
 
     defp sink_batched(sink, policy) do
-      %{Replicant.Assembler.new(sink, batch: policy) | stream_floor: 0}
+      {:ok, asm} =
+        Replicant.Assembler.new(sink, batch: policy)
+        |> Replicant.Assembler.handle_message(@batch_rel)
+
+      %{asm | stream_floor: 0}
     end
 
     test "a committed txn is BUFFERED (handle_batch NOT called; not delivered until flush)" do
@@ -1351,7 +1474,9 @@ defmodule Replicant.AssemblerTest do
       asm = deliver_streamed(StreamDeliverSink, 100)
       {:ok, asm} = Assembler.handle_message(asm, %StreamStop{})
 
-      assert {:skipped, 900, asm} =
+      # {:skipped_empty}: ack is sink-kind-gated at the AssemblerServer (Rule 3's
+      # append clause) — a state mirror still acks/releases the empty WAL.
+      assert {:skipped_empty, 900, asm} =
                Assembler.handle_message(asm, %StreamCommit{
                  xid: 100,
                  commit_lsn: 900,
@@ -1883,7 +2008,8 @@ defmodule Replicant.AssemblerTest do
       assert handle != nil
       assert File.exists?(handle.path)
 
-      assert {:skipped, 900, _asm} =
+      # {:skipped_empty}: ack is sink-kind-gated at the AssemblerServer (Rule 3).
+      assert {:skipped_empty, 900, _asm} =
                Assembler.handle_message(asm, %StreamCommit{
                  xid: 100,
                  commit_lsn: 900,
@@ -2614,7 +2740,16 @@ defmodule Replicant.AssemblerTest do
           | stream_floor: 0
         }
 
+      {:ok, asm} = Assembler.handle_message(asm, @batch_rel)
       {:ok, asm} = Assembler.handle_message(asm, %Begin{final_lsn: 100, xid: 1})
+
+      {:ok, asm} =
+        Assembler.handle_message(
+          asm,
+          %Replicant.Decoder.Messages.Insert{relation_id: 1, tuple_data: {"1"}}
+        )
+
+      # a real change (an empty commit is suppressed without opening the batch)
       assert {:buffered, asm} = Assembler.handle_message(asm, %Commit{lsn: 100})
       assert Assembler.batch_pending?(asm)
 

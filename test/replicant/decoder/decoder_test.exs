@@ -9,7 +9,7 @@ defmodule Replicant.Decoder.DecoderTest do
       bytes =
         <<73, 0, 0, 96, 0, 78, 0, 2, 116, 0, 0, 0, 3, 98, 97, 122, 116, 0, 0, 0, 3, 53, 54, 48>>
 
-      assert {:ok, %Messages.Insert{relation_id: 24_576, tuple_data: {"baz", "560"}}} =
+      assert {:ok, [%Messages.Insert{relation_id: 24_576, tuple_data: {"baz", "560"}}], _cache} =
                Decoder.decode(bytes)
     end
 
@@ -17,7 +17,10 @@ defmodule Replicant.Decoder.DecoderTest do
       # "B", final_lsn::binary-8 (file=0,offset=0x16E3778), timestamp::64, xid::32
       lsn_bytes = <<0::32, 0x16E3778::32>>
       bytes = <<"B", lsn_bytes::binary, 0::64, 42::32>>
-      assert {:ok, %Messages.Begin{final_lsn: final_lsn, xid: 42}} = Decoder.decode(bytes)
+
+      assert {:ok, [%Messages.Begin{final_lsn: final_lsn, xid: 42}], _cache} =
+               Decoder.decode(bytes)
+
       # decode_lsn/1 converts the {file, offset} byte pair to a single uint64 via
       # Bitwise.bsl(file, 32) + offset — always an integer, never a tuple. This
       # asserts the conversion result directly; a `refute match?({_, _}, final_lsn)`
@@ -50,7 +53,9 @@ defmodule Replicant.Decoder.DecoderTest do
     end
 
     test "decode/1 is total: every binary returns a tagged result, never raises" do
-      assert {:ok, %Messages.Begin{}} = Decoder.decode(<<"B", 0::32, 0x10::32, 0::64, 1::32>>)
+      assert {:ok, [%Messages.Begin{}], _cache} =
+               Decoder.decode(<<"B", 0::32, 0x10::32, 0::64, 1::32>>)
+
       assert {:error, _} = Decoder.decode(<<>>)
       assert {:error, _} = Decoder.decode(<<"Z">>)
     end
@@ -91,9 +96,11 @@ defmodule Replicant.Decoder.DecoderTest do
         <<"R", 7::integer-32, "public", 0, "t", 0, "d", 1::integer-16, cols::binary>>
 
       assert {:ok,
-              %Messages.Relation{
-                columns: [%Messages.Relation.Column{name: "c", type_modifier: -1}]
-              }} = Decoder.decode(bytes)
+              [
+                %Messages.Relation{
+                  columns: [%Messages.Relation.Column{name: "c", type_modifier: -1}]
+                }
+              ], _cache} = Decoder.decode(bytes)
     end
   end
 
@@ -124,16 +131,16 @@ defmodule Replicant.Decoder.DecoderTest do
     end
 
     test "decodes Stream Start / Stop / Commit / Abort (unambiguous by type byte)" do
-      assert {:ok, %StreamStart{xid: 515_103, first_segment: true}} =
+      assert {:ok, [%StreamStart{xid: 515_103, first_segment: true}], _cache} =
                Decoder.decode(<<"S", 515_103::32, 1::8>>)
 
-      assert {:ok, %StreamStop{}} = Decoder.decode(<<"E">>)
+      assert {:ok, [%StreamStop{}], _cache} = Decoder.decode(<<"E">>)
 
       # c: xid, flags(0), commit_lsn(8B pg_lsn), end_lsn(8B), commit_ts(i64). LSN 0/100 = 100.
-      assert {:ok, %StreamCommit{xid: 515_103, commit_lsn: 100, end_lsn: 101}} =
+      assert {:ok, [%StreamCommit{xid: 515_103, commit_lsn: 100, end_lsn: 101}], _cache} =
                Decoder.decode(<<"c", 515_103::32, 0::8, 0::32, 100::32, 0::32, 101::32, 0::64>>)
 
-      assert {:ok, %StreamAbort{xid: 515_103, subxid: 515_104}} =
+      assert {:ok, [%StreamAbort{xid: 515_103, subxid: 515_104}], _cache} =
                Decoder.decode(<<"A", 515_103::32, 515_104::32>>)
     end
 
@@ -142,7 +149,7 @@ defmodule Replicant.Decoder.DecoderTest do
       # one text column 't' with value "x": "t" <len::32> "x"
       streamed = <<"I", 515_103::32, 42::32, "N", 1::16, "t", 1::32, "x">>
 
-      assert {:ok, %Insert{xid: 515_103, relation_id: 42, tuple_data: {"x"}}} =
+      assert {:ok, [%Insert{xid: 515_103, relation_id: 42, tuple_data: {"x"}}], _cache} =
                Decoder.decode(streamed, streaming: true)
 
       # Under the v1 (non-streaming) decoder the same bytes mis-frame: the leading xid is read as
@@ -156,7 +163,7 @@ defmodule Replicant.Decoder.DecoderTest do
     test "a non-streamed Insert still decodes without xid under the default (v1) path" do
       v1 = <<"I", 42::32, "N", 1::16, "t", 1::32, "x">>
 
-      assert {:ok, %Insert{xid: nil, relation_id: 42, tuple_data: {"x"}}} =
+      assert {:ok, [%Insert{xid: nil, relation_id: 42, tuple_data: {"x"}}], _cache} =
                Decoder.decode(v1)
     end
 
@@ -169,12 +176,14 @@ defmodule Replicant.Decoder.DecoderTest do
       streamed_truncate = <<"T", 515_103::32, 2::32, 0::8, 100::32, 200::32>>
 
       assert {:ok,
-              %Truncate{
-                xid: 515_103,
-                number_of_relations: 2,
-                options: [],
-                truncated_relations: [100, 200]
-              }} = Decoder.decode(streamed_truncate, streaming: true)
+              [
+                %Truncate{
+                  xid: 515_103,
+                  number_of_relations: 2,
+                  options: [],
+                  truncated_relations: [100, 200]
+                }
+              ], _cache} = Decoder.decode(streamed_truncate, streaming: true)
     end
 
     test "byte-level tampering of a streamed frame's xid-prefixed body is caught value-free (spec §12.2, Rule 1)" do
@@ -213,13 +222,15 @@ defmodule Replicant.Decoder.DecoderTest do
       bytes = <<"M", 0::8, lsn_bytes::binary, "outbox", 0, 7::32, "payload">>
 
       assert {:ok,
-              %Message{
-                transactional?: false,
-                lsn: 0x16E3778,
-                prefix: "outbox",
-                content: "payload",
-                xid: nil
-              }} = Decoder.decode(bytes)
+              [
+                %Message{
+                  transactional?: false,
+                  lsn: 0x16E3778,
+                  prefix: "outbox",
+                  content: "payload",
+                  xid: nil
+                }
+              ], _cache} = Decoder.decode(bytes)
     end
 
     test "decodes a transactional Message (flags=1) under the v1 path" do
@@ -227,13 +238,15 @@ defmodule Replicant.Decoder.DecoderTest do
       bytes = <<"M", 1::8, lsn_bytes::binary, "outbox", 0, 7::32, "payload">>
 
       assert {:ok,
-              %Message{
-                transactional?: true,
-                lsn: 0x16E3778,
-                prefix: "outbox",
-                content: "payload",
-                xid: nil
-              }} = Decoder.decode(bytes)
+              [
+                %Message{
+                  transactional?: true,
+                  lsn: 0x16E3778,
+                  prefix: "outbox",
+                  content: "payload",
+                  xid: nil
+                }
+              ], _cache} = Decoder.decode(bytes)
     end
 
     test "decodes a STREAMED Message (xid-prefixed) only under streaming?: true" do
@@ -242,20 +255,22 @@ defmodule Replicant.Decoder.DecoderTest do
       streamed = <<"M", 515_103::32, 1::8, lsn_bytes::binary, "outbox", 0, 7::32, "payload">>
 
       assert {:ok,
-              %Message{
-                transactional?: true,
-                lsn: 0x16E3778,
-                prefix: "outbox",
-                content: "payload",
-                xid: 515_103
-              }} = Decoder.decode(streamed, streaming: true)
+              [
+                %Message{
+                  transactional?: true,
+                  lsn: 0x16E3778,
+                  prefix: "outbox",
+                  content: "payload",
+                  xid: 515_103
+                }
+              ], _cache} = Decoder.decode(streamed, streaming: true)
 
       # Under v1 the same bytes mis-frame: the leading xid is read as flags, and the null-split
       # + length-prefix body is shape-flexible enough to still match (unlike the rigid "N"/ncols
       # Insert body, which falls to :unsupported_message). So v1 yields a valid-but-WRONG decode —
       # garbled prefix/lsn and xid: nil — which is exactly why the streaming flag is load-bearing
       # for xid attachment. The streamed xid (515_103) is provably absent under v1.
-      assert {:ok, %Message{xid: nil, content: "payload"} = v1_msg} =
+      assert {:ok, [%Message{xid: nil, content: "payload"} = v1_msg], _cache} =
                Decoder.decode(streamed, streaming: false)
 
       refute v1_msg.prefix == "outbox"

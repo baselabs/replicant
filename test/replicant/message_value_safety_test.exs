@@ -167,7 +167,9 @@ defmodule Replicant.MessageValueSafetyTest do
       frame = message_frame(0, frame_prefix, @secret_content, byte_size(@secret_content))
 
       assert {:ok,
-              %Message{transactional?: false, prefix: ^frame_prefix, content: @secret_content}} =
+              [
+                %Message{transactional?: false, prefix: ^frame_prefix, content: @secret_content}
+              ], _cache} =
                Decoder.decode(frame)
     end
   end

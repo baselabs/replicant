@@ -3,20 +3,23 @@
 
 defmodule Replicant.Decoder do
   @moduledoc """
-  Binary decoder for the Postgres logical-replication `pgoutput` stream.
+  The decode boundary + dispatcher for the logical-replication stream.
 
-  The byte parser (`decode_message/1`) is vendored from `walex` (MIT; see NOTICE),
-  itself derived from `cainophile` and `supabase-realtime`. It raises on malformed
-  input and produces `%Unsupported{data: binary}` (carrying raw bytes) for unknown
-  message types.
+  `decode/2` dispatches one XLogData payload to the configured decoder plugin
+  (ADR-0009; `opts[:decoder]`, default `:pgoutput`) and is the value-free-error
+  boundary (Critical Rule 1): it catches every raise/throw/exit from ANY plugin's
+  parser — the vendored pgoutput byte parser raises on malformed input, the pglogical
+  parser throws on malformed frames, the wal2json JSON decoder errors on malformed
+  JSON — scrubs the raw bytes, and returns a value-free `{:error, %Replicant.Error{}}`.
+  No row value or raw WAL byte ever escapes the decode boundary.
 
-  **Callers MUST use `decode/1`, not `decode_message/1`.** `decode/1` is the
-  value-free-error boundary (Critical Rule 1): it catches every raise, scrubs the
-  raw bytes, and normalises `%Unsupported{}` into a value-free
-  `{:error, %Replicant.Error{reason: :unsupported_message}}`. No row value or raw
-  WAL byte ever escapes the decode boundary.
+  The pgoutput byte parser (`pgoutput_decode/2`, `@doc false`) is vendored from `walex`
+  (MIT; see NOTICE), itself derived from `cainophile` and `supabase-realtime`; it
+  produces `%Unsupported{data: binary}` (carrying raw bytes) for unknown message types,
+  which `decode/2` normalises value-free. **Callers MUST use `decode/2`.**
   """
 
+  alias Replicant.Decoder.Plugin
   alias Replicant.Error
 
   alias Replicant.Decoder.Messages.{
@@ -44,30 +47,43 @@ defmodule Replicant.Decoder do
   @pg_epoch DateTime.from_iso8601("2000-01-01T00:00:00Z")
 
   @doc """
-  Decode one pgoutput message, value-free on failure.
+  Decode one replication payload through the configured decoder plugin, value-free on
+  failure.
 
-  Returns `{:ok, message_struct}` on success, or
-  `{:error, %Error{reason: :decode_failure | :unsupported_message}}` — never
+  `opts[:decoder]` selects the plugin (`:pgoutput` default, `:pglogical`, `:wal2json`);
+  `opts[:cache]` is the plugin's per-connection state (threaded by the Connection).
+  Returns `{:ok, messages, cache}` (zero or more decoded structs — wal2json emits a
+  synthesized `%Relation{}` ahead of a schema-drifted change) or
+  `{:error, %Error{reason: :decode_failure | :unsupported_message | ...}}` — never
   raises, never surfaces raw bytes.
   """
-  @spec decode(binary(), keyword()) :: {:ok, struct()} | {:error, Error.t()}
+  @spec decode(binary(), keyword()) ::
+          {:ok, [struct()], term()} | {:error, Error.t()}
   def decode(binary, opts \\ []) when is_binary(binary) do
+    decoder = Keyword.get(opts, :decoder, :pgoutput)
+    cache = Keyword.get(opts, :cache)
+
+    Plugin.module_for(decoder).decode(binary, cache, opts)
+  rescue
+    exception -> {:error, Error.decode_failure(exception)}
+  catch
+    # A `throw`/`exit` from any plugin parser would otherwise crash the Connection
+    # process (decode/2 runs THERE — connection.ex forward_message — so the assembler's
+    # own rescue/catch does NOT cover it) with a reason term that can embed raw WAL bytes.
+    # Scrub it value-free (Critical Rule 1), mirroring the assembler's decode boundary.
+    _kind, _reason -> {:error, %Error{reason: :decode_failure}}
+  end
+
+  @doc false
+  @spec pgoutput_decode(binary(), keyword()) ::
+          {:ok, struct()} | {:error, Error.t()}
+  def pgoutput_decode(binary, opts \\ []) when is_binary(binary) do
     streaming? = Keyword.get(opts, :streaming, false)
 
     case decode_message(binary, streaming?) do
       %Unsupported{} -> {:error, %Error{reason: :unsupported_message}}
       message -> {:ok, message}
     end
-  rescue
-    exception -> {:error, Error.decode_failure(exception)}
-  catch
-    # A `throw`/`exit` from the vendored parser would otherwise crash the Connection
-    # process (decode/1 runs THERE — connection.ex forward_message — so the assembler's
-    # own rescue/catch does NOT cover it) with a reason term that can embed raw WAL bytes.
-    # Scrub it value-free (Critical Rule 1), mirroring the assembler's decode boundary.
-    # Defense-in-depth: the vendored parser only `raise`s today, so this fires only on a
-    # future parser change that introduces a throw/exit.
-    _kind, _reason -> {:error, %Error{reason: :decode_failure}}
   end
 
   # Stream-control messages (spec §5) — unambiguous by type byte, decoded regardless

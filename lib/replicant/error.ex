@@ -25,6 +25,10 @@ defmodule Replicant.Error do
           | :snapshot_progress_invalid
           | :checkpoint_store_failed
           | :checkpoint_store_schema_mismatch
+          | :decoder_protocol_unsupported
+          | :decoder_option_unsupported
+          | :decoder_lsn_missing
+          | :decoder_capability_unsupported
 
   @type t :: %__MODULE__{
           reason: reason(),

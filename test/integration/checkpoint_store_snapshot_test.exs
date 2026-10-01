@@ -1,6 +1,9 @@
 defmodule Replicant.CheckpointStoreSnapshotTest do
   use ExUnit.Case, async: false
   @moduletag :integration
+  # pgoutput publications are PG10+; a 9.6 primary cannot drive this module (excluded
+  # via the :pg10 tag in test_helper.exs — the 9-row runs the plugin-decoder legs).
+  @moduletag :pg10
 
   alias Replicant.Test.PG16
 

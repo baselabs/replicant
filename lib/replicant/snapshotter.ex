@@ -37,7 +37,8 @@ defmodule Replicant.Snapshotter do
           required(:publication) => [String.t()],
           required(:sink) => module(),
           required(:reply_to) => pid(),
-          optional(:mode) => :sink_owned | :lib
+          optional(:mode) => :sink_owned | :lib,
+          optional(:tables) => [{String.t(), String.t()}] | nil
         }
 
   @doc "Spawn + LINK the snapshotter to the caller (the Connection) so it is torn down with the pipeline. Returns the pid."
@@ -82,11 +83,21 @@ defmodule Replicant.Snapshotter do
     start_mono = System.monotonic_time(:millisecond)
     mode = Map.get(args, :mode, :sink_owned)
 
-    # Route a QueryBuilder validation failure (`{:error, reason}`) through the value-free
-    # `snapshot_error/1` (never a raw MatchError that could leak the reason), before any
-    # connection is opened. `table_columns/0` has no identifier argument (the publication
-    # is bound as `$1`), so it returns a plain SQL string — no validation tuple to unwrap.
-    table_columns_sql = QueryBuilder.table_columns()
+    # The table set is publication-driven for pgoutput (byte-unchanged bind of `$1`) or
+    # an explicit validated list for the plugin decoders (ADR-0009 §8). A validation
+    # failure routes through the value-free `snapshot_error/1` before any connection
+    # opens.
+    {table_columns_sql, params} =
+      case Map.get(args, :tables) do
+        nil ->
+          {QueryBuilder.table_columns(), [publication]}
+
+        tables ->
+          case QueryBuilder.table_columns_for(tables) do
+            {:ok, sql} -> {sql, []}
+            {:error, reason} -> throw({:invalid, reason})
+          end
+      end
 
     case QueryBuilder.set_transaction_snapshot(name) do
       {:ok, set_snapshot_sql} ->
@@ -96,7 +107,7 @@ defmodule Replicant.Snapshotter do
           cp,
           set_snapshot_sql,
           table_columns_sql,
-          publication,
+          params,
           start_mono,
           mode
         )
@@ -112,7 +123,7 @@ defmodule Replicant.Snapshotter do
          cp,
          set_snapshot_sql,
          table_columns_sql,
-         publication,
+         table_params,
          start_mono,
          mode
        ) do
@@ -128,10 +139,10 @@ defmodule Replicant.Snapshotter do
             Postgrex.query!(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
             Postgrex.query!(c, set_snapshot_sql, [])
 
-            # One row per publication table: [schema, table, qualified, col_raw,
+            # One row per snapshot table: [schema, table, qualified, col_raw,
             # col_quoted, col_type_oids]. The column metadata (names + OIDs) lets the
             # v1 scan project <col>::text and cast each value through the stream's path.
-            tables = Postgrex.query!(c, table_columns_sql, [publication]).rows
+            tables = Postgrex.query!(c, table_columns_sql, table_params).rows
 
             Enum.reduce(tables, 0, fn [
                                         schema,

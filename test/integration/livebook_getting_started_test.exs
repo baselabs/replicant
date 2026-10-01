@@ -1,8 +1,9 @@
 defmodule Replicant.Integration.LivebookGettingStartedTest do
   @moduledoc """
   Executes `notebooks/getting_started.livemd` end to end against a LIVE PG16 so the notebook
-  can never silently rot: this test IS the notebook's CI (it rides `mix test`, which runs on the
-  PG16 + PG17 matrix — see `.github/workflows/ci.yml`).
+  can never silently rot: this test IS the notebook's CI (it rides `mix test` on every PG14+
+  matrix row — see `.github/workflows/ci.yml`; the plugin-decoder rows 9/12 skip it with a
+  logged reason: the notebook's `messages: true` demo needs the PG14+ pgoutput option).
 
   It parses the `.livemd`, extracts its ` ```elixir ` code cells, drops the `Mix.install/1` setup
   cell (deps are already loaded in the test VM), concatenates the rest, and evaluates them with
@@ -53,7 +54,23 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
   end
 
   test "the getting_started notebook's code cells run green against live PG16" do
-    if PG16.enabled?() do
+    # The notebook is the pgoutput tour; its `messages: true` demo cell needs PG14+
+    # (the pgoutput `messages` option arrived in PG14 — OBSERVED: PG12 rejects it with
+    # "unrecognized pgoutput option: messages"). The plugin-decoder matrix rows (9/12)
+    # carry their own suites; skip the tour there rather than run cells the substrate
+    # cannot express.
+    version = if PG16.enabled?(), do: Replicant.TestHelper.server_version_num(), else: 0
+
+    if PG16.enabled?() and version < 140_000 do
+      IO.puts(
+        "livebook tour skipped: the notebook's `messages: true` demo needs PG14+ " <>
+          "(pgoutput messages option); the plugin-decoder rows (9/12) carry their own suites"
+      )
+
+      :skipped
+    end
+
+    if PG16.enabled?() and version >= 140_000 do
       source = File.read!(@notebook)
       cells = extract_elixir_cells(source)
 
@@ -74,6 +91,7 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
       # Concatenate + evaluate as one top-to-bottom script (aliases/imports/bindings flow exactly
       # as Livebook runs the cells in order). The final cell's value is the summary map.
       script = Enum.join(runnable, "\n\n")
+
       {summary, _binding} = Code.eval_string(script, [], file: @notebook)
 
       assert is_map(summary),

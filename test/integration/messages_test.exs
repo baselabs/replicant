@@ -27,6 +27,11 @@ defmodule Replicant.MessagesTest do
 
   use ExUnit.Case, async: false
   @moduletag :integration
+  # The marquees pass the pgoutput `messages` option (PG14+ — a pre-14 walsender
+  # rejects it) and the §8.3 leg additionally sets logical_decoding_work_mem
+  # (PG13+) over proto-v2 streaming; the module is excluded on a pre-14 primary
+  # via the :pg14 tag in test_helper.exs — an honest exclusion, never a vacuous pass.
+  @moduletag :pg14
   # Each marquee drives real PG16 + (several) crash-injection / spill sequences that are
   # genuinely ~10s isolated under shared-PG16 load; match the streaming/spill suite ceiling.
   @moduletag timeout: 120_000

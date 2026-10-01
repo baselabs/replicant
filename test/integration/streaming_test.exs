@@ -1,6 +1,11 @@
 defmodule Replicant.StreamingTest do
   use ExUnit.Case, async: false
   @moduletag :integration
+  # These marquees assert STREAMED delivery (proto-v2 reassembly) and set
+  # logical_decoding_work_mem (PG13+) to force it; a pre-14 primary has neither,
+  # so the module is excluded there via the :pg14 tag in test_helper.exs — an
+  # honest exclusion, never a vacuous pass.
+  @moduletag :pg14
 
   alias Replicant.Test.PG16
 

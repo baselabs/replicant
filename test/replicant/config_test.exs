@@ -802,4 +802,310 @@ defmodule Replicant.ConfigTest do
       assert {:error, :invalid_identifier} = Config.validate(opts)
     end
   end
+
+  # ADR-0009 — decoder selection, per-decoder table-set keys, and start-time capability
+  # refusals. The default path (decoder absent) is byte-identical to 1.3.0.
+  describe "validate/1 decoder selection" do
+    test "decoder absent defaults to :pgoutput (the unchanged default path)" do
+      {:ok, cfg} = Config.validate(base_opts() ++ [sink: StateMirrorPersisted])
+      assert cfg.decoder == :pgoutput
+      assert cfg.publication == ["p"]
+      assert cfg.replication_sets == nil
+      assert cfg.tables == nil
+    end
+
+    test "decoder: :pgoutput is explicit and equivalent" do
+      {:ok, cfg} =
+        Config.validate(base_opts() ++ [sink: StateMirrorPersisted, decoder: :pgoutput])
+
+      assert cfg.decoder == :pgoutput
+    end
+
+    test "an unknown decoder atom is :config_invalid" do
+      for bad <- [:test_decoding, "wal2json", 1, nil] do
+        assert {:error, :config_invalid} =
+                 Config.validate(base_opts() ++ [sink: StateMirrorPersisted, decoder: bad])
+      end
+    end
+
+    test "decoder: :pglogical requires replication_sets and refuses the other table-set keys" do
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [sink: StateMirrorPersisted, decoder: :pglogical, replication_sets: "alpha"]
+        )
+
+      assert cfg.decoder == :pglogical
+      assert cfg.replication_sets == ["alpha"]
+      assert cfg.publication == nil
+
+      # missing table set
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 Keyword.delete(base_opts(), :publication) ++
+                   [decoder: :pglogical, sink: StateMirrorPersisted]
+               )
+
+      # the pgoutput key alongside the pglogical decoder
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 base_opts() ++
+                   [sink: StateMirrorPersisted, decoder: :pglogical, replication_sets: "alpha"]
+               )
+
+      # the wal2json key alongside the pglogical decoder
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 Keyword.delete(base_opts(), :publication) ++
+                   [
+                     sink: StateMirrorPersisted,
+                     decoder: :pglogical,
+                     replication_sets: "alpha",
+                     tables: [{"public", "t"}]
+                   ]
+               )
+    end
+
+    test "replication_sets accepts a validated list and rejects bad names (Critical Rule 2)" do
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [sink: StateMirrorPersisted, decoder: :pglogical, replication_sets: ["alpha", "beta"]]
+        )
+
+      assert cfg.replication_sets == ["alpha", "beta"]
+
+      for bad <- [[], ["alpha", "bad'name"], ["UPPER"], [""]] do
+        assert {:error, :invalid_identifier} =
+                 Config.validate(
+                   Keyword.delete(base_opts(), :publication) ++
+                     [sink: StateMirrorPersisted, decoder: :pglogical, replication_sets: bad]
+                 )
+      end
+    end
+
+    test "decoder: :wal2json requires tables as {schema, table} tuples and refuses the other keys" do
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [sink: StateMirrorPersisted, decoder: :wal2json, tables: [{"public", "orders"}]]
+        )
+
+      assert cfg.decoder == :wal2json
+      assert cfg.tables == [{"public", "orders"}]
+      assert cfg.publication == nil
+
+      # publication: alongside wal2json is the wrong key
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 base_opts() ++
+                   [
+                     sink: StateMirrorPersisted,
+                     decoder: :wal2json,
+                     tables: [{"public", "orders"}]
+                   ]
+               )
+
+      for bad <- [
+            [],
+            [{"public"}],
+            [{"public", "orders", "extra"}],
+            ["public.orders"],
+            [{1, "orders"}]
+          ] do
+        assert {:error, :config_invalid} =
+                 Config.validate(
+                   Keyword.delete(base_opts(), :publication) ++
+                     [sink: StateMirrorPersisted, decoder: :wal2json, tables: bad]
+                 )
+      end
+    end
+
+    test "allow_keyless_tables: defaults false, wal2json-only, boolean-only (the keyless pre-flight opt-in)" do
+      # wal2json silently DROPS an update/delete on a table with no replica-identity
+      # index and identity ≠ FULL (wal2json.c: skip + server WARNING, no wire signal),
+      # so the pipeline halts at start for such a configured table unless the operator
+      # explicitly accepts insert-only semantics with this flag.
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [sink: StateMirrorPersisted, decoder: :wal2json, tables: [{"public", "orders"}]]
+        )
+
+      assert cfg.allow_keyless_tables == false
+
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [
+              sink: StateMirrorPersisted,
+              decoder: :wal2json,
+              tables: [{"public", "orders"}],
+              allow_keyless_tables: true
+            ]
+        )
+
+      assert cfg.allow_keyless_tables == true
+
+      # the other decoders enforce keylessness themselves (pgoutput: the server refuses
+      # the write; pglogical: the keyless update arrives and halts at decode) — the
+      # opt-in flag alongside them is a misconfiguration, not silently ignored
+      # pgoutput keeps its publication; pglogical needs its sets — each decoder's own
+      # VALID config, with the flag alongside
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 base_opts() ++ [sink: StateMirrorPersisted, allow_keyless_tables: true]
+               )
+
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 Keyword.delete(base_opts(), :publication) ++
+                   [
+                     sink: StateMirrorPersisted,
+                     decoder: :pglogical,
+                     replication_sets: ["default"],
+                     allow_keyless_tables: true
+                   ]
+               )
+
+      for bad <- ["yes", 1, nil] do
+        assert {:error, :config_invalid} =
+                 Config.validate(
+                   Keyword.delete(base_opts(), :publication) ++
+                     [
+                       sink: StateMirrorPersisted,
+                       decoder: :wal2json,
+                       tables: [{"public", "orders"}],
+                       allow_keyless_tables: bad
+                     ]
+                 )
+      end
+    end
+
+    test "tables identifiers pass the allowlist (Critical Rule 2)" do
+      for bad <- [{"public", "bad'name"}, {"bad schema", "orders"}, {"public", "UPPER"}] do
+        assert {:error, :invalid_identifier} =
+                 Config.validate(
+                   Keyword.delete(base_opts(), :publication) ++
+                     [sink: StateMirrorPersisted, decoder: :wal2json, tables: [bad]]
+                 )
+      end
+    end
+
+    test "schema_check_interval: defaults 30s for wal2json, nil elsewhere, positive-integer-only" do
+      # the wal2json periodic schema guard (dropped-column backstop — the wire rules
+      # detect most drops immediately; this bounds the residual varlena/update-only
+      # window). pgoutput/pglogical get their schema from the wire (Relation re-emit
+      # on DDL), so the knob alongside them is a misconfiguration.
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [sink: StateMirrorPersisted, decoder: :wal2json, tables: [{"public", "orders"}]]
+        )
+
+      assert cfg.schema_check_interval == 30_000
+
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [
+              sink: StateMirrorPersisted,
+              decoder: :wal2json,
+              tables: [{"public", "orders"}],
+              schema_check_interval: 1_000
+            ]
+        )
+
+      assert cfg.schema_check_interval == 1_000
+
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 Keyword.delete(base_opts(), :publication) ++
+                   [
+                     sink: StateMirrorPersisted,
+                     decoder: :wal2json,
+                     tables: [{"public", "orders"}],
+                     schema_check_interval: 0
+                   ]
+               )
+
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 Keyword.delete(base_opts(), :publication) ++
+                   [
+                     sink: StateMirrorPersisted,
+                     decoder: :wal2json,
+                     tables: [{"public", "orders"}],
+                     schema_check_interval: "often"
+                   ]
+               )
+
+      assert {:error, :config_invalid} =
+               Config.validate(
+                 base_opts() ++ [sink: StateMirrorPersisted, schema_check_interval: 1_000]
+               )
+    end
+
+    test "streaming with a non-pgoutput decoder is refused :decoder_capability_unsupported" do
+      for {decoder, table_opts} <- [
+            {:pglogical, replication_sets: "alpha"},
+            {:wal2json, tables: [{"public", "orders"}]}
+          ] do
+        assert {:error, :decoder_capability_unsupported} =
+                 Config.validate(
+                   Keyword.delete(base_opts(), :publication) ++
+                     [
+                       sink: StateMirrorPersisted,
+                       decoder: decoder,
+                       streaming: [max_concurrent_txns: 4]
+                     ] ++ table_opts
+                 )
+      end
+    end
+
+    test "messages: true with :pglogical is refused :decoder_capability_unsupported" do
+      assert {:error, :decoder_capability_unsupported} =
+               Config.validate(
+                 Keyword.delete(base_opts(), :publication) ++
+                   [
+                     sink: StateMirrorPersisted,
+                     decoder: :pglogical,
+                     replication_sets: "alpha",
+                     messages: true
+                   ]
+               )
+    end
+
+    test "messages: true with :wal2json is accepted when the sink supports it" do
+      {:ok, cfg} =
+        Config.validate(
+          Keyword.delete(base_opts(), :publication) ++
+            [
+              sink: MessageCapableSink,
+              decoder: :wal2json,
+              tables: [{"public", "orders"}],
+              messages: true
+            ]
+        )
+
+      assert cfg.messages == true
+    end
+
+    test "failover: true with a non-pgoutput decoder is refused :decoder_capability_unsupported" do
+      for {decoder, table_opts} <- [
+            {:pglogical, replication_sets: "alpha"},
+            {:wal2json, tables: [{"public", "orders"}]}
+          ] do
+        assert {:error, :decoder_capability_unsupported} =
+                 Config.validate(
+                   Keyword.delete(base_opts(), :publication) ++
+                     [
+                       sink: StateMirrorPersisted,
+                       decoder: decoder,
+                       failover: true
+                     ] ++ table_opts
+                 )
+      end
+    end
+  end
 end

@@ -38,9 +38,36 @@ end
 version = Replicant.TestHelper.server_version_num()
 
 cond do
-  version == 0 -> ExUnit.configure(exclude: [:integration, :pg17])
-  version < 170_000 -> ExUnit.configure(exclude: [:pg17])
-  true -> :ok
+  version == 0 ->
+    ExUnit.configure(exclude: [:integration, :pg17, :pg14, :pg10])
+
+  # A PRE-10 primary (9.6) has no pgoutput stream to drive the core integration
+  # modules — `CREATE PUBLICATION` itself is PG10+ — so the publication-dependent
+  # modules carry :pg10 and are excluded here, honestly, never vacuously passed.
+  # The plugin-decoder coverage a 9.6 row exists for still runs: the parity
+  # per-leg tests self-skip any plugin the server lacks (pglogical/wal2json legs
+  # run on 9.6), and the pgoutput-on-9.6 refusal is its own untagged leg below.
+  # The :pg10+-assuming decoder trio (:pg_old_decoders) and the streaming/spill/
+  # messages set (:pg14 — proto-v2 streaming, the `messages` option and
+  # logical_decoding_work_mem are PG14+/PG13+; OBSERVED: PG12 fails the spill
+  # suites' SET with 42704) are excluded here too.
+  version < 100_000 ->
+    ExUnit.configure(exclude: [:pg17, :pg_old_decoders, :pg14, :pg10])
+
+  version < 140_000 ->
+    ExUnit.configure(exclude: [:pg17, :pg14])
+
+  # 14–16: the stock 15/16 images carry neither plugin (the :pg_old_decoders legs
+  # would fail probing for them); a plugin-bearing 14 keeps them included.
+  version < 170_000 ->
+    ExUnit.configure(exclude: [:pg17, :pg_old_decoders])
+
+  # 17/18: the :pg17 failover marquees RUN here (a `>= 150_000` catch-all branch
+  # above would have excluded them on the very rows they target — coverage killed
+  # silently; caught on the 18 substrate, 2026-09-30). Only the plugin-rows tag
+  # (:pg_old_decoders) stays excluded.
+  true ->
+    ExUnit.configure(exclude: [:pg_old_decoders])
 end
 
 # NOTE on `--include integration` against a PG16 server: ExUnit's `--include TAG` rescues a test

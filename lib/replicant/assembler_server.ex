@@ -461,6 +461,25 @@ defmodule Replicant.AssemblerServer do
     {:noreply, state}
   end
 
+  defp dispatch({:skipped_empty, lsn, asm}, from, state) do
+    # EMPTY transaction (zero changes, zero messages — the pre-PG15 wire behavior;
+    # PG15+ skips them server-side). No sink call. The frontier still advances
+    # (receipt-ordered, no drop-set rows to track — same as the watermark skip),
+    # but the ACK is gated on sink kind: an :append_log sink must NOT ack past its
+    # durable delivered frontier (its reconnect origin detects out-of-band advances
+    # by confirmed_flush staying <= checkpoint — Critical Rule 3's append clause;
+    # the keepalive's non-advancing reply covers its steady-state feedback), while
+    # a state mirror acks `lsn` and releases the proven-empty WAL.
+    state = track_window(%{state | asm: asm}, [], lsn)
+
+    if Replicant.Sink.sink_kind(asm.sink) == :append_log do
+      {:noreply, state}
+    else
+      send(from, {:sink_committed, lsn})
+      {:noreply, state}
+    end
+  end
+
   # A2 (Task 9, spec §7.1): a NON-transactional pg_logical_emit_message delivered standalone via
   # handle_message/2. The sink durably persisted it (no commit boundary, no transaction-watermark
   # dedup — at-least-once per the handle_message/2 doc); ack `lsn` to the Connection exactly as a

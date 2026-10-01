@@ -74,6 +74,34 @@ prior transactions are unchanged — a re-delivery would have doubled them.
 The demo is intentionally minimal (one table, `id` PK). Real deployments
 extend the sink per table — the seam is the point, not the schema.
 
+## Swapping the decoder (pre-15 sources through pglogical / wal2json)
+
+The stack above targets `pgoutput` on Postgres 18. A pre-15 source that already carries
+the `pglogical` or `wal2json` output plugin streams through the SAME sink and checkpoint
+contract — the same container image, one env change (`application.ex` builds the
+per-decoder table-set key from `REPLICANT_DECODER`):
+
+```bash
+# pglogical (a pglogical 2.x node; the table rides the "default" replication set)
+REPLICANT_DECODER=pglogical
+REPLICANT_REPLICATION_SETS=default            # comma list
+
+# wal2json (format-version 2, wal2json >= 2.6)
+REPLICANT_DECODER=wal2json
+REPLICANT_TABLES=public.orders               # comma list of schema.table pairs
+REPLICANT_ALLOW_KEYLESS=true                 # ONLY for a genuinely insert-only table
+                                              # (no replica-identity key): without this a
+                                              # keyless table HALTS the pipeline at start —
+                                              # the fail-closed default, because wal2json
+                                              # drops its updates/deletes plugin-side with
+                                              # no wire signal
+```
+
+A dropped column halts `:destructive` on every decoder; under wal2json the residual
+TOASTable-on-update-only case is caught by the periodic catalog guard
+(`schema_check_interval`, default 30s). Delivery is byte-identical across the three
+decoders (proven by `test/integration/decoder_parity_test.exs`).
+
 ## CI
 
 The `reference-example` CI job builds this stack every push and drives the

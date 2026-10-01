@@ -10,7 +10,7 @@ defmodule Replicant.Config do
   """
 
   alias Replicant.{CheckpointStore, Connection, Identifier, Sink}
-
+  alias Replicant.Decoder.Plugin, as: DecoderPlugin
   # `:batch` is deliberately NOT in this type: it is a DERIVED key (normalized from
   # `checkpoint_store[:batch]` by `fetch_batch/3`), and a top-level `batch:` option is
   # rejected with `:config_invalid`. Advertising it here would invite the trapdoor.
@@ -23,9 +23,12 @@ defmodule Replicant.Config do
   @type t :: %{
           optional(:batch_delivery) => keyword() | nil,
           optional(:streaming) => keyword() | nil,
+          optional(:allow_keyless_tables) => boolean(),
           connection: keyword(),
           slot_name: String.t(),
-          publication: [String.t()],
+          publication: [String.t()] | nil,
+          replication_sets: [String.t()] | nil,
+          tables: [{String.t(), String.t()}] | nil,
           sink: module(),
           go_forward_only: boolean(),
           snapshot: boolean() | keyword(),
@@ -33,7 +36,8 @@ defmodule Replicant.Config do
           max_command_retries: non_neg_integer(),
           checkpoint_store: keyword() | nil,
           failover: boolean(),
-          messages: boolean()
+          messages: boolean(),
+          decoder: Replicant.Decoder.Plugin.decoder_atom()
         }
 
   @doc """
@@ -61,11 +65,14 @@ defmodule Replicant.Config do
              | :conflicting_start_mode
              | :snapshot_unsupported
              | :batch_unsupported
-             | :messages_unsupported}
+             | :messages_unsupported
+             | :decoder_capability_unsupported}
   def validate(opts) when is_list(opts) do
     with {:ok, connection} <- fetch_connection(opts),
-         {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
-         {:ok, publication} <- fetch_publications(opts),
+         {:ok, decoder} <- fetch_decoder(opts),
+         {:ok, table_set} <- fetch_table_set(opts, decoder),
+         {:ok, allow_keyless_tables} <- fetch_allow_keyless_tables(opts, decoder),
+         {:ok, schema_check_interval} <- fetch_schema_check_interval(opts, decoder),
          {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
          {:ok, max_command_retries} <- fetch_max_command_retries(opts),
@@ -75,6 +82,7 @@ defmodule Replicant.Config do
          {:ok, batch} <- fetch_batch(opts, checkpoint_store, max_inflight_lag),
          {:ok, streaming} <- fetch_streaming(opts, max_inflight_lag),
          {:ok, failover} <- fetch_failover(opts),
+         :ok <- validate_decoder_capabilities(decoder, streaming, messages, failover),
          go_forward_only = Keyword.get(opts, :go_forward_only, false) == true,
          {:ok, snapshot} <- fetch_snapshot(opts),
          :ok <- validate_start_mode(go_forward_only, snapshot),
@@ -82,8 +90,11 @@ defmodule Replicant.Config do
       {:ok,
        %{
          connection: connection,
-         slot_name: slot_name,
-         publication: publication,
+         slot_name: table_set.slot_name,
+         publication: table_set.publication,
+         replication_sets: table_set.replication_sets,
+         tables: table_set.tables,
+         decoder: decoder,
          sink: sink,
          go_forward_only: go_forward_only,
          snapshot: snapshot,
@@ -94,12 +105,180 @@ defmodule Replicant.Config do
          batch: batch,
          batch_delivery: batch_delivery,
          streaming: streaming,
-         messages: messages
+         messages: messages,
+         allow_keyless_tables: allow_keyless_tables,
+         schema_check_interval: schema_check_interval
        }}
     end
   end
 
   def validate(_opts), do: {:error, :config_invalid}
+
+  # ADR-0009 §2 — decoder selection. `decoder:` accepts exactly the three behavior
+  # atoms; anything else (including a string) is :config_invalid, never a silent
+  # fallback to the default.
+  defp fetch_decoder(opts) do
+    case Keyword.get(opts, :decoder, :pgoutput) do
+      decoder when decoder in [:pgoutput, :pglogical, :wal2json] -> {:ok, decoder}
+      _bad -> {:error, :config_invalid}
+    end
+  end
+
+  # The table-set key is named per decoder (ADR-0009 §2): `publication:` for pgoutput
+  # (unchanged), `replication_sets:` for pglogical, `tables:` (`{schema, table}`
+  # tuples) for wal2json. A key belonging to another decoder present alongside the
+  # chosen one is :config_invalid (the likely misconfiguration), never silently
+  # ignored. Every name passes Identifier.validate/1 before it reaches SQL or a plugin
+  # option (Critical Rule 2).
+  defp fetch_table_set(opts, decoder) do
+    with {:ok, slot_name} <- fetch_identifier(opts, :slot_name),
+         {:ok, table_set} <- fetch_table_set_for(decoder, opts) do
+      {:ok, Map.put(table_set, :slot_name, slot_name)}
+    end
+  end
+
+  # The wal2json keyless pre-flight opt-in (ADR-0009 divergence resolution): a
+  # wal2json walsender silently DROPS an update/delete on a table with no
+  # replica-identity index and identity ≠ FULL (wal2json.c — a server WARNING, no
+  # wire signal), so the pipeline halts at start for such a configured table by
+  # default. `allow_keyless_tables: true` is the operator's explicit
+  # insert-only-semantics acceptance. pgoutput (the server refuses the write) and
+  # pglogical (the keyless update arrives and halts at decode) enforce keylessness
+  # themselves, so the flag alongside them is :config_invalid — the likely
+  # misconfiguration, never silently ignored.
+  defp fetch_allow_keyless_tables(opts, decoder) do
+    case Keyword.get(opts, :allow_keyless_tables, false) do
+      false -> {:ok, false}
+      true when decoder == :wal2json -> {:ok, true}
+      true -> {:error, :config_invalid}
+      _bad -> {:error, :config_invalid}
+    end
+  end
+
+  # The wal2json periodic schema guard's interval in ms (ADR-0009 divergence
+  # resolution): the decoder's wire rules detect a dropped column immediately for
+  # inserts and fixed-width columns, but a dropped VARLENA column on an update-only
+  # table is indistinguishable from the unchanged-TOAST sentinel on the wire — the
+  # guard re-reads the catalog and bounds that residual window (default 30s).
+  # pgoutput/pglogical re-emit Relation on DDL (wal2json cannot — format 2 carries
+  # no relation messages), so the knob alongside them is :config_invalid.
+  defp fetch_schema_check_interval(opts, decoder) do
+    case Keyword.get(opts, :schema_check_interval) do
+      nil ->
+        {:ok, if(decoder == :wal2json, do: 30_000, else: nil)}
+
+      n when is_integer(n) and n > 0 and decoder == :wal2json ->
+        {:ok, n}
+
+      _bad ->
+        {:error, :config_invalid}
+    end
+  end
+
+  defp fetch_table_set_for(:pgoutput, opts) do
+    if Keyword.has_key?(opts, :replication_sets) or Keyword.has_key?(opts, :tables) do
+      {:error, :config_invalid}
+    else
+      with {:ok, publication} <- fetch_publications(opts) do
+        {:ok, %{publication: publication, replication_sets: nil, tables: nil}}
+      end
+    end
+  end
+
+  defp fetch_table_set_for(:pglogical, opts) do
+    if Keyword.has_key?(opts, :publication) or Keyword.has_key?(opts, :tables) do
+      {:error, :config_invalid}
+    else
+      with {:ok, sets} <- fetch_name_list(opts, :replication_sets) do
+        {:ok, %{publication: nil, replication_sets: sets, tables: nil}}
+      end
+    end
+  end
+
+  defp fetch_table_set_for(:wal2json, opts) do
+    if Keyword.has_key?(opts, :publication) or Keyword.has_key?(opts, :replication_sets) do
+      {:error, :config_invalid}
+    else
+      with {:ok, tables} <- fetch_tables(opts) do
+        {:ok, %{publication: nil, replication_sets: nil, tables: tables}}
+      end
+    end
+  end
+
+  # A single validated name OR a non-empty list of them (the publication precedent),
+  # normalised to a list.
+  defp fetch_name_list(opts, key) do
+    case Keyword.get(opts, key) do
+      name when is_binary(name) ->
+        with :ok <- Identifier.validate(name), do: {:ok, [name]}
+
+      names when is_list(names) and names != [] ->
+        with :ok <- validate_each_identifier(names), do: {:ok, names}
+
+      [] ->
+        {:error, :invalid_identifier}
+
+      _other ->
+        {:error, :config_invalid}
+    end
+  end
+
+  # wal2json's table set: a non-empty list of exactly `{schema, table}` string pairs,
+  # both identifier-validated (they ride the `add-tables` plugin option — Critical
+  # Rule 2).
+  defp fetch_tables(opts) do
+    case Keyword.get(opts, :tables) do
+      tables when is_list(tables) and tables != [] ->
+        if Enum.all?(tables, &table_pair?/1),
+          do: validate_table_pairs(tables),
+          else: {:error, :config_invalid}
+
+      _other ->
+        {:error, :config_invalid}
+    end
+  end
+
+  defp validate_table_pairs(tables) do
+    tables
+    |> Enum.reduce_while(:ok, fn {schema, table}, :ok ->
+      with :ok <- Identifier.validate(schema),
+           :ok <- Identifier.validate(table) do
+        {:cont, :ok}
+      else
+        {:error, :invalid_identifier} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      :ok -> {:ok, tables}
+      err -> err
+    end
+  end
+
+  defp table_pair?({schema, table}) when is_binary(schema) and is_binary(table), do: true
+  defp table_pair?(_other), do: false
+
+  # ADR-0009 §8 — capabilities are refused at start, never degraded at run time:
+  # `streaming:` (pgoutput proto-v2 in-progress streaming), `messages: true` on
+  # pglogical (it registers no message callback), and `failover: true` (whose tested
+  # surface is the pgoutput decoder).
+  defp validate_decoder_capabilities(decoder, streaming, messages, failover) do
+    plugin = DecoderPlugin.module_for(decoder)
+    caps = plugin.capabilities()
+
+    cond do
+      is_list(streaming) and :streaming not in caps ->
+        {:error, :decoder_capability_unsupported}
+
+      messages == true and :messages not in caps ->
+        {:error, :decoder_capability_unsupported}
+
+      failover and decoder != :pgoutput ->
+        {:error, :decoder_capability_unsupported}
+
+      true ->
+        :ok
+    end
+  end
 
   @doc """
   The go-forward-only start guard. Refuses ONLY the exact unsafe triple — a

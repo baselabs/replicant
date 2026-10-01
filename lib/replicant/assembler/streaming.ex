@@ -265,7 +265,13 @@ defmodule Replicant.Assembler.Streaming do
         do: {:flush, :max_span, asm},
         else: {:buffered, asm}
     else
-      {:skipped, lsn, asm}
+      # {:skipped_empty} (not {:skipped}): a WATERMARK skip acks lsn <= checkpoint
+      # unconditionally (below the durable frontier by construction), but an EMPTY
+      # txn's lsn sits ABOVE it — for an :append_log sink that ack would advance the
+      # slot past the durable delivered frontier and blind its origin callback to an
+      # out-of-band advance (Critical Rule 3's append clause). The dispatch clause
+      # gates this ack on sink kind; a state mirror acks (releases empty WAL).
+      {:skipped_empty, lsn, asm}
     end
   end
 

@@ -18,6 +18,9 @@ defmodule Replicant.IncrementalSnapshotTest do
   """
   use ExUnit.Case, async: false
   @moduletag :integration
+  # pgoutput publications are PG10+; a 9.6 primary cannot drive this module (excluded
+  # via the :pg10 tag in test_helper.exs — the 9-row runs the plugin-decoder legs).
+  @moduletag :pg10
 
   alias Replicant.Test.{IncrementalSnapshotSink, PG16}
 
@@ -417,7 +420,12 @@ defmodule Replicant.IncrementalSnapshotTest do
       # (spec §6.4), emitting :chunk_retried on each redo (spec §9 "no silent re-read loops").
       {writer, go} = start_writer(fn w, n -> update_random_nopk(w, n, "inc_nopk_c") end)
 
-      assert_receive {:snapshot_failed, :snapshot_table_contended}, 60_000
+      # 90s of the test's 120s ceiling: three taint-redo cycles against a continuous
+      # writer are wall-clock, and a loaded host (or a CI 2-core runner) stretches the
+      # writer/reader interleave well past a minute — OBSERVED once under full-suite
+      # load, 2026-09-30; the assertion's CONTENT is the bounded-attempts halt, which
+      # still requires all three attempts to fire inside this window.
+      assert_receive {:snapshot_failed, :snapshot_table_contended}, 90_000
       assert_receive {:snapshot_retried, "public.inc_nopk_c"}, 5_000
 
       stop_writer(writer, go)
@@ -478,8 +486,11 @@ defmodule Replicant.IncrementalSnapshotTest do
 
       start_incremental(slot, "inccompl_pub", chunk_rows: 200, max_pending_chunks: 4)
 
-      # Data chunks applied, then the completion call faults → halt.
-      assert_receive {:snapshot_failed, _reason}, 15_000
+      # Data chunks applied, then the completion call faults → halt. 45s (was 15s):
+      # the chunk ladder plus the fault path is wall-clock, and a loaded host or a
+      # 2-core CI runner stretches it past 15s without any defect (OBSERVED once
+      # under full-suite load, 2026-09-30); the asserted CONTENT is unchanged.
+      assert_receive {:snapshot_failed, _reason}, 45_000
       detach(failed)
       PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
 
@@ -1279,6 +1290,16 @@ defmodule Replicant.IncrementalSnapshotTest do
   end
 
   defp setup_uuid_table(c, table, pub, rows) do
+    # gen_random_uuid() is core SQL from PG13; a pre-13 server needs pgcrypto for it
+    # (OBSERVED on the 12.22 substrate: 42883 undefined_function). One-time, idempotent,
+    # and only attempted where needed — the CI rows and the substrate connect as a
+    # superuser; a locked-down shared role on <13 would surface the error honestly.
+    [[ver]] = Postgrex.query!(c, "SHOW server_version_num", []).rows
+
+    if String.to_integer(ver) < 130_000 do
+      Postgrex.query!(c, "CREATE EXTENSION IF NOT EXISTS pgcrypto", [])
+    end
+
     reset_pub_table(
       c,
       table,

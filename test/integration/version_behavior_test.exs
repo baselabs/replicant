@@ -27,8 +27,14 @@ defmodule Replicant.Integration.VersionBehaviorTest do
     pub = "repl_r05_pub_#{System.unique_integer([:positive])}"
 
     Postgrex.query!(ctrl, "CREATE TABLE IF NOT EXISTS r05_ver (id int PRIMARY KEY)", [])
-    Postgrex.query!(ctrl, "DROP PUBLICATION IF EXISTS #{pub}", [])
-    Postgrex.query!(ctrl, "CREATE PUBLICATION #{pub} FOR TABLE r05_ver", [])
+
+    # Publications exist from PG 10 (ADR-0009's 9.6 row has none); the pgoutput test
+    # below still runs — the 9.6 refusal of pgoutput is asserted in DecoderHaltsTest.
+    if server_version_num(ctrl) >= 100_000 do
+      Postgrex.query!(ctrl, "DROP PUBLICATION IF EXISTS #{pub}", [])
+      Postgrex.query!(ctrl, "CREATE PUBLICATION #{pub} FOR TABLE r05_ver", [])
+    end
+
     drop_slot(ctrl, slot)
 
     on_exit(fn ->
@@ -44,7 +50,9 @@ defmodule Replicant.Integration.VersionBehaviorTest do
 
         try do
           drop_slot(c, slot)
-          Postgrex.query!(c, "DROP PUBLICATION IF EXISTS #{pub}", [])
+
+          if server_version_num(c) >= 100_000,
+            do: Postgrex.query!(c, "DROP PUBLICATION IF EXISTS #{pub}", [])
         after
           PG16.stop_conn(c)
         end
@@ -65,8 +73,10 @@ defmodule Replicant.Integration.VersionBehaviorTest do
     # tests against the version it claims (non-vacuity — a skipped/mis-wired row emits nothing).
     IO.puts("R05-SUBSTRATE-RECEIPT pg=#{major} version_num=#{version}")
 
-    assert major in [15, 16, 17, 18],
-           "R05 supports PostgreSQL 15-18; live server_version_num=#{version} is out of range"
+    # ADR-0009: the matrix gained the 9.6 and 12 rows (the plugin decoders' servers);
+    # pgoutput-oriented branches below still gate themselves on major >= 10.
+    assert major in [9, 12, 15, 16, 17, 18],
+           "R05 supports PostgreSQL 9.6 and 12-18; live server_version_num=#{version} is out of range"
 
     case System.get_env("EXPECTED_PG_MAJOR") do
       nil ->
@@ -87,7 +97,8 @@ defmodule Replicant.Integration.VersionBehaviorTest do
        %{ctrl: ctrl, slot: slot, version: version} do
     # Directly exercises the per-version column gate against the real catalog. On PG15 the
     # query is `wal_status`-only; selecting `conflicting` (as pre-R05) would error here.
-    Postgrex.query!(ctrl, "SELECT pg_create_logical_replication_slot($1, 'pgoutput')", [slot])
+    plugin = if server_version_num(ctrl) >= 100_000, do: "pgoutput", else: "wal2json"
+    Postgrex.query!(ctrl, "SELECT pg_create_logical_replication_slot($1, $2)", [slot, plugin])
 
     {:ok, status_sql} = QueryBuilder.slot_invalidation_status(slot, version)
 
@@ -100,9 +111,14 @@ defmodule Replicant.Integration.VersionBehaviorTest do
         assert status_sql =~ "conflicting"
         refute status_sql =~ "invalidation_reason"
 
-      true ->
+      version >= 130_000 ->
         assert status_sql =~ "wal_status"
         refute status_sql =~ "conflicting"
+
+      # ADR-0009 §9: PG 9.6-12 select NO invalidation column (the NULL::text tier)
+      true ->
+        assert status_sql =~ "NULL::text"
+        refute status_sql =~ "wal_status"
     end
 
     rows = Postgrex.query!(ctrl, status_sql, []).rows
@@ -153,7 +169,14 @@ defmodule Replicant.Integration.VersionBehaviorTest do
 
       ref = Process.monitor(pid)
 
-      assert_receive {:failover_unsup, %{reason: :failover_unsupported}},
+      # On PG < 10 the pgoutput-decoder gate (ADR-0009 §9) supersedes the failover
+      # gate — pgoutput itself is refused there before any FAILOVER grammar exists.
+      expected_reason =
+        if server_version_num(ctrl) >= 100_000,
+          do: :failover_unsupported,
+          else: :decoder_unsupported_on_server
+
+      assert_receive {:failover_unsup, %{reason: ^expected_reason}},
                      10_000,
                      "PG#{div(version, 10_000)} rejects failover slots; the pipeline must halt " <>
                        "{:config, :failover_unsupported} BEFORE emitting FAILOVER to the server"

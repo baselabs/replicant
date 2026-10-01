@@ -45,13 +45,72 @@ defmodule ReplicationPipeline.Application do
         database: env!("SOURCE_DB")
       ],
       slot_name: env!("REPLICANT_SLOT_NAME"),
-      publication: env!("REPLICANT_PUBLICATION"),
       sink: ReplicationPipeline.Sink,
       # A :state_mirror sink from an empty checkpoint must declare its intent:
       # this example streams NEW changes only. Pre-existing source rows are NOT
       # backfilled — `snapshot: true` is the one-flag alternative (see README).
       go_forward_only: true
     ]
+    |> Keyword.merge(decoder_opts(env("REPLICANT_DECODER", "pgoutput")))
+  end
+
+  # The decoder's table-set key is per-decoder (ADR-0009): `publication:` for the
+  # default pgoutput stack, `replication_sets:` for pglogical, `tables:` for
+  # wal2json — so the same container image reads a pre-15 source through its
+  # existing output plugin by changing REPLICANT_DECODER (plus its table-set env).
+  defp decoder_opts("pgoutput"), do: [publication: env!("REPLICANT_PUBLICATION")]
+
+  defp decoder_opts("pglogical") do
+    [
+      decoder: :pglogical,
+      replication_sets: env_list("REPLICANT_REPLICATION_SETS", ["default"])
+    ]
+  end
+
+  defp decoder_opts("wal2json") do
+    [
+      decoder: :wal2json,
+      tables: env_tables("REPLICANT_TABLES", [{"public", "orders"}])
+    ]
+    |> allow_keyless()
+  end
+
+  defp allow_keyless(opts) do
+    if env("REPLICANT_ALLOW_KEYLESS", "false") == "true",
+      do: Keyword.put(opts, :allow_keyless_tables, true),
+      else: opts
+  end
+
+  defp env(name, default) do
+    case System.fetch_env(name) do
+      {:ok, value} -> value
+      :error -> default
+    end
+  end
+
+  defp env_list(name, default) do
+    case System.fetch_env(name) do
+      {:ok, value} -> value |> String.split(",", trim: true) |> Enum.map(&String.trim/1)
+      :error -> default
+    end
+  end
+
+  defp env_tables(name, default) do
+    case System.fetch_env(name) do
+      {:ok, value} ->
+        value
+        |> String.split(",", trim: true)
+        |> Enum.map(&String.trim/1)
+        |> Enum.map(fn qualified ->
+          case String.split(qualified, ".") do
+            [schema, table] -> {schema, table}
+            _other -> raise ArgumentError, "REPLICANT_TABLES needs schema.table pairs"
+          end
+        end)
+
+      :error ->
+        default
+    end
   end
 
   defp env!(name), do: System.fetch_env!(name)

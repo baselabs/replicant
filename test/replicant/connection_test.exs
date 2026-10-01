@@ -597,6 +597,78 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
+  describe "keyless_tables/2 (the wal2json pre-flight predicate)" do
+    alias Replicant.Decoder.Messages.Relation
+    alias Replicant.Decoder.Messages.Relation.Column
+
+    # wal2json.c:1869-1897 — an UPDATE/DELETE on a table with NO replica-identity
+    # index and identity ≠ FULL is skipped plugin-side (a server WARNING, no wire
+    # signal). The predicate names exactly those configured tables.
+    test "a table with no key columns and identity ≠ FULL is keyless" do
+      rel = %Relation{
+        id: 1,
+        namespace: "public",
+        name: "events",
+        replica_identity: :nothing,
+        columns: [%Column{name: "payload", type: "text", flags: [], type_modifier: -1}]
+      }
+
+      cache = %{relations: %{{"public", "events"} => rel}}
+
+      assert Connection.keyless_tables(cache, [{"public", "events"}]) == [
+               {"public", "events"}
+             ]
+    end
+
+    test "a PK table on default identity is keyed; FULL is keyed; an identity index is keyed" do
+      keyed_default = %Relation{
+        replica_identity: :default,
+        columns: [%Column{name: "id", type: "int4", flags: [:key], type_modifier: -1}]
+      }
+
+      keyed_full = %Relation{
+        replica_identity: :all_columns,
+        columns: [%Column{name: "id", type: "int4", flags: [], type_modifier: -1}]
+      }
+
+      keyed_index = %Relation{
+        replica_identity: :index,
+        columns: [%Column{name: "k", type: "text", flags: [:key], type_modifier: -1}]
+      }
+
+      cache = %{
+        relations: %{
+          {"public", "a"} => keyed_default,
+          {"public", "b"} => keyed_full,
+          {"public", "c"} => keyed_index
+        }
+      }
+
+      assert Connection.keyless_tables(cache, [
+               {"public", "a"},
+               {"public", "b"},
+               {"public", "c"}
+             ]) == []
+    end
+
+    test "a PK'd table switched to REPLICA IDENTITY NOTHING is keyless (rd_replidindex is cleared server-side)" do
+      rel = %Relation{
+        replica_identity: :nothing,
+        columns: [%Column{name: "id", type: "int4", flags: [], type_modifier: -1}]
+      }
+
+      cache = %{relations: %{{"public", "halted"} => rel}}
+
+      assert Connection.keyless_tables(cache, [{"public", "halted"}]) == [
+               {"public", "halted"}
+             ]
+    end
+
+    test "tables absent from the cache are not reported here (the :table_missing halt owns absence)" do
+      assert Connection.keyless_tables(%{relations: %{}}, [{"public", "ghost"}]) == []
+    end
+  end
+
   describe "classify_slot_status/1 (PG16 wal_status + conflicting)" do
     test "an absent slot classifies :absent (first run → create)" do
       assert Connection.classify_slot_status([]) == :absent
@@ -1003,16 +1075,37 @@ defmodule Replicant.ConnectionTest do
     test "absent slot + empty checkpoint + snapshot: true → creates the EXPORT_SNAPSHOT slot" do
       result = [%Postgrex.Result{rows: []}]
 
+      # PG15+ keeps the EXPORT_SNAPSHOT keyword; a directly-constructed state with an
+      # unknown version (0) also keeps the published form (the builder treats unknown
+      # as PG15+, mirroring create_durable_slot/4). Here the explicit PG16 major.
       st =
         state(
           step: :invalidation_check,
           snapshot: true,
           checkpoint_lsn: 0,
-          checkpoint_state: :empty
+          checkpoint_state: :empty,
+          server_version_num: 160_014
         )
 
       assert {:query, sql, new_state} = Connection.handle_result(result, st)
-      assert sql =~ "CREATE_REPLICATION_SLOT conn_test LOGICAL pgoutput EXPORT_SNAPSHOT"
+      assert sql == "CREATE_REPLICATION_SLOT conn_test LOGICAL pgoutput EXPORT_SNAPSHOT;"
+      assert new_state.step == :create_export_slot
+    end
+
+    test "absent slot + snapshot: true on a pre-15 server → the bare export form (ADR-0009)" do
+      result = [%Postgrex.Result{rows: []}]
+
+      st =
+        state(
+          step: :invalidation_check,
+          snapshot: true,
+          checkpoint_lsn: 0,
+          checkpoint_state: :empty,
+          server_version_num: 120_008
+        )
+
+      assert {:query, sql, new_state} = Connection.handle_result(result, st)
+      assert sql == "CREATE_REPLICATION_SLOT conn_test LOGICAL pgoutput;"
       assert new_state.step == :create_export_slot
     end
 
@@ -2206,6 +2299,56 @@ defmodule Replicant.ConnectionTest do
       state = %Replicant.Connection{last_commit_lsn: 0}
       msg = %Message{transactional?: true, lsn: 999}
       assert Replicant.Connection.track_txn(state, msg) == state
+    end
+  end
+
+  # ADR-0009 §4 — the connect-time option probe's per-decoder option list. The
+  # pglogical probe MUST run proto_format 'json': a native peek on a slot with
+  # pending WAL is refused feature_not_supported ("produces binary output"), which
+  # the probe used to misread as option rejection — falsely halting EVERY pglogical
+  # resume with pending WAL (OBSERVED live 2026-09-30: crash-resume died with
+  # :decoder_option_unsupported before streaming a frame). Red proof: flip the
+  # swap out (return options unchanged) and the pglogical row below fails.
+  describe "probe_options/2 (the option pre-flight's per-decoder list)" do
+    test "pglogical probes with textual json output; every other option rides unchanged" do
+      state = %Connection{
+        decoder: %{
+          kind: :pglogical,
+          cache: nil,
+          tables: nil,
+          discovered: nil,
+          replication_sets: nil
+        }
+      }
+
+      assert Connection.probe_options(state, [
+               {"startup_params_format", "1"},
+               {"min_proto_version", "1"},
+               {"max_proto_version", "1"},
+               {"proto_format", "native"},
+               {"\"pglogical.replication_set_names\"", "default"}
+             ]) == [
+               {"startup_params_format", "1"},
+               {"min_proto_version", "1"},
+               {"max_proto_version", "1"},
+               {"proto_format", "json"},
+               {"\"pglogical.replication_set_names\"", "default"}
+             ]
+    end
+
+    test "wal2json probes with its EXACT stream options (textual output probes the real set)" do
+      state = %Connection{
+        decoder: %{
+          kind: :wal2json,
+          cache: nil,
+          tables: nil,
+          discovered: nil,
+          replication_sets: nil
+        }
+      }
+
+      options = [{"\"format-version\"", "2"}, {"\"numeric-data-types-as-string\"", "true"}]
+      assert Connection.probe_options(state, options) == options
     end
   end
 end
