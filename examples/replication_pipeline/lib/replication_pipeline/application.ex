@@ -97,19 +97,15 @@ defmodule ReplicationPipeline.Application do
 
   defp env_tables(name, default) do
     case System.fetch_env(name) do
-      {:ok, value} ->
-        value
-        |> String.split(",", trim: true)
-        |> Enum.map(&String.trim/1)
-        |> Enum.map(fn qualified ->
-          case String.split(qualified, ".") do
-            [schema, table] -> {schema, table}
-            _other -> raise ArgumentError, "REPLICANT_TABLES needs schema.table pairs"
-          end
-        end)
+      {:ok, value} -> value |> String.split(",", trim: true) |> Enum.map(&parse_table/1)
+      :error -> default
+    end
+  end
 
-      :error ->
-        default
+  defp parse_table(qualified) do
+    case qualified |> String.trim() |> String.split(".") do
+      [schema, table] -> {schema, table}
+      _other -> raise ArgumentError, "REPLICANT_TABLES needs schema.table pairs"
     end
   end
 

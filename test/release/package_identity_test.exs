@@ -109,6 +109,44 @@ defmodule Replicant.PackageIdentityTest do
     assert :ok == PackageIdentity.check_build(@version, @commit, @digest, runner)
   end
 
+  test "package check takes the PUBLISHED path when the ephemeral runner has no local tags but origin has the release tag" do
+    # A CI checkout without fetched tags must not decide release state from its partial
+    # clone: with the version published (tag on origin), the check routes to the
+    # published-identity path, not the candidate path that fails on the existing remote
+    # tag (OBSERVED: the post-1.4.0 CI run took the candidate path and failed, 2026-10-01).
+    tag_commit = String.duplicate("b", 40)
+
+    runner = fn
+      "git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"] ->
+        {"", 1}
+
+      "git", ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/v1.2.0"] ->
+        {tag_commit <> "\trefs/tags/v1.2.0\n", 0}
+
+      "git", ["rev-parse", "refs/tags/v1.2.0^{}"] ->
+        {tag_commit <> "\n", 0}
+
+      "git",
+      ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/v1.2.0", "refs/tags/v1.2.0^{}"] ->
+        {tag_commit <> "\trefs/tags/v1.2.0^{}\n", 0}
+
+      "git", ["merge-base", "--is-ancestor", ^tag_commit, @commit] ->
+        {"", 0}
+
+      "curl", args ->
+        case List.last(args) do
+          "https://api.github.com/repos/baselabs/replicant/releases/tags/v1.2.0" ->
+            {~s({"tag_name":"v1.2.0","target_commitish":"#{tag_commit}","draft":false,"prerelease":false}),
+             0}
+
+          "https://hex.pm/api/packages/replicant/releases/1.2.0" ->
+            {~s({"version":"1.2.0","checksum":"#{@digest}","has_docs":true}), 0}
+        end
+    end
+
+    assert :ok == PackageIdentity.check_build(@version, @commit, @digest, runner)
+  end
+
   test "package check rejects a published Hex checksum that differs from the tracked digest" do
     tag_commit = String.duplicate("b", 40)
 
@@ -163,7 +201,11 @@ defmodule Replicant.PackageIdentityTest do
     assert message =~ "is not an ancestor"
   end
 
-  test "package check without a local tag still requires the full namespace to be free" do
+  test "package check with the release tag on origin fails closed when the tracked published digest is missing" do
+    # A remote tag means the release state is PUBLISHED (origin, not the runner's
+    # partial clone, decides) — so the candidate path's namespace-free check no longer
+    # applies here; the mint-time gate (verify_candidate!) owns that check instead.
+    # A published version with no tracked digest is incoherent and fails closed.
     runner = fn
       "git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"] ->
         {"", 1}
@@ -173,7 +215,7 @@ defmodule Replicant.PackageIdentityTest do
     end
 
     assert {:error, message} = PackageIdentity.check_build(@version, @commit, nil, runner)
-    assert message =~ "remote tag v1.2.0 already exists"
+    assert message =~ "published package digest is missing or invalid"
   end
 
   test "command execution has a hard deadline" do

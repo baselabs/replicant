@@ -30,10 +30,29 @@ defmodule Replicant.PackageIdentity do
   def check_build(version, source_commit, published_digest, runner \\ &run/2) do
     tag = "v#{version}"
 
-    case local_tag_state(tag, runner) do
+    case tag_release_state(tag, runner) do
       :absent -> check_candidate(version, runner)
       :present -> check_published_build(version, tag, source_commit, published_digest, runner)
       {:error, _message} = error -> error
+    end
+  end
+
+  # The release state comes from ORIGIN, not the runner's clone: an ephemeral CI
+  # checkout without fetched tags must not route a published version down the
+  # candidate path (which fails on the existing remote tag).
+  defp tag_release_state(tag, runner) do
+    case local_tag_state(tag, runner) do
+      :present -> :present
+      :absent -> remote_tag_state(tag, runner)
+      {:error, _message} = error -> error
+    end
+  end
+
+  defp remote_tag_state(tag, runner) do
+    case runner.("git", ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/#{tag}"]) do
+      {_output, 2} -> :absent
+      {_output, 0} -> :present
+      {output, status} -> {:error, "remote tag check failed (exit #{status}): #{structural(output)}"}
     end
   end
 
