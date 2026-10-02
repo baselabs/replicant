@@ -229,8 +229,11 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   with the marquee executing, PG15, PG16, PG17, PG18; plus the docs/package and
   reference-example jobs), run URL derivable as
   `https://github.com/baselabs/replicant/actions/runs/36973967528`; the fresh-review
-  repair round's successor run is recorded beside it in the repo's Actions history for
-  the commit carrying this sentence. Local full-geometry corroboration on the BaseLabs
+  repair round's receipt is run `37013373244` (commit `cf93df9`, six rows), and the
+  15 plugin lane's binding receipt is run `37019950420` (commit `fee13e4` — all seven
+  test rows green, the plugin row at 893/2 with the full variant executing; its
+  immediate predecessor `37018576121` red on a postgres readiness race the lane's
+  second dice-roll surfaced, fixed by requiring three consecutive readiness probes). Local full-geometry corroboration on the BaseLabs
   ephemeral cluster, at the fresh-review repair revision (counts include that round's
   new guard tests): 12 row with the 9.6 secondary wired and `EXPECTED_PG_MAJOR` set —
   879/16 (re-verified on images rebuilt from the per-major-pin Dockerfile — the
