@@ -14,7 +14,7 @@ defmodule Replicant.ReleaseContractTest do
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
   @previous_release "1.4.0"
-  @published_digest "7b8505c0449d2257f6039957d946a6a280082aeac0e5f25506e10481e3cf0d26"
+  @published_digest "bea4af25b23aeccbaf595cd0530d5785bb4d2b3a5629925660307249756adde6"
 
   defp version, do: Mix.Project.config()[:version]
 
