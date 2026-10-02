@@ -100,7 +100,8 @@ REPLICANT_ALLOW_KEYLESS=true                 # ONLY for a genuinely insert-only 
 A dropped column halts `:destructive` on every decoder; under wal2json the residual
 TOASTable-on-update-only case is caught by the periodic catalog guard
 (`schema_check_interval`, default 30s). Delivery is byte-identical across the three
-decoders (proven by `test/integration/decoder_parity_test.exs`).
+decoders (proven by `test/integration/decoder_parity_test.exs` — CI's 12 plugin row
+runs all three on one server, plus both plugins again on a real 9.6 secondary).
 
 ## CI
 

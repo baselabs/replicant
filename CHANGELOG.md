@@ -43,6 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminations) multiplied the guard's tick rate. The armed timer is now tracked and
   canceled on re-arm (red proof: with the cancel removed, the new integration test
   observes the stale timer still live after a reconnect).
+- **Fresh-review repair round (cross-family post-commit review, 11 confirmed findings
+  fixed):** the four SHIPPED records that still carried the original overclaim are
+  corrected — `README.md`, the released-1.4.0 CHANGELOG sentence (struck through with
+  a pointer here, history preserved), `docs/ROADMAP.md` A7, and the reference example's
+  README — none of which the first repair round had touched. The pglogical decoder now
+  synthesizes REPLICA IDENTITY FULL key flags like pgoutput (its wire flags come only
+  from the identity-index bitmap, which is empty under FULL — the same metadata defect
+  the strengthened parity projection found in wal2json; red-proven by unit test). The
+  parity marquee's version probe now FAILS CLOSED (a probe error previously read as
+  version 0, which could silently drop the 15+ legs), its plugin probes stop leaking
+  connections and use unique slot names, every compared table carries an exact
+  change-count assert on every leg (an emptied table can no longer hide behind
+  `[] == []`), the pgoutput-vs-wal2json core legs compare the WHOLE normalized
+  delivery (transaction boundaries and ordering included), and parity_full's INSERT —
+  the one change all three decoders deliver — is compared across all of them. ADR
+  receipts now carry the binding CI run identifier inside the repo (not only in the
+  untracked development record).
 - **Records corrected to match shipped behavior:** ADR-0009's Consequences no longer
   say a wal2json column DROP is invisible until reconnect (the two wire rules catch it
   in stream; the bounded residual and the DROP-batched-with-ADD deferral window are now
@@ -101,7 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `REPLICA IDENTITY NOTHING` table's keyless writes never reach the stream (the
   server refuses them for pgoutput publications; wal2json drops them plugin-side),
   and a wal2json replica-identity change is detected at the next reconnect.
-  Byte-identical cross-decoder delivery (pgoutput on 15 vs both plugins on 9.6/12)
+  Byte-identical cross-decoder delivery ~~(pgoutput on 15 vs both plugins on 9.6/12)~~
+  *(corrected 2026-10-02: as shipped in 1.4.0 that exact comparison never executed in
+  CI — see the [Unreleased] section above for what was wrong and what now runs.)*
   is proven live by `test/integration/decoder_parity_test.exs`; real captured bytes
   from both plugins joined the conformance suite with tamper tests.
 

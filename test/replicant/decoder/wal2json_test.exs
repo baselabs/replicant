@@ -521,7 +521,35 @@ defmodule Replicant.Decoder.Wal2jsonTest do
                decode(payload, cache)
     end
 
-    test "an extreme float arrives as the server's exact float8out text (1e+20, not Elixir's 1.0e20)" do
+    test "FIRST-SIGHT synthesis under REPLICA IDENTITY FULL flags every column [:key] (the unseeded-table path)" do
+      # tables the connect-time read did NOT pre-seed build their relation at the
+      # first change (synthesize_relation); under FULL the whole row is the key and
+      # the flags must match pgoutput exactly (fresh-review finding F5 — this path
+      # is otherwise unexercised: the marquee's tables are all pre-seeded)
+      cache = Wal2json.init_cache(replica_identity: %{{"public", "t"} => :all_columns})
+
+      payload =
+        doc(%{
+          "action" => "I",
+          "schema" => "public",
+          "table" => "t",
+          "columns" => [
+            %{"name" => "id", "typeoid" => 20, "value" => "1"},
+            %{"name" => "a", "typeoid" => 25, "value" => "x"}
+          ]
+        })
+
+      assert {:ok, [rel, %Messages.Insert{}], _} = decode(payload, cache)
+      assert rel.replica_identity == :all_columns
+      assert Enum.map(rel.columns, & &1.flags) == [[:key], [:key]]
+    end
+
+    test "a string-wrapped extreme float passes through UNCHANGED (the only wire form the option set produces)" do
+      # NOTE the precise claim: under numeric-data-types-as-string the plugin sends
+      # "1e+20" as a JSON STRING, and this asserts the binary-passthrough clause
+      # delivers it verbatim. The re-render defect (Elixir "1.0e20") was only
+      # reachable through a JSON NUMBER, which the fail-closed test above proves
+      # halts instead — so float TEXT can never be re-rendered on this option set.
       cache =
         Wal2json.init_cache(
           relations: %{

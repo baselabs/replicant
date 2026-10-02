@@ -61,6 +61,32 @@ defmodule Replicant.Decoder.PglogicalTest do
     <<?T, 2::16, ?t, 2::32, "1\0", ?n>>
   end
 
+  describe "REPLICA IDENTITY FULL key-flag parity (pgoutput flags the whole row)" do
+    # pglogical's wire key flags come only from the identity-index bitmap, which is
+    # EMPTY under FULL (no identity index) — the catalog read must widen the flags to
+    # every column, or the delivered Change.columns metadata contradicts pgoutput for
+    # the same table (fresh-review finding F4; OBSERVED in pglogical_proto_native.c).
+    test "an R message for a catalog-known FULL table flags EVERY column [:key]" do
+      full_cache =
+        Pglogical.init_cache(
+          column_types: %{
+            {"public", "users"} => %{"id" => {"int8", -1}, "name" => {"text", -1}}
+          },
+          replica_identity: %{{"public", "users"} => :all_columns}
+        )
+
+      assert {:ok, [%Messages.Relation{} = rel], _} = decode(relation_frame(), full_cache)
+
+      assert Enum.map(rel.columns, & &1.flags) == [[:key], [:key]]
+    end
+
+    test "a DEFAULT-identity table keeps the wire flags verbatim (id key, name not)" do
+      assert {:ok, [%Messages.Relation{} = rel], _} = decode(relation_frame())
+
+      assert Enum.map(rel.columns, & &1.flags) == [[:key], []]
+    end
+  end
+
   describe "startup message" do
     test "version-1 startup with an overlapping protocol range decodes to no messages" do
       startup =

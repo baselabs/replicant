@@ -167,8 +167,12 @@ be read through its existing logical-decoding output plugin instead:
 
 The same `Replicant.Sink` contract, `commit_lsn` watermark, checkpoint modes and halt
 semantics apply; a fixture transaction delivers byte-identically (after LSN, xid and
-timestamp normalization) across pgoutput on 15 and both plugins on 9.6/12 — proven live
-in `test/integration/decoder_parity_test.exs`.
+timestamp normalization) across pgoutput and both plugins — compared on one server by
+CI's 12 plugin row (pgoutput vs `pglogical` vs `wal2json` on the 12 primary, plus both
+plugins again on a real 9.6 secondary started beside it) in
+`test/integration/decoder_parity_test.exs`; the truncate + transactional-message
+variant runs the same way on any 15+ server carrying the plugins (ADR-0009 records the
+one such run and why CI wires none).
 
 **Keyless tables never stream silently missing updates.** wal2json drops an
 update/delete on a table with no replica-identity index and `REPLICA IDENTITY ≠ FULL`

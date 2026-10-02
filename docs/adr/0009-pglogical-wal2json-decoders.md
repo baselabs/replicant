@@ -221,18 +221,23 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   output plugin — pgoutput included — listed in `output_plugin_libraries`), receipt in
   the development tree's outcome record.
 
-  Receipts (2026-10-02, full-geometry local matrix on real docker-built servers,
-  per-row `mix test` results; detailed log at
-  `.kimosabe/evidence/repair-1.4.0-credibility/matrix-counts.txt` in the development
-  tree): 12 row with the 9.6 secondary wired — 876 passed / 16 excluded (the marquee's
-  full comparison executed: pgoutput@12 vs both plugins@12 vs both plugins@9.6);
-  9.6 row — 806 passed / 86 excluded; 15 — 878/14; 16 — 878/14; 17 — 880/12 (one
-  transient spill-marquee wait timeout on a first run under shared-substrate load,
-  green alone and on immediate full rerun); 18 — 880/12; unit-only — 799/93. The CI
-  run for the commit carrying this amendment (all six matrix rows; the 12 row runs
-  the 9.6 secondary this amendment adds) is the binding substrate receipt and is
-  recorded with its run identifier in the development tree's outcome record
-  (`.kimosabe/work/`) at closeout.
+  Receipts, in this repo (per-row `mix test` results on real docker-built servers):
+  **CI run 36973967528** on commit `f2537f6` — the binding receipt, all six rows green
+  (PG9, PG12 with the 9.6 secondary this amendment wires — 876 passed / 16 excluded
+  with the marquee executing, PG15, PG16, PG17, PG18; plus the docs/package and
+  reference-example jobs), run URL derivable as
+  `https://github.com/baselabs/replicant/actions/runs/36973967528`; the fresh-review
+  repair round's successor run is recorded beside it in the repo's Actions history for
+  the commit carrying this sentence. Local full-geometry corroboration on the BaseLabs
+  ephemeral cluster, at the fresh-review repair revision (counts include that round's
+  new guard tests): 12 row with the 9.6 secondary wired and `EXPECTED_PG_MAJOR` set —
+  879/16; at the first repair revision the same row measured 875/16 without
+  `EXPECTED_PG_MAJOR` and 876/16 with it (the version-behavior test is conditionally
+  defined from that var; CI always sets it); 9.6 row — 806/86;
+  15 — 878/14; 16 — 878/14; 17 — 880/12 (one transient spill-marquee wait timeout on a
+  first run under shared-substrate load, green alone and on immediate full rerun);
+  18 — 880/12; unit-only — 799/93. The development tree's outcome record
+  (`.kimosabe/work/`, untracked by design) carries the raw logs behind these numbers.
 - Real captured bytes from the 9.6 and 12 servers (one frame per message kind per plugin)
   join the conformance suite with the same byte-flip tamper test the pgoutput fixtures
   carry, so each new fixture is proven to go red on mutation.

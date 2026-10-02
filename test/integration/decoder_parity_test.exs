@@ -34,41 +34,46 @@ defmodule Replicant.DecoderParityTest do
 
   defp pg96_enabled?, do: @pg96_url not in [nil, ""]
 
+  # FAIL-CLOSED: a version probe that cannot reach its server raises (a catch->0
+  # here would let a transient blip flip a 15+ primary to "0" and silently drop the
+  # full-variant legs while the run still passes — the fresh-review F2/F10 finding)
   defp major(url) do
-    {:ok, pid} = Postgrex.start_link(conn_opts(url))
+    {:ok, pid} = Postgrex.start_link(conn_opts(url) ++ [sync_connect: true, backoff_type: :stop])
 
     [[v]] =
       Postgrex.query!(pid, "SELECT current_setting('server_version_num')::int", []).rows
 
     GenServer.stop(pid)
     v
-  catch
-    _, _ -> 0
   end
 
   defp plugin_availability_on(url) do
-    {:ok, ctrl} = Postgrex.start_link(conn_opts(url))
+    {:ok, ctrl} = Postgrex.start_link(conn_opts(url) ++ [backoff_type: :stop])
 
-    pglogical? =
-      Postgrex.query!(
-        ctrl,
-        "SELECT count(*) FROM pg_available_extensions WHERE name = 'pglogical'",
-        []
-      ).rows == [[1]]
+    try do
+      pglogical? =
+        Postgrex.query!(
+          ctrl,
+          "SELECT count(*) FROM pg_available_extensions WHERE name = 'pglogical'",
+          []
+        ).rows == [[1]]
 
-    wal2json? = wal2json_available?(ctrl)
-    GenServer.stop(ctrl)
-    %{pglogical: pglogical?, wal2json: wal2json?}
+      %{pglogical: pglogical?, wal2json: wal2json_available?(ctrl)}
+    after
+      GenServer.stop(ctrl)
+    end
   end
 
+  # a UNIQUE slot name per probe: a fixed name makes one aborted run's leftover slot
+  # flunk the next run's probe (a self-inflicted false "wal2json unavailable")
   defp wal2json_available?(ctrl) do
-    Postgrex.query!(
-      ctrl,
-      "SELECT * FROM pg_create_logical_replication_slot('probe_avail_w2j', 'wal2json')",
-      []
-    )
+    slot = "probe_avail_w2j_#{System.unique_integer([:positive])}"
 
-    Postgrex.query!(ctrl, "SELECT pg_drop_replication_slot('probe_avail_w2j')", [])
+    Postgrex.query!(ctrl, "SELECT * FROM pg_create_logical_replication_slot($1, 'wal2json')", [
+      slot
+    ])
+
+    Postgrex.query!(ctrl, "SELECT pg_drop_replication_slot($1)", [slot])
     true
   rescue
     _ -> false
@@ -140,8 +145,9 @@ defmodule Replicant.DecoderParityTest do
     DecoderParity.apply_fixture!(ctrl, variant)
 
     # The fixture is ONE transaction; the core variant carries 10 changes (incl. the
-    # NULL + extreme-float row), the truncate+message variant 13 — wait for a
-    # non-empty delivery and let it settle before snapshotting.
+    # NULL + extreme-float row), the truncate+message variant 12 changes plus one
+    # transactional message — wait for a non-empty delivery and let it settle
+    # before snapshotting.
     PG16.wait_until(fn ->
       txns = ParitySink.since(mark)
       txns != [] and hd(txns).changes != []
@@ -200,21 +206,23 @@ defmodule Replicant.DecoderParityTest do
   end
 
   setup do
-    unless PG16.enabled?() do
-      :ok
+    if PG16.enabled?() do
+      {:ok, _} = ParitySink.start_link()
+
+      # Plugin availability on BOTH wired servers: the marquee FAILS LOUD when an
+      # expected plugin is absent (a missing leg narrows the comparison silently —
+      # the exact vacuity this suite refuses).
+      avail = plugin_availability_on(System.fetch_env!("REPLICANT_TEST_URL"))
+
+      pg96_avail =
+        if pg96_enabled?(), do: plugin_availability_on(@pg96_url), else: nil
+
+      {:ok, %{avail: avail, pg96_avail: pg96_avail}}
+    else
+      # no primary URL: the test body's flunk delivers the clear message (probing
+      # here would only raise a fuzzier fetch_env! error first)
+      {:ok, %{avail: %{pglogical: false, wal2json: false}, pg96_avail: nil}}
     end
-
-    {:ok, _} = ParitySink.start_link()
-
-    # Plugin availability on BOTH wired servers: the marquee FAILS LOUD when an
-    # expected plugin is absent (a missing leg narrows the comparison silently —
-    # the exact vacuity this suite refuses).
-    avail = plugin_availability_on(System.fetch_env!("REPLICANT_TEST_URL"))
-
-    pg96_avail =
-      if pg96_enabled?(), do: plugin_availability_on(@pg96_url), else: nil
-
-    {:ok, %{avail: avail, pg96_avail: pg96_avail}}
   end
 
   @tag :pg_old_decoders
@@ -269,18 +277,30 @@ defmodule Replicant.DecoderParityTest do
     # joins that set cannot be compared on that table. ---
     pg12_pglogical = leg(url, :pglogical, :core, "12")
     pg12_wal2json = leg(url, :wal2json, :core, "12")
-
-    # Every leg must have DELIVERED the fixture's changes (not vacuously equal empties).
-    assert table_changes(pg12_pglogical, "parity_all") != [], "pglogical@12 delivered nothing"
-    assert table_changes(pg12_wal2json, "parity_all") != [], "wal2json@12 delivered nothing"
-
-    # --- the pgoutput CORE reference on the SAME primary — the cross-family
-    # comparison the marquee exists for. The core leg runs on EVERY plugin row
-    # (10-14 and 15+ alike); the truncate+message variant is a SEPARATE 15+ leg
-    # below, so a core-vs-full variant mismatch can never compare. ---
     pgoutput_core = leg(url, :pgoutput, :core, "pg")
 
-    assert table_changes(pgoutput_core, "parity_all") != [], "pgoutput delivered nothing"
+    # NON-VACUITY at exact counts (fresh-review F6): every compared table must
+    # carry its expected change count on every leg — an attachment/wiring failure
+    # that empties a table cannot hide behind [] == []. parity_full under pglogical
+    # carries its INSERT only (default_insert_only set); every other cell is
+    # ins+upd+del (parity_all: 2 inserts + update) and parity_nothing is the single
+    # insert everywhere (keyless U/D never stream on any decoder).
+    for {txns, full_dml_count, label} <- [
+          {pg12_pglogical, 1, "pglogical@12"},
+          {pg12_wal2json, 3, "wal2json@12"},
+          {pgoutput_core, 3, "pgoutput"}
+        ] do
+      assert_change_counts(
+        txns,
+        %{
+          "parity_all" => 3,
+          "parity_idx" => 3,
+          "parity_full" => full_dml_count,
+          "parity_nothing" => 1
+        },
+        label
+      )
+    end
 
     # The compared core — the tables ALL compared decoders carry identically, at the
     # FULL field projection (op/schema/table/record/old_record/unchanged/columns —
@@ -291,20 +311,34 @@ defmodule Replicant.DecoderParityTest do
     # (RI FULL) is pgoutput/wal2json-only under pglogical (OBSERVED plugin
     # constraint: no usable identity index ⇒ insert-only set), so it is compared
     # everywhere EXCEPT against pglogical.
-    for legs <- [
-          {pgoutput_core, pg12_pglogical, "parity_all"},
-          {pgoutput_core, pg12_pglogical, "parity_idx"},
-          {pgoutput_core, pg12_pglogical, "parity_nothing"},
-          {pgoutput_core, pg12_wal2json, "parity_all"},
-          {pgoutput_core, pg12_wal2json, "parity_idx"},
-          {pgoutput_core, pg12_wal2json, "parity_full"},
-          {pgoutput_core, pg12_wal2json, "parity_nothing"},
-          {pg12_pglogical, pg12_wal2json, "parity_all"},
-          {pg12_pglogical, pg12_wal2json, "parity_idx"},
-          {pg12_pglogical, pg12_wal2json, "parity_nothing"}
+    # WHOLE-DELIVERY equality for the pair whose coverage is complete (F3:
+    # pgoutput vs wal2json both deliver the full fixture — one transaction, same
+    # change order, same metadata; per-table projections alone would hide a
+    # transaction-boundary difference). Pairs involving pglogical compare per
+    # table (its parity_full coverage is insert-only by plugin constraint) plus
+    # the parity_full INSERT below.
+    assert pgoutput_core == pg12_wal2json,
+           "pgoutput and wal2json core deliveries differ:\nleft:  " <>
+             inspect(pgoutput_core, limit: :infinity, pretty: true) <>
+             "\nright: " <> inspect(pg12_wal2json, limit: :infinity, pretty: true)
+
+    for {a, b, table, op} <- [
+          {pgoutput_core, pg12_pglogical, "parity_all", nil},
+          {pgoutput_core, pg12_pglogical, "parity_idx", nil},
+          {pgoutput_core, pg12_pglogical, "parity_nothing", nil},
+          {pgoutput_core, pg12_wal2json, "parity_all", nil},
+          {pgoutput_core, pg12_wal2json, "parity_idx", nil},
+          {pgoutput_core, pg12_wal2json, "parity_full", nil},
+          {pgoutput_core, pg12_wal2json, "parity_nothing", nil},
+          {pg12_pglogical, pg12_wal2json, "parity_all", nil},
+          {pg12_pglogical, pg12_wal2json, "parity_idx", nil},
+          {pg12_pglogical, pg12_wal2json, "parity_nothing", nil},
+          # parity_full's INSERT is the one parity_full change ALL THREE decoders
+          # deliver — comparable for pglogical too (its upd/del never ride the
+          # insert-only set)
+          {pgoutput_core, pg12_pglogical, "parity_full", :insert}
         ] do
-      {a, b, table} = legs
-      assert table_changes(a, table) == table_changes(b, table), diff_legs(a, b, table)
+      assert table_changes(a, table, op) == table_changes(b, table, op), diff_legs(a, b, table)
     end
 
     # --- the 9.6 cross-vintage plugin legs (same core, real 9.6 substrate),
@@ -313,23 +347,43 @@ defmodule Replicant.DecoderParityTest do
       pg96_pglogical = leg(@pg96_url, :pglogical, :core, "96")
       pg96_wal2json = leg(@pg96_url, :wal2json, :core, "96")
 
-      assert table_changes(pg96_pglogical, "parity_all") != [], "pglogical@9.6 delivered nothing"
-      assert table_changes(pg96_wal2json, "parity_all") != [], "wal2json@9.6 delivered nothing"
+      assert_change_counts(
+        pg96_pglogical,
+        %{
+          "parity_all" => 3,
+          "parity_idx" => 3,
+          "parity_full" => 1,
+          "parity_nothing" => 1
+        },
+        "pglogical@9.6"
+      )
 
-      for legs <- [
-            {pg96_pglogical, pg12_pglogical, "parity_all"},
-            {pg96_pglogical, pg12_pglogical, "parity_idx"},
-            {pg96_pglogical, pg12_pglogical, "parity_nothing"},
-            {pg96_wal2json, pg12_wal2json, "parity_all"},
-            {pg96_wal2json, pg12_wal2json, "parity_idx"},
-            {pg96_wal2json, pg12_wal2json, "parity_full"},
-            {pg96_wal2json, pg12_wal2json, "parity_nothing"},
-            {pg96_pglogical, pg96_wal2json, "parity_idx"},
-            {pg96_pglogical, pgoutput_core, "parity_all"},
-            {pg96_wal2json, pgoutput_core, "parity_all"}
+      assert_change_counts(
+        pg96_wal2json,
+        %{
+          "parity_all" => 3,
+          "parity_idx" => 3,
+          "parity_full" => 3,
+          "parity_nothing" => 1
+        },
+        "wal2json@9.6"
+      )
+
+      for {a, b, table, op} <- [
+            {pg96_pglogical, pg12_pglogical, "parity_all", nil},
+            {pg96_pglogical, pg12_pglogical, "parity_idx", nil},
+            {pg96_pglogical, pg12_pglogical, "parity_nothing", nil},
+            {pg96_wal2json, pg12_wal2json, "parity_all", nil},
+            {pg96_wal2json, pg12_wal2json, "parity_idx", nil},
+            {pg96_wal2json, pg12_wal2json, "parity_full", nil},
+            {pg96_wal2json, pg12_wal2json, "parity_nothing", nil},
+            {pg96_pglogical, pg96_wal2json, "parity_idx", nil},
+            {pg96_pglogical, pgoutput_core, "parity_all", nil},
+            {pg96_wal2json, pgoutput_core, "parity_all", nil},
+            {pg96_pglogical, pgoutput_core, "parity_full", :insert},
+            {pg96_wal2json, pg12_wal2json, "parity_full", nil}
           ] do
-        {a, b, table} = legs
-        assert table_changes(a, table) == table_changes(b, table), diff_legs(a, b, table)
+        assert table_changes(a, table, op) == table_changes(b, table, op), diff_legs(a, b, table)
       end
     end
 
@@ -372,10 +426,10 @@ defmodule Replicant.DecoderParityTest do
   # compares THIS — a narrowed field subset would let a divergence in any dropped
   # field pass silently (review finding: the old projection omitted schema and
   # column metadata entirely).
-  defp table_changes(txns, table) do
+  defp table_changes(txns, table, op \\ nil) do
     txns
     |> Enum.flat_map(& &1.changes)
-    |> Enum.filter(&(&1.table == table))
+    |> Enum.filter(&(&1.table == table and (op == nil or &1.op == op)))
     |> Enum.map(fn ch ->
       %{
         op: ch.op,
@@ -387,6 +441,17 @@ defmodule Replicant.DecoderParityTest do
         columns: ch.columns
       }
     end)
+  end
+
+  # Exact per-table change counts — the marquee's non-vacuity floor: a leg that
+  # delivered NOTHING for a compared table cannot pass (a bare != [] assert guards
+  # only one table per leg; fresh-review F6).
+  defp assert_change_counts(txns, expected, label) do
+    actual =
+      Enum.map(expected, fn {table, _} -> {table, length(table_changes(txns, table))} end)
+
+    assert actual == Enum.to_list(expected),
+           "#{label} delivered wrong change counts: #{inspect(actual)} (expected #{inspect(Enum.to_list(expected))})"
   end
 
   defp truncate_count(txns) do

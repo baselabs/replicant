@@ -237,7 +237,10 @@ defmodule Replicant.Decoder.Pglogical do
         namespace: namespace,
         name: name,
         replica_identity: Map.get(cache.replica_identity, key),
-        columns: merge_types(columns, Map.get(cache.column_types, key))
+        columns:
+          columns
+          |> merge_types(Map.get(cache.column_types, key))
+          |> merge_key_flags(Map.get(cache.replica_identity, key))
       }
 
       {:ok, [relation], %{cache | relids: Map.put(cache.relids, relid, key)}}
@@ -251,6 +254,18 @@ defmodule Replicant.Decoder.Pglogical do
   # keeps type nil — the casting layer's documented lenient fallback delivers the raw
   # server text for an unknown type, and the column-set change itself is classified by
   # the assembler's schema-change logic.
+  #
+  # KEY FLAGS under REPLICA IDENTITY FULL: pglogical's wire flags come solely from the
+  # identity-index bitmap (pglogical_proto_native.c: RelationGetIndexAttrBitmap with
+  # INDEX_ATTR_BITMAP_IDENTITY_KEY), which is EMPTY under FULL — there is no identity
+  # index. pgoutput flags every column [:key] there, so the delivered Change.columns
+  # metadata must match: the connect-time catalog read (which does know `relreplident`)
+  # widens the flags to the whole row under FULL.
+  defp merge_key_flags(columns, :all_columns),
+    do: Enum.map(columns, fn col -> %{col | flags: [:key]} end)
+
+  defp merge_key_flags(columns, _default_or_index_or_unknown), do: columns
+
   defp merge_types(columns, nil), do: columns
 
   defp merge_types(columns, types) do
