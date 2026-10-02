@@ -44,13 +44,16 @@ cond do
   # A PRE-10 primary (9.6) has no pgoutput stream to drive the core integration
   # modules — `CREATE PUBLICATION` itself is PG10+ — so the publication-dependent
   # modules carry :pg10 and are excluded here, honestly, never vacuously passed.
-  # The plugin-decoder coverage a 9.6 row exists for still runs: the parity
-  # per-leg tests self-skip any plugin the server lacks (pglogical/wal2json legs
-  # run on 9.6), and the pgoutput-on-9.6 refusal is its own untagged leg below.
-  # The :pg10+-assuming decoder trio (:pg_old_decoders) and the streaming/spill/
-  # messages set (:pg14 — proto-v2 streaming, the `messages` option and
+  # The :pg_old_decoders trio (the parity marquee, the halt legs, the crash-resume
+  # marquee) is ALSO excluded on a 9.6 PRIMARY: those legs assume a PG10+ plugin
+  # primary. The 9.6 row's live plugin coverage is therefore the untagged
+  # pgoutput-on-9.6 refusal leg below, while the parity marquee's 9.6 CROSS-VINTAGE
+  # legs run on the 12 ROW's job: CI starts the real 9.6 secondary beside the 12
+  # primary and exports REPLICANT_PG96_URL, and the marquee FLUNKS (never narrows)
+  # if that wiring is missing on a pre-15 plugin row. The streaming/spill/messages
+  # set (:pg14 — proto-v2 streaming, the `messages` option and
   # logical_decoding_work_mem are PG14+/PG13+; OBSERVED: PG12 fails the spill
-  # suites' SET with 42704) are excluded here too.
+  # suites' SET with 42704) is excluded here too.
   version < 100_000 ->
     ExUnit.configure(exclude: [:pg17, :pg_old_decoders, :pg14, :pg10])
 

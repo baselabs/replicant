@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The decoder-parity marquee now actually executes the comparison 1.4.0 claimed.**
+  As shipped in 1.4.0, CI could never run it: the marquee was tagged `:pg_old_decoders`
+  (excluded on the 9.6 row), the pgoutput reference leg gated at PG ≥ 15 (no plugin row
+  ever satisfied it), and `REPLICANT_PG96_URL` was empty on the 12 row — so the 9.6 legs
+  self-skipped and the "byte-identical across decoders" claim rested on a silently
+  narrowed, plugin-vs-plugin-only comparison. The geometry is fixed end to end: the 12
+  CI row now starts a real 9.6 secondary beside the 12 primary and exports
+  `REPLICANT_PG96_URL`; the pgoutput reference runs on the SAME primary (core variant on
+  10-14; the truncate + transactional-message variant needs PG14+ messages and runs on a
+  15+ plugin-bearing server, which no CI lane wires — local-run coverage, stated
+  honestly); and an unavailable expected leg now FAILS LOUD (flunk) instead of shrinking
+  the comparison. The fixture also grew a row of NULL scalars and extreme-magnitude
+  floats (`1e20` float8, `-2.5e-7` float4 — text verified identical on the 9.6 and 12
+  float-output vintages), and the keyless `parity_nothing` table rides its own
+  insert-only publication for the pgoutput leg (a default publication makes the server
+  refuse the fixture's keyless UPDATE outright, which would abort the whole fixture
+  transaction; the refusal itself stays proven by the halt test).
+- **wal2json JSON-number normalization is fail-closed, not silently re-rendered.**
+  Under `numeric-data-types-as-string` (mandatory, pre-flighted at connect) wal2json
+  string-wraps every int/oid/float/numeric value in the server's own output text, so a
+  JSON number in a column value is structurally impossible on the wire; the decoder's
+  old lenient fallback (`Integer/Float.to_string/1`) was unreachable for real plugin
+  output but WRONG where it sat — Elixir renders `1.0e20` where PostgreSQL's float8out
+  says `1e+20` — so it would have silently delivered divergent bytes had any path ever
+  reached it. It now halts `:decode_failure` (value-free) instead. The value-text
+  boundary (floats needing more than 15 significant digits print differently on pre-PG12
+  servers than on PG12+ — a server fact, not a decoder divergence) is documented in the
+  moduledoc and ADR-0009.
+- **The wal2json periodic schema guard no longer stacks timers across reconnects.**
+  Every entry to streaming re-armed `:erlang.send_after/3` without canceling the
+  previous timer, so fast reconnect cycles (paced store retries, walsender
+  terminations) multiplied the guard's tick rate. The armed timer is now tracked and
+  canceled on re-arm (red proof: with the cancel removed, the new integration test
+  observes the stale timer still live after a reconnect).
+- **Records corrected to match shipped behavior:** ADR-0009's Consequences no longer
+  say a wal2json column DROP is invisible until reconnect (the two wire rules catch it
+  in stream; the bounded residual and the DROP-batched-with-ADD deferral window are now
+  documented), the wal2json moduledoc no longer says the destructive-drop
+  classification "never fires" under that decoder, and `pg_old.dockerfile`'s wal2json
+  comment names the commit actually checked out (`75629c2`, the `wal2json_2_6` tag —
+  it previously cited `75a4b494`, a commit the build never used).
+
 ## [1.4.0] - 2026-09-30
 
 ### Fixed

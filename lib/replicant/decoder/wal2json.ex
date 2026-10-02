@@ -22,14 +22,40 @@ defmodule Replicant.Decoder.Wal2json do
 
   ## Documented divergences from the pgoutput contract
 
-  wal2json's format 2 CANNOT express a dropped column: the plugin omits a column only
-  when it is unchanged-TOASTed, so a column that vanishes from the change stream is
-  indistinguishable from an untouched TOASTed column and surfaces as the `unchanged`
-  sentinel indefinitely — the assembler's destructive-drop classification (Critical
-  Rule 4) never fires under this decoder. A dropped column is therefore caught at the
-  NEXT reconnect's catalog read (the synthesized relation shrinks) rather than in
-  stream. A column ADD is detected and classified as usual (the append-only drift
-  merge above).
+  wal2json's format 2 has no relation message, so a dropped column is detected from
+  the change stream by two wire rules (`dropped_columns/3`): a cached column ABSENT
+  from an INSERT is dropped (inserts carry every live column — NULLs included, as
+  in-array `null` values), and a cached FIXED-WIDTH column ABSENT from an UPDATE is
+  dropped (no column STORAGE setting can store a fixed-width type out-of-line). Both
+  re-emit the subset relation ahead of the change and the assembler's destructive
+  classification (Critical Rule 4) halts fail-closed, exactly like a pgoutput
+  Relation re-emit after the same DDL. The residual: a dropped TOASTable column on
+  an update-only table is wire-identical to the unchanged-TOAST sentinel and stays
+  `unchanged:` until the periodic catalog guard (`schema_check_interval`, default
+  30s) or the next reconnect's catalog read re-emits the shrunken relation. A DROP
+  and an ADD committed in one DDL batch take the append-only drift branch first
+  (the ADD is visible in the change, the DROP is not), so the destructive halt for
+  that DROP is deferred to the guard or reconnect. A column ADD alone is detected
+  and classified as usual. A replica-identity change is still only visible at the
+  next reconnect's catalog read.
+
+  ## Value text: byte-identical to pgoutput, with one server-vintage boundary
+
+  With `numeric-data-types-as-string` (pre-flighted at connect — a build that
+  rejects it halts `:decoder_option_unsupported` before streaming), wal2json emits
+  every column value as the SERVER'S OWN output-function text: int2/4/8, oid,
+  float4/8 and numeric as JSON strings, bool as a JSON boolean, bytea as bare hex,
+  every other type as an escaped JSON string, NULL as an in-array `null`. A JSON
+  number in a column value is therefore structurally impossible on the wire, and
+  `normalize_value/2` fails closed (`:decode_failure`) on one rather than
+  re-rendering it — an Elixir re-render (for example `Float.to_string/1`'s
+  `"1.0e20"`) is NOT the server's float8out text (`"1e+20"`) and would silently
+  diverge from what pgoutput delivers. The one boundary is a SERVER fact, not a
+  decoder one: a float whose shortest round-trip needs more than 15 significant
+  digits prints differently on pre-PG12 servers (`%.{DBL_DIG}g`) than on PG12+
+  (shortest round-trip), so cross-vintage comparisons of that magnitude class
+  compare different server text; within one server both decoders deliver identical
+  bytes.
   """
 
   @behaviour Replicant.Decoder.Plugin
@@ -251,7 +277,7 @@ defmodule Replicant.Decoder.Wal2json do
         new_columns =
           Enum.map(new_names, fn name ->
             col = Enum.find(columns, &(&1["name"] == name))
-            synthesize_column(col, identity_names)
+            synthesize_column(col, identity_names, relation.replica_identity)
           end)
 
         updated = %{relation | columns: (relation.columns || []) ++ new_columns}
@@ -296,20 +322,31 @@ defmodule Replicant.Decoder.Wal2json do
 
   defp synthesize_relation(doc, key, columns, cache) do
     identity_names = identity_column_names(doc)
+    replica_identity = Map.get(cache.replica_identity, key)
 
     %Messages.Relation{
       id: Map.get(cache.relids, key) || default_relation_id(key),
       namespace: elem(key, 0),
       name: elem(key, 1),
-      replica_identity: Map.get(cache.replica_identity, key),
-      columns: Enum.map(columns, &synthesize_column(&1, identity_names))
+      replica_identity: replica_identity,
+      columns: Enum.map(columns, &synthesize_column(&1, identity_names, replica_identity))
     }
   end
 
-  defp synthesize_column(col, identity_names) do
+  # Key flags match pgoutput's Relation semantics: under REPLICA IDENTITY FULL the
+  # WHOLE ROW is the key (every column flagged), otherwise only the identity
+  # columns the change carries (include-pk's list).
+  defp synthesize_column(col, identity_names, replica_identity) do
+    flags =
+      cond do
+        replica_identity == :all_columns -> [:key]
+        col["name"] in identity_names -> [:key]
+        true -> []
+      end
+
     %Messages.Relation.Column{
       name: col["name"],
-      flags: if(col["name"] in identity_names, do: [:key], else: []),
+      flags: flags,
       type: OidDatabase.name_for_type_id(col["typeoid"]),
       type_modifier: type_modifier(col["type"] || "")
     }
@@ -484,9 +521,14 @@ defmodule Replicant.Decoder.Wal2json do
   end
 
   # JSON-typed values back to the server's text form — the casting layer (ADR-0008)
-  # receives exactly the text pgoutput delivers. With numeric-data-types-as-string on,
-  # numbers already arrive as JSON strings; bool is a JSON boolean; bytea arrives as
-  # bare hex without the `\x` prefix.
+  # receives exactly the text pgoutput delivers. With numeric-data-types-as-string on
+  # (pre-flighted at connect), wal2json string-wraps int2/4/8, oid, float4/8 and
+  # numeric, emits bool as a JSON boolean and bytea as bare hex without the `\x`
+  # prefix, and escapes every other type's output text. A JSON NUMBER in a column
+  # value is structurally impossible on that option set (wal2json.c emits one only
+  # with the option off), so it fails closed here instead of being re-rendered:
+  # Elixir's float text ("1.0e20") is not the server's float8out text ("1e+20"), and
+  # a silent re-render would diverge from what pgoutput delivers for the same value.
   defp normalize_value(nil, _col), do: nil
 
   defp normalize_value(value, %Messages.Relation.Column{type: "boolean"})
@@ -500,9 +542,7 @@ defmodule Replicant.Decoder.Wal2json do
   defp normalize_value(true, _col), do: "t"
   defp normalize_value(false, _col), do: "f"
   defp normalize_value(value, _col) when is_binary(value), do: value
-  defp normalize_value(value, _col) when is_integer(value), do: Integer.to_string(value)
-  defp normalize_value(value, _col) when is_float(value), do: Float.to_string(value)
-  defp normalize_value(_other, _col), do: throw(:malformed_value)
+  defp normalize_value(_impossible_json_number, _col), do: throw(:malformed_value)
 
   # ---- value/type helpers ----
 

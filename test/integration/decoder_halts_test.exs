@@ -176,6 +176,82 @@ defmodule Replicant.DecoderHaltsTest do
       detach_event(:schema_guard_halted)
       GenServer.stop(ctrl)
     end
+
+    test "a reconnect CANCELS the previous guard timer (fast reconnect cycles must not multiply the tick rate)" do
+      unless PG16.enabled?() do
+        flunk("REPLICANT_TEST_URL not set")
+      end
+
+      url = System.fetch_env!("REPLICANT_TEST_URL")
+      {:ok, ctrl} = Postgrex.start_link(conn_opts(url) ++ [backoff_type: :stop])
+
+      Postgrex.query!(ctrl, "DROP TABLE IF EXISTS halt_guard2 CASCADE", [])
+      Postgrex.query!(ctrl, "CREATE TABLE halt_guard2 (id int PRIMARY KEY, v text)", [])
+
+      slot = "rep_halt_grd2_#{System.unique_integer([:positive])}"
+      cleanup_slot(url, slot)
+
+      # a 60s interval: no tick may fire inside this test under ANY load, so a
+      # canceled timer is distinguishable from a naturally-delivered one
+      # (cancel_timer/1 returns false only for a timer that is gone — with 60s on
+      # the clock, "gone" can only mean CANCELED here)
+      {:ok, _} =
+        Replicant.start_link(
+          connection: conn_opts(url),
+          slot_name: slot,
+          sink: ParitySink,
+          go_forward_only: true,
+          decoder: :wal2json,
+          tables: [{"public", "halt_guard2"}],
+          schema_check_interval: 60_000
+        )
+
+      [{conn, _}] = Registry.lookup(Replicant.Registry, {slot, :connection})
+
+      PG16.wait_until(fn ->
+        is_reference(guard_timer(conn))
+      end)
+
+      ref1 = guard_timer(conn)
+      assert is_reference(ref1), "streaming armed no schema-guard timer"
+
+      # force a reconnect by terminating the walsender backing the slot
+      Postgrex.query!(
+        ctrl,
+        "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1",
+        [slot]
+      )
+
+      # the RE-ARM is the observable: poll the timer reference itself until it
+      # changes (a fresh ref proves a new streaming episode armed a new timer —
+      # observing slot activity instead could still see the OLD walsender before
+      # the asynchronous termination completes)
+      PG16.wait_until(fn ->
+        ref = guard_timer(conn)
+        is_reference(ref) and ref != ref1
+      end)
+
+      ref2 = guard_timer(conn)
+      assert is_reference(ref2) and ref2 != ref1, "the reconnect re-armed no fresh timer"
+
+      # the OLD timer is gone: at a 60s interval it cannot have fired inside this
+      # test, so false means it was CANCELED — before the fix it stayed live and
+      # every reconnect cycle stacked one more (tick-rate multiplication)
+      assert Process.cancel_timer(ref1) == false
+
+      # the NEW timer is live (hygiene: cancel it too)
+      assert is_integer(Process.cancel_timer(ref2))
+
+      Replicant.stop(slot)
+      wait_until_gone(slot)
+      GenServer.stop(ctrl)
+    end
+
+    defp guard_timer(conn) do
+      {_state_name, data} = :sys.get_state(conn)
+      {_mod, mod_state} = Map.fetch!(data, :state)
+      mod_state.schema_guard_timer
+    end
   end
 
   describe "wal2json wire-level dropped-column detection (immediate)" do
@@ -233,6 +309,97 @@ defmodule Replicant.DecoderHaltsTest do
       assert_receive {:wire_halted, %{kind: :destructive}}, 10_000
       wait_until_gone(slot)
       detach_event(:wire_halted)
+      GenServer.stop(ctrl)
+    end
+  end
+
+  describe "wal2json NULL column values (the insert-drop rule's every-live-column assumption)" do
+    @describetag :pg_old_decoders
+
+    test "an INSERT carrying NULLs delivers them as nils instead of false-halting :destructive" do
+      # The insert drop rule classifies a cached column ABSENT from an insert as
+      # dropped on the assumption wal2json carries every live column — NULLs
+      # included, as in-array null values (wal2json.c emits `null`, never skips
+      # the column). A plugin build that omitted NULL columns would make every
+      # NULL-bearing insert a false :destructive halt; this leg fails loud there.
+      unless PG16.enabled?() do
+        flunk("REPLICANT_TEST_URL not set")
+      end
+
+      url = System.fetch_env!("REPLICANT_TEST_URL")
+      {:ok, ctrl} = Postgrex.start_link(conn_opts(url) ++ [backoff_type: :stop])
+
+      Postgrex.query!(ctrl, "DROP TABLE IF EXISTS halt_null CASCADE", [])
+
+      Postgrex.query!(
+        ctrl,
+        "CREATE TABLE halt_null (id int PRIMARY KEY, n int, t text, f float8)",
+        []
+      )
+
+      slot = "rep_halt_null_#{System.unique_integer([:positive])}"
+      cleanup_slot(url, slot)
+      halted = attach_event(:null_leg_halted, [:replicant, :schema_change, :halted])
+
+      {:ok, _} =
+        Replicant.start_link(
+          connection: conn_opts(url),
+          slot_name: slot,
+          sink: ParitySink,
+          go_forward_only: true,
+          decoder: :wal2json,
+          tables: [{"public", "halt_null"}],
+          schema_check_interval: 60_000
+        )
+
+      PG16.wait_until(fn ->
+        rows =
+          Postgrex.query!(
+            ctrl,
+            "SELECT confirmed_flush_lsn FROM pg_replication_slots WHERE slot_name = $1",
+            [slot]
+          ).rows
+
+        rows != [] and rows != [[nil]]
+      end)
+
+      :timer.sleep(500)
+
+      mark = ParitySink.mark()
+
+      # every nullable column NULL, then a partial-NULL row, then a flip
+      Postgrex.query!(ctrl, "INSERT INTO halt_null VALUES (1, NULL, NULL, NULL)", [])
+      Postgrex.query!(ctrl, "INSERT INTO halt_null VALUES (2, 7, 'set', 1.5)", [])
+      Postgrex.query!(ctrl, "UPDATE halt_null SET n = NULL, t = 'was-null' WHERE id = 2", [])
+
+      :ok =
+        PG16.wait_until(fn ->
+          ParitySink.since(mark) |> Enum.flat_map(& &1.changes) |> length() == 3
+        end)
+
+      changes = ParitySink.since(mark) |> Enum.flat_map(& &1.changes)
+
+      by_id = fn id -> Enum.find(changes, &match?(%{record: %{"id" => ^id}}, &1)) end
+
+      # record values are POST-CAST (ADR-0008: int4 -> integer, float8 -> float,
+      # text -> binary); the plugin delivered NULLs as in-array nulls (live-probed)
+      assert %{record: %{"id" => 1, "n" => nil, "t" => nil, "f" => nil}} = by_id.(1)
+      assert %{record: %{"id" => 2, "n" => 7, "t" => "set", "f" => 1.5}} = by_id.(2)
+
+      update = Enum.find(changes, &(&1.op == :update))
+
+      # the KEY must be PRESENT with a nil value — record["n"] == nil would also
+      # pass for an ABSENT key, and a build that mis-represented the NULL as an
+      # unchanged-TOAST omission (absent, in `unchanged`) would slip through
+      assert %{"n" => nil, "t" => "was-null"} = update.record
+      refute "n" in (update.unchanged || [])
+
+      # the whole point: no destructive halt ever fired
+      refute_receive {:null_leg_halted, %{kind: :destructive}}, 1_000
+
+      Replicant.stop(slot)
+      wait_until_gone(slot)
+      detach_event(halted)
       GenServer.stop(ctrl)
     end
   end

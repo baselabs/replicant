@@ -1818,7 +1818,7 @@ defmodule Replicant.ConnectionTest do
       # Connection's mirror, or a stale-high spilled_bytes over-subtracts the §4 numerator and a
       # slow-sink reconnect that does not re-spill evades the RAM-bound halt indefinitely.
       {:query, _sql, identity_state} =
-        Connection.handle_connect(state(spilled_bytes: 4242, step: :disconnected))
+        Connection.handle_connect(state(spill: %{bytes: 4242, max: nil}, step: :disconnected))
 
       identity_result = [
         %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}
@@ -1826,7 +1826,7 @@ defmodule Replicant.ConnectionTest do
 
       {:query, _sql, new_state} = Connection.handle_result(identity_result, identity_state)
 
-      assert new_state.spilled_bytes == 0
+      assert new_state.spill.bytes == 0
     end
 
     test "recovery_check emits [:connection, :connected] with the source kind" do
@@ -2043,8 +2043,7 @@ defmodule Replicant.ConnectionTest do
           received_lsn: 0,
           stream_floor_lsn: 0,
           in_stream: false,
-          spilled_bytes: 0,
-          max_spill_bytes: 500,
+          spill: %{bytes: 0, max: 500},
           max_inflight_lag: 100,
           step: :streaming
         },
@@ -2054,7 +2053,7 @@ defmodule Replicant.ConnectionTest do
 
     test "the halt ceiling is max_inflight_lag + max_spill_bytes (RAM + disk)" do
       # received-floor 620, spilled 0 → resident lag 620 > 100 + 500 = 600 → halt
-      s = %{sp_state("c2") | received_lsn: 620, spilled_bytes: 0}
+      s = %{sp_state("c2") | received_lsn: 620, spill: %{sp_state("c2").spill | bytes: 0}}
       frame = <<?w, 0::64, 620::64, 0::64, "E">>
       assert {:disconnect, :sink_too_slow} = Replicant.Connection.handle_data(frame, s)
     end
@@ -2063,7 +2062,7 @@ defmodule Replicant.ConnectionTest do
       # WITHOUT the -spilled subtraction, received-floor 620 halts; WITH spilled=550,
       # 620-550=70 < 600 → no halt (forwards)
       {:ok, _} = Registry.register(Replicant.Registry, {"c2b", :assembler}, nil)
-      s = %{sp_state("c2b") | received_lsn: 620, spilled_bytes: 550}
+      s = %{sp_state("c2b") | received_lsn: 620, spill: %{sp_state("c2b").spill | bytes: 550}}
       frame = <<?w, 0::64, 620::64, 0::64, "E">>
       refute match?({:disconnect, :sink_too_slow}, Replicant.Connection.handle_data(frame, s))
     end
@@ -2071,7 +2070,7 @@ defmodule Replicant.ConnectionTest do
     test "a {:spilled_bytes, total} message updates the connection's spilled counter (handled, not swallowed by the catch-all)" do
       s = sp_state("c3")
       assert {:noreply, s2} = Replicant.Connection.handle_info({:spilled_bytes, 400}, s)
-      assert s2.spilled_bytes == 400
+      assert s2.spill.bytes == 400
     end
 
     test "a NON-spill connection (max_spill_bytes: nil) halts at EXACTLY max_inflight_lag (ceiling unchanged)" do

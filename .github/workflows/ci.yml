@@ -43,8 +43,10 @@ jobs:
       MIX_ENV: test
       REPLICANT_TEST_URL: postgres://postgres@localhost:${{ matrix.pg.port }}/postgres
       EXPECTED_PG_MAJOR: ${{ matrix.pg.major }}
-      # The 9.6 row's own server backs the parity suite's old-major legs
-      REPLICANT_PG96_URL: ${{ matrix.pg.major == '9' && format('postgres://postgres@localhost:{0}/postgres', matrix.pg.port) || '' }}
+      # The 12 row ALSO runs a real 9.6 beside it (the parity marquee's cross-vintage
+      # legs are part of ADR-0009's acceptance and FAIL LOUD when the URL is unset on
+      # a pre-15 plugin row). The 9 row's own server backs the value there.
+      REPLICANT_PG96_URL: ${{ (matrix.pg.major == '9' && format('postgres://postgres@localhost:{0}/postgres', matrix.pg.port)) || (matrix.pg.major == '12' && 'postgres://postgres@localhost:5609/postgres') || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -55,7 +57,9 @@ jobs:
         # Postgres directly with the flags (mirrors AGENTS.md). Without wal_level=logical the
         # integration suite would silently skip and CI would be green-but-vacuous. The
         # 9.6/12 rows build the plugin image from the committed Dockerfile instead of the
-        # stock base (ADR-0009), and bootstrap the pglogical extension + node.
+        # stock base (ADR-0009), and bootstrap the pglogical extension + node. The 12 row
+        # additionally starts the 9.6 secondary that backs REPLICANT_PG96_URL (the parity
+        # marquee's 9.6 legs run against it; without it the marquee flunks, not narrows).
         run: |
           if [ "${{ matrix.pg.plugins }}" = "true" ]; then
             docker build -f test/support/pg_old.dockerfile \
@@ -84,6 +88,25 @@ jobs:
             # replication connections from the CI network must pass pg_hba (9.6 rejects
             # them by default; OBSERVED on the substrate)
             docker exec pg sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
+          fi
+          if [ "${{ matrix.pg.major }}" = "12" ]; then
+            docker build -f test/support/pg_old.dockerfile \
+              --build-arg BASE=postgres:9.6@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698 \
+              -t replicant-pg9-plugins:ci .
+            docker run -d --name pg96 \
+              -e POSTGRES_HOST_AUTH_METHOD=trust \
+              -p 5609:5432 \
+              replicant-pg9-plugins:ci \
+              -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 \
+              -c shared_preload_libraries=pglogical
+            for _ in $(seq 1 30); do
+              docker exec pg96 pg_isready -U postgres && break
+              sleep 1
+            done
+            docker exec pg96 pg_isready -U postgres || { echo "PostgreSQL 9.6 never became ready"; exit 1; }
+            docker exec pg96 psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pglogical" \
+              -c "SELECT * FROM pglogical.create_node(node_name := 'ci_src96', dsn := 'postgres://postgres@localhost:5432/postgres')"
+            docker exec pg96 sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
           fi
 
       - name: Assert the live server is the expected major (substrate wiring)

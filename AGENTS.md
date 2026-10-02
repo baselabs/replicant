@@ -108,9 +108,13 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
   from the live 9.6/12 substrate servers (committed under `test/fixtures/`:
   `wal2json_*.{jsons}`, `pglogical_*.bin`) with the same byte-flip tamper discipline.
   The decoder-parity marquee (`test/integration/decoder_parity_test.exs`) proves one
-  fixture delivers byte-identically across pgoutput and both plugins; its legs skip
-  (never pass vacuously) on a server lacking the plugin; the 9.6 legs run when
-  `REPLICANT_PG96_URL` is set.
+  fixture delivers byte-identically across pgoutput and both plugins — FAIL-LOUD, never
+  narrowed: the primary must carry BOTH plugins, a pre-15 plugin row must wire
+  `REPLICANT_PG96_URL` to a real 9.6 carrying both (CI's 12 row starts that 9.6 beside
+  the 12 primary; the marquee flunks if the wiring is missing), and the pgoutput
+  reference runs on the same primary (core variant on 10-14; the truncate+message
+  variant on 15+, which needs PG14+ messages and a plugin-bearing server no CI lane
+  wires today).
 - **Supported PostgreSQL versions: 9.6, 12, 15, 16, 17, 18.** The 9.6 and 12 rows exist
   for the plugin decoders (ADR-0009): their images are built by
   `test/support/pg_old.dockerfile` (digest-pinned `postgres:9.6`/`postgres:12` +

@@ -201,16 +201,38 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   the way the 15 to 18 mappings are. Images are built from a committed Dockerfile that
   compiles the two extensions against the official `postgres:9.6` and `postgres:12`
   images, pinned by digest. No mock, stub or canned payload stands in for a server.
-- One fixture (a transaction touching every casted type, a TOASTed column updated without
-  touching it, an update and a delete under each replica identity, a truncate, and a
-  transactional message where the plugin can carry one) is committed. The delivered
+- One fixture (a transaction touching every casted type — NULL scalars and
+  extreme-magnitude floats included — a TOASTed column updated without touching it, an
+  update and a delete under each replica identity, a truncate, and a transactional
+  message where the plugin can carry one) is committed. The delivered
   `%Replicant.Transaction{}` list is byte-identical, after `commit_lsn`, `xid` and
-  timestamps are normalized, across pgoutput on 15, pglogical on 9.6 and 12, and wal2json
-  on 9.6 and 12. The comparison is a test that reads the three deliveries and diffs them;
-  a difference is a failure, not a documented deviation. The truncate and message legs run
-  only where a plugin plus server can carry them (pgoutput on 15; wal2json on 12; pglogical
-  and 9.6 carry neither — verification section), and the byte-identical core is the legs all
-  five decoder×server cells share.
+  timestamps are normalized, across pgoutput, pglogical and wal2json. The comparison is
+  a test that reads the deliveries and diffs them; a difference is a failure, not a
+  documented deviation, and a missing expected leg FAILS LOUD instead of narrowing the
+  comparison. CI's lane is the 12 row: pgoutput (core variant) on the 12 primary against
+  pglogical and wal2json on that same primary AND on a real 9.6 secondary started beside
+  it (`REPLICANT_PG96_URL`; the marquee flunks if the wiring is missing on a pre-15
+  plugin row). The truncate + transactional-message variant (messages are PG14+, and
+  the pgoutput leg needs `messages: true` plus a sink implementing `handle_message/2`)
+  runs the same way on any 15+ plugin-bearing primary — no CI lane wires one; it was
+  EXECUTED once locally against a real 15.19 with both plugins (wal2json master
+  `75a4b494`, a build newer than the committed 2.6 pin, which predates PG15's
+  `ReorderBufferTXN` change and does not compile there; PG15 also requires every
+  output plugin — pgoutput included — listed in `output_plugin_libraries`), receipt in
+  the development tree's outcome record.
+
+  Receipts (2026-10-02, full-geometry local matrix on real docker-built servers,
+  per-row `mix test` results; detailed log at
+  `.kimosabe/evidence/repair-1.4.0-credibility/matrix-counts.txt` in the development
+  tree): 12 row with the 9.6 secondary wired — 876 passed / 16 excluded (the marquee's
+  full comparison executed: pgoutput@12 vs both plugins@12 vs both plugins@9.6);
+  9.6 row — 806 passed / 86 excluded; 15 — 878/14; 16 — 878/14; 17 — 880/12 (one
+  transient spill-marquee wait timeout on a first run under shared-substrate load,
+  green alone and on immediate full rerun); 18 — 880/12; unit-only — 799/93. The CI
+  run for the commit carrying this amendment (all six matrix rows; the 12 row runs
+  the 9.6 secondary this amendment adds) is the binding substrate receipt and is
+  recorded with its run identifier in the development tree's outcome record
+  (`.kimosabe/work/`) at closeout.
 - Real captured bytes from the 9.6 and 12 servers (one frame per message kind per plugin)
   join the conformance suite with the same byte-flip tamper test the pgoutput fixtures
   carry, so each new fixture is proven to go red on mutation.
@@ -245,13 +267,18 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
 - Sinks see no new struct, callback or field; a sink written for pgoutput runs unchanged
   against a 9.6 server. The guarantees table in `docs/INVARIANTS.md` applies per checkpoint
   mode, not per decoder.
-- Operators of 9.6 to 12 accept three documented differences: a replica-identity change is
-  classified at the next reconnect (wal2json); a column DROP is invisible to the wal2json
-  stream (an absent column is the unchanged-TOAST sentinel, so the drop surfaces as
-  `unchanged:` until the next reconnect's catalog read); and `type_modifier` is `-1` where
-  the plugin's stream does not carry it (wal2json parses real typmods from its type
-  strings and pglogical takes them from the connect-time catalog read, so `-1` survives
-  only on a catalog miss).
+- Operators of 9.6 to 12 accept documented differences, each bounded: a replica-identity
+  change is classified at the next reconnect (wal2json); a column DROP is caught IN
+  STREAM by the two wire rules (a cached column absent from an INSERT, or absent from an
+  UPDATE when its cached type is fixed-width — verification section), with a bounded
+  residual: a dropped TOASTable column on an update-only table stays `unchanged:` until
+  the periodic catalog guard (`schema_check_interval`, default 30s) or the next
+  reconnect's catalog read, and a DROP committed in the same DDL batch as an ADD takes
+  the append-only drift branch first (the ADD is visible in the change, the DROP is
+  not), deferring that DROP's destructive halt to the same guard-or-reconnect window;
+  and `type_modifier` is `-1` where the plugin's stream does not carry it (wal2json
+  parses real typmods from its type strings and pglogical takes them from the
+  connect-time catalog read, so `-1` survives only on a catalog miss).
 - The test matrix grows by two rows and one image build; the images are the maintainer's
   to keep building as the official base images age.
 - The library gains its first plugin-specific error atoms; `t:Replicant.Error.reason/0` and

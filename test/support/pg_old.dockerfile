@@ -33,7 +33,8 @@ RUN set -eux; \
     *) \
       apt-get update; \
       apt-get install -y --no-install-recommends build-essential git ca-certificates \
-        libkrb5-dev libselinux1-dev libxslt1-dev libpam0g-dev zlib1g-dev libedit-dev \
+        libkrb5-dev libselinux1-dev libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev \
+        libzstd-dev liblz4-dev \
         postgresql-server-dev-$PG_MAJOR; \
       ;; \
     esac
@@ -47,8 +48,10 @@ RUN set -eux; \
     make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
     make install PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
-# wal2json master @ 75a4b494 (≥ 2.6: numeric-data-types-as-string) as `wal2json`, and
-# the wal2json_2_4 tag as `wal2json2_4` (the option-rejection halt's live lever).
+# wal2json 2.6 — the wal2json_2_6 tag's "Stamp 2.6" commit 75629c2 (carries
+# numeric-data-types-as-string; the option's coverage verified live on the built
+# image) as `wal2json`, and the wal2json_2_4 tag as `wal2json2_4` (the
+# option-rejection halt's live lever).
 RUN set -eux; \
     git clone --quiet https://github.com/eulerto/wal2json.git /tmp/wal2json; \
     cd /tmp/wal2json; \

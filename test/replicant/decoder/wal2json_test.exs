@@ -442,6 +442,113 @@ defmodule Replicant.Decoder.Wal2jsonTest do
               ], _} =
                decode(payload, cache)
     end
+
+    test "a JSON number in a column value FAILS CLOSED (structurally impossible under the shipped option set)" do
+      # numeric-data-types-as-string (pre-flighted at connect) string-wraps every
+      # int/float/numeric value; a JSON number on the wire means the option contract
+      # broke. Re-rendering (Integer/Float.to_string) would silently deliver text the
+      # server never sent for scientific-notation floats ("1.0e20" vs float8out's
+      # "1e+20"), so the decoder halts value-free instead.
+      cache =
+        Wal2json.init_cache(
+          relations: %{
+            {"public", "t"} => %Messages.Relation{
+              id: 1,
+              namespace: "public",
+              name: "t",
+              replica_identity: :default,
+              columns: [
+                %Messages.Relation.Column{name: "n", flags: [], type: "int4", type_modifier: -1},
+                %Messages.Relation.Column{name: "f", flags: [], type: "float8", type_modifier: -1}
+              ]
+            }
+          },
+          replica_identity: %{{"public", "t"} => :default}
+        )
+
+      for bad <- [7, 1.5, 1.0e20] do
+        payload =
+          doc(%{
+            "action" => "I",
+            "schema" => "public",
+            "table" => "t",
+            "columns" => [%{"name" => "n", "typeoid" => 23, "value" => bad}]
+          })
+
+        assert {:error, %Replicant.Error{reason: :decode_failure}} = decode(payload, cache)
+      end
+    end
+
+    test "NULL column values deliver as tuple nils (the insert-drop rule's every-live-column assumption)" do
+      cache =
+        Wal2json.init_cache(
+          relations: %{
+            {"public", "t"} => %Messages.Relation{
+              id: 1,
+              namespace: "public",
+              name: "t",
+              replica_identity: :default,
+              columns: [
+                %Messages.Relation.Column{
+                  name: "id",
+                  flags: [:key],
+                  type: "int8",
+                  type_modifier: -1
+                },
+                %Messages.Relation.Column{name: "t", flags: [], type: "text", type_modifier: -1},
+                %Messages.Relation.Column{name: "f", flags: [], type: "float8", type_modifier: -1}
+              ]
+            }
+          },
+          replica_identity: %{{"public", "t"} => :default}
+        )
+
+      payload =
+        doc(%{
+          "action" => "I",
+          "schema" => "public",
+          "table" => "t",
+          "columns" => [
+            %{"name" => "id", "typeoid" => 20, "value" => "1"},
+            %{"name" => "t", "typeoid" => 25, "value" => nil},
+            %{"name" => "f", "typeoid" => 701, "value" => nil}
+          ]
+        })
+
+      # the column ENTRY rides with value null — it is NOT absent, so the insert-drop
+      # rule does not fire (live-proven on wal2json@9.6/@12; decoder_halts_test.exs)
+      assert {:ok, [%Messages.Relation{}, %Messages.Insert{tuple_data: {"1", nil, nil}}], _} =
+               decode(payload, cache)
+    end
+
+    test "an extreme float arrives as the server's exact float8out text (1e+20, not Elixir's 1.0e20)" do
+      cache =
+        Wal2json.init_cache(
+          relations: %{
+            {"public", "t"} => %Messages.Relation{
+              id: 1,
+              namespace: "public",
+              name: "t",
+              replica_identity: :default,
+              columns: [
+                %Messages.Relation.Column{name: "f", flags: [], type: "float8", type_modifier: -1}
+              ]
+            }
+          },
+          replica_identity: %{{"public", "t"} => :default}
+        )
+
+      payload =
+        doc(%{
+          "action" => "I",
+          "schema" => "public",
+          "table" => "t",
+          "columns" => [%{"name" => "f", "typeoid" => 701, "value" => "1e+20"}]
+        })
+
+      assert {:ok, [%Messages.Relation{}, %Messages.Insert{tuple_data: {"1e+20"}}], _} =
+               decode(payload, cache)
+    end
   end
 
   describe "T and M actions" do

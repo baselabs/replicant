@@ -120,8 +120,10 @@ defmodule Replicant.Connection do
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
-          spilled_bytes: non_neg_integer(),
-          max_spill_bytes: non_neg_integer() | nil,
+          # The spill accounting pair rides ONE map field (the 31-flat-field BEAM
+          # boundary the struct comment above documents): the assembler-reported
+          # spilled byte mirror and the configured disk ceiling.
+          spill: %{bytes: non_neg_integer(), max: non_neg_integer() | nil},
           checkpoint_store: keyword() | nil,
           batch_delivery: keyword() | nil,
           failover: boolean(),
@@ -178,8 +180,7 @@ defmodule Replicant.Connection do
     checkpoint_state: :empty,
     received_lsn: 0,
     max_inflight_lag: @default_max_inflight_lag,
-    spilled_bytes: 0,
-    max_spill_bytes: nil,
+    spill: %{bytes: 0, max: nil},
     checkpoint_store: nil,
     batch_delivery: nil,
     failover: false,
@@ -196,6 +197,7 @@ defmodule Replicant.Connection do
     reader_pid: nil,
     step: :disconnected,
     messages: false,
+    schema_guard_timer: nil,
     decoder: @decoder_defaults
   ]
 
@@ -245,8 +247,7 @@ defmodule Replicant.Connection do
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
-       spilled_bytes: 0,
-       max_spill_bytes: spill_ceiling(Map.get(config, :streaming)),
+       spill: %{bytes: 0, max: spill_ceiling(Map.get(config, :streaming))},
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
        failover: Map.get(config, :failover, false),
@@ -408,7 +409,7 @@ defmodule Replicant.Connection do
          in_txn: false,
          open_streams: MapSet.new(),
          last_commit_lsn: 0,
-         spilled_bytes: 0,
+         spill: %{state.spill | bytes: 0},
          # The frontier epoch is KEPT across (re)connect (monotonic; only `start_streaming`
          # bumps it) so a fresh window always adopts a strictly-higher epoch than any
          # in-flight pre-reconnect frontier cast (85672f1 stale-epoch class). The per-stream
@@ -1100,9 +1101,20 @@ defmodule Replicant.Connection do
       Map.new(info, fn {key, entry} ->
         columns =
           Enum.map(entry.columns, fn col ->
+            # Under REPLICA IDENTITY FULL every column IS a key column — pgoutput
+            # flags the whole row [:key] there, and the delivered Change.columns
+            # metadata must match (there is no identity index under FULL, so
+            # identity_key alone would flag nothing).
+            flags =
+              cond do
+                entry.replident == :all_columns -> [:key]
+                col.identity_key -> [:key]
+                true -> []
+              end
+
             %Column{
               name: col.name,
-              flags: if(col.identity_key, do: [:key], else: []),
+              flags: flags,
               type: OidDatabase.name_for_type_id(col.type_oid),
               type_modifier: col.typmod
             }
@@ -1335,7 +1347,7 @@ defmodule Replicant.Connection do
   # swallows it and the spill window never extends.
 
   def handle_info({:spilled_bytes, total}, state) when is_integer(total) do
-    {:noreply, %{state | spilled_bytes: total}}
+    {:noreply, %{state | spill: %{state.spill | bytes: total}}}
   end
 
   # ---- wal2json periodic schema guard (ADR-0009 divergence resolution) ----
@@ -1417,8 +1429,16 @@ defmodule Replicant.Connection do
 
   defp arm_schema_guard(%{decoder: %{kind: :wal2json}} = state) do
     interval = state.decoder[:schema_check_interval] || 30_000
-    _ = :erlang.send_after(interval, self(), :schema_guard_tick)
-    state
+
+    # CANCEL any timer a previous streaming episode armed: Postgrex keeps mod_state
+    # across reconnects, and every entry to :streaming re-arms here — without the
+    # cancel, a fast reconnect cycle (store paced-retry, walsender termination)
+    # STACKS one live timer per cycle and multiplies the guard's tick rate.
+    if is_reference(state.schema_guard_timer) do
+      Process.cancel_timer(state.schema_guard_timer)
+    end
+
+    %{state | schema_guard_timer: :erlang.send_after(interval, self(), :schema_guard_tick)}
   end
 
   defp arm_schema_guard(state), do: state
@@ -1810,17 +1830,17 @@ defmodule Replicant.Connection do
          received_lsn: received,
          checkpoint_lsn: cp,
          stream_floor_lsn: floor,
-         spilled_bytes: spilled
+         spill: %{bytes: spilled}
        }) do
     received - max(cp, floor || received) - spilled
   end
 
-  # The §4 halt ceiling. No spill configured (`max_spill_bytes: nil`): the base
+  # The §4 halt ceiling. No spill configured (`spill.max: nil`): the base
   # `max_inflight_lag` (RAM-only bound, unchanged). Spill configured: extend the ceiling
   # by the disk budget — resident lag may run up to RAM + disk before the sink is
   # genuinely too slow (the numerator already subtracts the spilled bytes).
-  defp effective_lag_bound(%{max_inflight_lag: base, max_spill_bytes: nil}), do: base
-  defp effective_lag_bound(%{max_inflight_lag: base, max_spill_bytes: ceil}), do: base + ceil
+  defp effective_lag_bound(%{max_inflight_lag: base, spill: %{max: nil}}), do: base
+  defp effective_lag_bound(%{max_inflight_lag: base, spill: %{max: ceil}}), do: base + ceil
 
   defp forward_message(payload, state) do
     case Decoder.decode(payload,

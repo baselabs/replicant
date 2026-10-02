@@ -51,10 +51,26 @@ defmodule Replicant.Test.DecoderParity do
       :pgoutput ->
         pub = Keyword.fetch!(extra, :publication)
         Postgrex.query!(conn, "DROP PUBLICATION IF EXISTS #{pub}", [])
+        Postgrex.query!(conn, "DROP PUBLICATION IF EXISTS #{pub}_nothing", [])
+
+        # parity_nothing rides an INSERT-ONLY publication: a default publication
+        # (publishes updates) makes the server REFUSE the fixture's keyless
+        # UPDATE/DELETE outright (55000 — the refusal the halt test proves on its
+        # own leg), aborting the whole fixture transaction before any leg
+        # delivers. Insert-only publish mirrors the semantics the other decoders
+        # run the table under (wal2json's allow_keyless_tables insert-only
+        # opt-in, pglogical's default_insert_only set): the keyless writes
+        # SUCCEED server-side and stream nothing — the documented divergence —
+        # so the delivered comparison covers every table identically.
+        Postgrex.query!(
+          conn,
+          "CREATE PUBLICATION #{pub} FOR TABLE parity_all, parity_full, parity_idx",
+          []
+        )
 
         Postgrex.query!(
           conn,
-          "CREATE PUBLICATION #{pub} FOR TABLE parity_all, parity_full, parity_idx, parity_nothing",
+          "CREATE PUBLICATION #{pub}_nothing FOR TABLE parity_nothing WITH (publish = 'insert')",
           []
         )
 
@@ -105,6 +121,23 @@ defmodule Replicant.Test.DecoderParity do
              '2026-09-29 12:00:00', '2026-09-29 12:00:00+00', '1 day 2 hours',
              '{"k": 1}', '{"j": 2}', '00000000-0000-0000-0000-000000000001', '$1,234.56',
              '{1,2,NULL}', '{a,b}', '{1.10,NULL}', repeat('x', 10000))
+      """)
+
+      # NULL scalars + extreme-magnitude floats (text identical across the pre-PG12
+      # and PG12+ float8out vintages — live-probed: -2.5e-7 float4 -> "-2.5e-07",
+      # 1e20 float8 -> "1e+20" on both 9.6 and 12; the >15-significant-digit class
+      # is server-vintage text and deliberately NOT in this fixture). NULLs prove
+      # wal2json carries null columns in-array (the insert-drop rule's assumption)
+      # and that every decoder delivers them identically.
+      p.("""
+      INSERT INTO parity_all (id, c_bool, c_int2, c_int4, c_int8, c_float4, c_float8,
+             c_numeric, c_text, c_varchar, c_char, c_bytea, c_date, c_time, c_timetz,
+             c_ts, c_tstz, c_interval, c_json, c_jsonb, c_uuid, c_money, c_arr_int,
+             c_arr_text, c_arr_numeric, c_blob)
+         VALUES (2, NULL, NULL, NULL, NULL, -2.5e-7, 1e20,
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             NULL, NULL, NULL)
       """)
 
       # unchanged TOAST: update a non-TOAST column; c_blob stays sentinel
