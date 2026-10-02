@@ -33,9 +33,38 @@ defmodule Replicant.TestHelper do
       end
     end
   end
+
+  # Does the PRIMARY carry BOTH plugin decoders? (pg_available_extensions lists
+  # installable extensions; wal2json is not an extension, but the plugin-bearing
+  # images ship it and every image that carries one carries the other.) This makes
+  # the :pg_old_decoders exclusion a fact about the server instead of a guess from
+  # its version: a stock 15 primary excludes the trio exactly as before, while a
+  # 15 plugin lane (pg_old.dockerfile-built) runs it — "wherever plugins are
+  # installed". A pre-10 primary still excludes the trio unconditionally (its legs
+  # assume a PG10+ primary: publications, pgoutput).
+  def primary_carries_plugins? do
+    url = System.get_env("REPLICANT_TEST_URL")
+
+    if url in [nil, ""] do
+      false
+    else
+      {:ok, conn} = Postgrex.start_link(PG16.pg_opts())
+
+      try do
+        Postgrex.query!(
+          conn,
+          "SELECT count(*) FROM pg_available_extensions WHERE name = 'pglogical'",
+          []
+        ).rows == [[1]]
+      after
+        GenServer.stop(conn)
+      end
+    end
+  end
 end
 
 version = Replicant.TestHelper.server_version_num()
+plugins? = Replicant.TestHelper.primary_carries_plugins?()
 
 cond do
   version == 0 ->
@@ -58,19 +87,22 @@ cond do
     ExUnit.configure(exclude: [:pg17, :pg_old_decoders, :pg14, :pg10])
 
   version < 140_000 ->
-    ExUnit.configure(exclude: [:pg17, :pg14])
+    ExUnit.configure(
+      exclude: if(plugins?, do: [:pg17, :pg14], else: [:pg17, :pg14, :pg_old_decoders])
+    )
 
-  # 14–16: the stock 15/16 images carry neither plugin (the :pg_old_decoders legs
-  # would fail probing for them); a plugin-bearing 14 keeps them included.
+  # 14–16: a STOCK 15/16 primary carries neither plugin and excludes the trio; a
+  # plugin-bearing primary of any of these majors (the CI 15 plugin lane) runs it
+  # — the exclusion is decided by the plugin probe above, not the version.
   version < 170_000 ->
-    ExUnit.configure(exclude: [:pg17, :pg_old_decoders])
+    ExUnit.configure(exclude: if(plugins?, do: [:pg17], else: [:pg17, :pg_old_decoders]))
 
   # 17/18: the :pg17 failover marquees RUN here (a `>= 150_000` catch-all branch
   # above would have excluded them on the very rows they target — coverage killed
-  # silently; caught on the 18 substrate, 2026-09-30). Only the plugin-rows tag
-  # (:pg_old_decoders) stays excluded.
+  # silently; caught on the 18 substrate, 2026-09-30). The plugin-row trio runs
+  # only when the primary carries the plugins (stock 17/18 images do not).
   true ->
-    ExUnit.configure(exclude: [:pg_old_decoders])
+    ExUnit.configure(exclude: if(plugins?, do: [], else: [:pg_old_decoders]))
 end
 
 # NOTE on `--include integration` against a PG16 server: ExUnit's `--include TAG` rescues a test

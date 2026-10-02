@@ -404,9 +404,12 @@ defmodule Replicant.DecoderHaltsTest do
     end
   end
 
-  # Old-rows-only by construction: the wal2json2_4 plugin name exists only in the
-  # committed pg_old image (rows 9/12) — a stock 15-18 primary refuses the library
-  # outright (42501 output_plugin_libraries, OBSERVED on an 18 substrate).
+  # The wal2json2_4 plugin name exists only in the committed pg_old image for the
+  # PRE-15 majors (wal2json_2_4 predates PG15 and does not compile there): rows 9/12
+  # own this leg and a missing lever there FLUNKS (the image build broke); a 15+
+  # plugin lane skips it with a logged reason (structurally absent, never silently);
+  # a stock 15-18 primary excludes the whole trio (the plugin probe) and never
+  # reaches here.
   describe ":decoder_option_unsupported (an old wal2json build rejects the option set)" do
     @describetag :pg_old_decoders
 
@@ -423,29 +426,44 @@ defmodule Replicant.DecoderHaltsTest do
       # slot and its START_REPLICATION is rejected with invalid_parameter_value.
       slot = "rep_halt_old_w2j_#{System.unique_integer([:positive])}"
 
-      Postgrex.query!(
-        ctrl,
-        "SELECT * FROM pg_create_logical_replication_slot($1, 'wal2json2_4')",
-        [slot]
-      )
+      case Postgrex.query(
+             ctrl,
+             "SELECT * FROM pg_create_logical_replication_slot($1, 'wal2json2_4')",
+             [slot]
+           ) do
+        {:ok, _} ->
+          attach(slot, :decoder_option_unsupported)
+          cleanup_slot(url, slot)
 
-      attach(slot, :decoder_option_unsupported)
-      cleanup_slot(url, slot)
+          {:ok, _} =
+            Replicant.start_link(
+              connection: conn_opts(url),
+              slot_name: slot,
+              sink: ParitySink,
+              go_forward_only: true,
+              decoder: :wal2json,
+              tables: [{"public", "parity_all"}]
+            )
 
-      {:ok, _} =
-        Replicant.start_link(
-          connection: conn_opts(url),
-          slot_name: slot,
-          sink: ParitySink,
-          go_forward_only: true,
-          decoder: :wal2json,
-          tables: [{"public", "parity_all"}]
-        )
+          assert_receive {:halted, :decoder_option_unsupported}, 10_000
+          wait_until_gone(slot)
+          Postgrex.query!(ctrl, "SELECT pg_drop_replication_slot($1)", [slot])
+          GenServer.stop(ctrl)
 
-      assert_receive {:halted, :decoder_option_unsupported}, 10_000
-      wait_until_gone(slot)
-      Postgrex.query!(ctrl, "SELECT pg_drop_replication_slot($1)", [slot])
-      GenServer.stop(ctrl)
+        {:error, %{postgres: %{code: code}}}
+        when code in [:insufficient_privilege, :undefined_object] ->
+          if Replicant.TestHelper.server_version_num() < 150_000 do
+            flunk(
+              "wal2json2_4 is absent on a pre-15 plugin row — the pg_old image build broke the option-halt lever"
+            )
+          else
+            IO.puts(
+              "wal2json2_4 option-halt leg skipped: the 15+ pg_old image does not build the 2.4 lever (it does not compile there)"
+            )
+
+            GenServer.stop(ctrl)
+          end
+      end
     end
   end
 

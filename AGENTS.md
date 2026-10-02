@@ -115,11 +115,17 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
   reference runs on the same primary (core variant on 10-14; the truncate+message
   variant on 15+, which needs PG14+ messages and a plugin-bearing server no CI lane
   wires today).
-- **Supported PostgreSQL versions: 9.6, 12, 15, 16, 17, 18.** The 9.6 and 12 rows exist
-  for the plugin decoders (ADR-0009): their images are built by
-  `test/support/pg_old.dockerfile` (digest-pinned `postgres:9.6`/`postgres:12` +
-  pglogical 2.4.8 + wal2json 2.6 + a `wal2json2_4` build for the option-halt test);
-  the rows carry `EXPECTED_PG_MAJOR` 9 and 12. Behavior is version-gated by
+- **Supported PostgreSQL versions: 9.6, 12, 15, 16, 17, 18.** The 9.6, 12 and
+  15-plugin rows exist for the plugin decoders (ADR-0009): their images are built by
+  `test/support/pg_old.dockerfile` (digest-pinned bases + pglogical 2.4.8 + wal2json
+  pinned per major — the `wal2json_2_6` tag on pre-15 bases, master `75a4b494` on 15+
+  where 2.6 does not compile — plus a `wal2json2_4` build on pre-15 only, the
+  option-halt test's lever). A PG15+ server gates every output plugin: plugin lanes
+  there start with
+  `output_plugin_libraries=wal2json,pglogical_output,pgoutput`. The trio's
+  `:pg_old_decoders` exclusion is decided by a plugin probe on the primary, not the
+  version: a stock 15-18 excludes it, a plugin-bearing primary of any major runs it.
+  The rows carry `EXPECTED_PG_MAJOR`. Behavior is version-gated by
   `server_version_num`: the slot-invalidation query selects only the columns that exist on
   the connected major (PG15 → `wal_status`; PG16 → `+ conflicting`; PG17/18 → `+
   invalidation_reason, synced`), and failover slots are created on PG17/18 but structurally

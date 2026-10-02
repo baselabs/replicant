@@ -109,8 +109,15 @@ defmodule Replicant.PublishCandidateTest do
         replicant_load_hex_api_key "$2"
       '''
 
-      {_output, status} = System.cmd("bash", ["-c", command, "bash", @loader, file])
+      # stderr is CAPTURED, not inherited: the loader's rejection banner is a
+      # `::error::` GitHub-Actions annotation, and an inherited stderr would leak
+      # it into the job log where Actions renders it as a failure annotation on a
+      # PASSING run (observed on every green CI run since the script landed)
+      {output, status} =
+        System.cmd("bash", ["-c", command, "bash", @loader, file], stderr_to_stdout: true)
+
       assert status == 1, "#{file} should be rejected"
+      assert output =~ "publish_candidate: project credential file"
     end
   end
 

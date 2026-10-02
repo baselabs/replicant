@@ -60,6 +60,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the one change all three decoders deliver — is compared across all of them. ADR
   receipts now carry the binding CI run identifier inside the repo (not only in the
   untracked development record).
+- **The 15 plugin lane is committed and CI-wired (the last disclosed residual,
+  closed).** `pg_old.dockerfile` now pins wal2json per major — the `wal2json_2_6`
+  tag on pre-15 bases (byte-identical to the shipped 9.6/12 substrate; re-verified
+  879/16 on rebuilt images) and master `75a4b494` on 15+, where 2.6 does not compile.
+  CI gains a 15 plugin row (same digest-pinned base; `output_plugin_libraries`
+  listing wal2json, `pglogical_output` and — a PG15+ subtlety this lane proved —
+  pgoutput itself), and the `:pg_old_decoders` exclusion is now decided by a plugin
+  probe on the primary rather than its version, so the parity marquee's
+  truncate+message full variant executes IN CI against the repo's own pinned bytes
+  (893/893 locally on the committed image). The `wal2json2_4` option-halt leg is
+  lane-aware: fail-loud if the lever is absent on a pre-15 plugin row, explicit
+  logged skip on 15+ where the 2.4 build cannot exist.
+- **A spurious `publish_candidate` error annotation no longer appears on green CI
+  runs.** The credential-loader rejection tests exercised the loader's
+  `::error::` banner with inherited stderr, so Actions rendered the expected
+  rejection as a failure annotation on every passing run; the tests now capture the
+  output (and assert the banner), keeping the annotation for real release failures
+  only.
 - **Records corrected to match shipped behavior:** ADR-0009's Consequences no longer
   say a wal2json column DROP is invisible until reconnect (the two wire rules catch it
   in stream; the bounded residual and the DROP-batched-with-ADD deferral window are now

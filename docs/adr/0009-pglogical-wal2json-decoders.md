@@ -115,7 +115,8 @@ halt semantics do not change.
 | 10, 11 | present | pglogical 2.x | yes | not in the matrix; documented as untested |
 | 12 | present | pglogical 2.x | yes | a real 12 in the matrix (new row): pgoutput and both plugins on one server |
 | 13, 14 | present | pglogical 2.x | yes | not in the matrix; documented as untested |
-| 15 to 18 | present, tested today | not tested here | not tested here | existing rows; pgoutput only |
+| 15 | present, tested today | a real 15 plugin lane in the matrix (wal2json master `75a4b494`; pglogical 2.4.8) | yes | the 15 plugin row runs the full trio incl. the truncate+message variant; a stock-15 row keeps pgoutput-only coverage |
+| 16 to 18 | present, tested today | not tested here (a plugin-bearing primary of any major runs the trio via the plugin probe — no lane wires one) | not tested here | existing rows; pgoutput only |
 
 Which pglogical release supports which major, and the exact wal2json release that
 introduced each option named above, are read from the two projects' own sources before the
@@ -214,12 +215,13 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   it (`REPLICANT_PG96_URL`; the marquee flunks if the wiring is missing on a pre-15
   plugin row). The truncate + transactional-message variant (messages are PG14+, and
   the pgoutput leg needs `messages: true` plus a sink implementing `handle_message/2`)
-  runs the same way on any 15+ plugin-bearing primary — no CI lane wires one; it was
-  EXECUTED once locally against a real 15.19 with both plugins (wal2json master
-  `75a4b494`, a build newer than the committed 2.6 pin, which predates PG15's
-  `ReorderBufferTXN` change and does not compile there; PG15 also requires every
-  output plugin — pgoutput included — listed in `output_plugin_libraries`), receipt in
-  the development tree's outcome record.
+  runs in CI on the 15 plugin lane: `pg_old.dockerfile` pins wal2json per major
+  (the `wal2json_2_6` tag on pre-15 bases — the committed bytes the 9.6/12 receipts
+  are built on — and master `75a4b494` on 15+, where 2.6 predates PG15's
+  `ReorderBufferTXN` change and does not compile), and the lane's server starts with
+  `output_plugin_libraries=wal2json,pglogical_output,pgoutput` (PG15+ gates EVERY
+  output plugin, pgoutput included). An earlier one-off run against a 15.19 with
+  wal2json `75a4b494` preceded the lane and is retained in the development record.
 
   Receipts, in this repo (per-row `mix test` results on real docker-built servers):
   **CI run 36973967528** on commit `f2537f6` — the binding receipt, all six rows green
@@ -231,7 +233,10 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   the commit carrying this sentence. Local full-geometry corroboration on the BaseLabs
   ephemeral cluster, at the fresh-review repair revision (counts include that round's
   new guard tests): 12 row with the 9.6 secondary wired and `EXPECTED_PG_MAJOR` set —
-  879/16; at the first repair revision the same row measured 875/16 without
+  879/16 (re-verified on images rebuilt from the per-major-pin Dockerfile — the
+  pre-15 substrate bytes are unchanged); 15 plugin row (committed-image bytes,
+  plugin-probe admission, no include flags) — 893/2 with the full variant executing;
+  at the first repair revision the same 12 row measured 875/16 without
   `EXPECTED_PG_MAJOR` and 876/16 with it (the version-behavior test is conditionally
   defined from that var; CI always sets it); 9.6 row — 806/86;
   15 — 878/14; 16 — 878/14; 17 — 880/12 (one transient spill-marquee wait timeout on a

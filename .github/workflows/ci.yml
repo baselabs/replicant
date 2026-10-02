@@ -35,7 +35,13 @@ jobs:
         pg:
           - { major: "9", port: "5609", digest: "sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698", plugins: true }
           - { major: "12", port: "5612", digest: "sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c", plugins: true }
-          - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111" }
+          # The 15 PLUGIN lane: same digest-pinned 15 base, built from the committed
+          # pg_old.dockerfile (wal2json master @ 75a4b494 there — 2.6 does not compile
+          # on 15). PG15+ gates EVERY output plugin, so the run passes
+          # output_plugin_libraries for wal2json, pglogical_output AND pgoutput.
+          - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111", plugins: true, plugin_gucs: "-c output_plugin_libraries=wal2json,pglogical_output,pgoutput" }
+          # The stock 15 row (pgoutput only) keeps its own lane below.
+          - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111", stock: true }
           - { major: "16", port: "5599", digest: "sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5" }
           - { major: "17", port: "5617", digest: "sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449" }
           - { major: "18", port: "5618", digest: "sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941" }
@@ -74,7 +80,8 @@ jobs:
             -p ${{ matrix.pg.port }}:5432 \
             "$IMAGE" \
             -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 \
-            $( [ "${{ matrix.pg.plugins }}" = "true" ] && echo "-c shared_preload_libraries=pglogical" || echo "" )
+            $( [ "${{ matrix.pg.plugins }}" = "true" ] && echo "-c shared_preload_libraries=pglogical" || echo "" ) \
+            $( [ -n "${{ matrix.pg.plugin_gucs }}" ] && echo "${{ matrix.pg.plugin_gucs }}" || echo "" )
           for _ in $(seq 1 30); do
             docker exec pg pg_isready -U postgres && break
             sleep 1
