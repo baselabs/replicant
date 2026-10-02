@@ -300,9 +300,12 @@ on pglogical — ADR-0009), `{:config, :failover_unsupported}`, and
 ## Decoder selection (ADR-0009)
 
 `decoder:` selects the logical-decoding output plugin: `:pgoutput` (the default,
-PostgreSQL 15-18, byte-identical to 1.3.0; the plugin matrix also runs it on 12), `:pglogical` (the `pglogical_output`
-binary protocol, pglogical 2.x, PostgreSQL 9.6-14) or `:wal2json` (JSON format
-version 2, wal2json ≥ 2.6, PostgreSQL 9.6-14). The sink contract, the `commit_lsn`
+PostgreSQL 15-18, byte-identical to 1.3.0; the plugin matrix also runs it on 12 and
+on the 15 plugin lane), `:pglogical` (the `pglogical_output`
+binary protocol, pglogical 2.x) or `:wal2json` (JSON format
+version 2, wal2json ≥ 2.6). The tested plugin lanes are 9.6, 12 and 15 (ADR-0009's
+matrix — on 15 the lane pins a post-2.6 wal2json master commit carrying the PG15
+compile shims). The sink contract, the `commit_lsn`
 watermark, both checkpoint modes and every halt keep their semantics across decoders.
 The table set is named per decoder — `publication:` for pgoutput,
 `replication_sets:` for pglogical, `tables: [{schema, table}]` for wal2json — and the
@@ -326,7 +329,10 @@ remain are all fail-closed, none silent (OBSERVED from the plugins' sources):
   TOASTable column on an update-only table, wire-identical to the unchanged-TOAST
   sentinel) is bounded by the periodic catalog re-read `schema_check_interval`
   (default `30_000` ms, wal2json-only) — detection within one interval, through the
-  same `:destructive` classification.
+  same `:destructive` classification. A DROP committed in the same DDL batch as an
+  ADD is deferred to that same guard-or-reconnect window (the visible ADD rides the
+  append-only drift branch first, so the DROP stays hidden until the next guard
+  tick).
 - **`type_modifier`** carries pgoutput's raw atttypmod where the plugin's stream
   expresses it.
 

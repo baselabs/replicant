@@ -10,9 +10,11 @@ consumer sibling to [`arcadic`](https://github.com/baselabs/arcadic).
 Multitenancy, classification, and Ash resources live one layer up, in the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter.
 
-> **Status:** 1.4.0 is the current release (candidate bytes bound in the release
-> manifest; see CHANGELOG `[1.4.0]`). It adds the plugin decoders — read a
-> PostgreSQL 9.6 to 14 server through its existing `pglogical` or `wal2json`
+> **Status:** 1.4.1 is the current release (see CHANGELOG `[1.4.1]`). It corrects
+> the records and test geometry behind the plugin decoders' parity claim, adds the
+> 15 plugin lane, and fixes the third parallel RI-FULL key-flag path — the plugin
+> decoders themselves arrived in 1.4.0: read a
+> PostgreSQL 9.6 to 15 server through its existing `pglogical` or `wal2json`
 > output plugin with the same sink contract, watermark, and halts
 > (ADR-0009; see CHANGELOG `[1.4.0]`). 1.3.0 hardened the value layer every sink
 > receives — multidimensional arrays of every casted type, locale-honest `money`,

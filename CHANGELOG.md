@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-02
+
 ### Fixed
 
 - **The decoder-parity marquee now actually executes the comparison 1.4.0 claimed.**
@@ -891,7 +893,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.4.1...HEAD
+[1.4.1]: https://github.com/baselabs/replicant/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/baselabs/replicant/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/baselabs/replicant/compare/v1.2.4...v1.3.0
 [1.2.4]: https://github.com/baselabs/replicant/compare/v1.2.3...v1.2.4

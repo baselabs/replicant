@@ -74,7 +74,9 @@ with NULL or a placeholder). A change of replica identity or a dropped column cl
 `:destructive` and halts fail-closed — on every decoder: pgoutput/pglogical re-emit relation
 metadata after DDL, and under wal2json the drop is detected at the change (an insert missing a
 cached column, or a fixed-width column missing from an update) or within one
-`schema_check_interval` (default 30s) for the TOASTable-on-update-only case.
+`schema_check_interval` (default 30s) for the TOASTable-on-update-only case — a DROP
+committed in the same DDL batch as an ADD defers to that same window (the ADD rides
+the append-only drift branch first).
 
 ## 5. Stay tenant-blind
 

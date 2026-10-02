@@ -78,8 +78,9 @@ docker run -d --name replicant_pg16 -e POSTGRES_HOST_AUTH_METHOD=trust \
 
 Point the input below at it (it defaults to `REPLICANT_TEST_URL`, then to the local
 container above). This notebook tours the default `pgoutput` decoder (PostgreSQL
-15-18); a pre-15 server that carries the `pglogical` or `wal2json` output plugin is
-read the same way via `decoder:` — see the feature table at the end.
+15-18); a server that carries the `pglogical` or `wal2json` output plugin (the
+tested lanes are 9.6, 12 and 15) is read the same way via `decoder:` — see the
+feature table at the end.
 
 ```elixir
 default_url = System.get_env("REPLICANT_TEST_URL") || "postgres://postgres@localhost:5599/postgres"
@@ -834,7 +835,7 @@ telemetry, halt-reason, and casting reference:
 | Failover slots (PG17+, HA) | `failover: true` | [README — failover](https://hexdocs.pm/replicant/readme.html#failover-slots-pg17) |
 | Append-log consumers | `sink_kind/0` → `:append_log` + `handle_slot_origin/2` | [README — slot origin](https://hexdocs.pm/replicant/readme.html#slot-origin-for-go-forward-append-consumers) |
 | Destructive-DDL migration window | `handle_schema_change/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
-| Plugin decoders for PostgreSQL 9.6-14 | `decoder: :pglogical` + `replication_sets:` / `decoder: :wal2json` + `tables:` | [README — plugin decoders](https://hexdocs.pm/replicant/readme.html#reading-pre-15-servers-through-pglogical-or-wal2json-adr-0009) |
+| Plugin decoders for PostgreSQL 9.6-15 | `decoder: :pglogical` + `replication_sets:` / `decoder: :wal2json` + `tables:` | [README — plugin decoders](https://hexdocs.pm/replicant/readme.html#reading-pre-15-servers-through-pglogical-or-wal2json-adr-0009) |
 | Keyless-table insert-only streams (wal2json) | `allow_keyless_tables: true` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
 | wal2json dropped-column guard interval | `schema_check_interval: 30_000` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
 
