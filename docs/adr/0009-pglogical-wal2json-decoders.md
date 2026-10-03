@@ -250,7 +250,12 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   15 plugin lane's binding receipt is run `37019950420` (commit `fee13e4` — all seven
   test rows green, the plugin row at 893/2 with the full variant executing; its
   immediate predecessor `37018576121` red on a postgres readiness race the lane's
-  second dice-roll surfaced, fixed by requiring three consecutive readiness probes). Local full-geometry corroboration on the BaseLabs
+  second dice-roll surfaced, fixed by requiring three consecutive readiness probes). The
+  9.6 snapshot leg's binding receipt is run `37122961851` (commit `b481dc8`, 2026-10-03 —
+  all rows green): the leg executes on the PG9 row against its own server (811 passed /
+  86 excluded) and on the PG12 row against the wired 9.6 secondary (881 passed /
+  16 excluded); its skip tag is unreachable on both rows because the workflow sets
+  `REPLICANT_PG96_URL` unconditionally there. Local full-geometry corroboration on the BaseLabs
   ephemeral cluster, at the fresh-review repair revision (counts include that round's
   new guard tests): 12 row with the 9.6 secondary wired and `EXPECTED_PG_MAJOR` set —
   879/16 (re-verified on images rebuilt from the per-major-pin Dockerfile — the
