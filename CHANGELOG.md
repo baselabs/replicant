@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A plugin-decoder snapshot on PostgreSQL 9.6 can adopt its exported snapshot.**
+  `Replicant.QueryBuilder.set_transaction_snapshot/1` admitted only the three-part name
+  PostgreSQL 10 and later export (`%08X-%08X-%d`), but 9.6 exports a two-part name
+  (`%08X-%d`, for example `00004E57-1`). A `decoder: :wal2json` (or `:pglogical`)
+  pipeline with `snapshot: true` on 9.6 therefore failed its back-fill with
+  `:snapshot_failed` and then held at `:snapshot_incomplete`, fail-closed, never
+  delivering a row. The allowlist now admits both forms with the same character class
+  (no quote or whitespace can reach the string literal). A new connected leg
+  (`test/integration/plugin_snapshot_pg96_test.exs`, run on a 9.6 row or with
+  `REPLICANT_PG96_URL`, skipped by ExUnit elsewhere) back-fills under the 9.6 name while
+  a writer commits continuously from before the slot exists until after the snapshot
+  completes, and asserts every row in the table arrives exactly once across snapshot
+  and stream, with rows on both sides of the handoff and every streamed commit above
+  the snapshot watermark. A back-fill that ignores the exported snapshot fails it
+  (observed three of three).
+
 ## [1.4.1] - 2026-10-02
 
 ### Fixed

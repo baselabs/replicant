@@ -403,8 +403,31 @@ defmodule Replicant.QueryBuilderTest do
       assert sql == "SET TRANSACTION SNAPSHOT '00000003-0000DD8A-1'"
     end
 
+    test "adopts a PostgreSQL 9.6 exported-snapshot name (two parts: xid-hex, counter)" do
+      # 9.6 exports "%08X-%d" (observed: "00004E57-1" from CREATE_REPLICATION_SLOT ...
+      # LOGICAL wal2json on 9.6.24); 10+ exports "%08X-%08X-%d".
+      {:ok, sql} = QueryBuilder.set_transaction_snapshot("00004E57-1")
+      assert sql == "SET TRANSACTION SNAPSHOT '00004E57-1'"
+    end
+
     test "rejects a name with a quote/whitespace/injection (string-literal guard)" do
-      for bad <- ["00000003'; DROP--", "00 00", "abc", "'", "1-2-3; DROP", ""] do
+      for bad <-
+            [
+              "00000003'; DROP--",
+              "00 00",
+              "abc",
+              "'",
+              "1-2-3; DROP",
+              "",
+              "1-2; DROP",
+              "1-'",
+              "-1",
+              "1-",
+              "1--2",
+              "1-2-3-4",
+              "1-2\n",
+              "00004E57-1 "
+            ] do
         assert {:error, :invalid_snapshot_name} = QueryBuilder.set_transaction_snapshot(bad)
       end
     end

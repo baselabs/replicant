@@ -16,11 +16,13 @@ defmodule Replicant.QueryBuilder do
   @spec identify_system() :: String.t()
   def identify_system, do: "IDENTIFY_SYSTEM"
 
-  # PG exports a snapshot name as "%08X-%08X-%d". This allowlist forbids quotes and
-  # whitespace so the name is safe inside the SET TRANSACTION SNAPSHOT '<name>' STRING
-  # LITERAL — it is NOT an identifier position, so `Identifier.validate/1` (which rejects
-  # uppercase hex and hyphens) is the WRONG guard here (spec §9).
-  @snapshot_name ~r/\A[0-9A-Fa-f]{1,16}-[0-9A-Fa-f]{1,16}-\d{1,10}\z/
+  # PG 10+ exports a snapshot name as "%08X-%08X-%d"; PG 9.6 exports "%08X-%d" (observed
+  # "00004E57-1" from CREATE_REPLICATION_SLOT ... LOGICAL wal2json on 9.6.24), so the
+  # middle hex group is optional. This allowlist forbids quotes and whitespace so the name
+  # is safe inside the SET TRANSACTION SNAPSHOT '<name>' STRING LITERAL — it is NOT an
+  # identifier position, so `Identifier.validate/1` (which rejects uppercase hex and
+  # hyphens) is the WRONG guard here (spec §9).
+  @snapshot_name ~r/\A[0-9A-Fa-f]{1,16}(?:-[0-9A-Fa-f]{1,16})?-\d{1,10}\z/
 
   @doc """
   Replication command that starts streaming WAL from `start_lsn` for the publication set.
