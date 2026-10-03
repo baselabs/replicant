@@ -78,7 +78,9 @@ separate.
     mix compile --warnings-as-errors
     mix test
     mix dialyzer
-    # or all quality gates at once:
+    # or three of those gates at once — the alias is exactly
+    # `format --check-formatted` + `credo --strict` + `dialyzer`;
+    # `mix compile --warnings-as-errors` and `mix test` are NOT in it:
     mix quality
 
 All gates must pass before a commit/PR. Update `CHANGELOG.md` under
@@ -114,7 +116,13 @@ Bypass with `git commit --no-verify` (CI still enforces both on push).
   the 12 primary; the marquee flunks if the wiring is missing), and the pgoutput
   reference runs on the same primary (core variant on 10-14; the truncate+message
   variant on 15+, which needs PG14+ messages and a plugin-bearing server no CI lane
-  wires today).
+  wires today). A connected snapshot leg
+  (`test/integration/plugin_snapshot_pg96_test.exs`) runs wherever a real pre-10 server
+  is wired (`REPLICANT_PG96_URL` when set, else a pre-10 `REPLICANT_TEST_URL` primary —
+  CI's 9.6 and 12 rows; skipped as unrunnable elsewhere): a `decoder: :wal2json` +
+  `snapshot: true` pipeline back-fills under 9.6's two-part exported-snapshot name
+  (`%08X-%d`; 10+ export three parts) while a writer commits across the handoff, and
+  every table row must arrive exactly once across snapshot and stream.
 - **Supported PostgreSQL versions: 9.6, 12, 15, 16, 17, 18.** The 9.6, 12 and
   15-plugin rows exist for the plugin decoders (ADR-0009): their images are built by
   `test/support/pg_old.dockerfile` (digest-pinned bases + pglogical 2.4.8 + wal2json

@@ -174,7 +174,11 @@ CI's 12 plugin row (pgoutput vs `pglogical` vs `wal2json` on the 12 primary, plu
 plugins again on a real 9.6 secondary started beside it) in
 `test/integration/decoder_parity_test.exs`; the truncate + transactional-message
 variant runs the same way on any 15+ server carrying the plugins (ADR-0009 records the
-one such run and why CI wires none).
+one such run and why CI wires none). The same 9.6 secondary also carries a connected
+snapshot leg (`test/integration/plugin_snapshot_pg96_test.exs`): PostgreSQL 9.6 exports
+its snapshot name in a two-part form (`00004E57-1`; 10+ export three parts), and a
+`snapshot: true` back-fill adopts it, handing off to streaming gap-free and dup-free
+while a writer commits across the handoff.
 
 **Keyless tables never stream silently missing updates.** wal2json drops an
 update/delete on a table with no replica-identity index and `REPLICA IDENTITY ≠ FULL`

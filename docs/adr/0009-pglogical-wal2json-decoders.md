@@ -97,7 +97,11 @@ halt semantics do not change.
    them. `messages: true` on wal2json maps the `M` action to `%Message{}` with the same
    transactional split as ADR-0001. `snapshot: true` and `snapshot: [mode: :incremental]`
    work with every decoder: `EXPORT_SNAPSHOT` is a slot option, not a plugin one, and the
-   table set for the reader comes from the decoder's discovery query.
+   table set for the reader comes from the decoder's discovery query. The exported
+   snapshot's NAME diverges on 9.6 (`%08X-%d`, two parts; 10+ export
+   `%08X-%08X-%d`), and the back-fill adopts either form — through 1.4.1 the adoption
+   allowlist admitted only the three-part name, so a 9.6 snapshot halted
+   `:snapshot_failed` (see the plugin-fact entry below).
 9. **Server version gates.** On `server_version_num < 100000` the pgoutput decoder is
    refused `{:config, :decoder_unsupported_on_server}` before slot creation. The slot
    status query gains a tier below 130000 that selects no invalidation column (`wal_status`
@@ -111,7 +115,7 @@ halt semantics do not change.
 
 | PostgreSQL | pgoutput | pglogical_output | wal2json | Tested by |
 |---|---|---|---|---|
-| 9.6 | absent | pglogical 2.x | yes | a real 9.6 with both plugins in the matrix (new row) |
+| 9.6 | absent | pglogical 2.x | yes | a real 9.6 with both plugins in the matrix (new row); the connected snapshot leg (`plugin_snapshot_pg96_test.exs`) back-fills under 9.6's two-part exported-snapshot name |
 | 10, 11 | present | pglogical 2.x | yes | not in the matrix; documented as untested |
 | 12 | present | pglogical 2.x | yes | a real 12 in the matrix (new row): pgoutput and both plugins on one server |
 | 13, 14 | present | pglogical 2.x | yes | not in the matrix; documented as untested |
@@ -194,6 +198,19 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   suppresses them on the v1 path exactly as the streamed (proto-v2) path always had —
   no sink call, a state mirror acks the proven-empty WAL, an `:append_log` sink does not
   (Rule 3's append clause). On PG15+ nothing changes (the server skips them).
+- **PostgreSQL 9.6 exports a two-part exported-snapshot name** — `CREATE_REPLICATION_SLOT
+  ... LOGICAL` on 9.6 exports `%08X-%d` (OBSERVED live: `00004E57-1`, wal2json on
+  9.6.24), where 10 and later export `%08X-%08X-%d`. The §8 snapshot claim therefore does
+  not hold on 9.6 by slot options alone: the back-fill must ADOPT the exported name in
+  `SET TRANSACTION SNAPSHOT`, and through 1.4.1 the name allowlist admitted only the
+  three-part form — a 9.6 `snapshot: true` back-fill failed `:snapshot_failed` and held
+  `:snapshot_incomplete`, fail-closed, delivering nothing. RESOLVED 2026-10-03: the
+  allowlist admits both forms with the same character class (no quote, backslash or
+  whitespace reaches the string literal; `Identifier.validate/1` stays the wrong guard
+  there — it rejects uppercase hex and hyphens), and a connected leg
+  (`test/integration/plugin_snapshot_pg96_test.exs`) back-fills on a real 9.6 while a
+  writer commits across the handoff, asserting every row arrives exactly once across
+  snapshot and stream — a back-fill that ignores the exported snapshot fails it.
 
 ## Acceptance
 
