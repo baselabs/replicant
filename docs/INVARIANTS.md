@@ -100,5 +100,14 @@ that targets the core library; put them one layer up.
 | Incremental snapshot | `snapshot: [mode: :incremental]` | sink-owned effect-once chunks; lib-mode dup ≤ 1 chunk |
 | Spilled oversized transaction | `streaming: [spill: [...]]` | **inherits the active checkpoint-mode guarantee** (effect-once sink-owned; at-least-once lib-mode — spill adds no duplicates), delivered as a single-pass lazy `changes` |
 
+Snapshot records contain only published columns, in physical column order. Both
+readers honor pgoutput column lists on PostgreSQL 15+ and pglogical `set_att_list`;
+wal2json retains all configured-table columns. Different lists for a shared table
+halt `:snapshot_column_list_conflict` before any snapshot row is read or delivered.
+No unpublished key is added to a record or keyset bound. Without the complete PK,
+incremental readers use whole-table windows; sinks must support the resulting
+keyless shape. PostgreSQL rejects UPDATE/DELETE when a publication omits required
+replica-identity columns. Column filtering does not implement row filtering.
+
 See the [README](../README.md) for the full configuration reference and the [ROADMAP](ROADMAP.md)
 for the feature tracker.

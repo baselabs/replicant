@@ -144,6 +144,16 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `max_inflight_lag` (default 64 MiB) bounds how far the received WAL frontier may
   run ahead of the durable checkpoint before the sink is "too slow"
   (see the halt-reason table below).
+- **Snapshot column lists** — both readers project only published columns in physical
+  order: pgoutput's effective `attnames` on PostgreSQL 15+ (all columns before 15),
+  pglogical's `set_att_list` for the requested local sets, and all configured-table
+  columns for wal2json, which has no publication column lists. Differing lists for
+  one table halt `:snapshot_column_list_conflict` before reading snapshot rows;
+  identical lists are accepted. This filters columns, not publication row predicates.
+  Keys are never added: PostgreSQL rejects UPDATE/DELETE if the publication omits
+  required replica-identity columns. INSERT-only lists may omit keys; the sink must
+  handle that shape, and incremental readers use whole-table windows when the full
+  PK is unavailable.
 - **`Replicant.Snapshotter`** — reads a consistent snapshot of the publication's
   tables at the `EXPORT_SNAPSHOT` LSN (a `REPEATABLE READ` cursor on a separate
   connection) and pushes `%Change{op: :snapshot}` batches to the sink, behind a
@@ -277,6 +287,7 @@ durable checkpoint (loss = 0; duplicates bounded by the mode's contract).
 | `[:replicant, :checkpoint_store, :failed]` | the lib-mode checkpoint store faulted past its retry budget (or a permanent schema/config fault) | restore the store, fix the schema/config; restart |
 | `[:replicant, :schema_change, :halted]` | a destructive schema change (dropped column, replica-identity change, narrowing type) — or `handle_schema_change/2` vetoed | adapt the sink (or implement the callback to accept), then restart |
 | `[:replicant, :snapshot, :failed]` with `:snapshot_table_contended` | a backfilling table stayed hot through three contention attempts | backfill during a quieter window, or shrink `chunk_rows` |
+| `[:replicant, :snapshot, :failed]` with `:snapshot_column_list_conflict` | requested publications or local replication sets give one table different column lists | align the lists; for a failed initial snapshot, drop its incomplete slot before retrying |
 | `[:replicant, :snapshot, :failed]` (other) | the snapshot reader faulted (incl. connection faults during a backfill) | check source connectivity; restart — the backfill resumes from durable progress |
 | `[:replicant, :stream, :spill_exhausted]` | a spilled transaction exceeded `max_spill_bytes` | free disk / raise `max_spill_bytes` / shrink the oversized transaction |
 | `:decode_failure` | genuinely-malformed WAL/cast input at the value-free boundary | check upstream WAL/plugin integrity — this is never ordinary data |

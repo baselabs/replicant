@@ -27,14 +27,25 @@ Two facts were probe-established on live PG16 during design:
 
 ## Decision
 
+- **Column-list correction (October 10, 2026).** Table membership is a union;
+  column lists are not. PostgreSQL 15+ column discovery retains DISTINCT effective
+  `attnames` per table and projects only those attributes in `attnum` order.
+  Identical lists collapse; conflicting lists halt `:snapshot_column_list_conflict`
+  before snapshot delivery in either mode. The pre-15 query remains version-selected
+  because that catalog column does not exist. OBSERVED on PostgreSQL 18.6 via
+  `pg_logical_slot_peek_binary_changes`: differing lists, including a partial list
+  plus an unrestricted publication, produce `cannot use different column lists for
+  table "public.rep_column_probe" in different publications`. The live regression
+  is `test/integration/snapshot_columns_test.exs`.
 - **`publication: String | [String]`.** A single string is the **byte-unchanged default path**
   (the published 0.1.0 START_REPLICATION is reproduced exactly); a list enables multi-publication.
   Every name is validated via `Identifier.validate/1` and normalized to a list. (`config.ex`.)
-- **Discovery queries drive from a DISTINCT table set:**
+- **Table and PK discovery queries drive from a DISTINCT table set:**
   `(SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)) p`
   THEN join — collapsing the pubname dimension before the joins so `array_agg` never duplicates
   PK/column entries (decision #19; probe-proven `pk_raw = ["id"]` for a shared table).
-  (`query_builder.ex` `publication_tables/1`, `pk_columns/0`, `table_columns/0`.)
+  (`query_builder.ex` `publication_tables/1`, `pk_columns/0`; column discovery follows
+  the correction above.)
 - **A new fail-closed connect-chain `:publication_check` step.** After the recovery check and
   before slot invalidation/classification, run `publication_exists` (`pubname = ANY(...)`) and
   **halt if the found set ≠ the requested set** — because START_REPLICATION would otherwise

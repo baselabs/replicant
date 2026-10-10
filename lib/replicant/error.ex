@@ -21,6 +21,7 @@ defmodule Replicant.Error do
           | :spill_io_failed
           | :spill_exhausted
           | :snapshot_failed
+          | :snapshot_column_list_conflict
           | :snapshot_table_contended
           | :snapshot_progress_invalid
           | :checkpoint_store_failed

@@ -187,6 +187,10 @@ defmodule Replicant.Sink do
   Optional. Persist a batch of snapshot (backfill) rows for `context.table` — each a
   `%Replicant.Change{op: :snapshot}` — upserting by table PK.
 
+  Records contain only published columns. An INSERT-only publication can omit its
+  key; the sink must support that keyless shape. The reader never adds unpublished
+  keys and uses a whole-table incremental window when any PK column is excluded.
+
   This callback serves BOTH snapshot modes with mode-conditional obligations
   (spec §6.1 — normative):
 

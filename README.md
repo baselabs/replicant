@@ -326,6 +326,22 @@ requires the sink to also implement `handle_snapshot/2` (batch upsert; clear the
 checkpoint); a mid-snapshot crash halts fail-closed (`:snapshot_incomplete`) for an
 operator to drop the slot and retry.
 
+**Snapshot columns.** Both snapshot modes read only the published column set, in
+physical table order. On PostgreSQL 15+, pgoutput uses each requested publication's
+effective column list; older servers have no column lists. Identical lists for a
+shared table are accepted; differing lists, including an unrestricted publication
+combined with a partial list, halt `:snapshot_column_list_conflict` before any
+snapshot rows are read or delivered. pglogical applies `set_att_list` from the
+requested local replication sets and uses the same conflict refusal. wal2json has
+table filters but no publication column lists, so it retains all configured-table
+columns. Snapshot column filtering does not apply publication row filters.
+
+Key columns are never added to that projection. PostgreSQL refuses UPDATE/DELETE
+when the published list omits replica-identity columns; INSERT-only lists can omit
+them. If the complete primary key is unavailable, incremental snapshots use the
+existing whole-table window instead of keyset pagination. Sinks must support that
+keyless record shape; Replicant does not manufacture a missing key.
+
 **Resumable incremental snapshot.** For large tables where an all-or-nothing `snapshot: true`
 (a crash at 99% of a multi-hour COPY redoes everything) is the adoption blocker, opt into the
 **incremental** mode instead:

@@ -18,6 +18,11 @@ defmodule Replicant.Snapshotter.Incremental do
   unit with `first?: true` on the attempt's FIRST batch. Three contention-discarded
   attempts halt `:snapshot_table_contended`; reconnect resets never consume the budget.
 
+  Column discovery shares `Replicant.Snapshotter`'s publication filtering and
+  `:snapshot_column_list_conflict` refusal. Keyset pagination requires every PK
+  column to be published; otherwise the whole-table window reads only the published
+  projection. Neither the row nor its pagination bound adds an unpublished key.
+
   ## Resume is re-discovered, never token-trusted (Critical Rule 2)
 
   On BOTH the initial resume and every reconnect-reload, table metadata (`qualified`,
@@ -68,6 +73,7 @@ defmodule Replicant.Snapshotter.Incremental do
           required(:connection) => keyword(),
           required(:publication) => [String.t()],
           optional(:tables) => [{String.t(), String.t()}] | nil,
+          optional(:replication_sets) => [String.t()] | nil,
           required(:sink) => module(),
           required(:mode) => :sink_owned | :lib,
           required(:snapshot) => keyword(),
@@ -159,7 +165,7 @@ defmodule Replicant.Snapshotter.Incremental do
   defp backfill(args) do
     do_backfill(args)
   rescue
-    _ -> {:error, :snapshot_failed}
+    e -> {:error, Replicant.Snapshotter.snapshot_error(e).reason}
   catch
     _kind, _reason -> {:error, :snapshot_failed}
   end
@@ -206,19 +212,18 @@ defmodule Replicant.Snapshotter.Incremental do
   # Tables WITHOUT a PK come from the full table set minus the pk_columns result (spec
   # §6.4), queued LAST (their whole-table windows are the contention-sensitive ones).
   defp discover(db, args) do
+    col_rows = Replicant.Snapshotter.table_columns(db, args)
+
     case Map.get(args, :tables) do
       nil ->
         pk_rows = Postgrex.query!(db, QueryBuilder.pk_columns(), [args.publication]).rows
-        col_rows = Postgrex.query!(db, QueryBuilder.table_columns(), [args.publication]).rows
         {:ok, all_sql} = QueryBuilder.publication_tables(args.publication)
         all_rows = Postgrex.query!(db, all_sql, [args.publication]).rows
         SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
 
       tables ->
         {:ok, pk_sql} = QueryBuilder.pk_columns_for(tables)
-        {:ok, col_sql} = QueryBuilder.table_columns_for(tables)
         pk_rows = Postgrex.query!(db, pk_sql, []).rows
-        col_rows = Postgrex.query!(db, col_sql, []).rows
         all_rows = Enum.map(tables, fn {s, t} -> [s, t, "#{s}.#{t}"] end)
         SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
     end
@@ -261,6 +266,13 @@ defmodule Replicant.Snapshotter.Incremental do
 
   defp keyed_ref(schema, table, qualified, pk_raw, pk_quoted, cols_by_q) do
     cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}})
+
+    # INSERT-only publications can omit the PK. Never project its raw value for a
+    # keyset bound or deliver it: use the existing whole-table window in that case.
+    {pk_raw, pk_quoted} =
+      if Enum.all?(pk_raw, &Map.has_key?(cmeta.col_type_names, &1)),
+        do: {pk_raw, pk_quoted},
+        else: {[], []}
 
     %{
       schema: schema,

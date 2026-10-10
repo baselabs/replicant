@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-10-10
+
+### Security
+
+- **Snapshot reads respect publication column lists.** Initial and incremental
+  snapshots no longer read columns outside the publication column list. PostgreSQL
+  15+ pgoutput discovery uses `pg_publication_tables.attnames` in physical column
+  order; older servers retain the version-selected unrestricted query. pglogical
+  discovery honors `pglogical.replication_set_table.set_att_list`; wal2json retains
+  all configured-table columns because it has no publication column-list facility.
+  Conflicting multi-publication or replication-set column lists halt with the
+  value-free `:snapshot_column_list_conflict` error before any snapshot row is read
+  or delivered. Identical lists are accepted, never combined into a broader list.
+  Unpublished key columns are never added to the projection: incremental snapshots
+  use the whole-table path when the complete primary key is unavailable. PostgreSQL
+  refuses UPDATE/DELETE when a publication omits required replica-identity columns.
+
 ## [1.4.2] - 2026-10-03
 
 ### Fixed
@@ -913,7 +930,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.4.2...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.4.3...HEAD
+[1.4.3]: https://github.com/baselabs/replicant/compare/v1.4.2...v1.4.3
 [1.4.2]: https://github.com/baselabs/replicant/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/baselabs/replicant/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/baselabs/replicant/compare/v1.3.0...v1.4.0

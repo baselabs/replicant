@@ -543,8 +543,8 @@ defmodule Replicant.QueryBuilder do
   A publication table with NO primary key returns no row here (PK-less fallback,
   spec §6.4). Row shape: `[schemaname, tablename, qualified, pk_raw, pk_quoted]`.
 
-  Per-column TYPE oids come from `table_columns/0` (the full column set already covers
-  the PK columns), so no per-PK type array is duplicated here.
+  Per-column TYPE oids come from `table_columns/1`. The reader may use this PK for
+  pagination only when ALL its columns are inside that published projection.
   """
   @spec pk_columns() :: String.t()
   def pk_columns do
@@ -561,8 +561,7 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  Query returning, per publication table, ALL its non-dropped user columns
-  (`attnum > 0 AND NOT attisdropped`, the `SELECT *` column set) ordered by `attnum` —
+  Query returning each publication table's published columns ordered by `attnum` —
   the raw `attname` (the `%Change{}.record` string key and the result column name), the
   server-quoted form via `quote_ident` (the ONLY form interpolated into the keyset/keyless
   `::text` projection — Critical Rule 2, the `format('%I')` precedent), and each column's
@@ -570,36 +569,56 @@ defmodule Replicant.QueryBuilder do
   and casts the `<col>::text` value through the SAME `Casting.Types.cast_record/2` path the
   stream uses, so snapshot and stream deliver byte-identical `%Change{}.record` values for
   EVERY column (spec §2 convergence — the F1 fix generalized from PK-only to all columns).
-  Publication name is bound `$1`. Row shape:
+  PostgreSQL 15+ uses the effective `pg_publication_tables.attnames` list. Earlier
+  servers have no column lists and use all non-dropped user columns. The caller
+  must supply the probed server version. Publication names are bound `$1`. Different
+  lists produce separate rows for the same table; the reader MUST reject those
+  before reading any table data. Identical lists produce one row. Row shape:
   `[schemaname, tablename, qualified, col_raw, col_quoted, col_type_oids]`.
   """
-  @spec table_columns() :: String.t()
-  def table_columns do
+  @spec table_columns(non_neg_integer()) :: String.t()
+  def table_columns(server_version_num \\ 150_000) when is_integer(server_version_num) do
+    {published, filter, grouping} =
+      if server_version_num >= 150_000 do
+        {"SELECT DISTINCT schemaname, tablename, attnames FROM pg_publication_tables WHERE pubname = ANY($1)",
+         " AND a.attname = ANY(p.attnames)", ", p.attnames"}
+      else
+        {"SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)",
+         "", ""}
+      end
+
     "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
       "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
       "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
       "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
-      "FROM (SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)) p " <>
+      "FROM (#{published}) p " <>
       "JOIN pg_class c ON c.relname = p.tablename " <>
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
       "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-      "GROUP BY p.schemaname, p.tablename"
+      filter <> " GROUP BY p.schemaname, p.tablename" <> grouping
   end
 
   @doc """
-  The `table_columns/0` row shape for an EXPLICIT table list (the pglogical/wal2json
-  decoders' snapshot path, ADR-0009 §8): same columns, same `attnum` order, but the
+  The `table_columns/1` row shape for an EXPLICIT table list (the pglogical/wal2json
+  decoders' snapshot path, ADR-0009 §8): same `attnum` order, but the
   table set comes from the caller (`VALUES` — both parts of every pair are
-  `Identifier.validate`d) instead of `pg_publication_tables`.
+  `Identifier.validate`d) instead of `pg_publication_tables`. For pglogical, pass
+  replication sets as the second argument and bind them as `$1`: `set_att_list`
+  restricts the projection per local set. Identical effective projections deduplicate;
+  conflicting ones remain separate rows for the reader's refusal. With no sets
+  (wal2json), all non-dropped columns remain selected.
   """
-  @spec table_columns_for([{String.t(), String.t()}]) ::
+  @spec table_columns_for([{String.t(), String.t()}], [String.t()] | nil) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
-  def table_columns_for(tables) when is_list(tables) and tables != [] do
+  def table_columns_for(tables, replication_sets \\ nil)
+
+  def table_columns_for(tables, replication_sets) when is_list(tables) and tables != [] do
     with :ok <- ensure_valid_pairs(tables) do
       values = table_values(tables)
+      {sets_join, filter, grouping} = snapshot_set_columns(replication_sets)
 
       {:ok,
-       "SELECT n.nspname AS schemaname, c.relname AS tablename, " <>
+       "SELECT DISTINCT n.nspname AS schemaname, c.relname AS tablename, " <>
          "format('%I.%I', n.nspname, c.relname) AS qualified, " <>
          "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
          "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
@@ -607,12 +626,22 @@ defmodule Replicant.QueryBuilder do
          "FROM (VALUES #{values}) AS p0(nsp, rel) " <>
          "JOIN pg_namespace n ON n.nspname = p0.nsp " <>
          "JOIN pg_class c ON c.relname = p0.rel AND c.relnamespace = n.oid " <>
+         sets_join <>
          "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-         "GROUP BY n.nspname, c.relname"}
+         filter <> " GROUP BY n.nspname, c.relname" <> grouping}
     end
   end
 
-  def table_columns_for(_other), do: {:error, :invalid_identifier}
+  def table_columns_for(_other, _sets), do: {:error, :invalid_identifier}
+
+  defp snapshot_set_columns(nil), do: {"", "", ""}
+
+  defp snapshot_set_columns(sets) when is_list(sets) do
+    {"JOIN pglogical.replication_set_table r ON r.set_reloid = c.oid " <>
+       "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
+       "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id ",
+     " AND (r.set_att_list IS NULL OR a.attname = ANY(r.set_att_list))", ", r.set_id"}
+  end
 
   @doc """
   The `pk_columns/0` row shape for an EXPLICIT table list (the pglogical/wal2json

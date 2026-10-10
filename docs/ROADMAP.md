@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-09-28 · **Latest published:** `v1.3.0` (tagged) · **Candidate:** none · **Branch:** `main`
+**Updated:** 2026-10-10 · **Release base:** `v1.4.2` (`8bf47a3`) · **Preparing:** `1.4.3` (digest binding and publication pending)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,26 +15,12 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.3.0 is the latest published release**, on Hex and tagged `v1.3.0` (the
-  1.3.0 remediation release: full multidim-array casting, locale-honest money, lossless
-  timetz, raising-free `lsn_from_string/1`, signed `atttypmod`, decoder strictness, and the
-  complete telemetry/halt/casting reference docs; see CHANGELOG `[1.3.0]` and ADR-0008). Prior:
-  1.2.4 (docs/examples release with no library API change). It
-  is a docs/examples release with no library API change: the docker-compose reference
-  example (`examples/replication_pipeline` — a Postgres→Postgres bridge with an effect-once
-  sink, receipts ledger, session-identity binding, and liveness healthcheck) plus its
-  `reference-example` CI canary, with the examples' READMEs shipped in the Hex package;
-  see CHANGELOG `[1.2.4]`. Version 1.2.3
-  keeps append-log acknowledgements bound to the durable delivered checkpoint while preserving
-  filtered-WAL idle advancement for state mirrors; see CHANGELOG `[1.2.3]`. Version 1.2.2
-  closes the incremental-backfill restart gap before the first chunk commits by adding an
-  explicit durable pending state and resuming discovery from the live slot origin. Version
-  1.2.1 bounds keyed incremental-snapshot contention after
-  three discarded attempts and carries the post-publication package-identity correction.
-  Version 1.2.0
-  carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed telemetry shapes,
-  logical-message value-safety, the `handle_slot_origin/2` callback, and proven PostgreSQL
-  15–18 support); 1.0.0 shipped at `v1.0.0`.
+- **`replicant` 1.4.3 release preparation:** snapshot column exposure fix for
+  pgoutput and pglogical, including conflict refusal and unpublished-key handling.
+  Source version and security notes are prepared; candidate digest binding and
+  publication remain coordinator steps. The base is the 1.4.2 release at `8bf47a3`,
+  which fixes PostgreSQL 9.6 exported-snapshot names; 1.4.0 introduced pglogical and
+  wal2json decoders. See CHANGELOG and ADR-0009 for prior release evidence.
 - **AshReplicant compatibility — OBSERVED, September 21, 2026:** `rg -n`/`sed` reads of
   the owner's `mix.exs`, `mix.lock`, and `CHANGELOG.md` show source version 1.2.0,
   declared Replicant range `>= 1.2.3 and < 2.0.0-0`, and committed Replicant lock 1.2.3.

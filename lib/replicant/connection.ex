@@ -651,6 +651,7 @@ defmodule Replicant.Connection do
       connection: state.connection,
       publication: state.publication,
       tables: decoder_discovered(state),
+      replication_sets: decoder_sets(state),
       sink: state.sink,
       mode: if(lib_mode?(state), do: :lib, else: :sink_owned),
       reply_to: self()
@@ -1316,9 +1317,10 @@ defmodule Replicant.Connection do
     end
   end
 
-  def handle_info({:snapshot_failed, _error}, %{step: :snapshotting} = state) do
-    Replicant.Supervisor.halt(state.slot_name, {:snapshot, :snapshot_failed})
-    {:disconnect, :snapshot_failed}
+  def handle_info({:snapshot_failed, error}, %{step: :snapshotting} = state) do
+    reason = Replicant.Snapshotter.snapshot_error(error).reason
+    Replicant.Supervisor.halt(state.slot_name, {:snapshot, reason})
+    {:disconnect, reason}
   end
 
   # The paced-retry timer fired while a fault episode is still active (store_retry_count > 0):
@@ -2045,6 +2047,7 @@ defmodule Replicant.Connection do
         connection: state.connection,
         publication: state.publication,
         tables: decoder_discovered(state),
+        replication_sets: decoder_sets(state),
         sink: state.sink,
         mode: if(lib_mode?(state), do: :lib, else: :sink_owned),
         snapshot: state.snapshot,

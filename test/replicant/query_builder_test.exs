@@ -518,7 +518,7 @@ defmodule Replicant.QueryBuilderTest do
   end
 
   describe "table_columns/0" do
-    test "discovers ALL non-dropped columns ordered by attnum with server-quoted names + type oids" do
+    test "discovers published columns ordered by attnum with server-quoted names + type oids" do
       sql = QueryBuilder.table_columns()
       assert sql =~ "pg_attribute"
       assert sql =~ "attnum > 0"

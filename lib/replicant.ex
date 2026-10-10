@@ -110,6 +110,13 @@ defmodule Replicant do
   discovery from the live slot origin after a pre-chunk crash. Both snapshot modes are
   mutually exclusive with `go_forward_only: true`.
 
+  Both modes read only published columns in physical order: pgoutput column lists
+  on PostgreSQL 15+, pglogical replication-set column lists, or all configured-table
+  columns for wal2json. Different lists for one table halt
+  `:snapshot_column_list_conflict` before snapshot delivery. Unpublished keys are
+  never added; incremental backfills use a whole-table window if the complete PK
+  is unavailable. Publication row filters are not applied by snapshot readers.
+
   Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` includes
   `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`,
   plus the start-gate rejections `:conflicting_start_mode`, `:snapshot_unsupported`,

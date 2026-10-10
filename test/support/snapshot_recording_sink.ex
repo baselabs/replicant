@@ -32,10 +32,21 @@ defmodule Replicant.Test.SnapshotRecordingSink do
   end
 
   @impl true
-  def handle_snapshot(changes, _context) do
-    Agent.update(__MODULE__, fn state -> %{state | snapshot: state.snapshot ++ changes} end)
+  def handle_snapshot(changes, context) do
+    Agent.update(__MODULE__, fn state ->
+      %{
+        state
+        | snapshot: state.snapshot ++ changes,
+          progress: Map.get(context, :progress, state.progress),
+          complete?: Map.get(context, :backfill_complete?, state.complete?)
+      }
+    end)
+
     :ok
   end
+
+  @impl true
+  def snapshot_progress, do: {:ok, Agent.get(__MODULE__, & &1.progress)}
 
   @impl true
   def handle_snapshot_complete(lsn) do
@@ -43,5 +54,5 @@ defmodule Replicant.Test.SnapshotRecordingSink do
     {:ok, lsn}
   end
 
-  defp initial, do: %{snapshot: [], txns: [], watermark: nil, complete?: false}
+  defp initial, do: %{snapshot: [], txns: [], watermark: nil, complete?: false, progress: nil}
 end

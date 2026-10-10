@@ -299,6 +299,19 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
 
 ## Consequences
 
+- **Snapshot column correction (October 10, 2026).** Both readers use
+  `pglogical.replication_set_table.set_att_list` for the requested local sets.
+  OBSERVED in the pglogical 2.4.8 SQL schema: the stored field is `set_att_list
+  text[]`; the effective-list function calls its output `att_list`. Identical
+  effective projections deduplicate; Replicant refuses conflicting set lists with
+  `:snapshot_column_list_conflict`, as an explicit snapshot policy instead of
+  combining columns. This is stricter than pglogical's set combination behavior.
+  wal2json's documented parameters provide table filters, not publication column
+  lists, so its snapshot behavior remains all configured-table columns. Unpublished
+  PK columns are never added for pagination; either reader preserves the published
+  projection, and incremental backfills use whole-table windows when necessary.
+  The connected regression is `test/integration/pglogical_snapshot_columns_test.exs`;
+  it requires a server carrying pglogical and is skipped when unavailable.
 - Sinks see no new struct, callback or field; a sink written for pgoutput runs unchanged
   against a 9.6 server. The guarantees table in `docs/INVARIANTS.md` applies per checkpoint
   mode, not per decoder.

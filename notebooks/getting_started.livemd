@@ -598,6 +598,14 @@ at the snapshot LSN, gap-free and dup-free. A snapshot-capable sink adds
 `handle_snapshot/2` (upsert a batch; clear the table on `first_for_table?`) and
 `handle_snapshot_complete/1` (persist the handoff checkpoint).
 
+Both snapshot modes read only published columns in physical order. PostgreSQL 15+
+publication column lists and pglogical replication-set column lists restrict the
+projection; wal2json retains all configured-table columns. Conflicting lists for
+one table halt `:snapshot_column_list_conflict` before snapshot delivery. Keys are
+never added to the projection: if the complete primary key is unpublished, the
+incremental reader uses a whole-table window and the sink must handle keyless rows.
+PostgreSQL refuses UPDATE/DELETE when required replica-identity columns are omitted.
+
 ```elixir
 defmodule LbSnapshotSink do
   @moduledoc false
