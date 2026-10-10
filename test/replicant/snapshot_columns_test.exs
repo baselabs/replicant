@@ -54,9 +54,15 @@ defmodule Replicant.SnapshotColumnsUnitTest do
     assert Snapshotter.snapshot_error(error).reason == :invalid_identifier
   end
 
-  test "table_columns requires an explicit probed server version" do
-    refute {:table_columns, 0} in QueryBuilder.__info__(:functions)
+  test "snapshots read the version-aware projection, never the 1.4.x census" do
+    # table_columns/0 is restored for 1.4.x callers (1.5.1); no reader may use it.
+    assert {:table_columns, 0} in QueryBuilder.__info__(:functions)
     assert {:table_columns, 1} in QueryBuilder.__info__(:functions)
+
+    for path <- ["lib/replicant/snapshotter.ex", "lib/replicant/snapshotter/incremental.ex"] do
+      refute File.read!(path) =~ ~r/QueryBuilder\.table_columns\(\)/
+      refute File.read!(path) =~ ~r/QueryBuilder\.table_columns_for\([^,()]+\)/
+    end
   end
 
   test "snapshot halt reason is observable at the supervisor boundary" do

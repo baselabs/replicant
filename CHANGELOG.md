@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.1] - Unreleased
+
+### Fixed
+
+- Restore `Replicant.QueryBuilder.table_columns/0` and the six-column row shape of
+  `table_columns_for/1`, byte for byte as in 1.4.2. 1.5.0 removed the first and
+  widened the second, which broke callers that rely on them, including
+  `AshReplicant.Coverage` 1.6.2 (`UndefinedFunctionError` at slot activation). Both
+  are census queries over every non-dropped column and are now documented as
+  deprecated; no snapshot path uses them. Snapshots keep the 1.5.0 guarantee
+  through `table_columns/1` and `table_columns_for/3`.
+
 ## [1.5.0] - 2026-10-10
 
 ### Security

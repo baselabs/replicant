@@ -561,6 +561,30 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
+  The 1.4.x census query: every non-dropped column of each table published by the
+  given publications, all columns regardless of a publication column list, in the
+  1.4.x row shape `[schemaname, tablename, qualified, col_raw, col_quoted,
+  col_type_oids]`. Kept unchanged for existing callers (for example
+  `AshReplicant.Coverage`). Snapshots never use it: they read
+  `table_columns/1`, which applies the column list, generated-column and row-filter
+  rules for the probed server version.
+  """
+  @doc deprecated:
+         "Use table_columns/1 with the probed server_version_num for the published projection."
+  @spec table_columns() :: String.t()
+  def table_columns do
+    "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
+      "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
+      "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
+      "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
+      "FROM (SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)) p " <>
+      "JOIN pg_class c ON c.relname = p.tablename " <>
+      "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
+      "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+      "GROUP BY p.schemaname, p.tablename"
+  end
+
+  @doc """
   Query returning each publication table's published columns ordered by `attnum` —
   the raw `attname` (the `%Change{}.record` string key and the result column name), the
   server-quoted form via `quote_ident` (the ONLY form interpolated into the keyset/keyless
@@ -654,6 +678,36 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
+  The 1.4.x census query for an explicit table list: every non-dropped column, in
+  the 1.4.x row shape `[schemaname, tablename, qualified, col_raw, col_quoted,
+  col_type_oids]`. Kept unchanged for existing callers. Snapshots use
+  `table_columns_for/3`.
+  """
+  @doc deprecated:
+         "Use table_columns_for/3 with the replication sets and probed server_version_num."
+  @spec table_columns_for([{String.t(), String.t()}]) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def table_columns_for(tables) when is_list(tables) and tables != [] do
+    with :ok <- ensure_valid_pairs(tables) do
+      values = table_values(tables)
+
+      {:ok,
+       "SELECT n.nspname AS schemaname, c.relname AS tablename, " <>
+         "format('%I.%I', n.nspname, c.relname) AS qualified, " <>
+         "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
+         "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
+         "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
+         "FROM (VALUES #{values}) AS p0(nsp, rel) " <>
+         "JOIN pg_namespace n ON n.nspname = p0.nsp " <>
+         "JOIN pg_class c ON c.relname = p0.rel AND c.relnamespace = n.oid " <>
+         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+         "GROUP BY n.nspname, c.relname"}
+    end
+  end
+
+  def table_columns_for(_other), do: {:error, :invalid_identifier}
+
+  @doc """
   The `table_columns/1` row shape for an EXPLICIT table list (the pglogical/wal2json
   decoders' snapshot path, ADR-0009 §8): same `attnum` order, but the
   table set comes from the caller (`VALUES` — both parts of every pair are
@@ -669,8 +723,6 @@ defmodule Replicant.QueryBuilder do
   """
   @spec table_columns_for([{String.t(), String.t()}], [String.t()] | nil, pos_integer() | nil) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
-  def table_columns_for(tables, replication_sets \\ nil, server_version_num \\ nil)
-
   def table_columns_for(tables, replication_sets, server_version_num)
       when is_list(tables) and tables != [] do
     with :ok <- ensure_valid_pairs(tables) do
