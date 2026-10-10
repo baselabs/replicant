@@ -37,6 +37,25 @@ Two facts were probe-established on live PG16 during design:
   plus an unrestricted publication, produce `cannot use different column lists for
   table "public.rep_column_probe" in different publications`. The live regression
   is `test/integration/snapshot_columns_test.exs`.
+- **Row-filter correction (October 10, 2026).** Initial snapshots in both
+  checkpoint modes and incremental chunks use PG15+ `pg_publication_tables.rowfilter`.
+  For a shared table, an unfiltered publication means no predicate; otherwise the
+  server-rendered predicates combine with OR. Every expression is parenthesized
+  before it is composed with a keyset bound. No client predicate is interpolated.
+  The connected regression is `test/integration/snapshot_rows_test.exs`.
+- **PG15 dropped-column collapse — documentation only.** OBSERVED in the
+  [PG15 `pgoutput_column_list_init` source](https://github.com/postgres/postgres/blob/REL_15_STABLE/src/backend/replication/pgoutput/pgoutput.c):
+  an explicit list is collapsed to NULL only when its bitmap member count equals
+  `RelationGetNumberOfAttributes`, which includes dropped columns. An implicit
+  list is already NULL. Consequently, a table with dropped attributes can have
+  identical effective `attnames` for an implicit list and an explicit list of
+  every live column, yet PG15 pgoutput rejects that combination. Snapshot
+  discovery accepts those effective lists; the stream refuses them fail-closed,
+  never exposing an unpublished column. No matching early refusal was added:
+  `attnames` plus `pg_attribute` cannot distinguish explicit and implicit lists
+  with the same names. Refusing all identical lists on a table with dropped
+  attributes would also reject combinations pgoutput accepts. Operators can use
+  consistently explicit or consistently implicit lists on PG15.
 - **`publication: String | [String]`.** A single string is the **byte-unchanged default path**
   (the published 0.1.0 START_REPLICATION is reproduced exactly); a list enables multi-publication.
   Every name is validated via `Identifier.validate/1` and normalized to a list. (`config.ex`.)

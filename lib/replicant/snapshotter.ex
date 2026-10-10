@@ -13,7 +13,9 @@ defmodule Replicant.Snapshotter do
 
   Both snapshot modes project only published columns, in physical column order:
   pgoutput uses `pg_publication_tables.attnames` on PostgreSQL 15+, pglogical uses
-  `set_att_list`, and wal2json keeps all configured-table columns. Conflicting lists
+  `set_att_list`, and wal2json keeps all configured-table columns. Both readers apply
+  server row filters too: pgoutput ORs them (an unfiltered publication wins);
+  pglogical ANDs its non-NULL set filters, matching its 2.4.8 output plugin. Conflicting lists
   halt `:snapshot_column_list_conflict` before any snapshot row is read or delivered.
 
   ## Value-free boundary (Critical Rule 1)
@@ -44,7 +46,8 @@ defmodule Replicant.Snapshotter do
           required(:reply_to) => pid(),
           optional(:mode) => :sink_owned | :lib,
           optional(:tables) => [{String.t(), String.t()}] | nil,
-          optional(:replication_sets) => [String.t()] | nil
+          optional(:replication_sets) => [String.t()] | nil,
+          required(:server_version_num) => non_neg_integer()
         }
 
   @doc "Spawn + LINK the snapshotter to the caller (the Connection) so it is torn down with the pipeline. Returns the pid."
@@ -61,7 +64,7 @@ defmodule Replicant.Snapshotter do
         send(reply_to, {:snapshot_done, lsn})
 
       {:error, %Error{} = e} ->
-        Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: e.reason})
+        Telemetry.event([:replicant, :snapshot, :failed], %{}, error_metadata(e))
         send(reply_to, {:snapshot_failed, e})
     end
 
@@ -114,7 +117,7 @@ defmodule Replicant.Snapshotter do
             Postgrex.query!(c, set_snapshot_sql, [])
 
             # One row per snapshot table: [schema, table, qualified, col_raw,
-            # col_quoted, col_type_oids]. The column metadata (names + OIDs) lets the
+            # col_quoted, col_type_oids, row_filter]. The column metadata (names + OIDs) lets the
             # v1 scan project <col>::text and cast each value through the stream's path.
             tables = table_columns(c, args)
 
@@ -124,10 +127,11 @@ defmodule Replicant.Snapshotter do
                                         qualified,
                                         col_raw,
                                         col_quoted,
-                                        col_type_oids
+                                        col_type_oids,
+                                        row_filter
                                       ],
                                       acc ->
-              cols = {col_raw, col_quoted, col_type_oids}
+              cols = {col_raw, col_quoted, col_type_oids, row_filter}
               acc + copy_table(c, sink, cp, schema, table, qualified, cols)
             end)
           end,
@@ -146,13 +150,20 @@ defmodule Replicant.Snapshotter do
   @doc false
   @spec table_columns(Postgrex.conn(), map()) :: [[term()]]
   def table_columns(db, args) do
-    {sql, params} = snapshot_columns_query(db, args)
-    rows = Postgrex.query!(db, sql, params).rows
+    {sql, params} = columns_query(args)
+    db |> Postgrex.query!(sql, params) |> Map.fetch!(:rows) |> validate_columns!()
+  end
 
+  @doc false
+  @spec validate_columns!([[term()]]) :: [[term()]]
+  def validate_columns!(rows) do
     # The query emits one row per distinct effective projection. Validate the WHOLE
     # result before either reader can scan a table or call a sink. Never union lists.
     _seen =
-      Enum.reduce(rows, MapSet.new(), fn [_, _, qualified, _, _, _], seen ->
+      Enum.reduce(rows, MapSet.new(), fn [_, _, qualified, raw, _, _, _], seen ->
+        if raw in [nil, []],
+          do: raise(Error, reason: :snapshot_no_publishable_columns, table: qualified)
+
         if MapSet.member?(seen, qualified),
           do: raise(Error, reason: :snapshot_column_list_conflict)
 
@@ -162,54 +173,47 @@ defmodule Replicant.Snapshotter do
     rows
   end
 
-  defp snapshot_columns_query(db, args) do
+  @doc false
+  @spec columns_query(map()) :: {String.t(), list()}
+  def columns_query(args) do
     case Map.get(args, :tables) do
       nil ->
-        [[version]] =
-          Postgrex.query!(db, "SELECT current_setting('server_version_num')::int", []).rows
-
-        {QueryBuilder.table_columns(version), [args.publication]}
+        {QueryBuilder.table_columns(Map.fetch!(args, :server_version_num)), [args.publication]}
 
       tables ->
         sets = Map.get(args, :replication_sets)
-        {:ok, sql} = QueryBuilder.table_columns_for(tables, sets)
-        {sql, if(is_nil(sets), do: [], else: [sets])}
+
+        case QueryBuilder.table_columns_for(tables, sets) do
+          {:ok, sql} -> {sql, if(is_nil(sets), do: [], else: [sets])}
+          {:error, reason} -> raise Error, reason: reason
+        end
     end
   end
 
   # Stream one table's rows via a server-side cursor (bounded memory), delivering each
   # non-empty batch to the sink. Guarantees >= 1 dispatch per table (an empty one with
   # first_for_table? = true when the table has no rows), so the sink's per-table reset
-  # always fires (redo-safety, spec §6.1). `cols` is the parallel `{col_raw, col_quoted,
-  # col_type_oids}` triple from `table_columns/0` (same `attnum` order).
-  defp copy_table(c, sink, cp, schema, table, qualified, {col_raw, col_quoted, col_type_oids}) do
-    qualified_display = "#{schema}.#{table}"
+  # always fires (redo-safety, spec §6.1). `cols` carries the parallel `{col_raw, col_quoted,
+  # col_type_oids}` arrays plus the server-rendered row filter from `table_columns/2` (same `attnum` order).
+  defp copy_table(
+         c,
+         sink,
+         cp,
+         schema,
+         table,
+         qualified,
+         {col_raw, col_quoted, col_type_oids, row_filter}
+       ) do
+    tbl = %{
+      schema: schema,
+      table: table,
+      qualified_display: "#{schema}.#{table}",
+      col_raw: col_raw,
+      type_names: Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1)
+    }
 
-    # array_agg over a table with zero non-dropped columns yields NULL — a degenerate
-    # (column-less) table. Emit the per-table reset and skip the scan, matching the prior
-    # `SELECT *` behaviour for a column-less table (no rows can ever be read). Emit the
-    # :table_completed telemetry (count 0) for parity with the normal branch.
-    if col_raw in [nil, []] do
-      dispatch_batch!(c, sink, [], cp, qualified_display, true)
-
-      Telemetry.event([:replicant, :snapshot, :table_completed], %{}, %{
-        table: qualified_display,
-        change_count: 0
-      })
-
-      0
-    else
-      tbl = %{
-        schema: schema,
-        table: table,
-        qualified_display: qualified_display,
-        col_raw: col_raw,
-        type_names: Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1)
-      }
-
-      sql = QueryBuilder.keyless_scan(qualified, col_quoted)
-      scan_table(c, sink, cp, tbl, sql)
-    end
+    sql = QueryBuilder.keyless_scan(qualified, col_quoted, row_filter)
+    scan_table(c, sink, cp, tbl, sql)
   end
 
   # Every column is projected as `<col>::text AS <col>` (the `sql` from
@@ -218,7 +222,7 @@ defmodule Replicant.Snapshotter do
   # deliver byte-identical `%Change{}.record` values for every type (spec §2 convergence —
   # the F1 fix back-ported from the incremental reader; previously `SELECT *` shipped
   # Postgrex's native decode, e.g. NaiveDateTime for a `timestamp` where the stream casts
-  # DateTime). `col_quoted` is server-quoted (`table_columns/0`'s `quote_ident`), never raw
+  # DateTime). `col_quoted` is server-quoted (`table_columns/2`'s `quote_ident`), never raw
   # — Critical Rule 2 (the `format('%I')` precedent), so the projection is injection-safe.
   defp scan_table(c, sink, cp, tbl, sql) do
     stream = Postgrex.stream(c, sql, [], max_rows: @batch)
@@ -327,9 +331,20 @@ defmodule Replicant.Snapshotter do
   defp cast_value(value, type) when is_binary(value), do: Types.cast_record(value, type)
 
   @doc false
+  @spec error_metadata(Error.t()) :: map()
+  def error_metadata(%Error{reason: :snapshot_no_publishable_columns, table: table}),
+    do: %{reason: :snapshot_no_publishable_columns, table: table}
+
+  def error_metadata(%Error{reason: reason}), do: %{reason: reason}
+
+  @doc false
   @spec snapshot_error(term()) :: Error.t()
-  def snapshot_error(%Error{reason: :snapshot_column_list_conflict}),
-    do: %Error{reason: :snapshot_column_list_conflict}
+  def snapshot_error(%Error{reason: reason})
+      when reason in [:snapshot_column_list_conflict, :invalid_identifier],
+      do: %Error{reason: reason}
+
+  def snapshot_error(%Error{reason: :snapshot_no_publishable_columns, table: table}),
+    do: %Error{reason: :snapshot_no_publishable_columns, table: table}
 
   def snapshot_error(%{__struct__: mod}),
     do: %Error{reason: :snapshot_failed, shape: inspect(mod)}

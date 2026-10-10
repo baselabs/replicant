@@ -647,6 +647,7 @@ defmodule Replicant.Connection do
 
     Replicant.Snapshotter.start(%{
       snapshot_name: snapshot_name,
+      server_version_num: state.server_version_num,
       consistent_point: cp,
       connection: state.connection,
       publication: state.publication,
@@ -2041,23 +2042,29 @@ defmodule Replicant.Connection do
     GenServer.cast(server, {:reset_snapshot_window, frontier_epoch(state) + 1})
     GenServer.cast(server, {:snapshot_floor, floor})
 
-    reader_pid =
-      Incremental.start(%{
-        slot_name: state.slot_name,
-        connection: state.connection,
-        publication: state.publication,
-        tables: decoder_discovered(state),
-        replication_sets: decoder_sets(state),
-        sink: state.sink,
-        mode: if(lib_mode?(state), do: :lib, else: :sink_owned),
-        snapshot: state.snapshot,
-        resume: sp,
-        floor_lsn: floor
-      })
+    reader_pid = Incremental.start(incremental_args(state, sp))
 
     # Thread the fresh reader pid into the state start_streaming returns (it preserves reader_pid),
     # so the NEXT reconnect can retire THIS reader in turn.
     start_streaming(%{state | reader_pid: reader_pid})
+  end
+
+  @doc false
+  @spec incremental_args(t(), Replicant.SnapshotProgress.t() | nil) :: map()
+  def incremental_args(state, sp) do
+    %{
+      slot_name: state.slot_name,
+      connection: state.connection,
+      publication: state.publication,
+      tables: decoder_discovered(state),
+      replication_sets: decoder_sets(state),
+      server_version_num: state.server_version_num,
+      sink: state.sink,
+      mode: if(lib_mode?(state), do: :lib, else: :sink_owned),
+      snapshot: state.snapshot,
+      resume: sp,
+      floor_lsn: state.backfill_floor
+    }
   end
 
   # On every (re)connect prepare the assembler for the resumed stream: lib mode SEEDS the

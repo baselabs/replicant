@@ -47,13 +47,34 @@ defmodule Replicant.Supervisor do
   self-termination deadlock — a child process cannot synchronously stop its own
   ancestor supervisor. The caller owns the distinguishing telemetry
   (`:slot_invalidated` / `:sink :failed` / `:schema_change :halted`); `halt/2`
-  performs only the teardown and returns immediately.
+  emits `[:replicant, :pipeline, :halted]` with the slot and structural atom reason
+  (plus `kind` for a two-atom reason), then starts teardown and returns immediately.
+  Arbitrary reason details are discarded.
   """
   @spec halt(String.t(), term()) :: :ok
-  def halt(slot_name, _reason) do
+  def halt(slot_name, reason) do
+    Replicant.Telemetry.event(
+      [:replicant, :pipeline, :halted],
+      %{},
+      Map.put(halt_metadata(reason), :slot_name, slot_name)
+    )
+
     _pid = spawn(fn -> terminate(slot_name) end)
     :ok
   end
+
+  # Only fixed atom classes survive. Never forward a raw error message, numeric
+  # lag, row value, or nested term supplied by a caller as a halt reason.
+  defp halt_metadata({kind, reason}) when is_atom(kind) and is_atom(reason),
+    do: %{kind: kind, reason: reason}
+
+  defp halt_metadata(%Replicant.Error{reason: reason}) when is_atom(reason),
+    do: %{reason: reason}
+
+  defp halt_metadata({kind, _detail}) when is_atom(kind), do: %{reason: kind}
+  defp halt_metadata({reason}) when is_atom(reason), do: %{reason: reason}
+  defp halt_metadata(reason) when is_atom(reason), do: %{reason: reason}
+  defp halt_metadata(_other), do: %{reason: :pipeline_halted}
 
   defp terminate(slot_name) do
     case Registry.lookup(Replicant.Registry, {slot_name, :pipeline}) do

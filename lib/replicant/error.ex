@@ -22,6 +22,7 @@ defmodule Replicant.Error do
           | :spill_exhausted
           | :snapshot_failed
           | :snapshot_column_list_conflict
+          | :snapshot_no_publishable_columns
           | :snapshot_table_contended
           | :snapshot_progress_invalid
           | :checkpoint_store_failed

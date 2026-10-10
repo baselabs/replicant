@@ -23,10 +23,18 @@ defmodule Replicant.Snapshotter.IncrementalTest do
       ["public", "orders", "public.orders", ["id"], [~s("id")]]
     ]
 
-    # table_columns/0 rows: every column, quoted names + atttypid (int4 = 23, text = 25).
+    # table_columns/1 rows: every column, quoted names + atttypid (int4 = 23, text = 25).
     col_rows = [
-      ["public", "orders", "public.orders", ["id", "note"], [~s("id"), ~s("note")], [23, 25]],
-      ["public", "nopk", "public.nopk", ["x"], [~s("x")], [25]]
+      [
+        "public",
+        "orders",
+        "public.orders",
+        ["id", "note"],
+        [~s("id"), ~s("note")],
+        [23, 25],
+        nil
+      ],
+      ["public", "nopk", "public.nopk", ["x"], [~s("x")], [25], nil]
     ]
 
     all_rows = [

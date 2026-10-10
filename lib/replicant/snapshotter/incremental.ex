@@ -27,7 +27,7 @@ defmodule Replicant.Snapshotter.Incremental do
 
   On BOTH the initial resume and every reconnect-reload, table metadata (`qualified`,
   `pk_quoted`, `pk_raw`, `col_quoted`, `col_type_names`) is re-discovered from the server
-  (`quote_ident`/`format('%I.%I')` via `QueryBuilder.pk_columns/0` + `table_columns/0`). The persisted
+  (`quote_ident`/`format('%I.%I')` via `QueryBuilder.pk_columns/0` + `table_columns/1`). The persisted
   progress token is attacker-writable (a row in the progress store) and `decode/1`
   validates only that `pk_quoted`/`pk_raw` are LISTS — NOT that their elements are safe
   identifiers. So the token is used ONLY for the resume POSITION (which tables are done,
@@ -65,7 +65,8 @@ defmodule Replicant.Snapshotter.Incremental do
           pk_raw: [String.t()],
           pk_quoted: [String.t()],
           col_quoted: [String.t()],
-          col_type_names: %{optional(String.t()) => String.t() | non_neg_integer()}
+          col_type_names: %{optional(String.t()) => String.t() | non_neg_integer()},
+          row_filter: String.t() | nil
         }
 
   @type args :: %{
@@ -78,7 +79,8 @@ defmodule Replicant.Snapshotter.Incremental do
           required(:mode) => :sink_owned | :lib,
           required(:snapshot) => keyword(),
           required(:resume) => SnapshotProgress.t() | nil,
-          required(:floor_lsn) => Replicant.lsn()
+          required(:floor_lsn) => Replicant.lsn(),
+          required(:server_version_num) => non_neg_integer()
         }
 
   @doc "Spawn + LINK the reader to the caller (the Connection). Returns the pid."
@@ -94,10 +96,11 @@ defmodule Replicant.Snapshotter.Incremental do
           :ok ->
             :ok
 
+          {:error, %Error{} = error} ->
+            halt_snapshot(args, error)
+
           {:error, reason} when is_atom(reason) ->
-            Telemetry.event([:replicant, :snapshot, :failed], %{}, %{reason: reason})
-            Replicant.Supervisor.halt(args.slot_name, {:snapshot, reason})
-            :ok
+            halt_snapshot(args, %Error{reason: reason})
         end
 
       {:error, :already_running} ->
@@ -111,6 +114,17 @@ defmodule Replicant.Snapshotter.Incremental do
         Replicant.Supervisor.halt(args.slot_name, {:snapshot, :duplicate_reader})
         :ok
     end
+  end
+
+  defp halt_snapshot(args, error) do
+    Telemetry.event(
+      [:replicant, :snapshot, :failed],
+      %{},
+      Replicant.Snapshotter.error_metadata(error)
+    )
+
+    Replicant.Supervisor.halt(args.slot_name, {:snapshot, error.reason})
+    :ok
   end
 
   @doc false
@@ -162,10 +176,14 @@ defmodule Replicant.Snapshotter.Incremental do
   end
 
   # Whole run inside the value-free boundary.
-  defp backfill(args) do
-    do_backfill(args)
+  defp backfill(args), do: with_error_boundary(fn -> do_backfill(args) end)
+
+  @doc false
+  @spec with_error_boundary((-> term())) :: term()
+  def with_error_boundary(fun) do
+    fun.()
   rescue
-    e -> {:error, Replicant.Snapshotter.snapshot_error(e).reason}
+    e -> {:error, Replicant.Snapshotter.snapshot_error(e)}
   catch
     _kind, _reason -> {:error, :snapshot_failed}
   end
@@ -180,7 +198,7 @@ defmodule Replicant.Snapshotter.Incremental do
 
     try do
       standby? = standby?(db)
-      version = server_version_num(db)
+      version = Map.fetch!(args, :server_version_num)
       sp = resume_or_discover(db, args, args.resume)
       chunk_rows = Keyword.fetch!(args.snapshot, :chunk_rows)
       loop(db, args, sp, chunk_rows, standby?, version)
@@ -191,11 +209,6 @@ defmodule Replicant.Snapshotter.Incremental do
 
   defp standby?(db),
     do: Postgrex.query!(db, QueryBuilder.is_in_recovery(), []).rows == [[true]]
-
-  defp server_version_num(db) do
-    [[v]] = Postgrex.query!(db, "SELECT current_setting('server_version_num')::int", []).rows
-    v
-  end
 
   # ---- discovery + RESUME RECONCILIATION (Critical Rule 2 injection defense) ----
 
@@ -255,17 +268,17 @@ defmodule Replicant.Snapshotter.Incremental do
   # the decoder's OWN (`name_for_type_id`), so a `<col>::text` value casts through EXACTLY
   # the stream side's cast path; an unmapped OID stays its integer (cast_record's fallback
   # returns the raw text — the same value-free graceful path the stream takes).
-  defp col_meta([_schema, _table, qualified, col_raw, col_quoted, col_type_oids]) do
+  defp col_meta([_schema, _table, qualified, col_raw, col_quoted, col_type_oids, row_filter]) do
     type_names =
       col_raw
       |> Enum.zip(Enum.map(col_type_oids, &OidDatabase.name_for_type_id/1))
       |> Map.new()
 
-    {qualified, %{col_quoted: col_quoted, col_type_names: type_names}}
+    {qualified, %{col_quoted: col_quoted, col_type_names: type_names, row_filter: row_filter}}
   end
 
   defp keyed_ref(schema, table, qualified, pk_raw, pk_quoted, cols_by_q) do
-    cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}})
+    cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}, row_filter: nil})
 
     # INSERT-only publications can omit the PK. Never project its raw value for a
     # keyset bound or deliver it: use the existing whole-table window in that case.
@@ -281,12 +294,13 @@ defmodule Replicant.Snapshotter.Incremental do
       pk_raw: pk_raw,
       pk_quoted: pk_quoted,
       col_quoted: cmeta.col_quoted,
-      col_type_names: cmeta.col_type_names
+      col_type_names: cmeta.col_type_names,
+      row_filter: cmeta.row_filter
     }
   end
 
   defp keyless_ref(schema, table, qualified, cols_by_q) do
-    cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}})
+    cmeta = Map.get(cols_by_q, qualified, %{col_quoted: [], col_type_names: %{}, row_filter: nil})
 
     %{
       schema: schema,
@@ -295,7 +309,8 @@ defmodule Replicant.Snapshotter.Incremental do
       pk_raw: [],
       pk_quoted: [],
       col_quoted: cmeta.col_quoted,
-      col_type_names: cmeta.col_type_names
+      col_type_names: cmeta.col_type_names,
+      row_filter: cmeta.row_filter
     }
   end
 
@@ -415,7 +430,8 @@ defmodule Replicant.Snapshotter.Incremental do
         table.qualified,
         table.col_quoted,
         table.pk_quoted,
-        length(bound || [])
+        length(bound || []),
+        table.row_filter
       )
 
     params = [chunk_rows | bound || []]
@@ -682,7 +698,9 @@ defmodule Replicant.Snapshotter.Incremental do
           Postgrex.query!(c, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", [])
 
           c
-          |> Postgrex.stream(QueryBuilder.keyless_scan(table.qualified, table.col_quoted), [],
+          |> Postgrex.stream(
+            QueryBuilder.keyless_scan(table.qualified, table.col_quoted, table.row_filter),
+            [],
             max_rows: 1000
           )
           |> Enum.reduce({:ok, true}, fn %Postgrex.Result{columns: cols, rows: rows},

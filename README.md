@@ -334,7 +334,15 @@ combined with a partial list, halt `:snapshot_column_list_conflict` before any
 snapshot rows are read or delivered. pglogical applies `set_att_list` from the
 requested local replication sets and uses the same conflict refusal. wal2json has
 table filters but no publication column lists, so it retains all configured-table
-columns. Snapshot column filtering does not apply publication row filters.
+columns. A snapshot selects the same columns and rows as the change stream.
+Both checkpoint modes and all incremental paths apply server row filters: PG15+
+publication filters combine with OR, and any unfiltered publication permits all
+rows; pglogical 2.4.8 combines non-NULL set filters with AND, even beside an
+unfiltered set. A NULL or empty publishable column list halts with
+`:snapshot_no_publishable_columns` and the table name. Generated columns follow
+the publication's stream policy (PG18 can publish stored generated columns).
+[ADR-0002](docs/adr/0002-multi-publication-per-pipeline.md) documents PG15's
+additional stream refusal when dropped columns prevent full-list collapse.
 
 Key columns are never added to that projection. PostgreSQL refuses UPDATE/DELETE
 when the published list omits replica-identity columns; INSERT-only lists can omit

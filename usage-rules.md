@@ -149,7 +149,13 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   pglogical's `set_att_list` for the requested local sets, and all configured-table
   columns for wal2json, which has no publication column lists. Differing lists for
   one table halt `:snapshot_column_list_conflict` before reading snapshot rows;
-  identical lists are accepted. This filters columns, not publication row predicates.
+  identical lists are accepted. Snapshots select the same columns and rows as the
+  stream, including generated-column policy. Both checkpoint modes and all
+  incremental paths apply server row predicates: PG15+ publications combine with
+  OR (any unfiltered publication wins); pglogical 2.4.8 non-NULL set filters
+  combine with AND, even beside an unfiltered set. NULL or empty projections
+  halt `:snapshot_no_publishable_columns` with the table name. ADR-0002 documents
+  PG15's additional fail-closed stream refusal for dropped-column list collapse.
   Keys are never added: PostgreSQL rejects UPDATE/DELETE if the publication omits
   required replica-identity columns. INSERT-only lists may omit keys; the sink must
   handle that shape, and incremental readers use whole-table windows when the full
@@ -231,12 +237,13 @@ Every event is value-free by construction: metadata keys are closed to
 `commit_lsn, change_count, byte_size, lag_ms, duration, attempt, max_retries,
 transactional, table, slot_name, reason, error_class, kind`, each with a
 value-shape contract enforced at emission (`Replicant.Telemetry` raises on an
-off-list key or a wrong shape — never ships a row value). All thirty events:
+off-list key or a wrong shape — never ships a row value). Events:
 
 | Event | Fires when | Measurements | Metadata |
 | --- | --- | --- | --- |
+| `[:replicant, :pipeline, :halted]` | a permanent fail-closed halt, before asynchronous teardown | — | `slot_name`, structural atom `reason`, optional atom `kind`; arbitrary details discarded |
 | `[:replicant, :connection, :connected]` | replication connection established (each connect/reconnect) | — | `kind` (`:primary`/recovery kind) |
-| `[:replicant, :connection, :disconnected]` | connection dropped — **also the only signal of the `:sink_too_slow` lag halt** (with `reason: :sink_too_slow` and a signed `lag` measurement in bytes) | `lag` (halt only) | `reason` (halt only) |
+| `[:replicant, :connection, :disconnected]` | connection dropped — **also carries the lag measurement for the `:sink_too_slow` halt** (with `reason: :sink_too_slow` and a signed `lag` measurement in bytes) | `lag` (halt only) | `reason` (halt only) |
 | `[:replicant, :connection, :slot_active]` | the slot is created/owned and streaming begins | — | — |
 | `[:replicant, :connection, :slot_invalidated]` | slot invalidation / fail-closed config rejection | — | `reason` (`:failover_unsupported`, `:publication_missing`, invalidation class) |
 | `[:replicant, :connection, :session_identity_rejected]` | the sink vetoed the replication-session identity | — | `reason: :session_identity_rejected` |
@@ -260,14 +267,15 @@ off-list key or a wrong shape — never ships a row value). All thirty events:
 | `[:replicant, :snapshot, :chunk_completed]` | one incremental chunk applied | — | `table`, `change_count` |
 | `[:replicant, :snapshot, :chunk_retried]` | a chunk was discarded for contention and will retry | — | `table`, `reason: :snapshot_table_contended` |
 | `[:replicant, :snapshot, :completed]` | the snapshot finished and handed off to streaming | `duration` | `commit_lsn`, `change_count` |
-| `[:replicant, :snapshot, :failed]` | the snapshot halted (value-free boundary) | — | `reason` (`:snapshot_failed`, `:snapshot_table_contended`, …) |
+| `[:replicant, :snapshot, :failed]` | the snapshot halted (value-free boundary) | — | `reason` (`:snapshot_failed`, `:snapshot_table_contended`, …); `table` for `:snapshot_no_publishable_columns` |
 | `[:replicant, :stream, :committed]` | a proto-v2 streamed transaction committed | — | `commit_lsn`, `byte_size` (`change_count` on the folded path) |
 | `[:replicant, :stream, :aborted]` | a streamed transaction aborted | — | `reason: :stream_abort` |
 | `[:replicant, :stream, :spilled]` | an oversized streamed transaction's tail spilled to disk | — | `byte_size`, `change_count` |
 | `[:replicant, :stream, :spill_exhausted]` | the disk ceiling was reached (halt follows) | — | `byte_size`, `reason: :spill_exhausted` |
 
 The two-column trap to know: the **lag halt** (`:sink_too_slow`) rides
-`[:replicant, :connection, :disconnected]`, not a dedicated event — alert on
+`[:replicant, :connection, :disconnected]`; `[:replicant, :pipeline, :halted]`
+also reports its structural reason but carries no lag measurement. Alert on
 `reason: :sink_too_slow`, not on the event name alone.
 
 ## Halt reasons (operator reference)

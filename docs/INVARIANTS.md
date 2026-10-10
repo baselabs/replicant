@@ -107,7 +107,14 @@ halt `:snapshot_column_list_conflict` before any snapshot row is read or deliver
 No unpublished key is added to a record or keyset bound. Without the complete PK,
 incremental readers use whole-table windows; sinks must support the resulting
 keyless shape. PostgreSQL rejects UPDATE/DELETE when a publication omits required
-replica-identity columns. Column filtering does not implement row filtering.
+replica-identity columns. A snapshot selects the same columns and rows as the
+change stream, including generated-column policy and server row filters. PG15+
+publication predicates combine with OR; any unfiltered publication wins.
+pglogical 2.4.8 non-NULL set predicates combine with AND, even beside an
+unfiltered set. Both checkpoint modes and all incremental scan paths enforce
+this. NULL or empty projections halt `:snapshot_no_publishable_columns` with the
+table name. PG15 can additionally refuse an effective-list match in the stream
+when dropped columns prevent its full-list collapse; see ADR-0002.
 
 See the [README](../README.md) for the full configuration reference and the [ROADMAP](ROADMAP.md)
 for the feature tracker.

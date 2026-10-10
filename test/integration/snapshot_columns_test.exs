@@ -73,7 +73,7 @@ defmodule Replicant.SnapshotColumnsTest do
 
   test "column metadata keeps attnum order even when publication lists visible before id", ctx do
     publish(ctx, hd(ctx.pubs), "(visible, id)")
-    [[_, _, _, raw, quoted, types]] = columns(ctx, [hd(ctx.pubs)])
+    [[_, _, _, raw, quoted, types, _]] = columns(ctx, [hd(ctx.pubs)])
     assert raw == ["id", "visible"]
     assert quoted == ["id", "visible"]
     assert types == [23, 25]
@@ -81,7 +81,7 @@ defmodule Replicant.SnapshotColumnsTest do
 
   test "no column list keeps all columns", ctx do
     publish(ctx, hd(ctx.pubs), "")
-    [[_, _, _, raw, _, _]] = columns(ctx, [hd(ctx.pubs)])
+    [[_, _, _, raw, _, _, _]] = columns(ctx, [hd(ctx.pubs)])
     assert raw == ["id", "private_secret", "visible"]
     start_pipeline(ctx, [hd(ctx.pubs)], true)
     PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
@@ -227,11 +227,104 @@ defmodule Replicant.SnapshotColumnsTest do
     assert [%{pk_raw: [], pk_quoted: [], col_quoted: ["visible"]}] = refs
   end
 
+  test "server attnames is non-NULL and attnum ordered even for a no-list publication", ctx do
+    [a, b] = ctx.pubs
+    publish(ctx, a, "")
+    publish(ctx, b, "(visible, private_secret, id)")
+
+    assert [[a, ["id", "private_secret", "visible"]], [b, ["id", "private_secret", "visible"]]] ==
+             Postgrex.query!(
+               ctx.db,
+               "SELECT pubname, attnames FROM pg_publication_tables WHERE pubname = ANY($1) ORDER BY pubname",
+               [ctx.pubs]
+             ).rows
+  end
+
+  for stored <- [false, true] do
+    @stored stored
+    @tag :snapshot_generated
+    @tag skip: Replicant.TestHelper.server_version_num() < if(stored, do: 180_000, else: 160_000)
+    test "generated stored column snapshot matches stream (publish stored: #{stored})", ctx do
+      Postgrex.query!(
+        ctx.db,
+        "ALTER TABLE #{ctx.table} ADD COLUMN derived int GENERATED ALWAYS AS (id * 2) STORED",
+        []
+      )
+
+      pub = hd(ctx.pubs)
+      option = if @stored, do: " WITH (publish_generated_columns = stored)", else: ""
+      publish(ctx, pub, option)
+      start_pipeline(ctx, [pub], true)
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+      [snapshot] = SnapshotRecordingSink.recorded().snapshot
+      assert Map.has_key?(snapshot.record, "derived") == @stored
+
+      Postgrex.query!(
+        ctx.db,
+        "INSERT INTO #{ctx.table} (id, private_secret, visible) VALUES (2, 'test-only-secret', 'after')",
+        []
+      )
+
+      PG16.wait_until(fn -> streamed_changes() != [] end)
+      [stream] = streamed_changes()
+      assert Map.keys(snapshot.record) == Map.keys(stream.record)
+    end
+  end
+
+  test "a table with no publishable columns is refused by name", ctx do
+    Postgrex.query!(
+      ctx.db,
+      "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible",
+      []
+    )
+
+    publish(ctx, hd(ctx.pubs), "")
+    error = assert_raise Replicant.Error, fn -> columns(ctx, [hd(ctx.pubs)]) end
+    assert error.reason == :snapshot_no_publishable_columns
+    assert error.table == "public.#{ctx.table}"
+  end
+
+  for mode <- [true, [mode: :incremental, chunk_rows: 1]] do
+    @mode mode
+    @tag :empty_projection
+    test "#{inspect(mode)} empty-projection halt exposes the refused table", ctx do
+      Postgrex.query!(
+        ctx.db,
+        "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible",
+        []
+      )
+
+      publish(ctx, hd(ctx.pubs), "")
+      handler = {__MODULE__, ctx.slot}
+
+      :telemetry.attach(
+        handler,
+        [:replicant, :snapshot, :failed],
+        &__MODULE__.empty_refusal/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+      start_pipeline(ctx, [hd(ctx.pubs)], @mode)
+      table = "public.#{ctx.table}"
+      assert_receive {:empty_refusal, :snapshot_no_publishable_columns, ^table}, 1_000
+      assert SnapshotRecordingSink.recorded().snapshot == []
+    end
+  end
+
+  def empty_refusal(_, _, meta, pid),
+    do: send(pid, {:empty_refusal, meta.reason, Map.get(meta, :table)})
+
   defp publish(ctx, pub, list) do
     Postgrex.query!(ctx.db, "CREATE PUBLICATION #{pub} FOR TABLE #{ctx.table} #{list}", [])
   end
 
-  defp columns(ctx, pubs), do: Snapshotter.table_columns(ctx.db, %{publication: pubs})
+  defp columns(ctx, pubs),
+    do:
+      Snapshotter.table_columns(ctx.db, %{
+        publication: pubs,
+        server_version_num: Replicant.TestHelper.server_version_num()
+      })
 
   defp start_pipeline(ctx, pubs, mode) do
     assert {:ok, _} =

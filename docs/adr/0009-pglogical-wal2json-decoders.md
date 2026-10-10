@@ -312,6 +312,20 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   projection, and incremental backfills use whole-table windows when necessary.
   The connected regression is `test/integration/pglogical_snapshot_columns_test.exs`;
   it requires a server carrying pglogical and is skipped when unavailable.
+- **Snapshot row-filter correction (October 10, 2026).** Both readers use
+  `pg_get_expr(set_row_filter::pg_node_tree, set_reloid)` for the requested local
+  sets. OBSERVED in pglogical 2.4.8 source: `get_table_replication_info` in
+  [pglogical_repset.c](https://github.com/2ndQuadrant/pglogical/blob/REL2_4_8/pglogical_repset.c)
+  accumulates every non-NULL filter, and `pglogical_change_filter` in
+  [pglogical_output_plugin.c](https://github.com/2ndQuadrant/pglogical/blob/REL2_4_8/pglogical_output_plugin.c)
+  rejects the change if any expression is false or NULL. Therefore the combination
+  is AND, including beside an unfiltered set; an unfiltered set does not override
+  another set's filter. Snapshots use that same rule with parenthesized server
+  expressions. wal2json has no server row-predicate option; its configured table
+  membership remains the filter. The live pglogical regression covers both readers,
+  two filters, a filtered/unfiltered pair, and wholly unfiltered sets. Local PG18.6
+  does not carry pglogical; execution belongs to the hosted 9.6, 12, and 15-plugin
+  CI legs, not to a simulated plugin.
 - Sinks see no new struct, callback or field; a sink written for pgoutput runs unchanged
   against a 9.6 server. The guarantees table in `docs/INVARIANTS.md` applies per checkpoint
   mode, not per decoder.

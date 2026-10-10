@@ -24,6 +24,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use the whole-table path when the complete primary key is unavailable. PostgreSQL
   refuses UPDATE/DELETE when a publication omits required replica-identity columns.
 
+- **Snapshot reads respect server row filters.** Initial snapshots in both
+  checkpoint modes, incremental keyset chunks, and whole-table windows select the
+  same rows as the change stream. PG15+ publication predicates combine with OR;
+  any unfiltered publication removes the predicate. pglogical 2.4.8 non-NULL
+  `set_row_filter` predicates combine with AND, even beside an unfiltered set.
+  Predicate text comes only from server catalogs (`pg_get_expr`), parenthesized
+  before composition. wal2json has table filters, not a server row-filter facility.
+
+### Changed
+
+- **Generated columns on PostgreSQL 16+: snapshot records now match stream
+  records.** A no-list publication omits generated columns from snapshots just as
+  pgoutput does. On PG18, `publish_generated_columns = stored` includes stored
+  generated columns in both. Users who previously consumed these columns only
+  from snapshots must account for their omission or opt into PG18's stored mode.
+
+### Fixed
+
+- Tables with NULL or empty publishable column lists halt with the typed
+  `:snapshot_no_publishable_columns` error naming the table, before any snapshot
+  delivery. They are never silently skipped or queried with an empty projection.
+- Invalid explicit table identifiers preserve `:invalid_identifier`; snapshot
+  discovery reuses the already-probed server version. Pipeline halt telemetry
+  exposes the structural reason, including snapshot column-list refusals.
+
+### Known limitations
+
+- **PG15 dropped columns:** identical effective `attnames` may pass snapshot
+  discovery while pgoutput rejects an explicit full live-column list combined
+  with an implicit list. PG15 counts dropped attribute slots when collapsing a
+  full list. This is documented only in ADR-0002: `attnames` plus `pg_attribute`
+  cannot recover whether each list was explicit. The stream fails closed; no
+  additional column is exposed.
+
 ## [1.4.2] - 2026-10-03
 
 ### Fixed

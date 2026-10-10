@@ -260,7 +260,7 @@ defmodule Replicant.QueryBuilder do
   `START_REPLICATION` with a missing publication silently streams the existing subset, so it
   CANNOT be the fail-closed gate (probe-verified).
 
-  Unlike `publication_tables/1` / `pk_columns/0` / `table_columns/0` (which run via
+  Unlike `publication_tables/1` / `pk_columns/0` / `table_columns/1` (which run via
   `Postgrex.query!/3` and bind `$1`), this query runs in the `Postgrex.ReplicationConnection`
   connect chain, whose `{:query, sql, state}` dispatch uses the SIMPLE query protocol — which
   cannot bind `$1`. So the validated names are interpolated into a single-quoted `IN (...)` list,
@@ -573,11 +573,13 @@ defmodule Replicant.QueryBuilder do
   servers have no column lists and use all non-dropped user columns. The caller
   must supply the probed server version. Publication names are bound `$1`. Different
   lists produce separate rows for the same table; the reader MUST reject those
-  before reading any table data. Identical lists produce one row. Row shape:
-  `[schemaname, tablename, qualified, col_raw, col_quoted, col_type_oids]`.
+  before reading any table data. Identical lists produce one row. PG15+ row filters
+  combine with OR; any unfiltered publication makes the table unfiltered. Filter
+  text is rendered by the server, never supplied by a client. Row shape:
+  `[schemaname, tablename, qualified, col_raw, col_quoted, col_type_oids, row_filter]`.
   """
   @spec table_columns(non_neg_integer()) :: String.t()
-  def table_columns(server_version_num \\ 150_000) when is_integer(server_version_num) do
+  def table_columns(server_version_num) when is_integer(server_version_num) do
     {published, filter, grouping} =
       if server_version_num >= 150_000 do
         {"SELECT DISTINCT schemaname, tablename, attnames FROM pg_publication_tables WHERE pubname = ANY($1)",
@@ -587,15 +589,40 @@ defmodule Replicant.QueryBuilder do
          "", ""}
       end
 
-    "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
-      "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
-      "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
-      "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
+    {cte, filter_join, row_filter, filter_group} = publication_row_filters(server_version_num)
+
+    cte <>
+      "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
+      column_aggregates() <>
+      ", " <>
+      row_filter <>
+      " AS row_filter " <>
       "FROM (#{published}) p " <>
       "JOIN pg_class c ON c.relname = p.tablename " <>
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
-      "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-      filter <> " GROUP BY p.schemaname, p.tablename" <> grouping
+      filter_join <>
+      "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+      filter <> " GROUP BY p.schemaname, p.tablename" <> grouping <> filter_group
+  end
+
+  # Keep a table even when the published attribute set is empty. NULL arrays are
+  # refused by the reader; an inner join would silently erase the table.
+  defp column_aggregates do
+    "array_agg(a.attname ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) AS col_raw, " <>
+      "array_agg(quote_ident(a.attname) ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) AS col_quoted, " <>
+      "array_agg(a.atttypid::int ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) AS col_type_oids"
+  end
+
+  defp publication_row_filters(version) when version < 150_000,
+    do: {"", "", "NULL::text", ""}
+
+  defp publication_row_filters(_version) do
+    {"WITH row_filters AS (SELECT schemaname, tablename, " <>
+       "CASE WHEN bool_or(rowfilter IS NULL) THEN NULL " <>
+       "ELSE string_agg('(' || rowfilter || ')', ' OR ' ORDER BY rowfilter) END AS row_filter " <>
+       "FROM pg_publication_tables WHERE pubname = ANY($1) GROUP BY schemaname, tablename) ",
+     "JOIN row_filters f ON f.schemaname = p.schemaname AND f.tablename = p.tablename ",
+     "f.row_filter", ", f.row_filter"}
   end
 
   @doc """
@@ -606,7 +633,9 @@ defmodule Replicant.QueryBuilder do
   replication sets as the second argument and bind them as `$1`: `set_att_list`
   restricts the projection per local set. Identical effective projections deduplicate;
   conflicting ones remain separate rows for the reader's refusal. With no sets
-  (wal2json), all non-dropped columns remain selected.
+  (wal2json), all non-dropped columns remain selected and there is no row predicate.
+  pglogical's non-NULL `set_row_filter` expressions combine with AND (2.4.8),
+  including when another set is unfiltered. `pg_get_expr` renders the server nodes.
   """
   @spec table_columns_for([{String.t(), String.t()}], [String.t()] | nil) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
@@ -616,19 +645,23 @@ defmodule Replicant.QueryBuilder do
     with :ok <- ensure_valid_pairs(tables) do
       values = table_values(tables)
       {sets_join, filter, grouping} = snapshot_set_columns(replication_sets)
+      {cte, filter_join, row_filter, filter_group} = set_row_filters(replication_sets)
 
       {:ok,
-       "SELECT DISTINCT n.nspname AS schemaname, c.relname AS tablename, " <>
+       cte <>
+         "SELECT DISTINCT n.nspname AS schemaname, c.relname AS tablename, " <>
          "format('%I.%I', n.nspname, c.relname) AS qualified, " <>
-         "array_agg(a.attname ORDER BY a.attnum) AS col_raw, " <>
-         "array_agg(quote_ident(a.attname) ORDER BY a.attnum) AS col_quoted, " <>
-         "array_agg(a.atttypid::int ORDER BY a.attnum) AS col_type_oids " <>
+         column_aggregates() <>
+         ", " <>
+         row_filter <>
+         " AS row_filter " <>
          "FROM (VALUES #{values}) AS p0(nsp, rel) " <>
          "JOIN pg_namespace n ON n.nspname = p0.nsp " <>
          "JOIN pg_class c ON c.relname = p0.rel AND c.relnamespace = n.oid " <>
          sets_join <>
-         "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-         filter <> " GROUP BY n.nspname, c.relname" <> grouping}
+         filter_join <>
+         "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
+         filter <> " GROUP BY n.nspname, c.relname" <> grouping <> filter_group}
     end
   end
 
@@ -641,6 +674,20 @@ defmodule Replicant.QueryBuilder do
        "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
        "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id ",
      " AND (r.set_att_list IS NULL OR a.attname = ANY(r.set_att_list))", ", r.set_id"}
+  end
+
+  defp set_row_filters(nil), do: {"", "", "NULL::text", ""}
+
+  # pglogical 2.4.8 accumulates all non-NULL set_row_filter nodes and rejects
+  # a change if ANY expression is false/NULL: AND, even beside an unfiltered set.
+  defp set_row_filters(_sets) do
+    {"WITH row_filters AS (SELECT r.set_reloid, " <>
+       "string_agg('(' || pg_get_expr(r.set_row_filter::pg_node_tree, r.set_reloid) || ')', " <>
+       "' AND ' ORDER BY r.set_id) AS row_filter " <>
+       "FROM pglogical.replication_set_table r " <>
+       "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
+       "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id GROUP BY r.set_reloid) ",
+     "JOIN row_filters f ON f.set_reloid = c.oid ", "f.row_filter", ", f.row_filter"}
   end
 
   @doc """
@@ -688,7 +735,7 @@ defmodule Replicant.QueryBuilder do
 
   @doc """
   Keyset chunk SELECT (spec §6.6). `col_quoted` (all columns) and `pk_quoted` (the PK
-  subset) come from `table_columns/0`/`pk_columns/0` (server-quoted — never validated
+  subset) come from `table_columns/1`/`pk_columns/0` (server-quoted — never validated
   client-side, never raw). `bound_arity` is the number of PK columns in the resume bound:
   `0` emits the first-chunk form (no WHERE); `n > 0` emits a ROW() comparison whose bounds
   are BIND PARAMETERS `$2..$n+1` (`$1` is the LIMIT) — a literal bound would be
@@ -705,33 +752,46 @@ defmodule Replicant.QueryBuilder do
   """
   @spec keyset_chunk(String.t(), [String.t()], [String.t()], non_neg_integer()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
-  def keyset_chunk(_qualified, _col_quoted, [], _bound_arity), do: {:error, :invalid_identifier}
+  @spec keyset_chunk(String.t(), [String.t()], [String.t()], non_neg_integer(), String.t() | nil) ::
+          {:ok, String.t()} | {:error, :invalid_identifier}
+  def keyset_chunk(qualified, col_quoted, pk_quoted, bound_arity, row_filter \\ nil)
 
-  def keyset_chunk(qualified, col_quoted, pk_quoted, 0) do
+  def keyset_chunk(_qualified, _col_quoted, [], _bound_arity, _row_filter),
+    do: {:error, :invalid_identifier}
+
+  def keyset_chunk(qualified, col_quoted, pk_quoted, 0, row_filter) do
     {:ok,
      "SELECT #{cast_projection(col_quoted)}#{rpk_select(pk_quoted)} FROM #{qualified} " <>
-       "ORDER BY #{pk_ref(qualified, pk_quoted)} LIMIT $1"}
+       filter_clause(row_filter, "WHERE") <> "ORDER BY #{pk_ref(qualified, pk_quoted)} LIMIT $1"}
   end
 
-  def keyset_chunk(qualified, col_quoted, pk_quoted, bound_arity)
+  def keyset_chunk(qualified, col_quoted, pk_quoted, bound_arity, row_filter)
       when bound_arity == length(pk_quoted) do
     params = Enum.map_join(2..(bound_arity + 1), ", ", &"$#{&1}")
 
     {:ok,
      "SELECT #{cast_projection(col_quoted)}#{rpk_select(pk_quoted)} FROM #{qualified} " <>
        "WHERE (#{pk_ref(qualified, pk_quoted)}) > (#{params}) " <>
-       "ORDER BY #{pk_ref(qualified, pk_quoted)} LIMIT $1"}
+       filter_clause(row_filter, "AND") <> "ORDER BY #{pk_ref(qualified, pk_quoted)} LIMIT $1"}
   end
 
   @doc """
   Whole-table scan for the PK-less fallback (spec §6.4). Every column is projected as
   `<col>::text AS <col>` (the SAME cast projection as `keyset_chunk/4`) so a PK-less
   table's snapshot rows converge with the stream too (the record values are cast; there
-  is no keyset bound). `col_quoted` is server-quoted (`table_columns/0`), never raw.
+  is no keyset bound). `col_quoted` is server-quoted (`table_columns/1`), never raw.
   """
   @spec keyless_scan(String.t(), [String.t()]) :: String.t()
-  def keyless_scan(qualified, col_quoted),
-    do: "SELECT #{cast_projection(col_quoted)} FROM #{qualified}"
+  @spec keyless_scan(String.t(), [String.t()], String.t() | nil) :: String.t()
+  def keyless_scan(qualified, col_quoted, row_filter \\ nil),
+    do: "SELECT #{cast_projection(col_quoted)} FROM #{qualified}" <> scan_filter(row_filter)
+
+  # Only server pg_get_expr-rendered expressions from discovery reach these builders.
+  # Parentheses preserve the predicate when composed with a keyset bound.
+  defp scan_filter(nil), do: ""
+  defp scan_filter(filter), do: " WHERE (#{filter})"
+  defp filter_clause(nil, _conjunction), do: ""
+  defp filter_clause(filter, conjunction), do: "#{conjunction} (#{filter}) "
 
   # Cast projection: every column as `<quoted>::text AS <quoted>`. The `::text` output
   # equals pgoutput text (both use the type's output function), and the reader casts it

@@ -58,7 +58,7 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
     @mode mode
     test "#{inspect(mode)} snapshot and INSERT stream both honor set_att_list", ctx do
       for set <- ctx.sets, do: add_table(ctx, set, ["visible", "id"])
-      assert [[_, _, _, ["id", "visible"], _, _]] = columns(ctx)
+      assert [[_, _, _, ["id", "visible"], _, _, _]] = columns(ctx)
 
       assert {:ok, _} =
                Replicant.start_link(
@@ -96,7 +96,59 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
 
   test "unfiltered sets preserve every column", ctx do
     for set <- ctx.sets, do: add_table(ctx, set, nil)
-    assert [[_, _, _, ["id", "private_secret", "visible"], _, _]] = columns(ctx)
+    assert [[_, _, _, ["id", "private_secret", "visible"], _, _, _]] = columns(ctx)
+  end
+
+  for mode <- [true, [mode: :incremental, chunk_rows: 1]],
+      {label, filters, expected, streamed} <- [
+        {"AND", ["id % 2 = 0", "id % 3 = 0"], [6], [12]},
+        {"unfiltered set retains other filter", [nil, "id % 2 = 0"], [2, 4, 6], [8, 10, 12]},
+        {"unfiltered", [nil, nil], [1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12]}
+      ] do
+    @mode mode
+    @filters filters
+    @expected expected
+    @streamed streamed
+    test "#{inspect(mode)} pglogical #{label} row filters match snapshot and stream", ctx do
+      Postgrex.query!(
+        ctx.db,
+        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'before' FROM generate_series(2,6) i",
+        []
+      )
+
+      for {set, filter} <- Enum.zip(ctx.sets, @filters) do
+        Postgrex.query!(
+          ctx.db,
+          "SELECT pglogical.replication_set_add_table($1, $2::regclass, false, $3::text[], $4::text)",
+          [set, ctx.table, ["id", "visible"], filter]
+        )
+      end
+
+      assert {:ok, _} =
+               Replicant.start_link(
+                 connection: PG16.pg_opts(),
+                 slot_name: ctx.slot,
+                 decoder: :pglogical,
+                 replication_sets: ctx.sets,
+                 sink: SnapshotRecordingSink,
+                 snapshot: @mode
+               )
+
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+
+      assert Enum.map(SnapshotRecordingSink.recorded().snapshot, & &1.record["id"]) |> Enum.sort() ==
+               @expected
+
+      Postgrex.query!(
+        ctx.db,
+        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'after' FROM generate_series(7,12) i",
+        []
+      )
+
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().txns != [] end)
+      ids = for txn <- SnapshotRecordingSink.recorded().txns, c <- txn.changes, do: c.record["id"]
+      assert Enum.sort(ids) == @streamed
+    end
   end
 
   defp add_table(ctx, set, names) do

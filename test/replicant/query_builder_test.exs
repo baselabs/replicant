@@ -508,7 +508,7 @@ defmodule Replicant.QueryBuilderTest do
       # joins against pg_publication_tables by the bound publication name
       assert sql =~ "pg_publication_tables"
       assert sql =~ "pubname = ANY($1)"
-      # Per-column TYPE oids now come from table_columns/0 (the full column set covers the
+      # Per-column TYPE oids now come from table_columns/1 (the full column set covers the
       # PK columns), so pk_columns/0 no longer duplicates a per-PK type array.
       refute sql =~ "atttypid"
       # multi-publication dedup: a table in two publications must NOT duplicate its array_agg
@@ -517,9 +517,9 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
-  describe "table_columns/0" do
+  describe "table_columns/1" do
     test "discovers published columns ordered by attnum with server-quoted names + type oids" do
-      sql = QueryBuilder.table_columns()
+      sql = QueryBuilder.table_columns(150_000)
       assert sql =~ "pg_attribute"
       assert sql =~ "attnum > 0"
       assert sql =~ "NOT a.attisdropped"

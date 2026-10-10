@@ -115,7 +115,12 @@ defmodule Replicant do
   columns for wal2json. Different lists for one table halt
   `:snapshot_column_list_conflict` before snapshot delivery. Unpublished keys are
   never added; incremental backfills use a whole-table window if the complete PK
-  is unavailable. Publication row filters are not applied by snapshot readers.
+  is unavailable. Snapshots select the same columns and rows as the stream,
+  including generated-column policy and server row filters. PG15+ publication
+  predicates combine with OR (any unfiltered publication wins); pglogical 2.4.8
+  non-NULL set predicates combine with AND, even beside an unfiltered set.
+  NULL or empty projections halt `:snapshot_no_publishable_columns` naming the
+  table. ADR-0002 documents PG15's additional dropped-column stream refusal.
 
   Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` includes
   `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`,
