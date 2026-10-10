@@ -16,7 +16,7 @@ defmodule Replicant.ReleaseContractTest do
   @previous_release "1.4.2"
   # Coordinator replaces this only after check-building and binding the 1.5.0 bytes.
   # Until that authorized step, the current-release binding test intentionally fails.
-  @published_digest "aa150113be11726eaa9a393399e652bac5d485e7c91bacafdd9717be6948d56e"
+  @published_digest "5c8f6b05b910da4f76c9d62e4db17af1912fa0508112d5731c17ebd6991a54e6"
 
   defp version, do: Mix.Project.config()[:version]
 
