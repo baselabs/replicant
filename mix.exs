@@ -84,18 +84,22 @@ defmodule Replicant.MixProject do
 
   defp docs do
     [
-      main: "Replicant",
+      # The README is the front page on HexDocs: value proposition, quick start,
+      # guarantees, compatibility. The `Replicant` module page carries the API.
+      main: "readme",
       # HexDocs source links resolve against the exact v#{@version} tag. Release
       # publication uses `git push origin v#{@version}` for only that tag, then uploads
       # the witnessed bytes through scripts/release/upload_candidate.exs; never rebuild
       # them at publish time.
       source_ref: "v#{@version}",
       source_url: @source_url,
+      # Four extras are named README.md; without explicit filenames ex_doc emits
+      # readme-1.html … readme-4.html and the front page (readme.html) does not exist.
       extras: [
-        "README.md",
+        {"README.md", filename: "readme"},
         "docs/INVARIANTS.md",
         "docs/ROADMAP.md",
-        "docs/adr/README.md",
+        {"docs/adr/README.md", filename: "adr-index"},
         "docs/adr/0001-logical-decoding-messages-delivery-guarantees.md",
         "docs/adr/0002-multi-publication-per-pipeline.md",
         "docs/adr/0003-value-free-error-boundary.md",
@@ -106,8 +110,8 @@ defmodule Replicant.MixProject do
         "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
         "docs/adr/0009-pglogical-wal2json-decoders.md",
         "notebooks/getting_started.livemd",
-        "examples/README.md",
-        "examples/replication_pipeline/README.md",
+        {"examples/README.md", filename: "examples"},
+        {"examples/replication_pipeline/README.md", filename: "reference-deployment"},
         "usage-rules.md",
         "CHANGELOG.md",
         "CONTRIBUTING.md",
@@ -153,14 +157,24 @@ defmodule Replicant.MixProject do
           Replicant.Connection,
           Replicant.AssemblerServer,
           Replicant.Assembler,
-          Replicant.CheckpointStore,
-          Replicant.Snapshotter
+          Replicant.CheckpointStore
+        ],
+        Snapshots: [
+          Replicant.Snapshotter,
+          Replicant.Snapshotter.Incremental,
+          Replicant.SnapshotWindow
         ],
         "Disk spill": [Replicant.Spill, Replicant.Spill.Reader, Replicant.Spill.Error],
-        "Decoding (pgoutput)": [
+        Decoders: [
           Replicant.Decoder,
+          Replicant.Decoder.Plugin,
+          Replicant.Decoder.PgOutput,
+          Replicant.Decoder.Pglogical,
+          Replicant.Decoder.Wal2json,
           Replicant.Decoder.Messages,
-          Replicant.Decoder.OidDatabase,
+          Replicant.Decoder.OidDatabase
+        ],
+        "Casting and SQL": [
           Replicant.Casting.Types,
           Replicant.Casting.ArrayParser,
           Replicant.Identifier,

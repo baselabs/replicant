@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.5.1] - Unreleased
+## [1.5.1] - 2026-10-10
 
 ### Fixed
 
@@ -18,6 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are census queries over every non-dropped column and are now documented as
   deprecated; no snapshot path uses them. Snapshots keep the 1.5.0 guarantee
   through `table_columns/1` and `table_columns_for/3`.
+
+### Documentation
+
+- The README is rewritten as the HexDocs front page: what Replicant guarantees, a
+  quick start with an idempotent sink, the guarantee for each delivery mode,
+  snapshot and stream parity, a decoder and capability compatibility matrix, the
+  configuration reference and the telemetry to alert on. Release history lives
+  here in the CHANGELOG.
+- The getting-started Livebook gains a snapshot-equals-stream section: a
+  publication with a column list and a row filter, proven identical by the
+  snapshot and by the stream. CI runs the notebook on every PostgreSQL 15+ row.
+- HexDocs groups the snapshot modules and every decoder, and the README extras
+  get stable page names.
 
 ## [1.5.0] - 2026-10-10
 
@@ -989,7 +1002,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/baselabs/replicant/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/baselabs/replicant/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/baselabs/replicant/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/baselabs/replicant/compare/v1.4.0...v1.4.1

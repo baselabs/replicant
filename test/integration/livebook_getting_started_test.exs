@@ -1,9 +1,10 @@
 defmodule Replicant.Integration.LivebookGettingStartedTest do
   @moduledoc """
-  Executes `notebooks/getting_started.livemd` end to end against a LIVE PG16 so the notebook
-  can never silently rot: this test IS the notebook's CI (it rides `mix test` on every PG14+
-  matrix row — see `.github/workflows/ci.yml`; the plugin-decoder rows 9/12 skip it with a
-  logged reason: the notebook's `messages: true` demo needs the PG14+ pgoutput option).
+  Executes `notebooks/getting_started.livemd` end to end against a LIVE PostgreSQL so the
+  notebook can never silently rot: this test IS the notebook's CI (it rides `mix test` on every
+  PG15+ matrix row — see `.github/workflows/ci.yml`; the plugin-decoder rows 9/12 skip it with a
+  logged reason: the notebook's column-list + row-filter publication needs PG15+, and its
+  `messages: true` demo needs the PG14+ pgoutput option).
 
   It parses the `.livemd`, extracts its ` ```elixir ` code cells, drops the `Mix.install/1` setup
   cell (deps are already loaded in the test VM), concatenates the rest, and evaluates them with
@@ -27,8 +28,8 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
 
   # The notebook's fixed demo slots (fixed, not per-run, so setup/teardown can enumerate + drop
   # them — the notebook's own setup is likewise self-healing across re-runs).
-  @demo_slots ~w(replicant_lb_core replicant_lb_snapshot replicant_lb_messages)
-  @demo_publications ~w(lb_pub lb_snapshot_pub lb_msg_pub)
+  @demo_slots ~w(replicant_lb_core replicant_lb_snapshot replicant_lb_parity replicant_lb_messages)
+  @demo_publications ~w(lb_pub lb_snapshot_pub lb_parity_pub lb_msg_pub)
 
   # A floor, NOT an exact count — its job is to fail RED if the extractor finds ~nothing (moved
   # file / broken fence), never to pin the notebook's exact structure. The real correctness signal
@@ -53,24 +54,26 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
     :ok
   end
 
-  test "the getting_started notebook's code cells run green against live PG16" do
-    # The notebook is the pgoutput tour; its `messages: true` demo cell needs PG14+
-    # (the pgoutput `messages` option arrived in PG14 — OBSERVED: PG12 rejects it with
+  test "the getting_started notebook's code cells run green against live PostgreSQL 15+" do
+    # The notebook is the pgoutput tour. Its snapshot-equals-stream section creates a
+    # publication with a column list and a row filter (`FOR TABLE t (cols) WHERE (...)`),
+    # which PostgreSQL added in 15, and its `messages: true` demo cell needs PG14+ (the
+    # pgoutput `messages` option arrived in PG14 — OBSERVED: PG12 rejects it with
     # "unrecognized pgoutput option: messages"). The plugin-decoder matrix rows (9/12)
     # carry their own suites; skip the tour there rather than run cells the substrate
     # cannot express.
     version = if PG16.enabled?(), do: Replicant.TestHelper.server_version_num(), else: 0
 
-    if PG16.enabled?() and version < 140_000 do
+    if PG16.enabled?() and version < 150_000 do
       IO.puts(
-        "livebook tour skipped: the notebook's `messages: true` demo needs PG14+ " <>
-          "(pgoutput messages option); the plugin-decoder rows (9/12) carry their own suites"
+        "livebook tour skipped: the notebook's column-list + row-filter publication needs " <>
+          "PG15+; the plugin-decoder rows (9/12) carry their own suites"
       )
 
       :skipped
     end
 
-    if PG16.enabled?() and version >= 140_000 do
+    if PG16.enabled?() and version >= 150_000 do
       source = File.read!(@notebook)
       cells = extract_elixir_cells(source)
 
@@ -119,6 +122,26 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
       # Logical-decoding message: a non-transactional message reached handle_message/2.
       assert summary.nontxn_message == {"lb_heartbeat", "tick"},
              "expected the non-txn message {\"lb_heartbeat\", \"tick\"}; got #{inspect(summary.nontxn_message)}"
+
+      # --- Snapshot equals stream (1.5.0): a PG15+ publication with a column list AND a
+      # row filter delivers the same projection and the same rows by both paths. ---
+      # Five seeded rows, two with qty = 0: the snapshot delivers exactly the three that
+      # pass the filter, with exactly the three published columns (no `internal_note`).
+      assert summary.parity_snapshot_ids == [1, 3, 5],
+             "snapshot should deliver only the row-filtered ids [1, 3, 5]; got #{inspect(summary.parity_snapshot_ids)}"
+
+      assert summary.parity_snapshot_columns == ["id", "item", "qty"],
+             "snapshot records should carry only the published columns; got #{inspect(summary.parity_snapshot_columns)}"
+
+      # The stream: id 6 (qty 0) was committed before id 7 (qty 2); id 7 arrived, id 6 did not.
+      assert summary.parity_stream_ids == [7],
+             "stream should deliver only the row-filtered id [7]; got #{inspect(summary.parity_stream_ids)}"
+
+      assert summary.parity_stream_columns == ["id", "item", "qty"],
+             "stream records should carry only the published columns; got #{inspect(summary.parity_stream_columns)}"
+
+      assert summary.parity_mirror_ids == [1, 3, 5, 7],
+             "parity mirror should hold the snapshot rows plus the streamed row; got #{inspect(summary.parity_mirror_ids)}"
 
       # --- Casting layer (1.3.0, ADR-0008), observed against the live server ---
       # Multidimensional arrays nest element-wise (only int[]/float[] recursed before).

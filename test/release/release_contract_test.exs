@@ -13,7 +13,7 @@ defmodule Replicant.ReleaseContractTest do
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.4.2"
+  @previous_release "1.5.0"
   # Coordinator replaces this only after check-building and binding the 1.5.1 bytes.
   # Until that authorized step, the current-release binding test intentionally fails.
   @published_digest "5c8f6b05b910da4f76c9d62e4db17af1912fa0508112d5731c17ebd6991a54e6"

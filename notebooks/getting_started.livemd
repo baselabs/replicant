@@ -14,12 +14,15 @@ live pipeline, and proven on a real Postgres that:
 2. the **unchanged-TOAST sentinel** tells your sink which columns to leave alone,
 3. delivery is **exactly-once** at transaction granularity (append-only ledger proof),
 4. a **snapshot backfill** bootstraps a populated table gap-free,
-5. **logical-decoding messages** reach `handle_message/2`,
-6. the **casting layer** delivers what you'd expect — nested multidimensional
+5. a snapshot delivers **exactly the published columns and filtered rows** of a
+   publication with a column list and a row filter (snapshot equals stream, 1.5),
+6. **logical-decoding messages** reach `handle_message/2`,
+7. the **casting layer** delivers what you'd expect — nested multidimensional
    arrays, locale-honest `money`, lossless `timetz`.
 
 Everything runs against a real Postgres; nothing is faked. The same assertions
-run in Replicant's CI against this notebook, so it cannot silently drift.
+run in Replicant's CI against this notebook, so it cannot silently drift. The tour
+needs PostgreSQL 15 or newer: publication column lists and row filters arrived in 15.
 
 ## The sink contract (all eleven callbacks)
 
@@ -40,7 +43,7 @@ surprises you later:
 | `sink_kind/0` | append sinks | declare `:append_log` ack behavior (default: state mirror) |
 | `handle_schema_change/2` | optional | accept/veto **destructive** DDL at your migration window |
 
-This notebook exercises the first five plus the message callback; the rest are
+This notebook exercises the first four plus the message callback; the rest are
 one config option away (see the toolbox at the end).
 
 ### The five critical rules (from `docs/INVARIANTS.md`)
@@ -57,7 +60,7 @@ one config option away (see the toolbox at the end).
 
 ```elixir
 Mix.install([
-  {:replicant, "~> 1.3"},
+  {:replicant, "~> 1.5"},
   {:kino, "~> 0.14"}
 ])
 ```
@@ -71,14 +74,14 @@ Replicant needs a Postgres started with `wal_level = logical`. The quickest way 
 get one locally:
 
 ```
-docker run -d --name replicant_pg16 -e POSTGRES_HOST_AUTH_METHOD=trust \
-  -p 5599:5432 postgres:16 \
+docker run -d --name replicant_pg18 -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -p 5599:5432 postgres:18 \
   -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10
 ```
 
 Point the input below at it (it defaults to `REPLICANT_TEST_URL`, then to the local
-container above). This notebook tours the default `pgoutput` decoder (PostgreSQL
-15-18); a server that carries the `pglogical` or `wal2json` output plugin (the
+container above). This notebook tours the default `pgoutput` decoder on PostgreSQL
+15 or newer; a server that carries the `pglogical` or `wal2json` output plugin (the
 tested lanes are 9.6, 12 and 15) is read the same way via `decoder:` — see the
 feature table at the end.
 
@@ -254,7 +257,7 @@ run.
 
 ```elixir
 # Self-heal: stop any leftover demo pipelines + drop their slots from a prior run.
-for slot <- ~w(replicant_lb_core replicant_lb_snapshot replicant_lb_messages) do
+for slot <- ~w(replicant_lb_core replicant_lb_snapshot replicant_lb_parity replicant_lb_messages) do
   Replicant.stop(slot)
   LbDemo.drop_slot(:lb_sql, slot)
 end
@@ -598,13 +601,8 @@ at the snapshot LSN, gap-free and dup-free. A snapshot-capable sink adds
 `handle_snapshot/2` (upsert a batch; clear the table on `first_for_table?`) and
 `handle_snapshot_complete/1` (persist the handoff checkpoint).
 
-Both snapshot modes read only published columns in physical order. PostgreSQL 15+
-publication column lists and pglogical replication-set column lists restrict the
-projection; wal2json retains all configured-table columns. Conflicting lists for
-one table halt `:snapshot_column_list_conflict` before snapshot delivery. Keys are
-never added to the projection: if the complete primary key is unpublished, the
-incremental reader uses a whole-table window and the sink must handle keyless rows.
-PostgreSQL refuses UPDATE/DELETE when required replica-identity columns are omitted.
+A snapshot reads the same columns and rows the stream delivers; the next section
+proves that on a publication with a column list and a row filter.
 
 ```elixir
 defmodule LbSnapshotSink do
@@ -732,7 +730,199 @@ LbDemo.stop(snapshot_slot)
 :snapshot_stopped
 ```
 
-## Beyond the basics 2 — logical-decoding messages
+## Beyond the basics 2 — snapshot equals stream (1.5)
+
+Since 1.5.0 a snapshot delivers exactly what the publication streams. A PostgreSQL
+15+ publication can name a **column list** and a **row filter**; both apply to the
+backfill and to the live stream alike, so a column the publication leaves out never
+leaves the server by either path, and a row the filter excludes is never delivered.
+
+`LbParitySink` is a snapshot-capable sink like the one above. It also keeps every
+delivered `%Change{}` in `LbCapture`, so we can look at the exact record keys that
+arrived.
+
+```elixir
+defmodule LbParitySink do
+  @moduledoc false
+  @behaviour Replicant.Sink
+
+  alias Replicant.{Change, Transaction}
+
+  @conn :lb_sql
+
+  @impl true
+  def checkpoint do
+    case Postgrex.query(@conn, "SELECT lsn FROM lb_parity_cp WHERE id = 1", []) do
+      {:ok, %Postgrex.Result{rows: [[lsn]]}} -> {:ok, lsn}
+      {:ok, %Postgrex.Result{rows: []}} -> {:ok, nil}
+      {:error, _} = err -> err
+    end
+  end
+
+  @impl true
+  def handle_snapshot(changes, %{first_for_table?: first?}) do
+    Postgrex.transaction(@conn, fn c ->
+      if first?, do: Postgrex.query!(c, "TRUNCATE lb_parity_sink", [])
+      Enum.each(changes, &upsert(c, &1))
+    end)
+
+    LbCapture.record(changes)
+    :ok
+  rescue
+    e -> {:error, e}
+  end
+
+  @impl true
+  def handle_snapshot_complete(lsn) do
+    set_cp(@conn, lsn)
+    {:ok, lsn}
+  end
+
+  @impl true
+  def handle_transaction(%Transaction{commit_lsn: lsn, changes: changes}) do
+    change_list = Enum.to_list(changes)
+
+    Postgrex.transaction(@conn, fn c ->
+      case Postgrex.query!(c, "SELECT lsn FROM lb_parity_cp WHERE id = 1", []).rows do
+        [[cp]] when is_integer(cp) and lsn <= cp ->
+          :skipped
+
+        _not_yet_applied ->
+          Enum.each(change_list, &upsert(c, &1))
+          set_cp(c, lsn)
+      end
+    end)
+
+    LbCapture.record(change_list)
+    {:ok, lsn}
+  end
+
+  # Snapshot rows and inserts/updates share one upsert; only the published columns exist.
+  defp upsert(c, %Change{op: op, record: r}) when op in [:snapshot, :insert, :update] do
+    Postgrex.query!(
+      c,
+      "INSERT INTO lb_parity_sink (id, item, qty) VALUES ($1, $2, $3) " <>
+        "ON CONFLICT (id) DO UPDATE SET item = EXCLUDED.item, qty = EXCLUDED.qty",
+      [r["id"], r["item"], r["qty"]]
+    )
+  end
+
+  defp upsert(c, %Change{op: :delete, old_record: old}) do
+    Postgrex.query!(c, "DELETE FROM lb_parity_sink WHERE id = $1", [old["id"]])
+  end
+
+  defp upsert(_c, _other), do: :ok
+
+  defp set_cp(c, lsn) do
+    Postgrex.query!(
+      c,
+      "INSERT INTO lb_parity_cp (id, lsn) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET lsn = EXCLUDED.lsn",
+      [lsn]
+    )
+  end
+end
+```
+
+The source table has four columns; the publication publishes three of them
+(`internal_note` stays private) and only rows with a positive quantity. Five rows are
+seeded, two of them with `qty = 0`, and the pipeline starts with `snapshot: true`:
+
+```elixir
+parity_ddl = [
+  "DROP PUBLICATION IF EXISTS lb_parity_pub",
+  "DROP TABLE IF EXISTS lb_parity_orders, lb_parity_sink, lb_parity_cp",
+  "CREATE TABLE lb_parity_orders (id int PRIMARY KEY, item text, qty int, internal_note text)",
+  "CREATE TABLE lb_parity_sink (id int PRIMARY KEY, item text, qty int)",
+  "CREATE TABLE lb_parity_cp (id int PRIMARY KEY, lsn bigint)",
+  # A column list (three of the four columns) AND a row filter (positive quantities only).
+  "CREATE PUBLICATION lb_parity_pub FOR TABLE lb_parity_orders (id, item, qty) WHERE (qty > 0)"
+]
+
+for stmt <- parity_ddl, do: Postgrex.query!(sql, stmt, [])
+
+seed = [{1, "widget", 3}, {2, "gadget", 0}, {3, "gizmo", 8}, {4, "doohickey", 0}, {5, "sprocket", 1}]
+
+for {id, item, qty} <- seed do
+  Postgrex.query!(
+    sql,
+    "INSERT INTO lb_parity_orders (id, item, qty, internal_note) VALUES ($1, $2, $3, $4)",
+    [id, item, qty, "cost-basis-#{id}"]
+  )
+end
+
+LbCapture.reset()
+parity_slot = "replicant_lb_parity"
+
+{:ok, _} =
+  LbDemo.start_pipeline(
+    connection: pg_opts,
+    slot_name: parity_slot,
+    publication: "lb_parity_pub",
+    sink: LbParitySink,
+    snapshot: true
+  )
+
+# Three of the five seeded rows satisfy `qty > 0`.
+LbDemo.wait_until(fn -> LbDemo.count(:lb_sql, "lb_parity_sink") == 3 end)
+
+snapshot_changes = LbCapture.all() |> List.flatten() |> Enum.filter(&(&1.op == :snapshot))
+parity_snapshot_ids = snapshot_changes |> Enum.map(& &1.record["id"]) |> Enum.sort()
+
+parity_snapshot_columns =
+  snapshot_changes |> Enum.flat_map(&Map.keys(&1.record)) |> Enum.uniq() |> Enum.sort()
+
+%{snapshot_ids: parity_snapshot_ids, snapshot_columns: parity_snapshot_columns}
+```
+
+The snapshot delivered ids `[1, 3, 5]` with exactly the keys `["id", "item", "qty"]`:
+no `internal_note`, no filtered row. Now the stream. We insert a filtered-out row
+first and a published row second; deliveries arrive in commit order, so once id 7 is
+in the mirror, id 6's absence is proof that the server applied the same filter to
+the stream:
+
+```elixir
+Postgrex.query!(
+  sql,
+  "INSERT INTO lb_parity_orders (id, item, qty, internal_note) VALUES (6, 'spacer', 0, 'cost-basis-6')",
+  []
+)
+
+Postgrex.query!(
+  sql,
+  "INSERT INTO lb_parity_orders (id, item, qty, internal_note) VALUES (7, 'flange', 2, 'cost-basis-7')",
+  []
+)
+
+LbDemo.wait_until(fn -> LbDemo.rows(:lb_sql, "SELECT id FROM lb_parity_sink WHERE id = 7") == [[7]] end)
+
+stream_changes = LbCapture.all() |> List.flatten() |> Enum.filter(&(&1.op == :insert))
+parity_stream_ids = Enum.map(stream_changes, & &1.record["id"])
+
+parity_stream_columns =
+  stream_changes |> Enum.flat_map(&Map.keys(&1.record)) |> Enum.uniq() |> Enum.sort()
+
+parity_mirror_ids = LbDemo.ids(:lb_sql, "lb_parity_sink")
+
+%{
+  stream_ids: parity_stream_ids,
+  stream_columns: parity_stream_columns,
+  mirror_ids: parity_mirror_ids,
+  same_shape?: parity_stream_columns == parity_snapshot_columns
+}
+```
+
+Snapshot and stream agree on columns and on rows. The same rule covers generated
+columns (excluded on PostgreSQL 12 to 15 as pgoutput excludes them; PostgreSQL 16+
+follow the publication's effective list), and an ambiguous projection, such as two
+publications naming one table with different column lists, halts
+`:snapshot_column_list_conflict` before a single row is read.
+
+```elixir
+LbDemo.stop(parity_slot)
+:parity_stopped
+```
+
+## Beyond the basics 3 — logical-decoding messages
 
 Postgres can emit out-of-band **messages** into the WAL via
 `pg_logical_emit_message` — perfect for the outbox pattern or heartbeats. Opt in
@@ -834,16 +1024,16 @@ telemetry, halt-reason, and casting reference:
 
 | Feature | Turn it on with | Where to read |
 | --- | --- | --- |
-| In-progress transaction streaming (proto-v2) | `streaming: [max_concurrent_txns: 64]` | [README — spill & streaming](https://hexdocs.pm/replicant/readme.html#consumer-side-disk-spill-oversized-transactions) |
-| Consumer-side disk spill (oversized txns) | `streaming: [spill: [dir: ..., max_spill_bytes: ...]]` | [README — spill & streaming](https://hexdocs.pm/replicant/readme.html#consumer-side-disk-spill-oversized-transactions) |
-| Resumable incremental snapshot | `snapshot: [mode: :incremental, chunk_rows: 1000]` | [README — snapshots](https://hexdocs.pm/replicant/readme.html#snapshots--backfill) |
-| Lib-owned checkpoint (non-transactional sinks) | `checkpoint_store: [connection: ..., table: ...]` | [README — lib mode](https://hexdocs.pm/replicant/readme.html#usage) |
-| Sink-owned atomic batch delivery | `batch_delivery: [max_transactions: 100]` | [README — batch delivery](https://hexdocs.pm/replicant/readme.html#usage) |
-| Multi-publication per pipeline | `publication: ["p1", "p2"]` | [README — multi-publication](https://hexdocs.pm/replicant/readme.html#usage) |
-| Failover slots (PG17+, HA) | `failover: true` | [README — failover](https://hexdocs.pm/replicant/readme.html#failover-slots-pg17) |
-| Append-log consumers | `sink_kind/0` → `:append_log` + `handle_slot_origin/2` | [README — slot origin](https://hexdocs.pm/replicant/readme.html#slot-origin-for-go-forward-append-consumers) |
+| In-progress transaction streaming (proto-v2) | `streaming: [max_concurrent_txns: 64]` | [README — configuration reference](https://hexdocs.pm/replicant/readme.html#configuration-reference) · [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
+| Consumer-side disk spill (oversized txns) | `streaming: [spill: [dir: ..., max_spill_bytes: ...]]` | [README — guarantees](https://hexdocs.pm/replicant/readme.html#guarantees) · [ADR-0005](https://hexdocs.pm/replicant/0005-spill-is-ephemeral-scratch.html) |
+| Resumable incremental snapshot | `snapshot: [mode: :incremental, chunk_rows: 1000]` | [README — guarantees](https://hexdocs.pm/replicant/readme.html#guarantees) · [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
+| Lib-owned checkpoint (non-transactional sinks) | `checkpoint_store: [connection: ..., table: ...]` | [README — guarantees](https://hexdocs.pm/replicant/readme.html#guarantees) · `Replicant.Sink` |
+| Sink-owned atomic batch delivery | `batch_delivery: [max_transactions: 100]` | [README — guarantees](https://hexdocs.pm/replicant/readme.html#guarantees) · `Replicant.Sink` |
+| Multi-publication per pipeline | `publication: ["p1", "p2"]` | [ADR-0002](https://hexdocs.pm/replicant/0002-multi-publication-per-pipeline.html) |
+| Failover slots (PG17+, HA) | `failover: true` | [README — compatibility](https://hexdocs.pm/replicant/readme.html#compatibility) · [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
+| Append-log consumers | `sink_kind/0` → `:append_log` + `handle_slot_origin/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) · `Replicant.Sink` |
 | Destructive-DDL migration window | `handle_schema_change/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
-| Plugin decoders for PostgreSQL 9.6-15 | `decoder: :pglogical` + `replication_sets:` / `decoder: :wal2json` + `tables:` | [README — plugin decoders](https://hexdocs.pm/replicant/readme.html#reading-pre-15-servers-through-pglogical-or-wal2json-adr-0009) |
+| Plugin decoders for servers without pgoutput | `decoder: :pglogical` + `replication_sets:` / `decoder: :wal2json` + `tables:` | [README — compatibility](https://hexdocs.pm/replicant/readme.html#compatibility) · [ADR-0009](https://hexdocs.pm/replicant/0009-pglogical-wal2json-decoders.html) |
 | Keyless-table insert-only streams (wal2json) | `allow_keyless_tables: true` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
 | wal2json dropped-column guard interval | `schema_check_interval: 30_000` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
 
@@ -872,7 +1062,7 @@ only, never a row value — critical rule 1).
 | `max_inflight_lag: 64 * 1024 * 1024` | how far the received WAL frontier may run ahead of the durable checkpoint before the sink is "too slow" | halt fail-closed (sink can't keep up) | rides `[:replicant, :connection, :disconnected]` with `reason: :sink_too_slow` + a signed `lag` measurement |
 | `checkpoint_store: [max_retries: 5, retry_backoff_ms: 1000]` (lib mode) | transient checkpoint-store faults (connect-read + mid-stream write) | halt after N retries; a permanent fault (schema/config) halts at once; `max_retries: 0` = halt-now | `[:replicant, :checkpoint_store, :retrying]` per attempt |
 | `max_command_retries: 5` | a persistent **pre-frame** replication-command error — slot exhaustion, a slot already active for another consumer, a forward-incompatible result — that otherwise reconnects forever | halt after N failed connect cycles; `max_command_retries: 0` = halt-now | `[:replicant, :connection, :command_error_halt]` on halt |
-| `failover: true` (PG17+) | enables an HA failover slot that survives a promoted standby | on PG16 halts `{:config, :failover_unsupported}`; an unpromoted synced slot halts fail-closed | — |
+| `failover: true` (PG17+) | enables an HA failover slot that survives a promoted standby | below PG17 halts `{:config, :failover_unsupported}`; an unpromoted synced slot halts fail-closed | — |
 
 Two scope notes for `max_command_retries`: it bounds only **pre-frame** errors — once
 the stream is flowing the counter resets on the first replication frame, so a later
@@ -897,6 +1087,14 @@ assert toast_unchanged == ["memo"]
 assert snapshot_mirror_count == 5
 assert nontxn_message == {"lb_heartbeat", "tick"}
 
+# Snapshot equals stream (1.5): only the published columns, only the filtered rows,
+# identically by both paths.
+assert parity_snapshot_ids == [1, 3, 5]
+assert parity_snapshot_columns == ["id", "item", "qty"]
+assert parity_stream_ids == [7]
+assert parity_stream_columns == ["id", "item", "qty"]
+assert parity_mirror_ids == [1, 3, 5, 7]
+
 assert multidim_numeric == [[Decimal.new("1.5"), Decimal.new(2)], [Decimal.new(3), nil]]
 assert multidim_bool == [[true, false]]
 assert [[%DateTime{}, %DateTime{}]] = tz_nested
@@ -914,6 +1112,11 @@ assert timetz_raw == "04:05:06.789-08"
   core_dup_count: core_dup_count,
   toast_unchanged: toast_unchanged,
   snapshot_mirror_count: snapshot_mirror_count,
+  parity_snapshot_ids: parity_snapshot_ids,
+  parity_snapshot_columns: parity_snapshot_columns,
+  parity_stream_ids: parity_stream_ids,
+  parity_stream_columns: parity_stream_columns,
+  parity_mirror_ids: parity_mirror_ids,
   nontxn_message: nontxn_message,
   multidim_numeric: multidim_numeric,
   multidim_bool: multidim_bool,

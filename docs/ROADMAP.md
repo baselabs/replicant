@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-10-10 · **Release base:** `v1.4.2` (`8bf47a3`) · **Preparing:** `1.5.0` (digest binding and publication pending)
+**Updated:** 2026-10-10 · **Current release:** `1.5.1` (2026-10-10)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,11 +15,16 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.5.0 release preparation:** snapshots select the same columns and
+- **`replicant` 1.5.0** (Hex, 2026-10-10): snapshots select the same columns and
   rows as the change stream, including publication column lists and row filters,
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
-  in ADR-0002. Candidate digest binding and publication remain coordinator steps.
+  in ADR-0002.
+- **`replicant` 1.5.1 is the current release** (2026-10-10; every published digest is in
+  `scripts/release/published_packages.sha256`): it restores
+  `Replicant.QueryBuilder.table_columns/0` and the 1.4.x row shape of
+  `table_columns_for/1` (both now documented as deprecated census queries) for
+  existing callers such as `AshReplicant.Coverage` 1.6.2; see CHANGELOG `[1.5.1]`.
   The following 1.0–1.3 narrative is retained verbatim from `8bf47a3` as history.
 - **`replicant` 1.3.0 is the latest published release**, on Hex and tagged `v1.3.0` (the
   1.3.0 remediation release: full multidim-array casting, locale-honest money, lossless
@@ -43,9 +48,8 @@ through later releases:
   15–18 support); 1.0.0 shipped at `v1.0.0`.
 
   **October 10, 2026 correction:** the 1.3.0 statement above is retained history.
-  OBSERVED in `scripts/release/published_packages.sha256`: package records extend
-  through 1.4.2. Version 1.5.0 is being prepared; its digest is not yet bound and
-  it has not been published by this repair.
+  OBSERVED in `scripts/release/published_packages.sha256` and on Hex: package
+  records extend through 1.5.0, and 1.5.1 follows it.
 
 - **AshReplicant compatibility — OBSERVED, September 21, 2026:** `rg -n`/`sed` reads of
   the owner's `mix.exs`, `mix.lock`, and `CHANGELOG.md` show source version 1.2.0,
