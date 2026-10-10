@@ -116,7 +116,9 @@ defmodule Replicant.Snapshotter.Incremental do
     end
   end
 
-  defp halt_snapshot(args, error) do
+  @doc false
+  @spec halt_snapshot(map(), Error.t()) :: :ok
+  def halt_snapshot(args, error) do
     Telemetry.event(
       [:replicant, :snapshot, :failed],
       %{},
@@ -227,18 +229,32 @@ defmodule Replicant.Snapshotter.Incremental do
   defp discover(db, args) do
     col_rows = Replicant.Snapshotter.table_columns(db, args)
 
+    {pk_sql, all_sql, params} = discovery_queries(args)
+    pk_rows = Postgrex.query!(db, pk_sql, params).rows
+
+    all_rows =
+      if all_sql,
+        do: Postgrex.query!(db, all_sql, params).rows,
+        else: Enum.map(args.tables, fn {s, t} -> [s, t, "#{s}.#{t}"] end)
+
+    SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
+  end
+
+  @doc false
+  @spec discovery_queries(map()) :: {String.t(), String.t() | nil, list()}
+  def discovery_queries(args) do
     case Map.get(args, :tables) do
       nil ->
-        pk_rows = Postgrex.query!(db, QueryBuilder.pk_columns(), [args.publication]).rows
-        {:ok, all_sql} = QueryBuilder.publication_tables(args.publication)
-        all_rows = Postgrex.query!(db, all_sql, [args.publication]).rows
-        SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
+        case QueryBuilder.publication_tables(args.publication) do
+          {:ok, all_sql} -> {QueryBuilder.pk_columns(), all_sql, [args.publication]}
+          {:error, reason} -> raise Error, reason: reason
+        end
 
       tables ->
-        {:ok, pk_sql} = QueryBuilder.pk_columns_for(tables)
-        pk_rows = Postgrex.query!(db, pk_sql, []).rows
-        all_rows = Enum.map(tables, fn {s, t} -> [s, t, "#{s}.#{t}"] end)
-        SnapshotProgress.new(parse_pk_rows(pk_rows, col_rows, all_rows), args.floor_lsn)
+        case QueryBuilder.pk_columns_for(tables) do
+          {:ok, pk_sql} -> {pk_sql, nil, []}
+          {:error, reason} -> raise Error, reason: reason
+        end
     end
   end
 

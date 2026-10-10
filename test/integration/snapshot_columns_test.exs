@@ -243,7 +243,7 @@ defmodule Replicant.SnapshotColumnsTest do
   for stored <- [false, true] do
     @stored stored
     @tag :snapshot_generated
-    @tag skip: Replicant.TestHelper.server_version_num() < if(stored, do: 180_000, else: 160_000)
+    @tag skip: Replicant.TestHelper.server_version_num() < if(stored, do: 180_000, else: 150_000)
     test "generated stored column snapshot matches stream (publish stored: #{stored})", ctx do
       Postgrex.query!(
         ctx.db,
@@ -274,7 +274,8 @@ defmodule Replicant.SnapshotColumnsTest do
   test "a table with no publishable columns is refused by name", ctx do
     Postgrex.query!(
       ctx.db,
-      "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible",
+      "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible, " <>
+        "ADD COLUMN derived int GENERATED ALWAYS AS (42) STORED",
       []
     )
 
@@ -290,7 +291,8 @@ defmodule Replicant.SnapshotColumnsTest do
     test "#{inspect(mode)} empty-projection halt exposes the refused table", ctx do
       Postgrex.query!(
         ctx.db,
-        "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible",
+        "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible, " <>
+          "ADD COLUMN derived int GENERATED ALWAYS AS (42) STORED",
         []
       )
 
@@ -309,6 +311,38 @@ defmodule Replicant.SnapshotColumnsTest do
       table = "public.#{ctx.table}"
       assert_receive {:empty_refusal, :snapshot_no_publishable_columns, ^table}, 1_000
       assert SnapshotRecordingSink.recorded().snapshot == []
+    end
+  end
+
+  for mode <- [true, [mode: :incremental, chunk_rows: 1]], dropped? <- [false, true] do
+    @mode mode
+    @dropped dropped?
+    test "#{inspect(mode)} zero-column table (all dropped: #{dropped?}) delivers only an empty reset",
+         ctx do
+      if @dropped do
+        Postgrex.query!(
+          ctx.db,
+          "ALTER TABLE #{ctx.table} DROP COLUMN id, DROP COLUMN private_secret, DROP COLUMN visible",
+          []
+        )
+      else
+        Postgrex.query!(ctx.db, "DROP TABLE #{ctx.table}", [])
+        Postgrex.query!(ctx.db, "CREATE TABLE #{ctx.table} ()", [])
+        Postgrex.query!(ctx.db, "INSERT INTO #{ctx.table} DEFAULT VALUES", [])
+      end
+
+      publish(ctx, hd(ctx.pubs), "")
+      assert [[_, _, _, [], [], [], nil]] = columns(ctx, [hd(ctx.pubs)])
+      start_pipeline(ctx, [hd(ctx.pubs)], @mode)
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+      assert SnapshotRecordingSink.recorded().snapshot == []
+
+      resets =
+        Enum.filter(SnapshotRecordingSink.recorded().batches, fn {_, context} ->
+          context[:table] == "public.#{ctx.table}" and context[:first_for_table?]
+        end)
+
+      assert [{[], _}] = resets
     end
   end
 

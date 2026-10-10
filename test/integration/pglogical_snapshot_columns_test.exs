@@ -151,6 +151,58 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
     end
   end
 
+  for mode <- [true, [mode: :incremental, chunk_rows: 1]] do
+    @mode mode
+    test "#{inspect(mode)} ignores predicates from sets that do not replicate INSERT", ctx do
+      [a, b] = ctx.sets
+
+      Postgrex.query!(
+        ctx.db,
+        "SELECT pglogical.alter_replication_set($1, false, true, true, true)",
+        [a]
+      )
+
+      for {set, filter} <- [{a, "id % 2 = 1"}, {b, "id % 2 = 0"}] do
+        Postgrex.query!(
+          ctx.db,
+          "SELECT pglogical.replication_set_add_table($1, $2::regclass, false, $3::text[], $4::text)",
+          [set, ctx.table, ["id", "visible"], filter]
+        )
+      end
+
+      Postgrex.query!(
+        ctx.db,
+        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'before' FROM generate_series(2,4) i",
+        []
+      )
+
+      assert {:ok, _} =
+               Replicant.start_link(
+                 connection: PG16.pg_opts(),
+                 slot_name: ctx.slot,
+                 decoder: :pglogical,
+                 replication_sets: ctx.sets,
+                 sink: SnapshotRecordingSink,
+                 snapshot: @mode
+               )
+
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+
+      assert Enum.sort(Enum.map(SnapshotRecordingSink.recorded().snapshot, & &1.record["id"])) ==
+               [2, 4]
+
+      Postgrex.query!(
+        ctx.db,
+        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'after' FROM generate_series(5,8) i",
+        []
+      )
+
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().txns != [] end)
+      ids = for txn <- SnapshotRecordingSink.recorded().txns, c <- txn.changes, do: c.record["id"]
+      assert Enum.sort(ids) == [6, 8]
+    end
+  end
+
   defp add_table(ctx, set, names) do
     Postgrex.query!(
       ctx.db,
@@ -162,7 +214,8 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
   defp columns(ctx) do
     Snapshotter.table_columns(ctx.db, %{
       tables: [{"public", ctx.table}],
-      replication_sets: ctx.sets
+      replication_sets: ctx.sets,
+      server_version_num: Replicant.TestHelper.server_version_num()
     })
   end
 end

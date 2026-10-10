@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-10-10 · **Release base:** `v1.4.2` (`8bf47a3`) · **Preparing:** `1.4.3` (digest binding and publication pending)
+**Updated:** 2026-10-10 · **Release base:** `v1.4.2` (`8bf47a3`) · **Preparing:** `1.5.0` (digest binding and publication pending)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -15,7 +15,7 @@
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 
-- **`replicant` 1.4.3 release preparation:** snapshots select the same columns and
+- **`replicant` 1.5.0 release preparation:** snapshots select the same columns and
   rows as the change stream, including publication column lists and row filters,
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
@@ -41,6 +41,12 @@ through later releases:
   carries the R01–R05 fixes (fail-closed unknown-checkpoint halt, typed telemetry shapes,
   logical-message value-safety, the `handle_slot_origin/2` callback, and proven PostgreSQL
   15–18 support); 1.0.0 shipped at `v1.0.0`.
+
+  **October 10, 2026 correction:** the 1.3.0 statement above is retained history.
+  OBSERVED in `scripts/release/published_packages.sha256`: package records extend
+  through 1.4.2. Version 1.5.0 is being prepared; its digest is not yet bound and
+  it has not been published by this repair.
+
 - **AshReplicant compatibility — OBSERVED, September 21, 2026:** `rg -n`/`sed` reads of
   the owner's `mix.exs`, `mix.lock`, and `CHANGELOG.md` show source version 1.2.0,
   declared Replicant range `>= 1.2.3 and < 2.0.0-0`, and committed Replicant lock 1.2.3.
@@ -136,7 +142,7 @@ shipped specs' §3 non-goal tables, (C) ecosystem/adoption-layer candidates
 
 | # | Item | Unlocks | Status |
 |---|---|---|---|
-| C1 | A proposed `metrics/0` helper on `Replicant.Telemetry` (`Telemetry.Metrics` definitions) | Oban/Broadway convention — 30 structure-only events exist; every consumer currently hand-authors metric definitions | Open |
+| C1 | A proposed `metrics/0` helper on `Replicant.Telemetry` (`Telemetry.Metrics` definitions) | Oban/Broadway convention — 31 structure-only events exist; every consumer currently hand-authors metric definitions | Open |
 | C2 | Broadway producer adapter | Opens replicant to the dominant Elixir data-pipeline ecosystem | Open |
 
 ### Closed boundaries (cited, not silently dropped)

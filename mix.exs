@@ -1,7 +1,7 @@
 defmodule Replicant.MixProject do
   use Mix.Project
 
-  @version "1.4.3"
+  @version "1.5.0"
   @source_url "https://github.com/baselabs/replicant"
 
   def project do

@@ -145,16 +145,20 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   run ahead of the durable checkpoint before the sink is "too slow"
   (see the halt-reason table below).
 - **Snapshot column lists** — both readers project only published columns in physical
-  order: pgoutput's effective `attnames` on PostgreSQL 15+ (all columns before 15),
+  order: pgoutput's effective `attnames` on PostgreSQL 15+ (non-dropped columns
+  before 15, excluding generated columns on PG12–15),
   pglogical's `set_att_list` for the requested local sets, and all configured-table
   columns for wal2json, which has no publication column lists. Differing lists for
   one table halt `:snapshot_column_list_conflict` before reading snapshot rows;
   identical lists are accepted. Snapshots select the same columns and rows as the
   stream, including generated-column policy. Both checkpoint modes and all
   incremental paths apply server row predicates: PG15+ publications combine with
-  OR (any unfiltered publication wins); pglogical 2.4.8 non-NULL set filters
-  combine with AND, even beside an unfiltered set. NULL or empty projections
-  halt `:snapshot_no_publishable_columns` with the table name. ADR-0002 documents
+  OR only among INSERT publications (an unfiltered INSERT publication wins).
+  Snapshots are INSERT-equivalent; no INSERT publication means no snapshot rows.
+  pglogical 2.4.8 non-NULL set filters combine with AND, even beside an unfiltered
+  set. A table with columns but no publishable projection halts
+  `:snapshot_no_publishable_columns` with the table name. Zero-column and
+  all-dropped tables retain the empty reset. ADR-0002 documents
   PG15's additional fail-closed stream refusal for dropped-column list collapse.
   Keys are never added: PostgreSQL rejects UPDATE/DELETE if the publication omits
   required replica-identity columns. INSERT-only lists may omit keys; the sink must
@@ -171,7 +175,9 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   APIs) needs no atomic data+checkpoint unit. Value-free boundary; lazy table create +
   shape-probe. With `snapshot: [mode: :incremental]` the store ALSO owns a second
   table — `progress_table` (default `"replicant_snapshot_progress"`, one row per slot)
-  — carrying the opaque, value-free backfill progress token. Both table names are
+  — carrying the opaque backfill progress token. PK bounds are row data;
+  `row_filter` text is publication configuration and can contain literal constants.
+  Persist the token without logging it. Both table names are
   configurable (`checkpoint_store: [table: ..., progress_table: ...]`) and both are
   created lazily. A store fault is bounded by two `:checkpoint_store` knobs — `max_retries`
   (default 5) and `retry_backoff_ms` (default 1000) — shared by both fault sites: a
@@ -296,6 +302,7 @@ durable checkpoint (loss = 0; duplicates bounded by the mode's contract).
 | `[:replicant, :schema_change, :halted]` | a destructive schema change (dropped column, replica-identity change, narrowing type) — or `handle_schema_change/2` vetoed | adapt the sink (or implement the callback to accept), then restart |
 | `[:replicant, :snapshot, :failed]` with `:snapshot_table_contended` | a backfilling table stayed hot through three contention attempts | backfill during a quieter window, or shrink `chunk_rows` |
 | `[:replicant, :snapshot, :failed]` with `:snapshot_column_list_conflict` | requested publications or local replication sets give one table different column lists | align the lists; for a failed initial snapshot, drop its incomplete slot before retrying |
+| `[:replicant, :snapshot, :failed]` with `:snapshot_no_publishable_columns` | a table has columns, but its column list or generated-column policy leaves no publishable columns | publish at least one stream-visible column; the event names `table`; zero-column tables retain an empty reset |
 | `[:replicant, :snapshot, :failed]` (other) | the snapshot reader faulted (incl. connection faults during a backfill) | check source connectivity; restart — the backfill resumes from durable progress |
 | `[:replicant, :stream, :spill_exhausted]` | a spilled transaction exceeded `max_spill_bytes` | free disk / raise `max_spill_bytes` / shrink the oversized transaction |
 | `:decode_failure` | genuinely-malformed WAL/cast input at the value-free boundary | check upstream WAL/plugin integrity — this is never ordinary data |

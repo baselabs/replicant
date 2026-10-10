@@ -7,14 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.4.3] - 2026-10-10
+## [1.5.0] - 2026-10-10
 
 ### Security
 
 - **Snapshot reads respect publication column lists.** Initial and incremental
   snapshots no longer read columns outside the publication column list. PostgreSQL
   15+ pgoutput discovery uses `pg_publication_tables.attnames` in physical column
-  order; older servers retain the version-selected unrestricted query. pglogical
+  order; PG12–15 explicitly excludes generated columns, and pre-12 queries never
+  reference `attgenerated`. pglogical
   discovery honors `pglogical.replication_set_table.set_att_list`; wal2json retains
   all configured-table columns because it has no publication column-list facility.
   Conflicting multi-publication or replication-set column lists halt with the
@@ -26,15 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Snapshot reads respect server row filters.** Initial snapshots in both
   checkpoint modes, incremental keyset chunks, and whole-table windows select the
-  same rows as the change stream. PG15+ publication predicates combine with OR;
-  any unfiltered publication removes the predicate. pglogical 2.4.8 non-NULL
+  same rows as INSERT changes. PG15+ publication predicates combine with OR only
+  among publications with `pubinsert`; an unfiltered INSERT publication removes
+  the predicate. With no INSERT publication, no snapshot rows are delivered. pglogical 2.4.8 non-NULL
   `set_row_filter` predicates combine with AND, even beside an unfiltered set.
   Predicate text comes only from server catalogs (`pg_get_expr`), parenthesized
   before composition. wal2json has table filters, not a server row-filter facility.
 
 ### Changed
 
-- **Generated columns on PostgreSQL 16+: snapshot records now match stream
+- **Public discovery API changes require 1.5.0.** `QueryBuilder.table_columns/0`
+  is removed; callers supply the probed version to `table_columns/1`. Discovery
+  rows grow from six to seven elements with `row_filter`. `keyset_chunk/5` and
+  `keyless_scan/3` accept that predicate; their shorter forms remain available.
+  pglogical callers of `table_columns_for/3` must supply the probed version.
+- **Generated columns on PostgreSQL 12+: snapshot records now match stream
   records.** A no-list publication omits generated columns from snapshots just as
   pgoutput does. On PG18, `publish_generated_columns = stored` includes stored
   generated columns in both. Users who previously consumed these columns only
@@ -42,12 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Tables with NULL or empty publishable column lists halt with the typed
-  `:snapshot_no_publishable_columns` error naming the table, before any snapshot
-  delivery. They are never silently skipped or queried with an empty projection.
+- A table with columns but no publishable projection halts with the typed
+  `:snapshot_no_publishable_columns` error naming the table before snapshot
+  delivery. Zero-column and all-dropped tables retain 1.4.2's empty reset.
 - Invalid explicit table identifiers preserve `:invalid_identifier`; snapshot
-  discovery reuses the already-probed server version. Pipeline halt telemetry
-  exposes the structural reason, including snapshot column-list refusals.
+  discovery reuses the already-probed server version and refuses an unprobed
+  version. `[:replicant, :pipeline, :halted]` exposes the structural reason,
+  including incremental snapshot column-list refusals.
+- Progress tokens contain PK bounds (row data) and `row_filter` text (publication
+  configuration). Persist them without logging either.
+- Verification for this repair: live PostgreSQL 18.6 column/row parity; offline
+  PG12–15 generated-column selection. PG12–15 and pglogical live regressions
+  remain version/plugin-gated.
 
 ### Known limitations
 
@@ -964,8 +977,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.4.3...HEAD
-[1.4.3]: https://github.com/baselabs/replicant/compare/v1.4.2...v1.4.3
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/baselabs/replicant/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/baselabs/replicant/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/baselabs/replicant/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/baselabs/replicant/compare/v1.3.0...v1.4.0

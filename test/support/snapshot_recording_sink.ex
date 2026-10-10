@@ -37,6 +37,7 @@ defmodule Replicant.Test.SnapshotRecordingSink do
       %{
         state
         | snapshot: state.snapshot ++ changes,
+          batches: state.batches ++ [{changes, context}],
           progress: Map.get(context, :progress, state.progress),
           complete?: Map.get(context, :backfill_complete?, state.complete?)
       }
@@ -54,5 +55,6 @@ defmodule Replicant.Test.SnapshotRecordingSink do
     {:ok, lsn}
   end
 
-  defp initial, do: %{snapshot: [], txns: [], watermark: nil, complete?: false, progress: nil}
+  defp initial,
+    do: %{snapshot: [], batches: [], txns: [], watermark: nil, complete?: false, progress: nil}
 end

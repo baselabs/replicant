@@ -335,12 +335,18 @@ snapshot rows are read or delivered. pglogical applies `set_att_list` from the
 requested local replication sets and uses the same conflict refusal. wal2json has
 table filters but no publication column lists, so it retains all configured-table
 columns. A snapshot selects the same columns and rows as the change stream.
-Both checkpoint modes and all incremental paths apply server row filters: PG15+
-publication filters combine with OR, and any unfiltered publication permits all
-rows; pglogical 2.4.8 combines non-NULL set filters with AND, even beside an
-unfiltered set. A NULL or empty publishable column list halts with
-`:snapshot_no_publishable_columns` and the table name. Generated columns follow
-the publication's stream policy (PG18 can publish stored generated columns).
+Snapshots are INSERT-equivalent. Both checkpoint modes and all incremental paths
+apply server row filters: PG15+ publication filters combine with OR only among
+publications that publish INSERT; an unfiltered INSERT publication permits all
+rows. With no INSERT publication, the snapshot delivers no rows. pglogical 2.4.8
+combines non-NULL set filters with AND, even beside an unfiltered set.
+A table with columns but no publishable projection halts with
+`:snapshot_no_publishable_columns` and the table name. A genuinely zero-column
+table, including one whose columns were all dropped, keeps the empty-reset
+behavior of 1.4.2. PG12–15 discovery excludes generated columns; PG16+ uses the
+publication's effective column list, including PG18's opt-in stored generated
+columns. These repairs were verified live on PostgreSQL 18.6; PG12–15 selection
+was verified offline, with a version-gated live regression for those servers.
 [ADR-0002](docs/adr/0002-multi-publication-per-pipeline.md) documents PG15's
 additional stream refusal when dropped columns prevent full-list collapse.
 
@@ -386,8 +392,10 @@ bounded: the pipeline retries `max_retries` times (default 5) `retry_backoff_ms`
 (default 1000 ms — ~5s of outage tolerated) then halts fail-closed; a permanent fault
 (schema mismatch / invalid config) halts immediately. With `snapshot: [mode:
 :incremental]` the store additionally owns a `progress_table` (default
-`"replicant_snapshot_progress"`) carrying the opaque, value-free backfill progress token
-— both table names are configurable.
+`"replicant_snapshot_progress"`) carrying the opaque backfill progress token.
+PK bounds are row data; `row_filter` text is publication configuration and can
+include literal constants. Persist the token without logging it. Both table names
+are configurable.
 
 **Persistent replication-command errors (`max_command_retries`, default 5).** A replication
 command that fails *before the stream starts* — e.g. `CREATE_REPLICATION_SLOT` when the

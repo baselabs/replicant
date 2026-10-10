@@ -14,7 +14,8 @@ defmodule Replicant.Snapshotter do
   Both snapshot modes project only published columns, in physical column order:
   pgoutput uses `pg_publication_tables.attnames` on PostgreSQL 15+, pglogical uses
   `set_att_list`, and wal2json keeps all configured-table columns. Both readers apply
-  server row filters too: pgoutput ORs them (an unfiltered publication wins);
+  server row filters too: pgoutput ORs INSERT predicates (an unfiltered INSERT
+  publication wins);
   pglogical ANDs its non-NULL set filters, matching its 2.4.8 output plugin. Conflicting lists
   halt `:snapshot_column_list_conflict` before any snapshot row is read or delivered.
 
@@ -161,7 +162,7 @@ defmodule Replicant.Snapshotter do
     # result before either reader can scan a table or call a sink. Never union lists.
     _seen =
       Enum.reduce(rows, MapSet.new(), fn [_, _, qualified, raw, _, _, _], seen ->
-        if raw in [nil, []],
+        if is_nil(raw),
           do: raise(Error, reason: :snapshot_no_publishable_columns, table: qualified)
 
         if MapSet.member?(seen, qualified),
@@ -176,14 +177,17 @@ defmodule Replicant.Snapshotter do
   @doc false
   @spec columns_query(map()) :: {String.t(), list()}
   def columns_query(args) do
+    version = Map.get(args, :server_version_num)
+    unless is_integer(version) and version > 0, do: raise(Error, reason: :snapshot_failed)
+
     case Map.get(args, :tables) do
       nil ->
-        {QueryBuilder.table_columns(Map.fetch!(args, :server_version_num)), [args.publication]}
+        {QueryBuilder.table_columns(version), [args.publication]}
 
       tables ->
         sets = Map.get(args, :replication_sets)
 
-        case QueryBuilder.table_columns_for(tables, sets) do
+        case QueryBuilder.table_columns_for(tables, sets, version) do
           {:ok, sql} -> {sql, if(is_nil(sets), do: [], else: [sets])}
           {:error, reason} -> raise Error, reason: reason
         end

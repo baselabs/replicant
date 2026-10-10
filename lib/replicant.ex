@@ -117,10 +117,14 @@ defmodule Replicant do
   never added; incremental backfills use a whole-table window if the complete PK
   is unavailable. Snapshots select the same columns and rows as the stream,
   including generated-column policy and server row filters. PG15+ publication
-  predicates combine with OR (any unfiltered publication wins); pglogical 2.4.8
-  non-NULL set predicates combine with AND, even beside an unfiltered set.
-  NULL or empty projections halt `:snapshot_no_publishable_columns` naming the
-  table. ADR-0002 documents PG15's additional dropped-column stream refusal.
+  predicates combine with OR among INSERT publications (an unfiltered INSERT
+  publication wins); snapshots are INSERT-equivalent. No INSERT publication means
+  no snapshot rows. pglogical 2.4.8 non-NULL set predicates combine with AND, even
+  beside an unfiltered set. PG12–15 excludes generated columns; PG16+ uses the
+  effective publication list. A table with columns but no publishable projection
+  halts `:snapshot_no_publishable_columns` naming the table. Zero-column and
+  all-dropped tables retain the empty reset. ADR-0002 documents PG15's additional
+  dropped-column stream refusal.
 
   Returns `{:ok, pipeline_pid}` or `{:error, reason}` where `reason` includes
   `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`,

@@ -126,6 +126,54 @@ defmodule Replicant.SnapshotRowsTest do
     end
   end
 
+  for mode <- [true, [mode: :incremental, chunk_rows: 1]] do
+    @mode mode
+    test "#{inspect(mode)} UPDATE/DELETE-only publication does not override INSERT filter", ctx do
+      [a, b] = ctx.pubs
+
+      Postgrex.query!(
+        ctx.db,
+        "CREATE PUBLICATION #{a} FOR TABLE #{ctx.table} WITH (publish = 'update,delete')",
+        []
+      )
+
+      Postgrex.query!(
+        ctx.db,
+        "CREATE PUBLICATION #{b} FOR TABLE #{ctx.table} WHERE (id % 2 = 0) WITH (publish = 'insert')",
+        []
+      )
+
+      assert {:ok, _} =
+               Replicant.start_link(
+                 connection: PG16.pg_opts(),
+                 slot_name: ctx.slot,
+                 publication: ctx.pubs,
+                 sink: SnapshotRecordingSink,
+                 snapshot: @mode
+               )
+
+      assert_receive :snapshot_completed, 10_000
+
+      assert Enum.sort(Enum.map(SnapshotRecordingSink.recorded().snapshot, & &1.record["id"])) ==
+               [2, 4]
+
+      Postgrex.query!(
+        ctx.db,
+        "INSERT INTO #{ctx.table} SELECT i, 'stream' FROM generate_series(6,10) i",
+        []
+      )
+
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().txns != [] end)
+
+      ids =
+        for txn <- SnapshotRecordingSink.recorded().txns,
+            change <- txn.changes,
+            do: change.record["id"]
+
+      assert Enum.sort(ids) == [6, 8, 10]
+    end
+  end
+
   test "incremental whole-table window filters rows when the published projection omits the PK",
        ctx do
     [pub | _] = ctx.pubs

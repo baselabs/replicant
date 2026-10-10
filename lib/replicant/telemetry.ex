@@ -12,6 +12,12 @@ defmodule Replicant.Telemetry do
   value itself. Off-list errors elide the rejected keys as well, because map keys can be
   attacker-controlled terms. The guard therefore cannot leak the bytes it exists to keep
   out. Mirrors `arcadic`'s allowlist pattern.
+
+  `[:replicant, :pipeline, :halted]` fires before permanent pipeline teardown.
+  Measurements are empty; metadata contains `slot_name`, the structural `reason`
+  atom, and optional `kind`. Snapshot refusals also emit
+  `[:replicant, :snapshot, :failed]`; `:snapshot_no_publishable_columns` includes
+  the structural `table` name. Neither event includes predicate text or row values.
   """
 
   # Metadata (the 3rd arg): key => value-shape contract. Derived from every emission site.

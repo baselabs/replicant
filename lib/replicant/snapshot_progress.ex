@@ -5,7 +5,9 @@ defmodule Replicant.SnapshotProgress do
 
   The wire form is version-tagged (`{:replicant_snapshot_progress, @version, map}`)
   self-identifying encoding — and decoded with `binary_to_term(bin, [:safe])`. It
-  contains PK-bound ROW VALUES: it is data-plane (persisted by the sink or the
+  contains PK-bound ROW VALUES and server-rendered `row_filter` text. The filter
+  is publication configuration, not row data, but may contain literal constants.
+  The token is data-plane (persisted by the sink or the
   checkpoint store) and must NEVER reach an error, log, or telemetry event
   (Critical Rule 1). A decode/shape fault is scrubbed to the bare
   `:snapshot_progress_invalid` — the raised exception is discarded, never inspected.

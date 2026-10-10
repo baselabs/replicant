@@ -14,11 +14,36 @@ defmodule Replicant.ReleaseContractTest do
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
   @previous_release "1.4.2"
-  # Coordinator replaces this only after check-building and binding the 1.4.3 bytes.
+  # Coordinator replaces this only after check-building and binding the 1.5.0 bytes.
   # Until that authorized step, the current-release binding test intentionally fails.
   @published_digest "aa150113be11726eaa9a393399e652bac5d485e7c91bacafdd9717be6948d56e"
 
   defp version, do: Mix.Project.config()[:version]
+
+  test "public discovery contract changes require the coordinated minor release" do
+    assert version() == "1.5.0"
+  end
+
+  test "snapshot release documents the halt, token contents, and conservative plugin policy" do
+    root = Path.expand("../..", __DIR__)
+    usage = File.read!(Path.join(root, "usage-rules.md"))
+    assert usage =~ "with `:snapshot_no_publishable_columns` |"
+    assert File.read!(@changelog) =~ "[:replicant, :pipeline, :halted]"
+
+    assert File.read!(Path.join(root, "lib/replicant/telemetry.ex")) =~
+             "[:replicant, :pipeline, :halted]"
+
+    assert File.read!(Path.join(root, "docs/ROADMAP.md")) =~ "31 structure-only events"
+    assert File.read!(Path.join(root, "docs/ROADMAP.md")) =~ "October 10, 2026 correction"
+
+    for path <- ["README.md", "usage-rules.md", "lib/replicant/snapshot_progress.ex"] do
+      assert File.read!(Path.join(root, path)) =~ "publication configuration"
+    end
+
+    adr = File.read!(Path.join(root, "docs/adr/0009-pglogical-wal2json-decoders.md"))
+    assert adr =~ "unions `set_att_list`"
+    assert adr =~ "conservative"
+  end
 
   test "package version advances past the preceding release" do
     assert Version.compare(version(), @previous_release) == :gt,

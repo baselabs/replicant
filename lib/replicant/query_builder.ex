@@ -570,16 +570,19 @@ defmodule Replicant.QueryBuilder do
   stream uses, so snapshot and stream deliver byte-identical `%Change{}.record` values for
   EVERY column (spec §2 convergence — the F1 fix generalized from PK-only to all columns).
   PostgreSQL 15+ uses the effective `pg_publication_tables.attnames` list. Earlier
-  servers have no column lists and use all non-dropped user columns. The caller
+  servers have no column lists and use non-dropped user columns. PG12–15 excludes
+  generated columns; pre-12 never references `attgenerated`. The caller
   must supply the probed server version. Publication names are bound `$1`. Different
   lists produce separate rows for the same table; the reader MUST reject those
   before reading any table data. Identical lists produce one row. PG15+ row filters
-  combine with OR; any unfiltered publication makes the table unfiltered. Filter
+  combine with OR among INSERT publications only; an unfiltered INSERT publication
+  makes the table unfiltered. Without an INSERT publication, the predicate is false. Filter
   text is rendered by the server, never supplied by a client. Row shape:
   `[schemaname, tablename, qualified, col_raw, col_quoted, col_type_oids, row_filter]`.
   """
   @spec table_columns(non_neg_integer()) :: String.t()
-  def table_columns(server_version_num) when is_integer(server_version_num) do
+  def table_columns(server_version_num)
+      when is_integer(server_version_num) and server_version_num > 0 do
     {published, filter, grouping} =
       if server_version_num >= 150_000 do
         {"SELECT DISTINCT schemaname, tablename, attnames FROM pg_publication_tables WHERE pubname = ANY($1)",
@@ -602,25 +605,50 @@ defmodule Replicant.QueryBuilder do
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
       filter_join <>
       "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-      filter <> " GROUP BY p.schemaname, p.tablename" <> grouping <> filter_group
+      filter <>
+      generated_column_filter(server_version_num) <>
+      " GROUP BY p.schemaname, p.tablename" <> grouping <> filter_group <> ", c.oid"
   end
 
-  # Keep a table even when the published attribute set is empty. NULL arrays are
-  # refused by the reader; an inner join would silently erase the table.
+  def table_columns(_unprobed), do: raise(Replicant.Error, reason: :snapshot_failed)
+
+  defp generated_column_filter(version) when version >= 120_000 and version < 160_000,
+    do: " AND a.attgenerated = ''"
+
+  defp generated_column_filter(_version), do: ""
+
+  # [] identifies a genuinely zero-column relation (including all-dropped schemas).
+  # NULL identifies an existing schema whose publishable projection is empty.
+  # Keep the table in both cases; the reader resets the former and refuses the latter.
   defp column_aggregates do
-    "array_agg(a.attname ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) AS col_raw, " <>
-      "array_agg(quote_ident(a.attname) ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) AS col_quoted, " <>
-      "array_agg(a.atttypid::int ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) AS col_type_oids"
+    [
+      {"a.attname", "name", "col_raw"},
+      {"quote_ident(a.attname)", "text", "col_quoted"},
+      {"a.atttypid::int", "integer", "col_type_oids"}
+    ]
+    |> Enum.map_join(", ", fn {expression, type, name} ->
+      "CASE WHEN EXISTS (SELECT 1 FROM pg_attribute physical " <>
+        "WHERE physical.attrelid = c.oid AND physical.attnum > 0 AND NOT physical.attisdropped) " <>
+        "THEN array_agg(#{expression} ORDER BY a.attnum) FILTER (WHERE a.attnum IS NOT NULL) " <>
+        "ELSE ARRAY[]::#{type}[] END AS #{name}"
+    end)
   end
 
-  defp publication_row_filters(version) when version < 150_000,
-    do: {"", "", "NULL::text", ""}
+  defp publication_row_filters(version) do
+    predicate =
+      if version < 150_000 do
+        "CASE WHEN bool_or(pub.pubinsert) THEN NULL ELSE 'false' END"
+      else
+        "CASE WHEN bool_or(rowfilter IS NULL) FILTER (WHERE pub.pubinsert) THEN NULL " <>
+          "ELSE COALESCE(string_agg('(' || rowfilter || ')', ' OR ' ORDER BY rowfilter) " <>
+          "FILTER (WHERE pub.pubinsert), 'false') END"
+      end
 
-  defp publication_row_filters(_version) do
     {"WITH row_filters AS (SELECT schemaname, tablename, " <>
-       "CASE WHEN bool_or(rowfilter IS NULL) THEN NULL " <>
-       "ELSE string_agg('(' || rowfilter || ')', ' OR ' ORDER BY rowfilter) END AS row_filter " <>
-       "FROM pg_publication_tables WHERE pubname = ANY($1) GROUP BY schemaname, tablename) ",
+       predicate <>
+       " AS row_filter FROM pg_publication_tables p " <>
+       "JOIN pg_publication pub ON pub.pubname = p.pubname " <>
+       "WHERE p.pubname = ANY($1) GROUP BY schemaname, tablename) ",
      "JOIN row_filters f ON f.schemaname = p.schemaname AND f.tablename = p.tablename ",
      "f.row_filter", ", f.row_filter"}
   end
@@ -632,17 +660,27 @@ defmodule Replicant.QueryBuilder do
   `Identifier.validate`d) instead of `pg_publication_tables`. For pglogical, pass
   replication sets as the second argument and bind them as `$1`: `set_att_list`
   restricts the projection per local set. Identical effective projections deduplicate;
-  conflicting ones remain separate rows for the reader's refusal. With no sets
+  conflicting ones remain separate rows for the reader's refusal. Supply the probed
+  server version as the third argument for pglogical's generated-column selection.
+  With no sets
   (wal2json), all non-dropped columns remain selected and there is no row predicate.
   pglogical's non-NULL `set_row_filter` expressions combine with AND (2.4.8),
   including when another set is unfiltered. `pg_get_expr` renders the server nodes.
   """
-  @spec table_columns_for([{String.t(), String.t()}], [String.t()] | nil) ::
+  @spec table_columns_for([{String.t(), String.t()}], [String.t()] | nil, pos_integer() | nil) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
-  def table_columns_for(tables, replication_sets \\ nil)
+  def table_columns_for(tables, replication_sets \\ nil, server_version_num \\ nil)
 
-  def table_columns_for(tables, replication_sets) when is_list(tables) and tables != [] do
+  def table_columns_for(tables, replication_sets, server_version_num)
+      when is_list(tables) and tables != [] do
     with :ok <- ensure_valid_pairs(tables) do
+      if not is_nil(replication_sets) and
+           not (is_integer(server_version_num) and server_version_num > 0),
+         do: raise(Replicant.Error, reason: :snapshot_failed)
+
+      generated =
+        if is_nil(replication_sets), do: "", else: generated_column_filter(server_version_num)
+
       values = table_values(tables)
       {sets_join, filter, grouping} = snapshot_set_columns(replication_sets)
       {cte, filter_join, row_filter, filter_group} = set_row_filters(replication_sets)
@@ -661,11 +699,12 @@ defmodule Replicant.QueryBuilder do
          sets_join <>
          filter_join <>
          "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-         filter <> " GROUP BY n.nspname, c.relname" <> grouping <> filter_group}
+         filter <>
+         generated <> " GROUP BY n.nspname, c.relname" <> grouping <> filter_group <> ", c.oid"}
     end
   end
 
-  def table_columns_for(_other, _sets), do: {:error, :invalid_identifier}
+  def table_columns_for(_other, _sets, _version), do: {:error, :invalid_identifier}
 
   defp snapshot_set_columns(nil), do: {"", "", ""}
 
@@ -678,12 +717,14 @@ defmodule Replicant.QueryBuilder do
 
   defp set_row_filters(nil), do: {"", "", "NULL::text", ""}
 
-  # pglogical 2.4.8 accumulates all non-NULL set_row_filter nodes and rejects
-  # a change if ANY expression is false/NULL: AND, even beside an unfiltered set.
+  # pglogical 2.4.8 replicates a table's inserts when any selected set has
+  # replicate_insert, then accumulates the non-NULL set_row_filter nodes of ALL
+  # selected sets, insert flag or not (pglogical_repset.c:458-498), and rejects a
+  # change if any expression is false/NULL: AND, even beside an unfiltered set.
   defp set_row_filters(_sets) do
     {"WITH row_filters AS (SELECT r.set_reloid, " <>
-       "string_agg('(' || pg_get_expr(r.set_row_filter::pg_node_tree, r.set_reloid) || ')', " <>
-       "' AND ' ORDER BY r.set_id) AS row_filter " <>
+       "CASE WHEN bool_or(s.replicate_insert) THEN string_agg('(' || pg_get_expr(r.set_row_filter::pg_node_tree, r.set_reloid) || ')', " <>
+       "' AND ' ORDER BY r.set_id) ELSE 'false' END AS row_filter " <>
        "FROM pglogical.replication_set_table r " <>
        "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
        "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id GROUP BY r.set_reloid) ",
@@ -783,7 +824,11 @@ defmodule Replicant.QueryBuilder do
   """
   @spec keyless_scan(String.t(), [String.t()]) :: String.t()
   @spec keyless_scan(String.t(), [String.t()], String.t() | nil) :: String.t()
-  def keyless_scan(qualified, col_quoted, row_filter \\ nil),
+  def keyless_scan(qualified, col_quoted, row_filter \\ nil)
+
+  def keyless_scan(qualified, [], _row_filter), do: "SELECT FROM #{qualified} WHERE FALSE"
+
+  def keyless_scan(qualified, col_quoted, row_filter),
     do: "SELECT #{cast_projection(col_quoted)} FROM #{qualified}" <> scan_filter(row_filter)
 
   # Only server pg_get_expr-rendered expressions from discovery reach these builders.

@@ -19,7 +19,9 @@ defmodule Replicant.SnapshotColumnsUnitTest do
   end
 
   test "pglogical filters real set_att_list catalog rows scoped to requested local sets" do
-    assert {:ok, sql} = QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha", "beta"])
+    assert {:ok, sql} =
+             QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha", "beta"], 120_000)
+
     assert sql =~ "pglogical.replication_set_table"
     assert sql =~ "r.set_att_list"
     assert sql =~ "s.set_name = ANY($1)"
@@ -41,7 +43,10 @@ defmodule Replicant.SnapshotColumnsUnitTest do
   test "invalid explicit identifiers raise a typed value-free error before any query" do
     error =
       assert_raise Replicant.Error, fn ->
-        Snapshotter.table_columns(:unused, %{tables: [{"public", "bad; secret"}]})
+        Snapshotter.table_columns(:unused, %{
+          tables: [{"public", "bad; secret"}],
+          server_version_num: 120_000
+        })
       end
 
     assert error.reason == :invalid_identifier
@@ -86,8 +91,8 @@ defmodule Replicant.SnapshotColumnsUnitTest do
     assert Snapshotter.validate_columns!([hd(rows)]) == [hd(rows)]
   end
 
-  test "NULL and empty publishable projections refuse the named table" do
-    for columns <- [nil, []] do
+  test "NULL publishable projections refuse the named table" do
+    for columns <- [nil] do
       error =
         assert_raise Replicant.Error, fn ->
           Snapshotter.validate_columns!([

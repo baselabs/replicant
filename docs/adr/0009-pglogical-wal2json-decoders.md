@@ -305,7 +305,11 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   text[]`; the effective-list function calls its output `att_list`. Identical
   effective projections deduplicate; Replicant refuses conflicting set lists with
   `:snapshot_column_list_conflict`, as an explicit snapshot policy instead of
-  combining columns. This is stricter than pglogical's set combination behavior.
+  combining columns. OBSERVED in `get_table_replication_info` in
+  [pglogical 2.4.8 source](https://github.com/2ndQuadrant/pglogical/blob/REL2_4_8/pglogical_repset.c):
+  pglogical unions `set_att_list` across selected sets with `bms_add_member`.
+  Replicant's refusal of differing lists is conservative: it does not reproduce
+  that union, and requires the operator to align the lists before snapshotting.
   wal2json's documented parameters provide table filters, not publication column
   lists, so its snapshot behavior remains all configured-table columns. Unpublished
   PK columns are never added for pagination; either reader preserves the published
@@ -320,7 +324,10 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   [pglogical_output_plugin.c](https://github.com/2ndQuadrant/pglogical/blob/REL2_4_8/pglogical_output_plugin.c)
   rejects the change if any expression is false or NULL. Therefore the combination
   is AND, including beside an unfiltered set; an unfiltered set does not override
-  another set's filter. Snapshots use that same rule with parenthesized server
+  another set's filter. Inserts flow when any selected set has `replicate_insert`,
+  and the filters of every selected set then apply, whatever each set's insert flag
+  (`pglogical_repset.c:458-498`); a snapshot delivers nothing when no selected set
+  replicates inserts. Snapshots use that same rule with parenthesized server
   expressions. wal2json has no server row-predicate option; its configured table
   membership remains the filter. The live pglogical regression covers both readers,
   two filters, a filtered/unfiltered pair, and wholly unfiltered sets. Local PG18.6
