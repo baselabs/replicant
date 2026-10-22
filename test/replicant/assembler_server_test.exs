@@ -89,6 +89,33 @@ defmodule Replicant.AssemblerServerTest do
     refute :sys.get_state(pid).halted
   end
 
+  test "an oversized unspillable transaction halts without processing credit or durable ack" do
+    {:ok, pid} =
+      AssemblerServer.start_link(
+        slot_name: "srv_budget",
+        sink: RecordingSink,
+        max_inflight_lag: 50
+      )
+
+    epoch = make_ref()
+    message = %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}
+    GenServer.cast(pid, {:message, message, 60, self(), {epoch, 60, 1}})
+    assert :sys.get_state(pid).halted
+    refute_received {:assembler_processed, _, _, _}
+    refute_received {:sink_committed, _}
+    assert RecordingSink.seen() == []
+  end
+
+  test "processing credits do not acknowledge an uncommitted transaction" do
+    pid = start("srv_credit", RecordingSink)
+    epoch = make_ref()
+    message = %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}
+    GenServer.cast(pid, {:message, message, 20, self(), {epoch, 20, 1}})
+    assert_receive {:assembler_processed, ^epoch, 20, 1}
+    refute_received {:sink_committed, _}
+    assert :sys.get_state(pid).asm.txn != nil
+  end
+
   test "the ack advances to txn.commit_lsn, NEVER a higher sink-returned LSN (no over-advance loss)" do
     pid = start("srv_wrong_lsn", WrongHighLsnSink)
     cast(pid, %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}, 20)
@@ -609,7 +636,7 @@ defmodule Replicant.AssemblerServerTest do
     alias Replicant.Decoder.Messages.Relation
     alias Replicant.Decoder.Messages.Relation.Column
 
-    test "the server builds a spill-capable assembler and signals {:spilled_bytes, total} to the connection after a spill" do
+    test "the server builds a spill-capable assembler and accounts its retained payload" do
       base = Path.join(System.tmp_dir!(), "srv_spill_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(base) end)
 
@@ -643,16 +670,13 @@ defmodule Replicant.AssemblerServerTest do
               {:message, %Insert{xid: 100, relation_id: 1, tuple_data: {"#{v}"}}, 60, self()}
             )
 
-      # The AssemblerServer signals the Connection via a PLAIN send → its handle_info substrate
-      # (the same idiom the existing dispatch/3 uses for {:sink_committed, lsn}). Task 10's
-      # Connection handles {:spilled_bytes, total} in handle_info. So assert the plain message,
-      # NOT a {:"$gen_cast", ...} wrapper. The 2s budget (not the 100ms default) matches
-      # the sibling spill asserts below: the spill is real file I/O, and a loaded host
-      # pages it out past 100ms without any defect (OBSERVED under load, 2026-09-30).
-      assert_receive {:spilled_bytes, total} when total > 0, 2_000
+      state = :sys.get_state(pid)
+      assert state.asm.spilled_total > 0
+      assert Replicant.Assembler.buffered_bytes(state.asm) <= 100
+      refute state.halted
     end
 
-    test "a spilled txn COMMITTING re-casts {:spilled_bytes} with the LOWER total (frees disk bytes; the §4 numerator un-strands after a large spilled txn commits)" do
+    test "committing a spilled transaction releases its retained payload and disk usage" do
       base = Path.join(System.tmp_dir!(), "srv_spdec_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(base) end)
 
@@ -694,20 +718,18 @@ defmodule Replicant.AssemblerServerTest do
 
       GenServer.cast(pid, {:message, %Replicant.Decoder.Messages.StreamStop{}, 4, self()})
 
-      # The spill fires → an INCREASE cast (2s budget: real file I/O under host load).
-      assert_receive {:spilled_bytes, up} when up > 0, 2_000
+      assert :sys.get_state(pid).asm.spilled_total > 0
 
-      # The commit delivers the spilled txn and frees its disk bytes → spilled_total drops → a NET
-      # re-cast with the LOWER total (RED before the CV3 fix cast the delta, not the net total —
-      # the numerator would strand stale-high after the commit).
       GenServer.cast(
         pid,
         {:message, %StreamCommit{xid: 100, commit_lsn: 900, end_lsn: 901, commit_timestamp: nil},
          8, self()}
       )
 
-      assert_receive {:spilled_bytes, down} when down < up, 2_000
-      assert :sys.get_state(pid).asm.spilled_total == down
+      assert_receive {:sink_committed, 900}
+      state = :sys.get_state(pid)
+      assert state.asm.spilled_total == 0
+      assert Replicant.Assembler.buffered_bytes(state.asm) == 0
     end
 
     test "a SINGLE row larger than max_inflight_lag spills — the bound-crossing change is appended BEFORE the spill trigger runs (CV2)" do
@@ -815,11 +837,7 @@ defmodule Replicant.AssemblerServerTest do
             )
 
       # Force the spill and capture the on-disk file path from xid 100's stream buffer.
-      # The 2000ms window (not the 100ms default) is load tolerance, not a weaker
-      # assertion: the casts are already in the server's mailbox and the signal MUST
-      # arrive — under a saturated test VM the 100ms window flaked 1-in-5 (OBSERVED
-      # 2026-09-30) while the spill always landed.
-      assert_receive {:spilled_bytes, total} when total > 0, 2_000
+      assert :sys.get_state(pid).asm.spilled_total > 0
       state = :sys.get_state(pid)
       spill_path = state.asm.stream_txns[100].spill.path
       assert File.exists?(spill_path)
@@ -1200,21 +1218,38 @@ defmodule Replicant.AssemblerServerTest do
       assert {:ok, {:ok, _epoch}} = Task.yield(task, 1_000) || Task.shutdown(task)
     end
 
-    test "F-PACE: open_snapshot_window IS still deferred when the frontier gap from the floor exceeds max_inflight_lag/2" do
-      # Same absolute floor, but the frontier is 600_000 above it — OVER the 500_000 gate. The gate
-      # still fires (stream drain has genuine priority) → the call is DEFERRED (no reply). This half
-      # proves the fix did not defeat the pacing gate (the estimate is now floor-relative, not 0).
+    test "snapshot pacing depends on buffered transaction data, not the frontier gap" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_pace_defer")
       floor = 1_000_000_000
       GenServer.cast(pid, {:snapshot_floor, floor})
       GenServer.cast(pid, {:snapshot_frontier, 0, floor + 600_000})
       :sys.get_state(pid)
 
+      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+
+      cast(
+        pid,
+        %Begin{final_lsn: floor + 600_000, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7},
+        600_000
+      )
+
       task =
         Task.async(fn -> Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders") end)
 
       refute Task.yield(task, 300)
-      Task.shutdown(task, :brutal_kill)
+
+      cast(
+        pid,
+        %Commit{
+          lsn: floor + 600_000,
+          end_lsn: floor + 600_001,
+          commit_timestamp: ~U[2026-07-04 00:00:00Z],
+          flags: []
+        },
+        8
+      )
+
+      assert {:ok, _epoch} = Task.await(task)
     end
 
     test "F-TAINT lib+batch: a stream write to an UNTRACKED table leaves a cold backfill table's chunk intact (drop-filter no-op, not taint-all)" do

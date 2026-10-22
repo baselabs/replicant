@@ -209,6 +209,17 @@ defmodule Replicant.Assembler do
     %{asm | txn: %{buffer | byte_size: buffer.byte_size + bytes}}
   end
 
+  @doc false
+  def buffered_bytes(asm) do
+    transaction_bytes = if asm.txn, do: asm.txn.byte_size, else: 0
+
+    streamed_bytes =
+      Enum.reduce(asm.stream_txns, 0, fn {_xid, buf}, n -> n + buf.resident_bytes end)
+
+    batch_bytes = Enum.reduce(asm.batch_txns, 0, fn txn, n -> n + :erlang.external_size(txn) end)
+    transaction_bytes + streamed_bytes + batch_bytes
+  end
+
   @doc """
   Handle one decoded message. Returns:
     * `{:ok, t()}` — accumulated, no boundary crossed.

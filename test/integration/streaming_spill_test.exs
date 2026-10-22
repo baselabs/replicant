@@ -123,7 +123,7 @@ defmodule Replicant.StreamingSpillTest do
     end
   end
 
-  test "an oversized never-committing streamed txn halts fail-closed :sink_too_slow (the §4 backstop pre-empts the deferred disk-ceiling halt) and cleans up",
+  test "an oversized streamed transaction halts on disk exhaustion and cleans up",
        %{
          ctrl: ctrl,
          slot: slot,
@@ -135,7 +135,7 @@ defmodule Replicant.StreamingSpillTest do
 
       :telemetry.attach(
         {__MODULE__, ref, :disc},
-        [:replicant, :connection, :disconnected],
+        [:replicant, :stream, :spill_exhausted],
         fn _e, _m, meta, _ -> send(test_pid, {:disc, ref, meta}) end,
         nil
       )
@@ -146,14 +146,7 @@ defmodule Replicant.StreamingSpillTest do
 
       Postgrex.transaction(ctrl, fn c -> bulk_insert(c, 40_000) end, timeout: 120_000)
 
-      # A single in-progress txn far larger than max_inflight_lag + max_spill_bytes arrives as a
-      # burst: the Connection reads its WAL faster than the assembler spills it, so the §4
-      # in-flight-lag backstop (`received − floor − spilled` > RAM + disk) halts fail-closed FIRST.
-      # The disk-ceiling `:spill_exhausted` halt is DEFERRED to the next StreamCommit — which never
-      # arrives for a never-committing oversized txn — so it cannot fire here; the disk ceiling is
-      # covered deterministically at the unit level. Red-capable on the halt REASON (a wrong-reason
-      # halt would fail this), unlike the prior registry-only assertion.
-      assert_receive {:disc, ^ref, %{reason: :sink_too_slow}}, 20_000
+      assert_receive {:disc, ^ref, %{reason: :spill_exhausted}}, 20_000
 
       PG16.wait_until(
         fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,

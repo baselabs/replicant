@@ -260,6 +260,11 @@ detected at the next change or within `schema_check_interval` (default 30 s).
 
 ## Configuration reference
 
+**Backpressure.** `max_inflight_lag` retains its historical name but now limits
+queued and retained payload bytes rather than WAL-position distance. Replication
+input pauses while the sink drains and resumes without disconnecting. This is a
+payload budget, not an exact process-memory limit.
+
 All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 
 | Option | Default | Purpose |
@@ -274,7 +279,7 @@ All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 | `checkpoint_store:` | off | `[connection:, table:, progress_table:, max_retries: 5, retry_backoff_ms: 1000, batch: [...]]`: library-owned checkpoint for non-transactional sinks |
 | `batch_delivery:` | off | `[max_transactions: 100, max_delay_ms: 1000]`: atomic batches through `handle_batch/1` |
 | `streaming:` | off | `[max_concurrent_txns: 64, spill: [dir:, max_spill_bytes:]]`: in-progress streaming and disk spill |
-| `max_inflight_lag:` | 64 MiB | WAL the connection may run ahead of the durable checkpoint before halting `:sink_too_slow` |
+| `max_inflight_lag:` | 64 MiB | Queued payload budget for pause/resume and a separate retained transaction/batch budget; oversized unspillable transactions halt `:buffer_limit_exceeded` |
 | `max_command_retries:` | `5` | connect cycles a pre-stream replication command may fail before the pipeline halts instead of reconnecting forever |
 | `messages:` | `false` | deliver `pg_logical_emit_message` payloads; the sink must implement `handle_message/2` |
 | `failover:` | `false` | create a `FAILOVER` slot on PostgreSQL 17+ |
@@ -296,8 +301,12 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
 
 - `[:replicant, :pipeline, :halted]` with the structural `reason` atom, on every
   fail-closed halt;
-- `[:replicant, :connection, :disconnected]` with `reason: :sink_too_slow` and a signed
-  `lag` measurement, when the sink falls behind the in-flight window.
+- `[:replicant, :buffer, :exhausted]` with `reason: :buffer_limit_exceeded`, when
+  retained transaction data cannot fit within the configured budget.
+
+`[:replicant, :connection, :paused]` and `:resumed` report normal backpressure, with
+queued payload bytes and message counts. Paused connections send durable feedback
+every five seconds; configure `wal_sender_timeout` comfortably above that interval.
 
 ## Documentation
 
