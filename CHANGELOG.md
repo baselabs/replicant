@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Pace replication intake using queued payload bytes and message counts, rather
+  than WAL-position distance. Pause without releasing slot ownership, continue
+  durable-only feedback, and reject stale drain credits after reconnects.
+- Pace incremental snapshot windows using retained transaction data. WAL archive
+  segment gaps no longer halt streaming or indefinitely defer snapshot reads.
+- Fail closed on actual buffer/spill exhaustion without confusing a slow sink
+  with a large WAL-position gap. Streamed message bytes remain charged after
+  changes are spilled.
+
 ## [1.5.1] - 2026-10-10
 
 ### Fixed

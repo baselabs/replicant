@@ -141,9 +141,12 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   `handle_message/2`). `streaming: [max_concurrent_txns: N]` (default 64) opts into
   proto-v2 in-progress transaction streaming; its nested `spill: [dir:, max_spill_bytes:]`
   opts into consumer-side disk spill for oversized streamed transactions.
-  `max_inflight_lag` (default 64 MiB) bounds how far the received WAL frontier may
-  run ahead of the durable checkpoint before the sink is "too slow"
-  (see the halt-reason table below).
+  `max_inflight_lag` (default 64 MiB) budgets queued payload bytes and, separately,
+  retained transaction/batch data. Intake pauses at that byte budget or 512 queued
+  messages and resumes at or below both half-watermarks without releasing the slot.
+  Processing credits never advance the durable checkpoint. Paused connections send
+  feedback every five seconds; set `wal_sender_timeout` comfortably above that.
+  These are payload budgets, not exact process-memory limits.
 - **Snapshot column lists** — both readers project only published columns in physical
   order: pgoutput's effective `attnames` on PostgreSQL 15+ (non-dropped columns
   before 15, excluding generated columns on PG12–15),
@@ -249,7 +252,9 @@ off-list key or a wrong shape — never ships a row value). Events:
 | --- | --- | --- | --- |
 | `[:replicant, :pipeline, :halted]` | a permanent fail-closed halt, before asynchronous teardown | — | `slot_name`, structural atom `reason`, optional atom `kind`; arbitrary details discarded |
 | `[:replicant, :connection, :connected]` | replication connection established (each connect/reconnect) | — | `kind` (`:primary`/recovery kind) |
-| `[:replicant, :connection, :disconnected]` | connection dropped — **also carries the lag measurement for the `:sink_too_slow` halt** (with `reason: :sink_too_slow` and a signed `lag` measurement in bytes) | `lag` (halt only) | `reason` (halt only) |
+| `[:replicant, :connection, :disconnected]` | connection dropped | — | — |
+| `[:replicant, :connection, :paused]` / `:resumed` | intake crosses the queue watermarks | `byte_size`, `change_count` | `slot_name` |
+| `[:replicant, :buffer, :exhausted]` | retained transaction data exceeds the budget and cannot be spilled or flushed | `byte_size` | `slot_name`, `reason: :buffer_limit_exceeded` |
 | `[:replicant, :connection, :slot_active]` | the slot is created/owned and streaming begins | — | — |
 | `[:replicant, :connection, :slot_invalidated]` | slot invalidation / fail-closed config rejection | — | `reason` (`:failover_unsupported`, `:publication_missing`, invalidation class) |
 | `[:replicant, :connection, :session_identity_rejected]` | the sink vetoed the replication-session identity | — | `reason: :session_identity_rejected` |
@@ -279,10 +284,8 @@ off-list key or a wrong shape — never ships a row value). Events:
 | `[:replicant, :stream, :spilled]` | an oversized streamed transaction's tail spilled to disk | — | `byte_size`, `change_count` |
 | `[:replicant, :stream, :spill_exhausted]` | the disk ceiling was reached (halt follows) | — | `byte_size`, `reason: :spill_exhausted` |
 
-The two-column trap to know: the **lag halt** (`:sink_too_slow`) rides
-`[:replicant, :connection, :disconnected]`; `[:replicant, :pipeline, :halted]`
-also reports its structural reason but carries no lag measurement. Alert on
-`reason: :sink_too_slow`, not on the event name alone.
+A slow sink triggers pause/resume, not a permanent halt. Actual retained-buffer or
+disk exhaustion still halts fail-closed; the halt table below describes recovery.
 
 ## Halt reasons (operator reference)
 
@@ -293,7 +296,7 @@ durable checkpoint (loss = 0; duplicates bounded by the mode's contract).
 | Halt signal | Cause | Operator action |
 | --- | --- | --- |
 | `[:replicant, :sink, :failed]` | the sink returned an error or raised | fix the sink/store it writes; restart the pipeline |
-| `:disconnected` + `reason: :sink_too_slow` | received WAL ran `max_inflight_lag` (default 64 MiB) past the durable checkpoint | speed the sink up, batch (`batch_delivery`), or raise the bound |
+| `:buffer_limit_exceeded` | retained transaction data exceeds `max_inflight_lag` and cannot be spilled or flushed | reduce transaction size, enable streaming with disk spill where supported, or raise the budget |
 | `[:replicant, :connection, :slot_invalidated]` | the slot was invalidated (`wal_status = 'lost'`), a requested publication vanished, or failover config was rejected | recreate the slot (accept the re-stream from its origin — see `handle_slot_origin/2` for append sinks); restore/rename the publication; drop `failover:` on PG<17 |
 | `[:replicant, :connection, :command_error_halt]` | persistent pre-frame command errors (slot exhaustion, slot already active, forward-incompatible result) | free a replication slot / disconnect the other consumer; then restart |
 | `[:replicant, :connection, :session_identity_rejected]` | the sink vetoed the actual replication-session identity | point at the intended source, or update the sink's accepted identity |

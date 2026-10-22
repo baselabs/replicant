@@ -47,7 +47,8 @@ defmodule Replicant.Assembler.Streaming do
         buf = %{
           buf
           | changes: [],
-            resident_bytes: 0,
+            resident_bytes:
+              Enum.reduce(buf.messages, 0, fn message, n -> n + :erlang.external_size(message) end),
             spilled_bytes: buf.spilled_bytes + wrote,
             spilled_by_subxid: by_subxid,
             spill: spill_handle
@@ -58,9 +59,8 @@ defmodule Replicant.Assembler.Streaming do
 
         Telemetry.event([:replicant, :stream, :spilled], %{}, %{byte_size: wrote, change_count: 0})
 
-        # Disk ceiling (spec §8): the frame is already on disk; record the breach on `spill_fault` —
-        # the next StreamCommit halts on it (do_handle_message's spill_fault clause matches
-        # `%StreamCommit{}` only; the halt is DEFERRED to a commit boundary). Do NOT deliver past it.
+        # The server checks this fault immediately after observation, without
+        # waiting for a Commit that an oversized transaction may never send.
         if spilled_total > Keyword.fetch!(asm.spill, :max_spill_bytes) do
           # Surface the disk-ceiling breach as the advertised value-free event (spec §11): byte_size is
           # a count, reason is allowlisted (no telemetry.ex change). Lets operators observe exhaustion
