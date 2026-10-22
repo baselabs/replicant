@@ -8,14 +8,7 @@ defmodule Replicant.CrashInjectionTest do
 
   alias Replicant.Test.{LedgerSink, PauseGate, PausingLedgerSink, PG16}
 
-  # The §4 spike tests drive an EXPLICIT small in-flight ceiling (128 KiB) via the
-  # `:max_inflight_lag` override, sized against the live 25ms/txn slow sink so a
-  # normal 200-txn burst (~40-75 KB peak lag incl. same-server pollution, see below)
-  # drains under it while a pathological 900-txn burst / a stuck sink trip the
-  # fail-closed halt. The PRODUCTION default is
-  # the far-larger backlog ceiling (`Replicant.Connection.default_max_inflight_lag/0`,
-  # 64 MiB) — this small override only makes the mechanism observable at test scale;
-  # it is NOT the shipped default.
+  # A small payload budget makes pause/resume observable with a 25ms/txn sink.
   @spike_bound 131_072
 
   setup do
@@ -303,31 +296,7 @@ defmodule Replicant.CrashInjectionTest do
     assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
-  # RISK #2 (spec §4 bounded in-flight window, proven against the live stream). The
-  # prior `max_len < 800` spike was VACUOUS: with no in-flight bound the mailbox scaled
-  # linearly with burst, so a threshold chosen for one burst is meaningless at another.
-  # These three tests encode the REAL §4 property: the in-flight WAL lag ceiling
-  # (`received_lsn - max(checkpoint_lsn, stream_floor_lsn)`) holds INDEPENDENT of burst —
-  # a small burst drains under it, a large one (or a stuck sink) halts fail-closed before
-  # the mailbox grows unbounded. No silent OOM/livelock either way.
-  #
-  # They drive an EXPLICIT `max_inflight_lag: @spike_bound` (128 KiB) so the mechanism is
-  # observable at test scale — NOT the production default (64 MiB backlog ceiling).
-  #
-  # WHY 128 KiB, not the original 64 KiB (de-flake, 2026-07-05, root-caused): `received_lsn`
-  # is pgoutput's `wal_end` = the SERVER's TOTAL WAL position, so it also counts WAL the
-  # TEST sink writes to the SAME PG16 (sink_orders/_replicant_checkpoint/_replicant_calls)
-  # plus post-churn autovacuum — "same-server pollution" of ~30-40 KB on top of the ~35 KB
-  # of real `orders` WAL for a 200-txn burst. At a 64 KiB ceiling the 200-burst peak (~40 KB
-  # baseline) sat only ~24 KB under the bound, and that pollution variance occasionally
-  # crossed it, HALTING the burst this test asserts must DRAIN (reproduced 1/15 under CPU
-  # load; test A alone never halted — only after the 900-txn B/C tests churned the DB). A
-  # real sink writes to a DIFFERENT mirror DB, so this is a test artifact. 128 KiB keeps the
-  # ~65-75 KB polluted 200-burst peak a safe ~55+ KB under the ceiling while the widened
-  # 900-txn bursts (~159 KB orders + pollution) still clear it decisively.
-  # Sizing (live PG16, 25ms/txn slow sink, @spike_bound = 131_072 B):
-  #   * 200-txn burst → peak lag ~40-75 KB (orders ~35 KB + pollution) → UNDER 128 KiB → drains.
-  #   * 900-txn burst → lag ~159 KB+ → OVER 128 KiB → fail-closed halt (fires ~740 txns in).
+  # Bursts must remain bounded regardless of unrelated WAL or sink write volume.
   @tag :spike
   @tag timeout: 120_000
   test "bounded in-flight window: the lag ceiling holds independent of burst size", %{
@@ -366,53 +335,42 @@ defmodule Replicant.CrashInjectionTest do
 
   @tag :spike
   @tag timeout: 120_000
-  test "bounded in-flight window: a 900-txn burst trips the fail-closed :sink_too_slow halt", %{
+  test "a 900-transaction burst pauses and drains without disconnecting", %{
     ctrl: ctrl,
     slot: slot
   } do
-    # (B) A PATHOLOGICAL 900-txn burst at the same slow sink exceeds the ceiling and
-    # halts fail-closed BEFORE the mailbox grows unbounded (the vacuous RED grew it).
-    attach_sink_too_slow(slot)
+    attach_pause(slot)
     start_pipeline(slot, sink: Replicant.Test.SlowLedgerSink, max_inflight_lag: @spike_bound)
+    conn = connection_pid(slot)
     for i <- 1..900, do: insert(ctrl, i, "n#{i}")
 
-    assert_receive {:sink_too_slow, %{lag: lag}}, 15_000
-    IO.puts("\n[spike B] 900-txn burst tripped :sink_too_slow at in-flight lag = #{lag} B")
-    assert lag > @spike_bound
-
-    # The pipeline is torn down permanently (fail-closed) — not livelocking/OOMing.
-    PG16.wait_until(
-      fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
-      400
-    )
-
-    :telemetry.detach({__MODULE__, {:too_slow, slot}})
+    assert_receive {:paused, %{change_count: count}}, 15_000
+    assert count <= 512
+    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 900 end, 2400)
+    assert connection_pid(slot) == conn
+    assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
   @tag :spike
   @tag timeout: 120_000
-  test "fail-closed halt: a genuinely-stuck sink halts (no silent OOM/livelock)", %{
+  test "a permanently stuck sink stops input without acknowledging undelivered rows", %{
     ctrl: ctrl,
     slot: slot
   } do
-    # The sink blocks forever on its first txn → the checkpoint never advances → the
-    # in-flight lag grows monotonically past the ceiling and MUST fail-closed halt.
-    attach_sink_too_slow(slot)
+    attach_pause(slot)
     start_pipeline(slot, sink: Replicant.Test.StuckLedgerSink, max_inflight_lag: @spike_bound)
     for i <- 1..900, do: insert(ctrl, i, "n#{i}")
 
-    assert_receive {:sink_too_slow, %{lag: lag}}, 15_000
-    IO.puts("\n[spike C] stuck sink tripped :sink_too_slow at in-flight lag = #{lag} B")
-    assert lag > @spike_bound
-
-    PG16.wait_until(
-      fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
-      400
-    )
+    assert_receive {:paused, %{change_count: count}}, 15_000
+    assert count <= 512
+    conn = connection_pid(slot)
+    paused = safe_conn_state(conn)
+    Process.sleep(200)
+    assert safe_conn_state(conn).flow.sent_bytes == paused.flow.sent_bytes
+    assert safe_conn_state(conn).flow.paused
 
     # Nothing was durably applied (the stuck sink never committed) — no partial state.
     assert count(ctrl, "sink_orders") == 0
-    :telemetry.detach({__MODULE__, {:too_slow, slot}})
   end
 
   # R01 (live): an UNKNOWN checkpoint (a raising `sink.checkpoint/0` → read fault, read as
@@ -481,11 +439,11 @@ defmodule Replicant.CrashInjectionTest do
     sample(n - 1, acc, reader)
   end
 
-  # The live in-flight WAL lag from the running Connection's state (0 if unreadable,
+  # Queued payload bytes from the running Connection's state (0 if unreadable,
   # e.g. mid-teardown after a halt).
   defp inflight_lag(conn) do
     case safe_conn_state(conn) do
-      %Replicant.Connection{received_lsn: r, checkpoint_lsn: c} -> r - c
+      %Replicant.Connection{flow: flow} -> Replicant.FlowControl.queued_bytes(flow)
       _ -> 0
     end
   end
@@ -567,15 +525,17 @@ defmodule Replicant.CrashInjectionTest do
     _, _ -> :unreadable
   end
 
-  defp attach_sink_too_slow(slot) do
+  defp attach_pause(slot) do
     :telemetry.attach(
-      {__MODULE__, {:too_slow, slot}},
-      [:replicant, :connection, :disconnected],
+      {__MODULE__, {:paused, slot}},
+      [:replicant, :connection, :paused],
       fn _e, meas, meta, pid ->
-        if meta[:reason] == :sink_too_slow, do: send(pid, {:sink_too_slow, meas})
+        if meta[:slot_name] == slot, do: send(pid, {:paused, meas})
       end,
       self()
     )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, {:paused, slot}}) end)
   end
 
   defp start_pipeline(slot, opts \\ []) do

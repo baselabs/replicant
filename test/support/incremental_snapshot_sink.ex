@@ -144,7 +144,7 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   @impl true
   def handle_snapshot(changes, %{table: table, first_for_table?: first?} = ctx) do
     cond do
-      take_fail_next_chunk?() ->
+      take_fail_next_chunk?() or take_fail_after_chunks?() ->
         {:error, :fail_next_chunk}
 
       Map.get(ctx, :backfill_complete?, false) and take_fail_completion?() ->
@@ -259,6 +259,30 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
     end
 
     :ok
+  end
+
+  @doc "Fails once after exactly count successful snapshot calls; arm before starting the pipeline."
+  @spec set_fail_after_chunks(pos_integer()) :: :ok
+  def set_fail_after_chunks(count) when is_integer(count) and count > 0 do
+    :ets.insert(@control_table, {:fail_after_chunks, count})
+    :ok
+  end
+
+  # Snapshot calls are serialized by the assembler. Count at the sink boundary
+  # so a fast backfill cannot complete between a test's poll and fault arming.
+  defp take_fail_after_chunks? do
+    case :ets.lookup(@control_table, :fail_after_chunks) do
+      [{:fail_after_chunks, 0}] ->
+        :ets.delete(@control_table, :fail_after_chunks)
+        true
+
+      [{:fail_after_chunks, _remaining}] ->
+        :ets.update_counter(@control_table, :fail_after_chunks, {2, -1})
+        false
+
+      [] ->
+        false
+    end
   end
 
   # -- internal --------------------------------------------------------------

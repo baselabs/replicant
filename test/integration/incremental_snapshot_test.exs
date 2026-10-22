@@ -151,6 +151,10 @@ defmodule Replicant.IncrementalSnapshotTest do
     if PG16.enabled?() do
       setup_int_table(ctrl, "inc_orders", "inc_pub", 5_000)
 
+      failed = attach_snapshot_failed(slot)
+      on_exit(fn -> detach(failed) end)
+      IncrementalSnapshotSink.set_fail_after_chunks(10)
+
       start_incremental(slot, "inc_pub", chunk_rows: 200, max_pending_chunks: 2)
 
       # A concurrent writer for the whole backfill (started AFTER the pipeline is streaming,
@@ -160,14 +164,8 @@ defmodule Replicant.IncrementalSnapshotTest do
       # streamed value) + INSERT ids 5001..5200. This is what makes the drop-set RED-able.
       {writer, go} = start_writer(fn w, n -> write_orders(w, n, "inc_orders", 5_000) end)
 
-      # Arm the fault after ~10 chunk ledger entries → the NEXT chunk halts fail-closed.
-      wait_chunks(10, 4_000)
-      failed = attach_snapshot_failed(slot)
-      IncrementalSnapshotSink.set_fail_next_chunk(true)
-
-      # Halt occurred: the snapshot :failed telemetry fired AND the pipeline tore down. Generous
-      # timeout: the fault lands on the NEXT chunk, but under full-suite load on the shared PG16 the
-      # applier can be starved (the documented "TIMEOUT ≠ logic bug" trap) — 30s absorbs that jitter.
+      # The sink fails the eleventh chunk before any effects, independently of
+      # scheduler speed. Progress must survive the fail-closed teardown.
       assert_receive {:snapshot_failed, _reason}, 30_000
       detach(failed)
       PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
@@ -177,6 +175,7 @@ defmodule Replicant.IncrementalSnapshotTest do
       assert token != nil
       refute backfill_complete?()
 
+      assert chunk_count() == 10
       pre_restart_len = length(IncrementalSnapshotSink.ledger())
 
       # Restart against the SAME durable sink state (after the PG-side slot is released).
@@ -555,34 +554,29 @@ defmodule Replicant.IncrementalSnapshotTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Test 7 (§12.5) — §4 backpressure: a slow sink halts :sink_too_slow mid-backfill; resume continues.
+  # Backpressure composes with an incremental backfill without tearing it down.
   # ---------------------------------------------------------------------------
   @tag timeout: 120_000
-  test "§4 backpressure: a slow sink trips :sink_too_slow DURING an incremental backfill (§12.5 composition)",
+  test "a slow sink pauses during incremental backfill then converges without restart",
        %{ctrl: ctrl, slot: slot} do
     if PG16.enabled?() do
       setup_int_table(ctrl, "inc_slow", "incslow_pub", 3_000)
 
-      too_slow = attach_sink_too_slow(slot)
+      paused = attach_pause(slot)
       IncrementalSnapshotSink.set_txn_delay(40)
 
-      # Tiny max_inflight_lag + a slow sink (40 ms/txn) + a heavy writer → the applier falls behind
-      # and the in-flight lag trips the §4 bound → :sink_too_slow halt DURING an in-flight incremental
-      # backfill (the §4 backpressure composes with the snapshot, not just v1 streaming — spec §4/§12.5).
+      # A small payload budget makes backpressure observable during snapshot delivery.
       start_incremental_slow(slot, "incslow_pub", 8_192, chunk_rows: 200, max_pending_chunks: 2)
       {writer, go} = start_writer(fn w, n -> write_orders(w, n, "inc_slow", 3_000) end)
 
-      assert_receive {:sink_too_slow, %{lag: lag}}, 30_000
-      assert lag > 8_192
-      detach(too_slow)
+      assert_receive {:paused, %{byte_size: bytes, change_count: count}}, 30_000
+      assert bytes >= 8_192 or count == 512
+      detach(paused)
       stop_writer(writer, go)
       IncrementalSnapshotSink.set_txn_delay(0)
-      PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
-
-      # The halt was genuinely MID-backfill (not after completion). The resume-from-partial-progress
-      # mechanism itself is the proven Test-1 gate (its sink-fault halt exercises the same resume path);
-      # this test's unique coverage is the :sink_too_slow TRIGGER composing with an incremental backfill.
-      refute backfill_complete?()
+      PG16.wait_until(fn -> backfill_complete?() end, 1600)
+      wait_converged(ctrl, "inc_slow")
+      assert Registry.lookup(Replicant.Registry, {slot, :pipeline}) != []
     end
   end
 
@@ -971,7 +965,7 @@ defmodule Replicant.IncrementalSnapshotTest do
   end
 
   # SLOW-sink incremental (§12.5): the delay-configurable sink + an explicit max_inflight_lag so a
-  # tiny bound trips the §4 :sink_too_slow halt. Same readiness gate as start_incremental/3.
+  # small budget triggers socket backpressure. Same readiness gate as start_incremental/3.
   defp start_incremental_slow(slot, pub, max_inflight_lag, snap_opts) do
     ref = make_ref()
     test_pid = self()
@@ -1182,15 +1176,15 @@ defmodule Replicant.IncrementalSnapshotTest do
     )
   end
 
-  defp attach_sink_too_slow(slot) do
-    ref = {__MODULE__, :too_slow, make_ref()}
+  defp attach_pause(slot) do
+    ref = {__MODULE__, :paused, make_ref()}
     test_pid = self()
 
     :telemetry.attach(
       ref,
-      [:replicant, :connection, :disconnected],
+      [:replicant, :connection, :paused],
       fn _e, meas, meta, _ ->
-        if meta[:reason] == :sink_too_slow, do: send(test_pid, {:sink_too_slow, meas})
+        if meta[:slot_name] == slot, do: send(test_pid, {:paused, meas})
       end,
       nil
     )

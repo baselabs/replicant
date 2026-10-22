@@ -29,8 +29,8 @@ defmodule Replicant.AssemblerServer do
 
   @doc """
   Open the drop-set tracking window for a table BEFORE the reader captures LW
-  (spec §2 R1). The reply is DEFERRED while the assembler-local in-flight estimate
-  (frontier − last applied LSN) exceeds max_inflight_lag ÷ 2 — the pacing gate
+  (spec §2 R1). The reply is DEFERRED while retained transaction/batch payloads
+  exceed max_inflight_lag ÷ 2 — the pacing gate
   (spec §4 R2): stream drain gets priority, chunks fill idle capacity.
 
   Replies `{:ok, epoch}` — the window GENERATION the reader now operates under. The
@@ -224,6 +224,15 @@ defmodule Replicant.AssemblerServer do
   # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
   # will terminate this process; reprocessing here would be wasted and unsafe.
   @impl true
+  def handle_cast({:message, message, bytes, from, {epoch, total_bytes, total_messages}}, state) do
+    {:noreply, state} = handle_cast({:message, message, bytes, from}, state)
+
+    unless state.halted,
+      do: send(from, {:assembler_processed, epoch, total_bytes, total_messages})
+
+    {:noreply, state}
+  end
+
   def handle_cast({:message, _message, _bytes, _from}, %{halted: true} = state) do
     {:noreply, state}
   end
@@ -231,25 +240,11 @@ defmodule Replicant.AssemblerServer do
   def handle_cast({:message, message, bytes, from}, state) do
     state = %{state | conn_pid: from}
 
-    # Append the change (handle_message) BEFORE accounting its WAL bytes + running the spill trigger
-    # (observe_bytes → maybe_spill): a change that crosses the RAM bound must be in the buffer when
-    # maybe_spill flushes, else it stays resident + unaccounted and a single row > max_inflight_lag
-    # never spills (CV2). Only a non-terminal {:ok, asm} carries a live buffer to account.
-    #
-    # Then signal the Connection its NET spilled total (up on a fresh spill, DOWN when a spilled txn
-    # commits/aborts and frees disk) so the §4 in-flight-lag numerator can subtract spilled bytes
-    # (spec §5 — they are on disk, not RAM, so a legitimately-spilling txn does not trip the halt).
-    # Casting the NET post-dispatch total (not the observe delta) keeps the numerator from stranding
-    # stale-high after a large spilled txn commits. A plain send → the Connection's handle_info,
-    # matching the {:sink_committed, _} dispatch idiom.
-    before = state.asm.spilled_total
+    # Account after appending so a threshold-crossing change is included in any spill.
+    # Processing credits are returned only after synchronous sink work completes.
     result = account_after_handle(Assembler.handle_message(state.asm, message), bytes)
-    {:noreply, new_state} = disp = dispatch(result, from, state)
-
-    if new_state.asm.spilled_total != before,
-      do: send(from, {:spilled_bytes, new_state.asm.spilled_total})
-
-    disp
+    {:noreply, state} = dispatch(result, from, state)
+    {:noreply, if(state.halted, do: state, else: release_capacity(state))}
   end
 
   # The Connection seeds the lib-mode watermark from its connect-time store read, before streaming.
@@ -436,8 +431,24 @@ defmodule Replicant.AssemblerServer do
   # Account WAL bytes + run the spill trigger AFTER the change is appended (CV2). Only a non-terminal
   # {:ok, asm} carries a resident buffer worth accounting; every terminal result already delivered or
   # deleted its buffer, so its trivial frame bytes are skipped.
-  defp account_after_handle({:ok, asm}, bytes), do: {:ok, Assembler.observe_bytes(asm, bytes)}
+  defp account_after_handle({:ok, asm}, bytes) do
+    asm = Assembler.observe_bytes(asm, bytes)
+    check_buffer({:ok, asm}, asm)
+  end
+
+  defp account_after_handle({:buffered, asm} = result, _bytes), do: check_buffer(result, asm)
   defp account_after_handle(result, _bytes), do: result
+
+  defp check_buffer(result, asm) do
+    limit = asm.max_inflight_lag || Replicant.Connection.default_max_inflight_lag()
+
+    cond do
+      asm.spill_fault != nil -> {:halt, asm.spill_fault, asm}
+      Assembler.buffered_bytes(asm) <= limit -> result
+      asm.batch_txns != [] -> {:flush, :max_buffer_bytes, asm}
+      true -> {:halt, %Replicant.Error{reason: :buffer_limit_exceeded}, asm}
+    end
+  end
 
   defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}
 
@@ -540,12 +551,19 @@ defmodule Replicant.AssemblerServer do
     # `reason` is already value-free. Terminate the whole pipeline permanently; cancel the
     # flush timer and mark halted so a stale :batch_timeout cannot drive a store write during
     # teardown (spec §9). Do NOT self-crash (a crash exit would race :one_for_all restart).
-    Replicant.Supervisor.halt(state.slot_name, reason)
+    if match?(%Replicant.Error{reason: :buffer_limit_exceeded}, reason) do
+      Telemetry.event(
+        [:replicant, :buffer, :exhausted],
+        %{byte_size: Assembler.buffered_bytes(halted_asm)},
+        %{slot_name: state.slot_name, reason: :buffer_limit_exceeded}
+      )
+    end
+
     # Discard any open spill files: a halt tears the pipeline down without a reset cast, so the
     # halted assembler's stream/batch spill files would leak on disk otherwise (spec §5 cleanup).
-    # The returned assembler is dropped — this process is terminating; we run the resets purely
-    # for the file-delete side effect.
+    # Clean up before scheduling teardown, which can otherwise terminate us mid-cleanup.
     _ = halted_asm |> Replicant.Assembler.reset_streams() |> Replicant.Assembler.reset_batch()
+    Replicant.Supervisor.halt(state.slot_name, reason)
     {:noreply, %{cancel_batch_timer(state) | halted: true}}
   end
 
@@ -577,7 +595,8 @@ defmodule Replicant.AssemblerServer do
     case Assembler.flush_batch(state.asm, reason) do
       {:ok, lsn, asm} ->
         send(state.conn_pid, {:sink_committed, lsn})
-        {:noreply, %{state | asm: asm}}
+        {:noreply, state} = dispatch(check_buffer({:ok, asm}, asm), state.conn_pid, state)
+        {:noreply, if(state.halted, do: state, else: release_capacity(state))}
 
       {:error, error, asm} ->
         Replicant.Supervisor.halt(state.slot_name, error)
@@ -839,16 +858,10 @@ defmodule Replicant.AssemblerServer do
   defp release_deferred(%{deferred_drain: {from, _, _}}, reply), do: GenServer.reply(from, reply)
   defp release_deferred(_state, _reply), do: :ok
 
-  # The pacing gate (spec §4 R2): assembler-local in-flight estimate vs max_inflight_lag ÷ 2 —
-  # stream drain gets priority, chunks fill idle capacity. The in-flight base is
-  # `max(last_applied, floor_lsn)`, NOT last_applied alone: `frontier` is seeded from ABSOLUTE
-  # wal_end LSNs (large — e.g. 1e9), but `last_applied` is 0 until the first commit, so on a fresh
-  # slot / idle DB `frontier − 0` is astronomically larger than max_inflight_lag ÷ 2 and the window
-  # would be paced open indefinitely (backfill never starts). Before any commit, "applied" is the
-  # backfill's consistent-point floor (`floor_lsn`, from {:snapshot_floor}). Same fresh-slot
-  # large-absolute-LSN class the batching span-cap base fixed via max(lib_checkpoint, stream_floor).
-  defp paced?(%{window: %{frontier: f}, last_applied: a, floor_lsn: floor, asm: asm}) do
+  # Let retained stream work drain before opening another snapshot window.
+  # Unrelated WAL-position gaps must never strand the reader.
+  defp paced?(%{asm: asm}) do
     max_lag = asm.max_inflight_lag || Replicant.Connection.default_max_inflight_lag()
-    f - max(a, floor) > div(max_lag, 2)
+    Assembler.buffered_bytes(asm) > div(max_lag, 2)
   end
 end
