@@ -145,8 +145,7 @@ record or review names the failure it prevents.
   CI runs the full suite on all six majors.
 - **Integration + crash-injection tests** (`test/integration/**`): gate on
   `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
-  unset. **Operator-approved Docker port mappings (never `localhost:5432`): PG9.6 → 5609,
-  PG12 → 5612, PG15 → 5615, PG16 → 5599, PG17 → 5617, PG18 → 5618.** Spin a major with
+  unset. Contributors without a server can spin a major (never on `localhost:5432`) with
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
   and `export REPLICANT_TEST_URL="postgres://postgres@localhost:<PORT>/postgres"`. A shared
   server needs a `LOGIN REPLICATION CREATEDB` role, its own test database, and
