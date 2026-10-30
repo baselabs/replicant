@@ -83,8 +83,8 @@ separate.
     # `mix compile --warnings-as-errors` and `mix test` are NOT in it:
     mix quality
 
-`mix quality` is the declared local gate together with `mix compile --warnings-as-errors` and
-`mix test`. Update `CHANGELOG.md` under `[Unreleased]`.
+CI runs these (`mix test` on all six PostgreSQL majors); run the ones that cover your change.
+Update `CHANGELOG.md` under `[Unreleased]`.
 
 **Pre-commit hook (one-time install per clone):** `.githooks/pre-commit` runs
 `mix format --check-formatted` + `mix credo --strict` and **blocks the commit on
@@ -97,28 +97,16 @@ graphify is unaffected.
 
 Bypass with `git commit --no-verify` (CI still enforces both on push).
 
-## Workflow (owner ruling, October 28, 2026)
+## Workflow
 
-Process is sized to the risk of the specific change, never the repository. Each check, gate,
-record or review names the failure it prevents.
+Make the change, run the tests that cover it, commit with named paths, and push to `main`. CI runs
+once on `main`; if it goes red, fix forward. Publishing, deploying and pushes to mirrors need the
+owner's approval for that action.
 
-- **Heavy** when the diff touches decoding and its scrub (`lib/replicant/decoder/`,
-  `error.ex`), identifier validation and SQL building (`identifier.ex`, `query_builder.ex`),
-  slot advance, acknowledgement and the watermark (`connection.ex`, `pipeline.ex`,
-  `checkpoint_store.ex`, `session_identity.ex`), transaction assembly and spill (`assembler*`,
-  `spill*`), destructive-change classification (`schema_change.ex`), the snapshot handoff
-  (`snapshotter*`, `snapshot_*`), or the telemetry allowlist (`telemetry.ex`). Write the
-  failing test first, get one independent review and do one fix round, and run the declared
-  local gate once before pushing. Heavy pushes need the owner's approval.
-- **Light** for everything else: focused checks on the changed behavior, then push; hosted CI
-  is the gate. No outcome record, gauge or review; the commit message is the record. A light
-  change the owner asked for lands without a separate push approval.
-- Publishing, deploying and pushes to mirrors always need the owner's approval for that action.
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
-- Superseded instructions and the long test-topology wording: `docs/reference/agent-history.md`.
 
 ## Testing
 
