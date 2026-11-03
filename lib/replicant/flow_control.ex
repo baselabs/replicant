@@ -1,5 +1,5 @@
 defmodule Replicant.FlowControl do
-  @moduledoc false
+  @moduledoc "Connection-local flow control state."
 
   # Cumulative, connection-generation-scoped credits cover the assembler mailbox.
   # They are independent of WAL positions and of durable checkpoint acknowledgements.
