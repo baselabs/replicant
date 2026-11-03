@@ -34,6 +34,7 @@ defmodule Replicant.Config do
           snapshot: boolean() | keyword(),
           max_inflight_lag: pos_integer(),
           max_command_retries: non_neg_integer(),
+          receive_timeout: pos_integer() | :infinity,
           checkpoint_store: keyword() | nil,
           failover: boolean(),
           messages: boolean(),
@@ -76,6 +77,7 @@ defmodule Replicant.Config do
          {:ok, checkpoint_store} <- fetch_checkpoint_store(opts),
          {:ok, max_inflight_lag} <- fetch_max_inflight_lag(opts),
          {:ok, max_command_retries} <- fetch_max_command_retries(opts),
+         {:ok, receive_timeout} <- fetch_receive_timeout(opts),
          {:ok, batch_delivery} <- fetch_batch_delivery(opts, checkpoint_store, max_inflight_lag),
          {:ok, sink} <- fetch_sink(opts, checkpoint_store != nil, batch_delivery != nil),
          {:ok, messages} <- fetch_messages(opts, sink),
@@ -100,6 +102,7 @@ defmodule Replicant.Config do
          snapshot: snapshot,
          max_inflight_lag: max_inflight_lag,
          max_command_retries: max_command_retries,
+         receive_timeout: receive_timeout,
          checkpoint_store: checkpoint_store,
          failover: failover,
          batch: batch,
@@ -374,7 +377,15 @@ defmodule Replicant.Config do
     if supported?, do: :ok, else: {:error, :snapshot_unsupported}
   end
 
-  # The bounded in-flight window ceiling (WAL bytes, spec §4). Omitted → the
+  defp fetch_receive_timeout(opts) do
+    case Keyword.get(opts, :receive_timeout, 60_000) do
+      :infinity -> {:ok, :infinity}
+      timeout when is_integer(timeout) and timeout >= 2 -> {:ok, timeout}
+      _ -> {:error, :config_invalid}
+    end
+  end
+
+  # The queued payload and retained-data budget (not WAL-position distance). Omitted → the
   # Connection default. A present value must be a positive integer; anything else is
   # a config error (never a silent fallback that would mask a mis-set bound).
   defp fetch_max_inflight_lag(opts) do

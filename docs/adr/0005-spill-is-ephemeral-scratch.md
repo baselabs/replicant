@@ -23,11 +23,16 @@ of the transaction. Two design questions follow:
   reconnect. There is **no fsync** — spill is not a WAL; a crash re-streams the transaction from
   the durable `confirmed_flush` LSN (the spill is discarded, never replayed).
   (`lib/replicant/spill.ex`, `lib/replicant/spill/reader.ex`.)
-- **Two ceilings**, not one: resident RAM is bounded by `max_inflight_lag` (the spill trigger),
-  and disk is bounded by `max_spill_bytes` (a transaction exceeding it halts `:spill_exhausted`).
-  The §4 in-flight numerator is `received − floor − spilled` compared to `max_inflight_lag +
-  max_spill_bytes`, so a legitimately-spilling transaction is not double-counted toward the RAM
-  halt.
+- **Independent queue, resident, and disk budgets.** Socket intake pauses on actual
+  queued payload bytes at `max_inflight_lag` (or 512 frames); completed assembler
+  frames release credits. WAL-position distance is not used as a memory estimate.
+  Streamed resident payload spills reclaimable row buffers above `max_inflight_lag`;
+  messages remain in memory and charged. Spill repeats until the budget is met or
+  no row payload can be reclaimed. `max_spill_bytes` separately limits spill files
+  (exceeding it halts `:spill_exhausted`). With spill configured, non-streamed
+  transactions retain a `max_inflight_lag + max_spill_bytes` **memory** allowance
+  for compatibility, since they cannot use the streamed spill path. None of these
+  budgets is an exact RSS limit: decoded-term overhead and socket buffers are extra.
 - **No in-lib encryption.** Key management is a separable subsystem with its own operational
   surface (KMS, rotation, envelope keys) that this library does not own. The operator places the
   spill `dir` on a secure/encrypted volume and cleans it on decommission; the default `dir` is a

@@ -15,17 +15,12 @@ defmodule Replicant.Connection do
     * decodes each XLogData payload behind Plan 1's value-free boundary and forwards
       the decoded message to `Replicant.AssemblerServer` — it never applies the sink,
       so it is always free to answer keepalives;
-    * tracks a **bounded in-flight window** (spec §4): the high-water received LSN
-      (`received_lsn`, the latest XLogData `wal_end`) minus the confirmed-durable
-      floor is the in-flight WAL lag — un-drained WAL, a proxy for the transaction
-      BACKLOG accumulating ahead of the sink. A single non-blocking integer
-      comparison in `handle_data/2` compares it to `max_inflight_lag` (a
-      backlog-sized ceiling, default 64 MiB);
-    * when the in-flight lag exceeds the bound the sink is genuinely lagging: it
-      **halts fail-closed** with `{:sink_too_slow, lag}` (surfaced telemetry +
-      `Replicant.Supervisor.halt/2` + `{:disconnect, :sink_too_slow}`) — never a
-      silent reconnect livelock or an unbounded-mailbox OOM. On restart it resumes
-      from the checkpoint (loss=0 by the §6 idempotent dedup);
+    * counts payload bytes and messages sent to, but not yet processed by, the
+      assembler. WAL-position distance is not a queue-size estimate: unrelated
+      WAL and segment switches can advance positions without publication data;
+    * pauses socket delivery at `max_inflight_lag` payload bytes (default 64 MiB)
+      or 512 queued messages and resumes below both half-watermarks. Cumulative,
+      connection-scoped processing credits cannot advance the durable checkpoint;
     * advances the ack asynchronously on `{:sink_committed, L}` from the AssemblerServer;
     * on connect/reconnect detects an invalidated slot (`wal_status = 'lost'` or
       `conflicting` on PG16) and halts the pipeline fail-closed — never silently
@@ -36,20 +31,23 @@ defmodule Replicant.Connection do
   `:invalidation_check` →
   (`:create_slot` if absent) → `:streaming`.
 
-  ## Why a fail-closed halt and not soft pacing (Postgrex flow-control)
+  ## Backpressure and retained transactions
 
-  `Postgrex.ReplicationConnection` re-arms the replication socket (`active: :once`)
-  **automatically** after each `handle_data/2` batch — the handler's return value has
-  no way to defer socket re-activation, so there is no lever to pause TCP reading
-  from the handler. `:max_messages` bounds only Postgrex's per-batch socket buffer,
-  not the downstream `AssemblerServer` mailbox. So true socket-level pacing is not
-  available; the bounded in-flight window is enforced by the fail-closed halt at the
-  ceiling — which bounds memory (the pipeline tears down before the mailbox grows
-  unbounded) and surfaces the overload rather than silently livelocking.
+  This implementation requires Postgrex's pause/resume callback extension. Pausing keeps
+  the connection and slot ownership alive. A five-second timer sends durable
+  feedback because incoming keepalives are also paused; configure the server's
+  `wal_sender_timeout` comfortably above that interval.
+
+  The assembler separately budgets retained transaction/batch payloads, spilling
+  streamed transactions or flushing committed batches. An oversized transaction
+  that cannot spill halts with `:buffer_limit_exceeded`, not a pause that would
+  prevent its own Commit from arriving. Neither budget is an exact RSS cap:
+  decoded-term overhead, socket buffers, and a one-message overshoot are additional.
   """
   use Postgrex.ReplicationConnection
+  require Logger
 
-  alias Replicant.{AssemblerServer, Decoder, QueryBuilder, Telemetry}
+  alias Replicant.{AssemblerServer, Decoder, FlowControl, QueryBuilder, Telemetry}
   alias Replicant.Decoder.Messages.{Begin, Commit, StreamAbort, StreamCommit, StreamStart}
   alias Replicant.Decoder.Messages.Relation
   alias Replicant.Decoder.Messages.Relation.Column
@@ -61,21 +59,7 @@ defmodule Replicant.Connection do
 
   @pg_epoch DateTime.to_unix(~U[2000-01-01 00:00:00Z], :microsecond)
 
-  # Default in-flight-lag ceiling in WAL bytes (spec §4 bounded in-flight window) —
-  # the multi-transaction BACKLOG bound. `received_lsn` advances per XLogData frame
-  # while `checkpoint_lsn` only advances at a Commit boundary, so the in-flight lag
-  # transiently includes the WAL of the single transaction currently mid-stream. This
-  # ceiling (64 MiB) is therefore sized to sit comfortably above any single
-  # normal-but-large transaction (bulk insert/update, large/TOASTed rows) so it fires
-  # ONLY when the sink is genuinely lagging and a real backlog of un-drained
-  # transactions accumulates — never on one in-flight txn. Override per pipeline via
-  # `Replicant.Config`'s `:max_inflight_lag`.
-  #
-  # PROTO-V1 LIMITATION: a single transaction whose own buffered WAL exceeds the bound
-  # would still trip the halt mid-transaction (there is no Commit boundary to advance
-  # the checkpoint until the whole txn arrives). Unbounded single-transaction size is
-  # a future slice (proto-v2 streaming of in-progress transactions); for v1, size the
-  # bound above the largest expected single transaction.
+  # Legacy option name retained for compatibility; the unit is delivered payload bytes.
   @default_max_inflight_lag 67_108_864
 
   # A6 command-error watchdog default budget — sourced DIRECTLY from the store retry family's
@@ -94,6 +78,7 @@ defmodule Replicant.Connection do
 
   @type step ::
           :disconnected
+          | :draining_assembler
           | :identity_check
           | :recovery_check
           | :publication_check
@@ -120,10 +105,7 @@ defmodule Replicant.Connection do
           received_lsn: Replicant.lsn(),
           stream_floor_lsn: Replicant.lsn() | nil,
           max_inflight_lag: pos_integer(),
-          # The spill accounting pair rides ONE map field (the 31-flat-field BEAM
-          # boundary the struct comment above documents): the assembler-reported
-          # spilled byte mirror and the configured disk ceiling.
-          spill: %{bytes: non_neg_integer(), max: non_neg_integer() | nil},
+          flow: FlowControl.t(),
           checkpoint_store: keyword() | nil,
           batch_delivery: keyword() | nil,
           failover: boolean(),
@@ -179,8 +161,8 @@ defmodule Replicant.Connection do
     checkpoint_lsn: 0,
     checkpoint_state: :empty,
     received_lsn: 0,
+    flow: %FlowControl{},
     max_inflight_lag: @default_max_inflight_lag,
-    spill: %{bytes: 0, max: nil},
     checkpoint_store: nil,
     batch_delivery: nil,
     failover: false,
@@ -201,7 +183,7 @@ defmodule Replicant.Connection do
     decoder: @decoder_defaults
   ]
 
-  @doc "The default in-flight-lag ceiling (WAL bytes) when the config omits it."
+  @doc "The default queued/retained payload budget in bytes when the config omits it."
   @spec default_max_inflight_lag() :: pos_integer()
   def default_max_inflight_lag, do: @default_max_inflight_lag
 
@@ -247,7 +229,7 @@ defmodule Replicant.Connection do
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
-       spill: %{bytes: 0, max: spill_ceiling(Map.get(config, :streaming))},
+       flow: FlowControl.new(Map.get(config, :receive_timeout, 60_000)),
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
        failover: Map.get(config, :failover, false),
@@ -287,7 +269,23 @@ defmodule Replicant.Connection do
          Replicant.CheckpointStore.retry_decision(faults - 1, max_retries) == :halt do
       halt_command_error(state)
     else
+      await_assembler(state)
+    end
+  end
+
+  defp await_assembler(state) do
+    if FlowControl.queued_messages(state.flow) == 0 do
       handle_connect_proceed(state)
+    else
+      token = make_ref()
+
+      GenServer.cast(
+        AssemblerServer.via(state.slot_name),
+        {:drain_before_reconnect, self(), token}
+      )
+
+      flow = %{state.flow | reconnect_barrier: token}
+      {:noreply, %{state | step: :draining_assembler, flow: flow}}
     end
   end
 
@@ -380,6 +378,8 @@ defmodule Replicant.Connection do
   end
 
   defp begin_recovery(state) do
+    cancel_stall_timer(state.flow)
+
     # Read the durable checkpoint (off the keepalive path — a blocking read is fine
     # here). In lib mode the store is the connect authority (a read FAULT halts
     # fail-closed in :invalidation_check — never fail-open, since a non-idempotent
@@ -392,12 +392,7 @@ defmodule Replicant.Connection do
     # retry accumulates toward the bound. Delegated to a @doc false helper (unit-tested).
     store_retry_count = reset_retry_count(state.store_retry_count, checkpoint_state)
 
-    # Reset the in-flight window on (re)connect. `stream_floor_lsn` is re-derived from
-    # the FIRST XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
-    # `START_REPLICATION` to the slot's server-side `confirmed_flush_lsn`, which for a
-    # fresh/empty checkpoint is the slot-creation LSN (a large absolute value), NOT 0.
-    # Measuring lag against that per-stream floor (never against absolute 0) is what
-    # keeps the very first frame from reading as a ~50 MB false "lag".
+    # Reset per-stream progress. Queue accounting is independent of these WAL positions.
     {:query, QueryBuilder.recovery_and_version(),
      %{
        state
@@ -409,7 +404,7 @@ defmodule Replicant.Connection do
          in_txn: false,
          open_streams: MapSet.new(),
          last_commit_lsn: 0,
-         spill: %{state.spill | bytes: 0},
+         flow: FlowControl.new(state.flow.receive_timeout),
          # The frontier epoch is KEPT across (re)connect (monotonic; only `start_streaming`
          # bumps it) so a fresh window always adopts a strictly-higher epoch than any
          # in-flight pre-reconnect frontier cast (85672f1 stale-epoch class). The per-stream
@@ -455,7 +450,24 @@ defmodule Replicant.Connection do
         do: %{ce | store_paced: false},
         else: %{ce | count: ce.count + 1}
 
-    {:noreply, %{state | step: :disconnected, command_error: command_error}}
+    cancel_feedback(state.flow)
+    cancel_health_timer(state.flow)
+
+    {:noreply,
+     %{
+       state
+       | step: :disconnected,
+         command_error: command_error,
+         flow: %{
+           state.flow
+           | paused: false,
+             timer: nil,
+             paused_at: nil,
+             health_timer: nil,
+             last_received: nil,
+             probing: false
+         }
+     }}
   end
 
   @impl true
@@ -1165,17 +1177,12 @@ defmodule Replicant.Connection do
   end
 
   @impl true
-  # XLogData: advance the in-flight high-water to this frame's `wal_end`, then decode
-  # behind the value-free boundary and forward the decoded message + raw byte-size to
-  # the AssemblerServer. A decode error halts fail-closed. When the in-flight WAL lag
-  # (`inflight_lag/1`, received frontier minus the confirmed-durable floor) exceeds
-  # the bound, the sink cannot keep up: halt fail-closed (§4) before the mailbox grows
-  # unbounded — a single non-blocking integer comparison, so keepalives are never
-  # starved.
+  # Track WAL progress for durability/snapshot boundaries, independently of queue credits.
   def handle_data(<<?w, _wal_start::64, wal_end::64, _clock::64, payload::binary>>, state) do
+    state = received(state)
+
     # Capture the per-stream floor from the FIRST frame — the position PG actually
-    # began streaming at (its clamped `confirmed_flush_lsn`), so lag is measured
-    # relative to the stream, never absolute 0.
+    # began streaming at (its clamped `confirmed_flush_lsn`) for batch-span accounting.
     stream_floor_lsn = state.stream_floor_lsn || wal_end
 
     # On the FIRST frame of a (re)connected stream, report the floor to the AssemblerServer — it is
@@ -1223,19 +1230,15 @@ defmodule Replicant.Connection do
         state
       end
 
-    lag = inflight_lag(state)
-
-    if lag > effective_lag_bound(state) do
-      halt_sink_too_slow(state, lag)
-    else
-      forward_message(payload, state)
-    end
+    forward_message(payload, state)
   end
 
   # Primary keepalive (spec A1 §3.1): forward the frontier in incremental mode, then dispatch to
   # keepalive_ack/3 — idle-advance a state mirror to wal_end, while an append log and every
   # non-idle sink reply only with the durable checkpoint (never the received wal_end).
   def handle_data(<<?k, wal_end::64, _clock::64, reply::8>>, state) do
+    state = received(state)
+
     # Whenever the pipeline is in incremental MODE (incremental?/1 stays true for the whole
     # pipeline lifetime, not only during an active backfill), forward the keepalive frontier so
     # a pending chunk window can close on an idle/trickle source (spec §2 D3). Cheap: one cast
@@ -1264,6 +1267,101 @@ defmodule Replicant.Connection do
   def handle_data(_other, state), do: {:noreply, state}
 
   @impl true
+  def handle_info(
+        {:assembler_drained, token},
+        %{step: :draining_assembler, flow: %{reconnect_barrier: token}} = state
+      ) do
+    cancel_feedback(state.flow)
+    handle_connect_proceed(%{state | flow: %{state.flow | reconnect_barrier: nil, timer: nil}})
+  end
+
+  def handle_info({:assembler_drained, _token}, state), do: {:noreply, state}
+
+  def handle_info({:assembler_processed, epoch, bytes, messages}, state) do
+    flow = state.flow |> FlowControl.processed(epoch, bytes, messages) |> manage_stall_timer()
+    state = %{state | flow: flow}
+
+    if flow.paused and FlowControl.drained?(flow, state.max_inflight_lag) do
+      cancel_feedback(flow)
+      flow_event(:resumed, state)
+      {:resume, arm_health(%{state | flow: %{flow | paused: false, timer: nil, paused_at: nil}})}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(
+        {:flow_feedback, epoch, token},
+        %{flow: %{epoch: epoch, paused: true, timer: {_timer, token}}} = state
+      ) do
+    flow = schedule_feedback(state.flow)
+    {:noreply, [encode_status_update(state.checkpoint_lsn)], %{state | flow: flow}}
+  end
+
+  # Independent of socket pause state: even one uncompleted Commit can pin WAL.
+  def handle_info(
+        {:assembler_stall, epoch, token},
+        %{flow: %{epoch: epoch, stall_timer: {_, token}}} = state
+      ) do
+    flow = %{state.flow | stall_timer: nil}
+
+    if FlowControl.queued_messages(flow) > 0 do
+      duration = max(System.monotonic_time(:millisecond) - flow.stall_since, 0)
+
+      if duration >= 5_000 do
+        measurements = %{
+          byte_size: FlowControl.queued_bytes(flow),
+          change_count: FlowControl.queued_messages(flow),
+          duration: duration
+        }
+
+        Telemetry.event([:replicant, :connection, :stalled], measurements, %{
+          slot_name: state.slot_name
+        })
+
+        Logger.warning(
+          "Replicant assembler stalled for slot #{state.slot_name}: no completed frames for #{duration}ms " <>
+            "(queued_messages=#{measurements.change_count}, queued_bytes=#{measurements.byte_size})"
+        )
+      end
+    end
+
+    {:noreply, %{state | flow: manage_stall_timer(flow)}}
+  end
+
+  def handle_info({:assembler_stall, _epoch, _token}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:receive_watchdog, token},
+        %{step: :streaming, flow: %{health_timer: {_, token}}} = state
+      ) do
+    flow = state.flow
+    age = max(System.monotonic_time(:millisecond) - flow.last_received, 0)
+
+    cond do
+      flow.paused ->
+        {:noreply, arm_health(state)}
+
+      flow.probing and age >= flow.receive_timeout ->
+        Telemetry.event([:replicant, :connection, :receive_timeout], %{duration: age}, %{
+          slot_name: state.slot_name,
+          reason: :receive_timeout
+        })
+
+        {:disconnect, :receive_timeout}
+
+      true ->
+        Telemetry.event([:replicant, :connection, :health], %{duration: age}, %{
+          slot_name: state.slot_name
+        })
+
+        flow = schedule_health(%{flow | probing: true})
+        {:noreply, [encode_status_update(state.checkpoint_lsn, 1)], %{state | flow: flow}}
+    end
+  end
+
+  def handle_info({:receive_watchdog, _token}, state), do: {:noreply, state}
+
   # Async ack: the AssemblerServer durably committed a txn ending at `lsn`.
   # Advance monotonically and report the new flush position. The in-memory advance
   # and the telemetry are UNCONDITIONAL; the standby-status-update buffer is emitted
@@ -1296,7 +1394,9 @@ defmodule Replicant.Connection do
 
         {:stream, sql, [],
          %{
-           arm_schema_guard(state)
+           (state
+            |> arm_schema_guard()
+            |> arm_health())
            | step: :streaming,
              checkpoint_lsn: lsn,
              received_lsn: lsn,
@@ -1342,15 +1442,6 @@ defmodule Replicant.Connection do
   # so count == 0 uniquely marks "no active fault episode").
   def handle_info(:store_retry_reconnect, state) do
     {:noreply, state}
-  end
-
-  # The AssemblerServer reports its running spilled-byte total so the §4 numerator can subtract it
-  # (spilled bytes are on disk, not RAM). Coarse: the last value wins; a frame or two of staleness
-  # is acceptable for this guard (spec §9/§10). MUST precede the catch-all below, or the catch-all
-  # swallows it and the spill window never extends.
-
-  def handle_info({:spilled_bytes, total}, state) when is_integer(total) do
-    {:noreply, %{state | spill: %{state.spill | bytes: total}}}
   end
 
   # ---- wal2json periodic schema guard (ADR-0009 divergence resolution) ----
@@ -1477,9 +1568,11 @@ defmodule Replicant.Connection do
   is 0 (we volunteer status). `clock` is microseconds since the PG 2000 epoch.
   """
   @spec encode_status_update(Replicant.lsn()) :: binary()
-  def encode_status_update(lsn) when is_integer(lsn) and lsn >= 0 do
+  def encode_status_update(lsn), do: encode_status_update(lsn, 0)
+
+  defp encode_status_update(lsn, reply) when is_integer(lsn) and lsn >= 0 do
     clock = System.os_time(:microsecond) - @pg_epoch
-    <<?r, lsn::64, lsn::64, lsn::64, clock::64, 0>>
+    <<?r, lsn::64, lsn::64, lsn::64, clock::64, reply>>
   end
 
   # On a keepalive: when a STATE MIRROR is IDLE (no open transaction AND every received commit
@@ -1591,17 +1684,6 @@ defmodule Replicant.Connection do
   # checkpoint mode (lib / sink-owned / per-txn) — a `:streaming` keyword turns it on.
   defp streaming?(%{streaming: s}), do: is_list(s)
   defp streaming?(_), do: false
-
-  # The disk spill ceiling (bytes) from `streaming[:spill][:max_spill_bytes]`, or nil when
-  # spill is not configured. Resolved once at `init/1` and extends the §4 halt ceiling.
-  defp spill_ceiling(streaming) when is_list(streaming) do
-    case Keyword.get(streaming, :spill) do
-      spill when is_list(spill) -> Keyword.get(spill, :max_spill_bytes)
-      _ -> nil
-    end
-  end
-
-  defp spill_ceiling(_), do: nil
 
   @doc false
   @spec lib_go_forward_violation?(map()) :: boolean()
@@ -1822,29 +1904,6 @@ defmodule Replicant.Connection do
 
   def reset_retry_count(_count, _success), do: 0
 
-  # In-flight WAL lag (bytes): received frontier minus the confirmed-durable floor,
-  # LESS the bytes already spilled to disk (§5 — spilled bytes are no longer resident,
-  # so they must not count toward the RAM-bounded numerator). The floor is the higher
-  # of the durable `checkpoint_lsn` (once a commit advances it to a real absolute LSN)
-  # and the per-stream `stream_floor_lsn` (the position PG began streaming at, used
-  # before the first commit while checkpoint is still 0). A cheap integer subtraction —
-  # safe to call on the keepalive-free hot path.
-  defp inflight_lag(%{
-         received_lsn: received,
-         checkpoint_lsn: cp,
-         stream_floor_lsn: floor,
-         spill: %{bytes: spilled}
-       }) do
-    received - max(cp, floor || received) - spilled
-  end
-
-  # The §4 halt ceiling. No spill configured (`spill.max: nil`): the base
-  # `max_inflight_lag` (RAM-only bound, unchanged). Spill configured: extend the ceiling
-  # by the disk budget — resident lag may run up to RAM + disk before the sink is
-  # genuinely too slow (the numerator already subtracts the spilled bytes).
-  defp effective_lag_bound(%{max_inflight_lag: base, spill: %{max: nil}}), do: base
-  defp effective_lag_bound(%{max_inflight_lag: base, spill: %{max: ceil}}), do: base + ceil
-
   defp forward_message(payload, state) do
     case Decoder.decode(payload,
            decoder: decoder_kind(state),
@@ -1868,8 +1927,16 @@ defmodule Replicant.Connection do
         # message: a multi-message payload (wal2json's relation + change) must not
         # double-count in txn.byte_size and the spill accounting.
         state = forward_each_message(messages, payload, state)
+        state = %{state | flow: manage_stall_timer(state.flow)}
 
-        {:noreply, state}
+        if FlowControl.full?(state.flow, state.max_inflight_lag) do
+          flow = %{state.flow | paused: true, paused_at: System.monotonic_time(:millisecond)}
+          state = %{state | flow: flow}
+          flow_event(:paused, state)
+          {:pause, %{state | flow: schedule_feedback(flow)}}
+        else
+          {:noreply, state}
+        end
 
       {:error, error} ->
         Replicant.Supervisor.halt(state.slot_name, error)
@@ -1883,14 +1950,89 @@ defmodule Replicant.Connection do
     |> Enum.reduce(state, fn {message, i}, acc ->
       bytes = if i == 0, do: byte_size(payload), else: 0
 
+      flow = FlowControl.push(acc.flow, bytes)
+
       GenServer.cast(
         AssemblerServer.via(state.slot_name),
-        {:message, message, bytes, self()}
+        {:message, message, bytes, self(),
+         {flow.epoch, flow.sent_bytes, flow.sent_messages, flow.queue}}
       )
 
-      acc |> update_in_stream(message) |> track_txn(message)
+      %{acc | flow: flow} |> update_in_stream(message) |> track_txn(message)
     end)
   end
+
+  defp manage_stall_timer(flow) do
+    cond do
+      FlowControl.queued_messages(flow) == 0 ->
+        cancel_stall_timer(flow)
+        %{flow | stall_timer: nil}
+
+      flow.stall_timer != nil ->
+        flow
+
+      true ->
+        token = make_ref()
+        age = max(System.monotonic_time(:millisecond) - flow.stall_since, 0)
+        delay = if age >= 5_000, do: 5_000, else: 5_000 - age
+        timer = Process.send_after(self(), {:assembler_stall, flow.epoch, token}, delay)
+        %{flow | stall_timer: {timer, token}}
+    end
+  end
+
+  defp cancel_stall_timer(%{stall_timer: {timer, _}}), do: Process.cancel_timer(timer)
+  defp cancel_stall_timer(_flow), do: :ok
+
+  # Timer tokens fence both reconnects and re-arming after a deliberate pause.
+  # Only actual protocol frames prove health; sending feedback cannot do so.
+  defp received(state) do
+    %{
+      state
+      | flow: %{state.flow | last_received: System.monotonic_time(:millisecond), probing: false}
+    }
+  end
+
+  defp arm_health(state) do
+    cancel_health_timer(state.flow)
+    state = received(state)
+    %{state | flow: schedule_health(state.flow)}
+  end
+
+  defp schedule_health(%{receive_timeout: :infinity} = flow), do: %{flow | health_timer: nil}
+
+  defp schedule_health(flow) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:receive_watchdog, token}, div(flow.receive_timeout, 2))
+    %{flow | health_timer: {timer, token}}
+  end
+
+  defp cancel_health_timer(%{health_timer: {timer, _}}), do: Process.cancel_timer(timer)
+  defp cancel_health_timer(_flow), do: :ok
+
+  defp schedule_feedback(flow) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:flow_feedback, flow.epoch, token}, 5_000)
+    %{flow | timer: {timer, token}}
+  end
+
+  defp flow_event(event, state) do
+    Telemetry.event(
+      [:replicant, :connection, event],
+      %{
+        byte_size: FlowControl.queued_bytes(state.flow),
+        change_count: FlowControl.queued_messages(state.flow),
+        duration:
+          if(state.flow.paused_at,
+            do: max(System.monotonic_time(:millisecond) - state.flow.paused_at, 0),
+            else: 0
+          )
+      },
+      %{slot_name: state.slot_name}
+    )
+  end
+
+  defp cancel_feedback(%{timer: nil}), do: :ok
+  defp cancel_feedback(%{timer: {timer, _token}}), do: Process.cancel_timer(timer)
 
   # Track the streaming decode context: StreamStart opens it (the following change messages carry
   # the (sub)xid prefix that only decodes correctly with streaming: true), StreamStop closes it.
@@ -1956,21 +2098,6 @@ defmodule Replicant.Connection do
 
   def track_txn(state, _msg), do: state
 
-  # Fail-closed lag-halt (spec §4): the sink is not draining fast enough — the
-  # in-flight window is exceeded. Surface it with value-free telemetry (the `reason`
-  # meta key is allowlisted; the `lag` measurement is a WAL-byte count, never a row
-  # value), tear the pipeline down permanently, and disconnect. This BOUNDS memory
-  # (no unbounded mailbox) and SURFACES the overload (no silent livelock). Restart
-  # resumes from the durable checkpoint (loss=0 by §6 dedup).
-  defp halt_sink_too_slow(state, lag) do
-    Telemetry.event([:replicant, :connection, :disconnected], %{lag: lag}, %{
-      reason: :sink_too_slow
-    })
-
-    Replicant.Supervisor.halt(state.slot_name, {:sink_too_slow, lag})
-    {:disconnect, :sink_too_slow}
-  end
-
   defp start_streaming(state) do
     # SINGLE WRITER of frontier_epoch: an incremental (re)connect opens a fresh window epoch
     # (fe + 1) HERE and nowhere else, so the {:reset_snapshot_window, epoch} prime_assembler
@@ -1988,7 +2115,10 @@ defmodule Replicant.Connection do
   defp stream_now(state) do
     {:ok, sql} = start_replication_sql(state, state.checkpoint_lsn)
 
-    {:stream, sql, [], arm_schema_guard(%{state | step: :streaming, in_stream: false})}
+    {:stream, sql, [],
+     %{state | step: :streaming, in_stream: false}
+     |> arm_schema_guard()
+     |> arm_health()}
   end
 
   # The START_REPLICATION command for the configured decoder (ADR-0009 §2): the plugin
@@ -2039,6 +2169,7 @@ defmodule Replicant.Connection do
     # and the fresh reader resumes from durable progress. Ordering: retire → reset → spawn.
     state = retire_reader(state)
     server = AssemblerServer.via(state.slot_name)
+    GenServer.cast(server, {:flow_queue, state.flow.queue})
     GenServer.cast(server, {:reset_snapshot_window, frontier_epoch(state) + 1})
     GenServer.cast(server, {:snapshot_floor, floor})
 
@@ -2072,6 +2203,8 @@ defmodule Replicant.Connection do
   # batch (reset) so a transient reconnect re-buffers a fresh batch (spec §9; the span base
   # lib_checkpoint is left to the assembler). Per-transaction sink-owned mode: no-op.
   defp prime_assembler(state, seed_lsn) do
+    GenServer.cast(AssemblerServer.via(state.slot_name), {:flow_queue, state.flow.queue})
+
     # Streaming is orthogonal to the checkpoint mode: on every (re)connect discard any
     # partially-buffered streamed transactions (spec §9) so a mid-stream reconnect never
     # replays a half-received in-progress txn. Runs before the mode-specific seed/reset.

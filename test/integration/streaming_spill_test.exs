@@ -123,7 +123,7 @@ defmodule Replicant.StreamingSpillTest do
     end
   end
 
-  test "an oversized never-committing streamed txn halts fail-closed :sink_too_slow (the §4 backstop pre-empts the deferred disk-ceiling halt) and cleans up",
+  test "an oversized streamed transaction halts on disk exhaustion and cleans up",
        %{
          ctrl: ctrl,
          slot: slot,
@@ -135,7 +135,7 @@ defmodule Replicant.StreamingSpillTest do
 
       :telemetry.attach(
         {__MODULE__, ref, :disc},
-        [:replicant, :connection, :disconnected],
+        [:replicant, :stream, :spill_exhausted],
         fn _e, _m, meta, _ -> send(test_pid, {:disc, ref, meta}) end,
         nil
       )
@@ -146,14 +146,7 @@ defmodule Replicant.StreamingSpillTest do
 
       Postgrex.transaction(ctrl, fn c -> bulk_insert(c, 40_000) end, timeout: 120_000)
 
-      # A single in-progress txn far larger than max_inflight_lag + max_spill_bytes arrives as a
-      # burst: the Connection reads its WAL faster than the assembler spills it, so the §4
-      # in-flight-lag backstop (`received − floor − spilled` > RAM + disk) halts fail-closed FIRST.
-      # The disk-ceiling `:spill_exhausted` halt is DEFERRED to the next StreamCommit — which never
-      # arrives for a never-committing oversized txn — so it cannot fire here; the disk ceiling is
-      # covered deterministically at the unit level. Red-capable on the halt REASON (a wrong-reason
-      # halt would fail this), unlike the prior registry-only assertion.
-      assert_receive {:disc, ^ref, %{reason: :sink_too_slow}}, 20_000
+      assert_receive {:disc, ^ref, %{reason: :spill_exhausted}}, 20_000
 
       PG16.wait_until(
         fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
@@ -163,6 +156,47 @@ defmodule Replicant.StreamingSpillTest do
       assert cp_lsn(ctrl) in [nil, 0]
       assert spill_files(spill_dir, slot) == []
     end
+  end
+
+  test "32 MiB non-streamed transaction fits the spill-enabled compatibility allowance",
+       %{ctrl: ctrl, slot: slot, spill_dir: spill_dir} do
+    Postgrex.query!(ctrl, "ALTER ROLE CURRENT_USER SET logical_decoding_work_mem = '64MB'", [])
+    Postgrex.query!(ctrl, "ALTER TABLE sp_orders ADD COLUMN payload text", [])
+    ref = make_ref()
+    owner = self()
+
+    :telemetry.attach_many(
+      {__MODULE__, ref},
+      [
+        [:replicant, :transaction, :assembled],
+        [:replicant, :stream, :committed],
+        [:replicant, :stream, :spilled]
+      ],
+      fn event, _, metadata, _ -> send(owner, {ref, event, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+    start_pipeline(slot, spill_dir,
+      max_inflight_lag: 16 * 1024 * 1024,
+      max_spill_bytes: 64 * 1024 * 1024
+    )
+
+    Postgrex.query!(
+      ctrl,
+      "INSERT INTO sp_orders SELECT id, repeat('test-payload-', 21846) FROM generate_series(1, 128) id",
+      [],
+      timeout: 30_000
+    )
+
+    PG16.wait_until(fn -> MapSet.size(row_ids(ctrl)) == 128 end, 1200)
+    assert calls_count(ctrl) == 1
+    assert_receive {^ref, [:replicant, :transaction, :assembled], %{byte_size: bytes}}
+    assert bytes > 32 * 1024 * 1024
+    refute_received {^ref, [:replicant, :stream, :committed], _}
+    refute_received {^ref, [:replicant, :stream, :spilled], _}
+    assert spill_files(spill_dir, slot) == []
   end
 
   defp start_pipeline(slot, spill_dir, opts) do

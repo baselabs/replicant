@@ -260,6 +260,16 @@ detected at the next change or within `schema_check_interval` (default 30 s).
 
 ## Configuration reference
 
+**Backpressure.** `max_inflight_lag` retains its historical name but now limits
+queued and retained payload bytes rather than WAL-position distance. Replication
+input pauses while the sink drains and resumes without disconnecting. This is a
+payload budget, not an exact process-memory limit. With spill enabled, non-streamed
+transactions retain a memory allowance of `max_inflight_lag + max_spill_bytes`;
+they cannot use the stream spill reader. Tune this alongside PostgreSQL's
+`logical_decoding_work_mem`, since enabling streaming does not force every
+transaction to stream. Incremental snapshots yield to queued WAL, not idle open
+transactions. Reconnects wait for the previous assembler queue before replay.
+
 All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 
 | Option | Default | Purpose |
@@ -274,7 +284,8 @@ All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 | `checkpoint_store:` | off | `[connection:, table:, progress_table:, max_retries: 5, retry_backoff_ms: 1000, batch: [...]]`: library-owned checkpoint for non-transactional sinks |
 | `batch_delivery:` | off | `[max_transactions: 100, max_delay_ms: 1000]`: atomic batches through `handle_batch/1` |
 | `streaming:` | off | `[max_concurrent_txns: 64, spill: [dir:, max_spill_bytes:]]`: in-progress streaming and disk spill |
-| `max_inflight_lag:` | 64 MiB | WAL the connection may run ahead of the durable checkpoint before halting `:sink_too_slow` |
+| `max_inflight_lag:` | 64 MiB | Queued payload budget for pause/resume and a separate retained transaction/batch budget; oversized unspillable transactions halt `:buffer_limit_exceeded` |
+| `receive_timeout:` | `60_000` ms | Unpaused stream receive-silence limit; probes every half-timeout, reconnects after silence reaches the limit (up to one probe interval later). `:infinity` disables it. |
 | `max_command_retries:` | `5` | connect cycles a pre-stream replication command may fail before the pipeline halts instead of reconnecting forever |
 | `messages:` | `false` | deliver `pg_logical_emit_message` payloads; the sink must implement `handle_message/2` |
 | `failover:` | `false` | create a `FAILOVER` slot on PostgreSQL 17+ |
@@ -296,8 +307,26 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
 
 - `[:replicant, :pipeline, :halted]` with the structural `reason` atom, on every
   fail-closed halt;
-- `[:replicant, :connection, :disconnected]` with `reason: :sink_too_slow` and a signed
-  `lag` measurement, when the sink falls behind the in-flight window.
+- `[:replicant, :buffer, :exhausted]` with `reason: :buffer_limit_exceeded`, when
+  retained transaction data cannot fit within the configured budget.
+
+`[:replicant, :connection, :paused]` and `:resumed` report normal backpressure, with
+queued payload bytes and message counts. Paused connections send durable feedback
+every five seconds; configure `wal_sender_timeout` comfortably above that interval.
+`[:replicant, :connection, :stalled]` and a warning log fire after five seconds
+with queued frames but no completed assembler frame, then repeat every five seconds
+without progress. This includes quiet publications below the pause thresholds and
+queues waiting across reconnects. Measurements are queued `byte_size`, `change_count`
+(frames), and `duration` (milliseconds since the last completion, or initial enqueue).
+The log remains visible without a telemetry handler; neither signal contains row or
+message payloads. Completion resets the stall clock; draining cancels the timer.
+
+Replace `:sink_too_slow` alerts with stall alerts **and** PostgreSQL slot-retention /
+primary-disk monitoring. A slow sink that keeps completing frames, including short
+pause/resume cycles, does not trigger a stall alert but can still accumulate WAL.
+Configure `max_slot_wal_keep_size` for a server-side retention bound. A
+retention-limit invalidation requires rebuilding the consumer; disconnecting alone
+does not release retained WAL.
 
 ## Documentation
 
@@ -329,3 +358,23 @@ The `pgoutput` byte parser, OID type database, type caster and array parser deri
 chain (cainophile, Supabase Realtime, epgsql).
 
 MIT. See [LICENSE](LICENSE).
+
+### Silent replication connections
+
+The receive watchdog requests an immediate PostgreSQL keepalive using the standard
+standby-status reply bit, including when the publication is idle or the server's
+`wal_sender_timeout` is disabled. Probes acknowledge only the durable checkpoint.
+`receive_timeout` applies to streaming (including concurrent incremental backfill),
+not the connect/query chain or an exported snapshot. Intentional socket pauses and
+assembler draining are excluded; resuming starts a fresh receive grace period.
+The assembler-stall event monitors sink progress independently of receive silence.
+
+`[:replicant, :connection, :health]` reports receive age in milliseconds as
+`duration`, with `slot_name`. `[:replicant, :connection, :receive_timeout]` reports
+the same age and `reason: :receive_timeout` before disconnect. No payload values
+are emitted. Timer tokens fence reconnects and pause/resume races.
+
+A timeout uses Postgrex's existing disconnect path and command retry budget;
+`max_command_retries: 0` hands recovery to the supervising application immediately.
+Reconnect reads the durable checkpoint and retains all slot/source identity and
+lost-slot guards. It never resets a checkpoint or recreates a lost mirror.

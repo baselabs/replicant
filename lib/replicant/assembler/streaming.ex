@@ -13,6 +13,26 @@ defmodule Replicant.Assembler.Streaming do
 
   alias Messages.{Message, StreamAbort, StreamCommit, StreamStart, StreamStop}
 
+  # Wire bytes are charged once after appending. Separate row/message counters let
+  # spilling release only row payloads and aborts release exactly the discarded tail.
+  def account_bytes(buf, top, bytes) do
+    {subxid, kind} = latest_entry(buf, top)
+    counters = Map.update(Map.fetch!(buf, kind), subxid, bytes, &(&1 + bytes))
+
+    buf
+    |> Map.put(kind, counters)
+    |> Map.put(:byte_size, buf.byte_size + bytes)
+    |> Map.put(:resident_bytes, buf.resident_bytes + bytes)
+  end
+
+  defp latest_entry(%{changes: [{sx, change} | _], messages: [msg | _]}, _top) do
+    if change.ordinal > msg.ordinal, do: {sx, :change_bytes}, else: {msg.xid, :message_bytes}
+  end
+
+  defp latest_entry(%{changes: [{sx, _} | _]}, _top), do: {sx, :change_bytes}
+  defp latest_entry(%{messages: [msg | _]}, _top), do: {msg.xid, :message_bytes}
+  defp latest_entry(_buf, top), do: {top, :change_bytes}
+
   # --- aggregate-resident spill (spec §5) ---
 
   # Aggregate-resident spill (spec §5): keep total in-memory reassembly ≈ max_inflight_lag. When the
@@ -25,15 +45,34 @@ defmodule Replicant.Assembler.Streaming do
     resident_total = Enum.reduce(streams, 0, fn {_xid, b}, acc -> acc + b.resident_bytes end)
 
     cond do
-      resident_total <= (bound || 0) -> {:ok, asm}
-      map_size(streams) == 0 -> {:ok, asm}
-      true -> spill_largest(asm)
+      resident_total <= (bound || 0) ->
+        {:ok, asm}
+
+      map_size(streams) == 0 ->
+        {:ok, asm}
+
+      true ->
+        case spill_largest(asm) do
+          {:ok, ^asm} -> {:ok, asm}
+          {:ok, %{spill_fault: nil} = spilled} -> maybe_spill(spilled)
+          result -> result
+        end
     end
   end
 
   def spill_largest(%Assembler{stream_txns: streams} = asm) do
-    {top, buf} = Enum.max_by(streams, fn {_xid, b} -> b.resident_bytes end)
+    candidate =
+      streams
+      |> Enum.reject(fn {_xid, buf} -> buf.changes == [] end)
+      |> Enum.max_by(fn {_xid, buf} -> Enum.sum(Map.values(buf.change_bytes)) end, fn -> nil end)
 
+    case candidate do
+      nil -> {:ok, asm}
+      {top, buf} -> spill_buffer(asm, top, buf)
+    end
+  end
+
+  defp spill_buffer(%Assembler{stream_txns: streams} = asm, top, buf) do
     case flush_buffer_tail(asm, top, buf) do
       {:ok, spill_handle, wrote} ->
         # Per-subxid frame counts of the flushed tail — so a spilled txn that later filters to EMPTY
@@ -47,7 +86,8 @@ defmodule Replicant.Assembler.Streaming do
         buf = %{
           buf
           | changes: [],
-            resident_bytes: 0,
+            resident_bytes: Enum.sum(Map.values(buf.message_bytes)),
+            change_bytes: %{},
             spilled_bytes: buf.spilled_bytes + wrote,
             spilled_by_subxid: by_subxid,
             spill: spill_handle
@@ -58,9 +98,8 @@ defmodule Replicant.Assembler.Streaming do
 
         Telemetry.event([:replicant, :stream, :spilled], %{}, %{byte_size: wrote, change_count: 0})
 
-        # Disk ceiling (spec §8): the frame is already on disk; record the breach on `spill_fault` —
-        # the next StreamCommit halts on it (do_handle_message's spill_fault clause matches
-        # `%StreamCommit{}` only; the halt is DEFERRED to a commit boundary). Do NOT deliver past it.
+        # The server checks this fault immediately after observation, without
+        # waiting for a Commit that an oversized transaction may never send.
         if spilled_total > Keyword.fetch!(asm.spill, :max_spill_bytes) do
           # Surface the disk-ceiling breach as the advertised value-free event (spec §11): byte_size is
           # a count, reason is allowlisted (no telemetry.ex change). Lets operators observe exhaustion
@@ -139,12 +178,13 @@ defmodule Replicant.Assembler.Streaming do
         spilled_total: asm.spilled_total - buf.spilled_bytes
     }
 
-    # Transactional messages tagged to an aborted subxid are dropped (mirrors the change-reject
-    # above); the surviving ones must RIDE the txn even when it carries zero row-changes — the v1
+    # pgoutput tags streamed messages with the top-level xid, even inside a savepoint.
+    # We cannot identify sub-aborted messages from that field. Messages still ride a
+    # transaction even when it carries zero row-changes — the v1
     # path (Begin→Message→Commit) delivers exactly that (effect-once, spec §7.1). A message-bearing
     # txn is therefore v1-DISTINGUISHABLE and must NOT be empty-suppressed, or the message is
     # silently lost (regression: the suppression keyed on row-changes alone).
-    live_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+    live_messages = buf.messages
 
     cond do
       resident == [] and spilled_live == 0 and live_messages == [] ->
@@ -192,7 +232,7 @@ defmodule Replicant.Assembler.Streaming do
   # deliver via the shared apply_sink path, threading the spill PATH so cleanup happens after durable
   # delivery (per-txn / lib+batch delete the file; sink-owned batch keeps it until flush, Task 8).
   def deliver_spilled_stream_commit(%Assembler{} = asm, lsn, ts, buf, reader) do
-    buf_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+    buf_messages = buf.messages
 
     txn = %Transaction{
       commit_lsn: lsn,
@@ -305,6 +345,8 @@ defmodule Replicant.Assembler.Streaming do
                  messages: [],
                  byte_size: 0,
                  resident_bytes: 0,
+                 change_bytes: %{},
+                 message_bytes: %{},
                  spilled_bytes: 0,
                  spilled_by_subxid: %{},
                  aborted: MapSet.new(),
@@ -367,7 +409,17 @@ defmodule Replicant.Assembler.Streaming do
         # append-only file, so record `sub` in the aborted set — replay skips any spilled frame
         # tagged `sub` (spec §5).
         kept = Enum.reject(buf.changes, fn {subxid, _change} -> subxid == sub end)
-        buf = %{buf | changes: kept, aborted: MapSet.put(buf.aborted, sub)}
+        changes = Map.delete(buf.change_bytes, sub)
+
+        buf = %{
+          buf
+          | changes: kept,
+            change_bytes: changes,
+            resident_bytes:
+              Enum.sum(Map.values(changes)) + Enum.sum(Map.values(buf.message_bytes)),
+            aborted: MapSet.put(buf.aborted, sub)
+        }
+
         {:ok, %{asm | stream_txns: Map.put(asm.stream_txns, top, buf)}}
 
       {:error, _} ->
