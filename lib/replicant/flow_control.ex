@@ -10,6 +10,8 @@ defmodule Replicant.FlowControl do
           reconnect_barrier: reference() | nil,
           queue: :atomics.atomics_ref() | nil,
           paused_at: integer() | nil,
+          stall_since: integer() | nil,
+          stall_timer: {reference(), reference()} | nil,
           sent_bytes: non_neg_integer(),
           sent_messages: non_neg_integer(),
           processed_bytes: non_neg_integer(),
@@ -22,6 +24,8 @@ defmodule Replicant.FlowControl do
             reconnect_barrier: nil,
             queue: nil,
             paused_at: nil,
+            stall_since: nil,
+            stall_timer: nil,
             sent_bytes: 0,
             sent_messages: 0,
             processed_bytes: 0,
@@ -35,14 +39,32 @@ defmodule Replicant.FlowControl do
 
   def push(flow, bytes) do
     :atomics.add(flow.queue, 1, 1)
-    %{flow | sent_bytes: flow.sent_bytes + bytes, sent_messages: flow.sent_messages + 1}
+
+    since =
+      if queued_messages(flow) == 0,
+        do: System.monotonic_time(:millisecond),
+        else: flow.stall_since
+
+    %{
+      flow
+      | sent_bytes: flow.sent_bytes + bytes,
+        sent_messages: flow.sent_messages + 1,
+        stall_since: since
+    }
   end
 
   def processed(flow, epoch, bytes, messages)
       when epoch == flow.epoch and bytes >= flow.processed_bytes and
              bytes <= flow.sent_bytes and messages >= flow.processed_messages and
              messages <= flow.sent_messages do
-    %{flow | processed_bytes: bytes, processed_messages: messages}
+    since =
+      cond do
+        messages == flow.sent_messages -> nil
+        messages > flow.processed_messages -> System.monotonic_time(:millisecond)
+        true -> flow.stall_since
+      end
+
+    %{flow | processed_bytes: bytes, processed_messages: messages, stall_since: since}
   end
 
   def processed(flow, _epoch, _bytes, _messages), do: flow

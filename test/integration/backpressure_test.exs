@@ -47,9 +47,9 @@ defmodule Replicant.BackpressureTest do
 
     :telemetry.attach(
       telemetry_id,
-      [:replicant, :connection, :pause_ongoing],
+      [:replicant, :connection, :stalled],
       fn _, measurements, metadata, owner ->
-        send(owner, {:pause_ongoing, measurements, metadata})
+        send(owner, {:stalled, measurements, metadata})
       end,
       owner
     )
@@ -118,13 +118,19 @@ defmodule Replicant.BackpressureTest do
     assert [[^backend, ^initial_flush]] = slot_status(ctrl, slot)
     assert connection_state(slot).flow.paused
     assert connection_state(slot).flow.sent_bytes == paused.flow.sent_bytes
-    assert_receive {:pause_ongoing, %{duration: duration, byte_size: queued}, %{slot_name: ^slot}}
-    assert duration >= 4900
+    assert_receive {:stalled, %{duration: duration, byte_size: queued}, %{slot_name: ^slot}}
+    assert duration >= 5000
     assert queued > 0
 
     # Repeated socket failures must not admit another full queue while the sink
     # remains blocked. The replacement connection waits before starting replay.
     for _ <- 1..3 do
+      PG16.wait_until(fn ->
+        Postgrex.query!(ctrl, "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1", [
+          slot
+        ]).rows == [[1]]
+      end)
+
       [[true]] =
         Postgrex.query!(
           ctrl,
@@ -134,6 +140,8 @@ defmodule Replicant.BackpressureTest do
 
       PG16.wait_until(fn -> connection_state(slot).step == :draining_assembler end, 1000)
       assert connection_state(slot).flow.sent_bytes == paused.flow.sent_bytes
+      assert connection_state(slot).flow.stall_since == paused.flow.stall_since
+      assert connection_state(slot).flow.stall_timer != nil
       refute connection_state(slot).flow.paused
       assert [[nil, ^initial_flush]] = slot_status(ctrl, slot)
     end

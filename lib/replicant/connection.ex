@@ -45,6 +45,7 @@ defmodule Replicant.Connection do
   decoded-term overhead, socket buffers, and a one-message overshoot are additional.
   """
   use Postgrex.ReplicationConnection
+  require Logger
 
   alias Replicant.{AssemblerServer, Decoder, FlowControl, QueryBuilder, Telemetry}
   alias Replicant.Decoder.Messages.{Begin, Commit, StreamAbort, StreamCommit, StreamStart}
@@ -282,13 +283,8 @@ defmodule Replicant.Connection do
         {:drain_before_reconnect, self(), token}
       )
 
-      flow = %{
-        state.flow
-        | reconnect_barrier: token,
-          paused_at: state.flow.paused_at || System.monotonic_time(:millisecond)
-      }
-
-      {:noreply, %{state | step: :draining_assembler, flow: schedule_feedback(flow)}}
+      flow = %{state.flow | reconnect_barrier: token}
+      {:noreply, %{state | step: :draining_assembler, flow: flow}}
     end
   end
 
@@ -381,6 +377,8 @@ defmodule Replicant.Connection do
   end
 
   defp begin_recovery(state) do
+    cancel_stall_timer(state.flow)
+
     # Read the durable checkpoint (off the keepalive path — a blocking read is fine
     # here). In lib mode the store is the connect authority (a read FAULT halts
     # fail-closed in :invalidation_check — never fail-open, since a non-idempotent
@@ -1266,7 +1264,7 @@ defmodule Replicant.Connection do
   def handle_info({:assembler_drained, _token}, state), do: {:noreply, state}
 
   def handle_info({:assembler_processed, epoch, bytes, messages}, state) do
-    flow = FlowControl.processed(state.flow, epoch, bytes, messages)
+    flow = state.flow |> FlowControl.processed(epoch, bytes, messages) |> manage_stall_timer()
     state = %{state | flow: flow}
 
     if flow.paused and FlowControl.drained?(flow, state.max_inflight_lag) do
@@ -1280,20 +1278,44 @@ defmodule Replicant.Connection do
 
   def handle_info(
         {:flow_feedback, epoch, token},
-        %{step: :draining_assembler, flow: %{epoch: epoch, timer: {_timer, token}}} = state
-      ) do
-    flow_event(:pause_ongoing, state)
-    {:noreply, %{state | flow: schedule_feedback(state.flow)}}
-  end
-
-  def handle_info(
-        {:flow_feedback, epoch, token},
         %{flow: %{epoch: epoch, paused: true, timer: {_timer, token}}} = state
       ) do
-    flow_event(:pause_ongoing, state)
     flow = schedule_feedback(state.flow)
     {:noreply, [encode_status_update(state.checkpoint_lsn)], %{state | flow: flow}}
   end
+
+  # Independent of socket pause state: even one uncompleted Commit can pin WAL.
+  def handle_info(
+        {:assembler_stall, epoch, token},
+        %{flow: %{epoch: epoch, stall_timer: {_, token}}} = state
+      ) do
+    flow = %{state.flow | stall_timer: nil}
+
+    if FlowControl.queued_messages(flow) > 0 do
+      duration = max(System.monotonic_time(:millisecond) - flow.stall_since, 0)
+
+      if duration >= 5_000 do
+        measurements = %{
+          byte_size: FlowControl.queued_bytes(flow),
+          change_count: FlowControl.queued_messages(flow),
+          duration: duration
+        }
+
+        Telemetry.event([:replicant, :connection, :stalled], measurements, %{
+          slot_name: state.slot_name
+        })
+
+        Logger.warning(
+          "Replicant assembler stalled for slot #{state.slot_name}: no completed frames for #{duration}ms " <>
+            "(queued_messages=#{measurements.change_count}, queued_bytes=#{measurements.byte_size})"
+        )
+      end
+    end
+
+    {:noreply, %{state | flow: manage_stall_timer(flow)}}
+  end
+
+  def handle_info({:assembler_stall, _epoch, _token}, state), do: {:noreply, state}
 
   # Async ack: the AssemblerServer durably committed a txn ending at `lsn`.
   # Advance monotonically and report the new flush position. The in-memory advance
@@ -1856,6 +1878,7 @@ defmodule Replicant.Connection do
         # message: a multi-message payload (wal2json's relation + change) must not
         # double-count in txn.byte_size and the spill accounting.
         state = forward_each_message(messages, payload, state)
+        state = %{state | flow: manage_stall_timer(state.flow)}
 
         if FlowControl.full?(state.flow, state.max_inflight_lag) do
           flow = %{state.flow | paused: true, paused_at: System.monotonic_time(:millisecond)}
@@ -1889,6 +1912,27 @@ defmodule Replicant.Connection do
       %{acc | flow: flow} |> update_in_stream(message) |> track_txn(message)
     end)
   end
+
+  defp manage_stall_timer(flow) do
+    cond do
+      FlowControl.queued_messages(flow) == 0 ->
+        cancel_stall_timer(flow)
+        %{flow | stall_timer: nil}
+
+      flow.stall_timer != nil ->
+        flow
+
+      true ->
+        token = make_ref()
+        age = max(System.monotonic_time(:millisecond) - flow.stall_since, 0)
+        delay = if age >= 5_000, do: 5_000, else: 5_000 - age
+        timer = Process.send_after(self(), {:assembler_stall, flow.epoch, token}, delay)
+        %{flow | stall_timer: {timer, token}}
+    end
+  end
+
+  defp cancel_stall_timer(%{stall_timer: {timer, _}}), do: Process.cancel_timer(timer)
+  defp cancel_stall_timer(_flow), do: :ok
 
   defp schedule_feedback(flow) do
     token = make_ref()

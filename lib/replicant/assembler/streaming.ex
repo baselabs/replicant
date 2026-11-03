@@ -178,12 +178,13 @@ defmodule Replicant.Assembler.Streaming do
         spilled_total: asm.spilled_total - buf.spilled_bytes
     }
 
-    # Transactional messages tagged to an aborted subxid are dropped (mirrors the change-reject
-    # above); the surviving ones must RIDE the txn even when it carries zero row-changes — the v1
+    # pgoutput tags streamed messages with the top-level xid, even inside a savepoint.
+    # We cannot identify sub-aborted messages from that field. Messages still ride a
+    # transaction even when it carries zero row-changes — the v1
     # path (Begin→Message→Commit) delivers exactly that (effect-once, spec §7.1). A message-bearing
     # txn is therefore v1-DISTINGUISHABLE and must NOT be empty-suppressed, or the message is
     # silently lost (regression: the suppression keyed on row-changes alone).
-    live_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+    live_messages = buf.messages
 
     cond do
       resident == [] and spilled_live == 0 and live_messages == [] ->
@@ -231,7 +232,7 @@ defmodule Replicant.Assembler.Streaming do
   # deliver via the shared apply_sink path, threading the spill PATH so cleanup happens after durable
   # delivery (per-txn / lib+batch delete the file; sink-owned batch keeps it until flush, Task 8).
   def deliver_spilled_stream_commit(%Assembler{} = asm, lsn, ts, buf, reader) do
-    buf_messages = Enum.reject(buf.messages, &(&1.xid in buf.aborted))
+    buf_messages = buf.messages
 
     txn = %Transaction{
       commit_lsn: lsn,
@@ -409,15 +410,13 @@ defmodule Replicant.Assembler.Streaming do
         # tagged `sub` (spec §5).
         kept = Enum.reject(buf.changes, fn {subxid, _change} -> subxid == sub end)
         changes = Map.delete(buf.change_bytes, sub)
-        messages = Map.delete(buf.message_bytes, sub)
 
         buf = %{
           buf
           | changes: kept,
-            messages: Enum.reject(buf.messages, &(&1.xid == sub)),
             change_bytes: changes,
-            message_bytes: messages,
-            resident_bytes: Enum.sum(Map.values(changes)) + Enum.sum(Map.values(messages)),
+            resident_bytes:
+              Enum.sum(Map.values(changes)) + Enum.sum(Map.values(buf.message_bytes)),
             aborted: MapSet.put(buf.aborted, sub)
         }
 

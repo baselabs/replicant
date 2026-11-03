@@ -14,8 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   option name and 64 MiB default remain. Queue intake also pauses at 512 messages
   and resumes below half of both thresholds. This is not a process-memory cap.
 - Slow sinks pause instead of halting with `:sink_too_slow`. Migrate alerts to
-  `[:replicant, :connection, :pause_ongoing]` (every five seconds while paused),
-  whose `duration` measurement is elapsed pause time in milliseconds. Monitor
+  `[:replicant, :connection, :stalled]` plus slot-retention alerts. Queued frames
+  with no completed assembler frame for five seconds emit telemetry and a warning,
+  paused or not, repeating every five seconds without progress. `duration` is time
+  since the last completion (or initial enqueue), in milliseconds. This replaces
+  the draft `:pause_ongoing` event. Slow but progressing sinks still require monitoring.
+  Monitor
   PostgreSQL slot WAL retention and disk space separately: feedback keeps the
   slot alive but never acknowledges undelivered data. There is no automatic
   pause deadline; configure a server-side WAL retention limit for disk protection.
@@ -29,8 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Drain old assembler work before reconnect replay, preventing queue multiplication
   and spill-file cleanup races when a sink is blocked.
-- Track retained batch bytes incrementally, release aborted subtransaction payload
+- Track retained batch bytes incrementally, release aborted subtransaction row-payload
   accounting, and spill reclaimable row buffers until within budget.
+- Streamed messages carry pgoutput's top-level xid even inside a savepoint; do
+  not claim to discard sub-aborted messages using that field. Their resident bytes
+  remain charged. Savepoint-message delivery semantics require separate work.
 - Do not re-track an already received transaction on a buffer-triggered batch flush.
 - Idle open transactions no longer indefinitely block snapshot windows.
 - Pace replication intake using queued payload bytes and message counts, rather

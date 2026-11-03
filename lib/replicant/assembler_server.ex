@@ -221,8 +221,6 @@ defmodule Replicant.AssemblerServer do
     end
   end
 
-  # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
-  # will terminate this process; reprocessing here would be wasted and unsafe.
   @impl true
   def handle_cast({:flow_queue, queue}, state), do: {:noreply, %{state | flow_queue: queue}}
 
@@ -246,15 +244,8 @@ defmodule Replicant.AssemblerServer do
     {:noreply, if(state.halted, do: state, else: release_capacity(state))}
   end
 
-  def handle_cast({:message, message, bytes, from, {epoch, total_bytes, total_messages}}, state) do
-    {:noreply, state} = handle_cast({:message, message, bytes, from}, state)
-
-    unless state.halted,
-      do: send(from, {:assembler_processed, epoch, total_bytes, total_messages})
-
-    {:noreply, state}
-  end
-
+  # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
+  # will terminate this process; reprocessing here would be wasted and unsafe.
   def handle_cast({:message, _message, _bytes, _from}, %{halted: true} = state) do
     {:noreply, state}
   end

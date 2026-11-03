@@ -99,7 +99,9 @@ defmodule Replicant.AssemblerServerTest do
 
     epoch = make_ref()
     message = %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}
-    GenServer.cast(pid, {:message, message, 60, self(), {epoch, 60, 1}})
+    queue = :atomics.new(1, [])
+    :atomics.put(queue, 1, 1)
+    GenServer.cast(pid, {:message, message, 60, self(), {epoch, 60, 1, queue}})
     assert :sys.get_state(pid).halted
     refute_received {:assembler_processed, _, _, _}
     refute_received {:sink_committed, _}
@@ -110,7 +112,9 @@ defmodule Replicant.AssemblerServerTest do
     pid = start("srv_credit", RecordingSink)
     epoch = make_ref()
     message = %Begin{final_lsn: 0x2A, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}
-    GenServer.cast(pid, {:message, message, 20, self(), {epoch, 20, 1}})
+    queue = :atomics.new(1, [])
+    :atomics.put(queue, 1, 1)
+    GenServer.cast(pid, {:message, message, 20, self(), {epoch, 20, 1, queue}})
     assert_receive {:assembler_processed, ^epoch, 20, 1}
     refute_received {:sink_committed, _}
     assert :sys.get_state(pid).asm.txn != nil

@@ -312,11 +312,18 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
 `[:replicant, :connection, :paused]` and `:resumed` report normal backpressure, with
 queued payload bytes and message counts. Paused connections send durable feedback
 every five seconds; configure `wal_sender_timeout` comfortably above that interval.
-`[:replicant, :connection, :pause_ongoing]` repeats at the same interval with queued
-`byte_size`, `change_count` (messages), and `duration` (elapsed pause milliseconds).
-Replace `:sink_too_slow` alerts with prolonged-pause alerts. A permanently stuck
-sink can retain WAL indefinitely: monitor slot retention and primary disk space,
-and configure `max_slot_wal_keep_size` for a server-side retention bound. A
+`[:replicant, :connection, :stalled]` and a warning log fire after five seconds
+with queued frames but no completed assembler frame, then repeat every five seconds
+without progress. This includes quiet publications below the pause thresholds and
+queues waiting across reconnects. Measurements are queued `byte_size`, `change_count`
+(frames), and `duration` (milliseconds since the last completion, or initial enqueue).
+The log remains visible without a telemetry handler; neither signal contains row or
+message payloads. Completion resets the stall clock; draining cancels the timer.
+
+Replace `:sink_too_slow` alerts with stall alerts **and** PostgreSQL slot-retention /
+primary-disk monitoring. A slow sink that keeps completing frames, including short
+pause/resume cycles, does not trigger a stall alert but can still accumulate WAL.
+Configure `max_slot_wal_keep_size` for a server-side retention bound. A
 retention-limit invalidation requires rebuilding the consumer; disconnecting alone
 does not release retained WAL.
 

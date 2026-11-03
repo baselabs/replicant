@@ -53,16 +53,20 @@ defmodule Replicant.BackpressureRegressionTest do
     %{asm: asm, dir: dir}
   end
 
-  test "partial abort releases resident bytes and messages", %{asm: asm} do
+  test "partial abort releases row bytes while top-level message bytes remain", %{asm: asm} do
     asm = handle(asm, %StreamStart{xid: 1, first_segment: true}, 0)
     asm = handle(asm, %Insert{xid: 2, relation_id: 1, tuple_data: {"2"}}, 800)
 
     asm =
-      handle(asm, %Message{xid: 2, transactional?: true, prefix: "test", content: "discard"}, 200)
+      handle(
+        asm,
+        %Message{xid: 1, transactional?: true, prefix: "test", content: "retained"},
+        200
+      )
 
     {:ok, asm} = Assembler.handle_message(asm, %StreamAbort{xid: 1, subxid: 2})
-    assert asm.stream_txns[1].messages == []
-    assert Assembler.buffered_bytes(asm) == 0
+    assert [%Message{xid: 1}] = asm.stream_txns[1].messages
+    assert Assembler.buffered_bytes(asm) == 200
     asm = handle(asm, %Insert{xid: 1, relation_id: 1, tuple_data: {"1"}}, 800)
     assert asm.stream_txns[1].spill == nil
     Assembler.reset_streams(asm)

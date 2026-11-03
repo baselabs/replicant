@@ -155,5 +155,26 @@ defmodule Replicant.ConnectionBufferAccountingTest do
     assert Replicant.FlowControl.queued_messages(state.flow) == 0
   end
 
+  test "only fresh completed-frame credits reset the stall clock, and stale timers are ignored" do
+    alias Replicant.FlowControl
+    flow = FlowControl.new() |> FlowControl.push(20) |> FlowControl.push(30)
+    old = System.monotonic_time(:millisecond) - 10_000
+    flow = %{flow | stall_since: old}
+    assert FlowControl.processed(flow, make_ref(), 20, 1).stall_since == old
+    assert FlowControl.processed(flow, flow.epoch, 0, 0).stall_since == old
+    advanced = FlowControl.processed(flow, flow.epoch, 20, 1)
+    assert advanced.stall_since > old
+    assert FlowControl.processed(advanced, flow.epoch, 20, 1) == advanced
+    assert FlowControl.processed(advanced, flow.epoch, 50, 2).stall_since == nil
+    token = make_ref()
+    state = %Connection{flow: %{flow | stall_timer: {make_ref(), token}}}
+
+    assert {:noreply, ^state} =
+             Connection.handle_info({:assembler_stall, make_ref(), token}, state)
+
+    assert {:noreply, ^state} =
+             Connection.handle_info({:assembler_stall, flow.epoch, make_ref()}, state)
+  end
+
   defp frame(payload), do: <<?w, 1_000::64, 1_000::64, 0::64, payload::binary>>
 end
