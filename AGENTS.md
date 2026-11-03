@@ -107,6 +107,10 @@ owner's approval for that action.
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
+- A release is finished only when its tag, its Hex package and docs, and its GitHub release all
+  exist. `scripts/release/publish_candidate.sh` does only Hex and docs, so finish with
+  `gh release create vX.Y.Z --verify-tag --target <tag's full commit SHA>`. While the GitHub release
+  is missing, the package check fails on every CI run, pull requests included.
 
 ## Testing
 
