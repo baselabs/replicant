@@ -239,7 +239,9 @@ defmodule Replicant.ConnectionTest do
           last_commit_lsn: 0x1000
         )
 
-      assert {:noreply, ^st} = Connection.handle_data(<<?k, 0x9999::64, 0::64, 0::8>>, st)
+      assert {:noreply, updated} = Connection.handle_data(<<?k, 0x9999::64, 0::64, 0::8>>, st)
+      assert %{updated | flow: st.flow} == st
+      assert is_integer(updated.flow.last_received)
     end
 
     test "IDLE + no reply requested: VOLUNTEERS a status update acking wal_end (A1)" do
@@ -317,7 +319,9 @@ defmodule Replicant.ConnectionTest do
         state(checkpoint_lsn: 0x1000, received_lsn: 0x1000, in_txn: true, last_commit_lsn: 0x1000)
 
       keepalive = <<?k, 0x9999::64, 0::64, 0::8>>
-      assert {:noreply, ^st} = Connection.handle_data(keepalive, st)
+      assert {:noreply, updated} = Connection.handle_data(keepalive, st)
+      assert %{updated | flow: st.flow} == st
+      assert is_integer(updated.flow.last_received)
     end
 
     test "IDLE but wal_end <= checkpoint + no reply: no redundant send" do
@@ -330,7 +334,9 @@ defmodule Replicant.ConnectionTest do
         )
 
       keepalive = <<?k, 0x1000::64, 0::64, 0::8>>
-      assert {:noreply, ^st} = Connection.handle_data(keepalive, st)
+      assert {:noreply, updated} = Connection.handle_data(keepalive, st)
+      assert %{updated | flow: st.flow} == st
+      assert is_integer(updated.flow.last_received)
     end
 
     test "ordering invariant (A1 §3.2): a Begin forwarded via forward_message blocks the next keepalive's idle-ack" do

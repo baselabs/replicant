@@ -28,6 +28,20 @@ defmodule Replicant.ConfigTest do
 
   alias Replicant.Config
 
+  test "receive silence timeout has a bounded default and an explicit opt-out" do
+    opts = base_opts() ++ [sink: StateMirrorPersisted]
+    assert {:ok, %{receive_timeout: 60_000}} = Config.validate(opts)
+
+    assert {:ok, %{receive_timeout: :infinity}} =
+             Config.validate(opts ++ [receive_timeout: :infinity])
+
+    assert {:ok, %{receive_timeout: 800}} = Config.validate(opts ++ [receive_timeout: 800])
+
+    for invalid <- [nil, false, 0, -1, 1, "800", 0.5] do
+      assert {:error, :config_invalid} = Config.validate(opts ++ [receive_timeout: invalid])
+    end
+  end
+
   # --- stub sinks (each a minimal valid Replicant.Sink) ---
 
   defmodule StateMirrorEmpty do

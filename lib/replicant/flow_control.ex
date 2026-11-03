@@ -6,6 +6,10 @@ defmodule Replicant.FlowControl do
   @max_messages 512
 
   @type t :: %__MODULE__{
+          receive_timeout: pos_integer() | :infinity,
+          last_received: integer() | nil,
+          health_timer: {reference(), reference()} | nil,
+          probing: boolean(),
           epoch: reference() | nil,
           reconnect_barrier: reference() | nil,
           queue: :atomics.atomics_ref() | nil,
@@ -20,7 +24,11 @@ defmodule Replicant.FlowControl do
           timer: {reference(), reference()} | nil
         }
 
-  defstruct epoch: nil,
+  defstruct receive_timeout: 60_000,
+            last_received: nil,
+            health_timer: nil,
+            probing: false,
+            epoch: nil,
             reconnect_barrier: nil,
             queue: nil,
             paused_at: nil,
@@ -33,7 +41,8 @@ defmodule Replicant.FlowControl do
             paused: false,
             timer: nil
 
-  def new, do: %__MODULE__{epoch: make_ref(), queue: :atomics.new(1, [])}
+  def new(timeout \\ 60_000),
+    do: %__MODULE__{epoch: make_ref(), queue: :atomics.new(1, []), receive_timeout: timeout}
 
   def push(%{epoch: nil}, bytes), do: push(new(), bytes)
 

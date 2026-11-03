@@ -93,6 +93,7 @@ defmodule Replicant.BackpressureTest do
         sink: SlowSink,
         go_forward_only: true,
         max_inflight_lag: 2048,
+        receive_timeout: 800,
         max_command_retries: 10
       )
 

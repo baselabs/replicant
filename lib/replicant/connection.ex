@@ -229,6 +229,7 @@ defmodule Replicant.Connection do
        received_lsn: 0,
        stream_floor_lsn: nil,
        max_inflight_lag: Map.get(config, :max_inflight_lag, @default_max_inflight_lag),
+       flow: FlowControl.new(Map.get(config, :receive_timeout, 60_000)),
        checkpoint_store: Map.get(config, :checkpoint_store),
        batch_delivery: Map.get(config, :batch_delivery),
        failover: Map.get(config, :failover, false),
@@ -403,7 +404,7 @@ defmodule Replicant.Connection do
          in_txn: false,
          open_streams: MapSet.new(),
          last_commit_lsn: 0,
-         flow: FlowControl.new(),
+         flow: FlowControl.new(state.flow.receive_timeout),
          # The frontier epoch is KEPT across (re)connect (monotonic; only `start_streaming`
          # bumps it) so a fresh window always adopts a strictly-higher epoch than any
          # in-flight pre-reconnect frontier cast (85672f1 stale-epoch class). The per-stream
@@ -450,13 +451,22 @@ defmodule Replicant.Connection do
         else: %{ce | count: ce.count + 1}
 
     cancel_feedback(state.flow)
+    cancel_health_timer(state.flow)
 
     {:noreply,
      %{
        state
        | step: :disconnected,
          command_error: command_error,
-         flow: %{state.flow | paused: false, timer: nil, paused_at: nil}
+         flow: %{
+           state.flow
+           | paused: false,
+             timer: nil,
+             paused_at: nil,
+             health_timer: nil,
+             last_received: nil,
+             probing: false
+         }
      }}
   end
 
@@ -1169,6 +1179,8 @@ defmodule Replicant.Connection do
   @impl true
   # Track WAL progress for durability/snapshot boundaries, independently of queue credits.
   def handle_data(<<?w, _wal_start::64, wal_end::64, _clock::64, payload::binary>>, state) do
+    state = received(state)
+
     # Capture the per-stream floor from the FIRST frame — the position PG actually
     # began streaming at (its clamped `confirmed_flush_lsn`) for batch-span accounting.
     stream_floor_lsn = state.stream_floor_lsn || wal_end
@@ -1225,6 +1237,8 @@ defmodule Replicant.Connection do
   # keepalive_ack/3 — idle-advance a state mirror to wal_end, while an append log and every
   # non-idle sink reply only with the durable checkpoint (never the received wal_end).
   def handle_data(<<?k, wal_end::64, _clock::64, reply::8>>, state) do
+    state = received(state)
+
     # Whenever the pipeline is in incremental MODE (incremental?/1 stays true for the whole
     # pipeline lifetime, not only during an active backfill), forward the keepalive frontier so
     # a pending chunk window can close on an idle/trickle source (spec §2 D3). Cheap: one cast
@@ -1270,7 +1284,7 @@ defmodule Replicant.Connection do
     if flow.paused and FlowControl.drained?(flow, state.max_inflight_lag) do
       cancel_feedback(flow)
       flow_event(:resumed, state)
-      {:resume, %{state | flow: %{flow | paused: false, timer: nil, paused_at: nil}}}
+      {:resume, arm_health(%{state | flow: %{flow | paused: false, timer: nil, paused_at: nil}})}
     else
       {:noreply, state}
     end
@@ -1317,6 +1331,37 @@ defmodule Replicant.Connection do
 
   def handle_info({:assembler_stall, _epoch, _token}, state), do: {:noreply, state}
 
+  def handle_info(
+        {:receive_watchdog, token},
+        %{step: :streaming, flow: %{health_timer: {_, token}}} = state
+      ) do
+    flow = state.flow
+    age = max(System.monotonic_time(:millisecond) - flow.last_received, 0)
+
+    cond do
+      flow.paused ->
+        {:noreply, arm_health(state)}
+
+      flow.probing and age >= flow.receive_timeout ->
+        Telemetry.event([:replicant, :connection, :receive_timeout], %{duration: age}, %{
+          slot_name: state.slot_name,
+          reason: :receive_timeout
+        })
+
+        {:disconnect, :receive_timeout}
+
+      true ->
+        Telemetry.event([:replicant, :connection, :health], %{duration: age}, %{
+          slot_name: state.slot_name
+        })
+
+        flow = schedule_health(%{flow | probing: true})
+        {:noreply, [encode_status_update(state.checkpoint_lsn, 1)], %{state | flow: flow}}
+    end
+  end
+
+  def handle_info({:receive_watchdog, _token}, state), do: {:noreply, state}
+
   # Async ack: the AssemblerServer durably committed a txn ending at `lsn`.
   # Advance monotonically and report the new flush position. The in-memory advance
   # and the telemetry are UNCONDITIONAL; the standby-status-update buffer is emitted
@@ -1349,7 +1394,9 @@ defmodule Replicant.Connection do
 
         {:stream, sql, [],
          %{
-           arm_schema_guard(state)
+           (state
+            |> arm_schema_guard()
+            |> arm_health())
            | step: :streaming,
              checkpoint_lsn: lsn,
              received_lsn: lsn,
@@ -1521,9 +1568,11 @@ defmodule Replicant.Connection do
   is 0 (we volunteer status). `clock` is microseconds since the PG 2000 epoch.
   """
   @spec encode_status_update(Replicant.lsn()) :: binary()
-  def encode_status_update(lsn) when is_integer(lsn) and lsn >= 0 do
+  def encode_status_update(lsn), do: encode_status_update(lsn, 0)
+
+  defp encode_status_update(lsn, reply) when is_integer(lsn) and lsn >= 0 do
     clock = System.os_time(:microsecond) - @pg_epoch
-    <<?r, lsn::64, lsn::64, lsn::64, clock::64, 0>>
+    <<?r, lsn::64, lsn::64, lsn::64, clock::64, reply>>
   end
 
   # On a keepalive: when a STATE MIRROR is IDLE (no open transaction AND every received commit
@@ -1934,6 +1983,32 @@ defmodule Replicant.Connection do
   defp cancel_stall_timer(%{stall_timer: {timer, _}}), do: Process.cancel_timer(timer)
   defp cancel_stall_timer(_flow), do: :ok
 
+  # Timer tokens fence both reconnects and re-arming after a deliberate pause.
+  # Only actual protocol frames prove health; sending feedback cannot do so.
+  defp received(state) do
+    %{
+      state
+      | flow: %{state.flow | last_received: System.monotonic_time(:millisecond), probing: false}
+    }
+  end
+
+  defp arm_health(state) do
+    cancel_health_timer(state.flow)
+    state = received(state)
+    %{state | flow: schedule_health(state.flow)}
+  end
+
+  defp schedule_health(%{receive_timeout: :infinity} = flow), do: %{flow | health_timer: nil}
+
+  defp schedule_health(flow) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:receive_watchdog, token}, div(flow.receive_timeout, 2))
+    %{flow | health_timer: {timer, token}}
+  end
+
+  defp cancel_health_timer(%{health_timer: {timer, _}}), do: Process.cancel_timer(timer)
+  defp cancel_health_timer(_flow), do: :ok
+
   defp schedule_feedback(flow) do
     token = make_ref()
     timer = Process.send_after(self(), {:flow_feedback, flow.epoch, token}, 5_000)
@@ -2040,7 +2115,10 @@ defmodule Replicant.Connection do
   defp stream_now(state) do
     {:ok, sql} = start_replication_sql(state, state.checkpoint_lsn)
 
-    {:stream, sql, [], arm_schema_guard(%{state | step: :streaming, in_stream: false})}
+    {:stream, sql, [],
+     %{state | step: :streaming, in_stream: false}
+     |> arm_schema_guard()
+     |> arm_health()}
   end
 
   # The START_REPLICATION command for the configured decoder (ADR-0009 §2): the plugin

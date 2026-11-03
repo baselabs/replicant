@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Bounded unpaused-stream liveness detection (`receive_timeout`, default 60s),
+  reply-requested idle probes, generation-fenced timers and value-free health /
+  receive-timeout telemetry. Silent half-open connections now enter the existing
+  durable-checkpoint reconnect path. Intentional pauses and exported snapshots
+  are excluded; missing/invalidated slot recovery still fails closed.
+
+
 ### Changed
 
 - `max_inflight_lag` now bounds queued payload bytes and separately retained

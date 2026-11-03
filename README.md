@@ -285,6 +285,7 @@ All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 | `batch_delivery:` | off | `[max_transactions: 100, max_delay_ms: 1000]`: atomic batches through `handle_batch/1` |
 | `streaming:` | off | `[max_concurrent_txns: 64, spill: [dir:, max_spill_bytes:]]`: in-progress streaming and disk spill |
 | `max_inflight_lag:` | 64 MiB | Queued payload budget for pause/resume and a separate retained transaction/batch budget; oversized unspillable transactions halt `:buffer_limit_exceeded` |
+| `receive_timeout:` | `60_000` ms | Unpaused stream receive-silence limit; probes every half-timeout, reconnects after silence reaches the limit (up to one probe interval later). `:infinity` disables it. |
 | `max_command_retries:` | `5` | connect cycles a pre-stream replication command may fail before the pipeline halts instead of reconnecting forever |
 | `messages:` | `false` | deliver `pg_logical_emit_message` payloads; the sink must implement `handle_message/2` |
 | `failover:` | `false` | create a `FAILOVER` slot on PostgreSQL 17+ |
@@ -357,3 +358,23 @@ The `pgoutput` byte parser, OID type database, type caster and array parser deri
 chain (cainophile, Supabase Realtime, epgsql).
 
 MIT. See [LICENSE](LICENSE).
+
+### Silent replication connections
+
+The receive watchdog requests an immediate PostgreSQL keepalive using the standard
+standby-status reply bit, including when the publication is idle or the server's
+`wal_sender_timeout` is disabled. Probes acknowledge only the durable checkpoint.
+`receive_timeout` applies to streaming (including concurrent incremental backfill),
+not the connect/query chain or an exported snapshot. Intentional socket pauses and
+assembler draining are excluded; resuming starts a fresh receive grace period.
+The assembler-stall event monitors sink progress independently of receive silence.
+
+`[:replicant, :connection, :health]` reports receive age in milliseconds as
+`duration`, with `slot_name`. `[:replicant, :connection, :receive_timeout]` reports
+the same age and `reason: :receive_timeout` before disconnect. No payload values
+are emitted. Timer tokens fence reconnects and pause/resume races.
+
+A timeout uses Postgrex's existing disconnect path and command retry budget;
+`max_command_retries: 0` hands recovery to the supervising application immediately.
+Reconnect reads the durable checkpoint and retains all slot/source identity and
+lost-slot guards. It never resets a checkpoint or recreates a lost mirror.
