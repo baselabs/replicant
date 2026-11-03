@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `max_inflight_lag` now bounds queued payload bytes and separately retained
+  transaction/batch payload, rather than WAL-position distance. The historical
+  option name and 64 MiB default remain. Queue intake also pauses at 512 messages
+  and resumes below half of both thresholds. This is not a process-memory cap.
+- Slow sinks pause instead of halting with `:sink_too_slow`. Migrate alerts to
+  `[:replicant, :connection, :stalled]` plus slot-retention alerts. Queued frames
+  with no completed assembler frame for five seconds emit telemetry and a warning,
+  paused or not, repeating every five seconds without progress. `duration` is time
+  since the last completion (or initial enqueue), in milliseconds. This replaces
+  the draft `:pause_ongoing` event. Slow but progressing sinks still require monitoring.
+  Monitor
+  PostgreSQL slot WAL retention and disk space separately: feedback keeps the
+  slot alive but never acknowledges undelivered data. There is no automatic
+  pause deadline; configure a server-side WAL retention limit for disk protection.
+- Retained payload exhaustion halts with `:buffer_limit_exceeded`. With spill
+  enabled, non-streamed transactions retain the compatibility ceiling of
+  `max_inflight_lag + max_spill_bytes`; they use memory, not spill files. Configure
+  this allowance deliberately, since PostgreSQL can send transactions smaller
+  than `logical_decoding_work_mem` without streaming even with protocol v2 enabled.
+
+### Fixed
+
+- Drain old assembler work before reconnect replay, preventing queue multiplication
+  and spill-file cleanup races when a sink is blocked.
+- Track retained batch bytes incrementally, release aborted subtransaction row-payload
+  accounting, and spill reclaimable row buffers until within budget.
+- Streamed messages carry pgoutput's top-level xid even inside a savepoint; do
+  not claim to discard sub-aborted messages using that field. Their resident bytes
+  remain charged. Savepoint-message delivery semantics require separate work.
+- Do not re-track an already received transaction on a buffer-triggered batch flush.
+- Idle open transactions no longer indefinitely block snapshot windows.
+- Pace replication intake using queued payload bytes and message counts, rather
+  than WAL-position distance. Pause without releasing slot ownership, continue
+  durable-only feedback, and reject stale drain credits after reconnects.
+- Pace incremental snapshot windows using queued stream work. WAL archive
+  segment gaps no longer halt streaming or indefinitely defer snapshot reads.
+- Fail closed on actual buffer/spill exhaustion without confusing a slow sink
+  with a large WAL-position gap. Streamed message bytes remain charged after
+  changes are spilled.
+
 ## [1.5.1] - 2026-10-10
 
 ### Fixed

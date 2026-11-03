@@ -20,6 +20,7 @@ defmodule Replicant.Error do
           | :too_many_streams
           | :spill_io_failed
           | :spill_exhausted
+          | :buffer_limit_exceeded
           | :snapshot_failed
           | :snapshot_column_list_conflict
           | :snapshot_no_publishable_columns

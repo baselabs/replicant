@@ -13,6 +13,12 @@ defmodule Replicant.Telemetry do
   attacker-controlled terms. The guard therefore cannot leak the bytes it exists to keep
   out. Mirrors `arcadic`'s allowlist pattern.
 
+  `[:replicant, :connection, :stalled]` reports queued frames without assembler
+  progress for five seconds, independent of pause state. Measurements are
+  `byte_size`, `change_count` (queued frames), and `duration` (milliseconds without
+  completion); metadata contains `slot_name`. A warning is also logged, and both
+  signals repeat every five seconds until progress resumes.
+
   `[:replicant, :pipeline, :halted]` fires before permanent pipeline teardown.
   Measurements are empty; metadata contains `slot_name`, the structural `reason`
   atom, and optional `kind`. Snapshot refusals also emit
@@ -51,9 +57,9 @@ defmodule Replicant.Telemetry do
 
   # Measurements (the 2nd arg): key => value-shape contract.
   #   * :non_neg_integer — `duration` (ms), `byte_size`, `change_count`.
-  #   * :integer         — `lag` is SIGNED: `received - max(cp, floor) - spilled` is
-  #     WAL-byte arithmetic that can go negative, so a non-negative guard would
-  #     over-reject a legitimate emission.
+  #   * :integer         — `lag` is SIGNED: `received - max(cp, floor)` is WAL-position
+  #     arithmetic, not a payload or memory budget. Preserve the signed contract
+  #     for diagnostic consumers.
   @measurement_shapes %{
     duration: :non_neg_integer,
     lag: :integer,
