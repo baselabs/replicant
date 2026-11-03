@@ -51,9 +51,9 @@ defmodule Replicant.Telemetry do
 
   # Measurements (the 2nd arg): key => value-shape contract.
   #   * :non_neg_integer — `duration` (ms), `byte_size`, `change_count`.
-  #   * :integer         — `lag` is SIGNED: `received - max(cp, floor) - spilled` is
-  #     WAL-byte arithmetic that can go negative, so a non-negative guard would
-  #     over-reject a legitimate emission.
+  #   * :integer         — `lag` is SIGNED: `received - max(cp, floor)` is WAL-position
+  #     arithmetic, not a payload or memory budget. Preserve the signed contract
+  #     for diagnostic consumers.
   @measurement_shapes %{
     duration: :non_neg_integer,
     lag: :integer,

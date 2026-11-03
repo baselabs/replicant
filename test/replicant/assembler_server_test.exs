@@ -1218,35 +1218,26 @@ defmodule Replicant.AssemblerServerTest do
       assert {:ok, {:ok, _epoch}} = Task.yield(task, 1_000) || Task.shutdown(task)
     end
 
-    test "snapshot pacing depends on buffered transaction data, not the frontier gap" do
+    test "snapshot pacing waits for queued work, not an idle open transaction" do
       pid = start_incremental_server(ChunkLedgerSink, "asrv_pace_defer")
-      floor = 1_000_000_000
-      GenServer.cast(pid, {:snapshot_floor, floor})
-      GenServer.cast(pid, {:snapshot_frontier, 0, floor + 600_000})
-      :sys.get_state(pid)
 
-      assert {:ok, _} = Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders")
+      flow =
+        Replicant.FlowControl.new()
+        |> Replicant.FlowControl.push(20)
+        |> Replicant.FlowControl.push(8)
 
-      cast(
-        pid,
-        %Begin{final_lsn: floor + 600_000, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7},
-        600_000
-      )
+      begin = %Begin{final_lsn: 600_000, commit_timestamp: ~U[2026-07-04 00:00:00Z], xid: 7}
+      GenServer.cast(pid, {:message, begin, 20, self(), {flow.epoch, 20, 1, flow.queue}})
+      assert_receive {:assembler_processed, _, 20, 1}
 
       task =
         Task.async(fn -> Replicant.AssemblerServer.open_snapshot_window(pid, "public.orders") end)
 
-      refute Task.yield(task, 300)
+      refute Task.yield(task, 100)
 
-      cast(
+      GenServer.cast(
         pid,
-        %Commit{
-          lsn: floor + 600_000,
-          end_lsn: floor + 600_001,
-          commit_timestamp: ~U[2026-07-04 00:00:00Z],
-          flags: []
-        },
-        8
+        {:message, %Commit{lsn: 600_000}, 8, self(), {flow.epoch, 28, 2, flow.queue}}
       )
 
       assert {:ok, _epoch} = Task.await(task)

@@ -412,12 +412,23 @@ defmodule Replicant.IncrementalSnapshotTest do
       failed = attach_snapshot_failed(slot)
       retried = attach_snapshot_retried(slot)
 
+      # Start the writer before the reader: a fast one-batch snapshot can otherwise
+      # finish before the writer even connects, leaving no contention to observe.
+      owner = self()
+
+      {writer, go} =
+        start_writer(fn w, n ->
+          update_random_nopk(w, n, "inc_nopk_c")
+          if n == 1, do: send(owner, :contention_writer_started)
+        end)
+
+      assert_receive :contention_writer_started, 5_000
+      on_exit(fn -> :atomics.put(go, 1, 0) end)
+
       start_incremental(slot, "incnopkc_pub", chunk_rows: 500, max_pending_chunks: 4)
 
-      # A CONTINUOUS writer: the keyless path has NO drop-set, so ANY concurrent write taints the
-      # whole read → redo. After @max_table_attempts (3) the reader halts :snapshot_table_contended
-      # (spec §6.4), emitting :chunk_retried on each redo (spec §9 "no silent re-read loops").
-      {writer, go} = start_writer(fn w, n -> update_random_nopk(w, n, "inc_nopk_c") end)
+      # The keyless path has no drop-set: concurrent writes taint the whole read.
+      # Three contended attempts must halt with a retry event for each redo.
 
       # 90s of the test's 120s ceiling: three taint-redo cycles against a continuous
       # writer are wall-clock, and a loaded host (or a CI 2-core runner) stretches the

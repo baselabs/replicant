@@ -158,6 +158,47 @@ defmodule Replicant.StreamingSpillTest do
     end
   end
 
+  test "32 MiB non-streamed transaction fits the spill-enabled compatibility allowance",
+       %{ctrl: ctrl, slot: slot, spill_dir: spill_dir} do
+    Postgrex.query!(ctrl, "ALTER ROLE CURRENT_USER SET logical_decoding_work_mem = '64MB'", [])
+    Postgrex.query!(ctrl, "ALTER TABLE sp_orders ADD COLUMN payload text", [])
+    ref = make_ref()
+    owner = self()
+
+    :telemetry.attach_many(
+      {__MODULE__, ref},
+      [
+        [:replicant, :transaction, :assembled],
+        [:replicant, :stream, :committed],
+        [:replicant, :stream, :spilled]
+      ],
+      fn event, _, metadata, _ -> send(owner, {ref, event, metadata}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, ref}) end)
+
+    start_pipeline(slot, spill_dir,
+      max_inflight_lag: 16 * 1024 * 1024,
+      max_spill_bytes: 64 * 1024 * 1024
+    )
+
+    Postgrex.query!(
+      ctrl,
+      "INSERT INTO sp_orders SELECT id, repeat('test-payload-', 21846) FROM generate_series(1, 128) id",
+      [],
+      timeout: 30_000
+    )
+
+    PG16.wait_until(fn -> MapSet.size(row_ids(ctrl)) == 128 end, 1200)
+    assert calls_count(ctrl) == 1
+    assert_receive {^ref, [:replicant, :transaction, :assembled], %{byte_size: bytes}}
+    assert bytes > 32 * 1024 * 1024
+    refute_received {^ref, [:replicant, :stream, :committed], _}
+    refute_received {^ref, [:replicant, :stream, :spilled], _}
+    assert spill_files(spill_dir, slot) == []
+  end
+
   defp start_pipeline(slot, spill_dir, opts) do
     ref = make_ref()
     test_pid = self()

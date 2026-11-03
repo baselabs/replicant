@@ -1815,8 +1815,15 @@ defmodule Replicant.ConnectionTest do
     test "recovery starts a fresh processing-credit generation" do
       flow = Replicant.FlowControl.push(Replicant.FlowControl.new(), 4242)
 
+      {:noreply, waiting} = Connection.handle_connect(state(flow: flow, step: :disconnected))
+      assert waiting.step == :draining_assembler
+      assert Replicant.FlowControl.queued_bytes(waiting.flow) == 4242
+
+      assert {:noreply, ^waiting} =
+               Connection.handle_info({:assembler_drained, make_ref()}, waiting)
+
       {:query, _sql, identity_state} =
-        Connection.handle_connect(state(flow: flow, step: :disconnected))
+        Connection.handle_info({:assembler_drained, waiting.flow.reconnect_barrier}, waiting)
 
       identity_result = [
         %Postgrex.Result{rows: [["7436598280501831754", "7", "0/16B6C50", "source_db"]]}

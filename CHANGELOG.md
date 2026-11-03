@@ -7,12 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `max_inflight_lag` now bounds queued payload bytes and separately retained
+  transaction/batch payload, rather than WAL-position distance. The historical
+  option name and 64 MiB default remain. Queue intake also pauses at 512 messages
+  and resumes below half of both thresholds. This is not a process-memory cap.
+- Slow sinks pause instead of halting with `:sink_too_slow`. Migrate alerts to
+  `[:replicant, :connection, :pause_ongoing]` (every five seconds while paused),
+  whose `duration` measurement is elapsed pause time in milliseconds. Monitor
+  PostgreSQL slot WAL retention and disk space separately: feedback keeps the
+  slot alive but never acknowledges undelivered data. There is no automatic
+  pause deadline; configure a server-side WAL retention limit for disk protection.
+- Retained payload exhaustion halts with `:buffer_limit_exceeded`. With spill
+  enabled, non-streamed transactions retain the compatibility ceiling of
+  `max_inflight_lag + max_spill_bytes`; they use memory, not spill files. Configure
+  this allowance deliberately, since PostgreSQL can send transactions smaller
+  than `logical_decoding_work_mem` without streaming even with protocol v2 enabled.
+
 ### Fixed
 
+- Drain old assembler work before reconnect replay, preventing queue multiplication
+  and spill-file cleanup races when a sink is blocked.
+- Track retained batch bytes incrementally, release aborted subtransaction payload
+  accounting, and spill reclaimable row buffers until within budget.
+- Do not re-track an already received transaction on a buffer-triggered batch flush.
+- Idle open transactions no longer indefinitely block snapshot windows.
 - Pace replication intake using queued payload bytes and message counts, rather
   than WAL-position distance. Pause without releasing slot ownership, continue
   durable-only feedback, and reject stale drain credits after reconnects.
-- Pace incremental snapshot windows using retained transaction data. WAL archive
+- Pace incremental snapshot windows using queued stream work. WAL archive
   segment gaps no longer halt streaming or indefinitely defer snapshot reads.
 - Fail closed on actual buffer/spill exhaustion without confusing a slow sink
   with a large WAL-position gap. Streamed message bytes remain charged after

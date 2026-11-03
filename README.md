@@ -263,7 +263,12 @@ detected at the next change or within `schema_check_interval` (default 30 s).
 **Backpressure.** `max_inflight_lag` retains its historical name but now limits
 queued and retained payload bytes rather than WAL-position distance. Replication
 input pauses while the sink drains and resumes without disconnecting. This is a
-payload budget, not an exact process-memory limit.
+payload budget, not an exact process-memory limit. With spill enabled, non-streamed
+transactions retain a memory allowance of `max_inflight_lag + max_spill_bytes`;
+they cannot use the stream spill reader. Tune this alongside PostgreSQL's
+`logical_decoding_work_mem`, since enabling streaming does not force every
+transaction to stream. Incremental snapshots yield to queued WAL, not idle open
+transactions. Reconnects wait for the previous assembler queue before replay.
 
 All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 
@@ -307,6 +312,13 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
 `[:replicant, :connection, :paused]` and `:resumed` report normal backpressure, with
 queued payload bytes and message counts. Paused connections send durable feedback
 every five seconds; configure `wal_sender_timeout` comfortably above that interval.
+`[:replicant, :connection, :pause_ongoing]` repeats at the same interval with queued
+`byte_size`, `change_count` (messages), and `duration` (elapsed pause milliseconds).
+Replace `:sink_too_slow` alerts with prolonged-pause alerts. A permanently stuck
+sink can retain WAL indefinitely: monitor slot retention and primary disk space,
+and configure `max_slot_wal_keep_size` for a server-side retention bound. A
+retention-limit invalidation requires rebuilding the consumer; disconnecting alone
+does not release retained WAL.
 
 ## Documentation
 

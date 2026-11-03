@@ -374,7 +374,7 @@ defmodule Replicant.Config do
     if supported?, do: :ok, else: {:error, :snapshot_unsupported}
   end
 
-  # The bounded in-flight window ceiling (WAL bytes, spec §4). Omitted → the
+  # The queued payload and retained-data budget (not WAL-position distance). Omitted → the
   # Connection default. A present value must be a positive integer; anything else is
   # a config error (never a silent fallback that would mask a mis-set bound).
   defp fetch_max_inflight_lag(opts) do

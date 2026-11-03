@@ -82,6 +82,7 @@ defmodule Replicant.Assembler.Batch do
       | batch_count: count,
         pending_lsn: lsn,
         batch_txns: [txn | asm.batch_txns],
+        batch_bytes: asm.batch_bytes + :erlang.external_size(txn),
         batch_spill_paths: prepend_path(asm.batch_spill_paths, spill_path)
     }
 
@@ -157,6 +158,7 @@ defmodule Replicant.Assembler.Batch do
            | batch_count: 0,
              pending_lsn: nil,
              batch_txns: [],
+             batch_bytes: 0,
              batch_spill_paths: [],
              lib_checkpoint: max(asm.lib_checkpoint || 0, lsn)
          }}

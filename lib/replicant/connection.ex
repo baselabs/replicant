@@ -77,6 +77,7 @@ defmodule Replicant.Connection do
 
   @type step ::
           :disconnected
+          | :draining_assembler
           | :identity_check
           | :recovery_check
           | :publication_check
@@ -266,7 +267,28 @@ defmodule Replicant.Connection do
          Replicant.CheckpointStore.retry_decision(faults - 1, max_retries) == :halt do
       halt_command_error(state)
     else
+      await_assembler(state)
+    end
+  end
+
+  defp await_assembler(state) do
+    if FlowControl.queued_messages(state.flow) == 0 do
       handle_connect_proceed(state)
+    else
+      token = make_ref()
+
+      GenServer.cast(
+        AssemblerServer.via(state.slot_name),
+        {:drain_before_reconnect, self(), token}
+      )
+
+      flow = %{
+        state.flow
+        | reconnect_barrier: token,
+          paused_at: state.flow.paused_at || System.monotonic_time(:millisecond)
+      }
+
+      {:noreply, %{state | step: :draining_assembler, flow: schedule_feedback(flow)}}
     end
   end
 
@@ -432,7 +454,12 @@ defmodule Replicant.Connection do
     cancel_feedback(state.flow)
 
     {:noreply,
-     %{state | step: :disconnected, command_error: command_error, flow: FlowControl.new()}}
+     %{
+       state
+       | step: :disconnected,
+         command_error: command_error,
+         flow: %{state.flow | paused: false, timer: nil, paused_at: nil}
+     }}
   end
 
   @impl true
@@ -1228,6 +1255,16 @@ defmodule Replicant.Connection do
   def handle_data(_other, state), do: {:noreply, state}
 
   @impl true
+  def handle_info(
+        {:assembler_drained, token},
+        %{step: :draining_assembler, flow: %{reconnect_barrier: token}} = state
+      ) do
+    cancel_feedback(state.flow)
+    handle_connect_proceed(%{state | flow: %{state.flow | reconnect_barrier: nil, timer: nil}})
+  end
+
+  def handle_info({:assembler_drained, _token}, state), do: {:noreply, state}
+
   def handle_info({:assembler_processed, epoch, bytes, messages}, state) do
     flow = FlowControl.processed(state.flow, epoch, bytes, messages)
     state = %{state | flow: flow}
@@ -1235,7 +1272,7 @@ defmodule Replicant.Connection do
     if flow.paused and FlowControl.drained?(flow, state.max_inflight_lag) do
       cancel_feedback(flow)
       flow_event(:resumed, state)
-      {:resume, %{state | flow: %{flow | paused: false, timer: nil}}}
+      {:resume, %{state | flow: %{flow | paused: false, timer: nil, paused_at: nil}}}
     else
       {:noreply, state}
     end
@@ -1243,8 +1280,17 @@ defmodule Replicant.Connection do
 
   def handle_info(
         {:flow_feedback, epoch, token},
+        %{step: :draining_assembler, flow: %{epoch: epoch, timer: {_timer, token}}} = state
+      ) do
+    flow_event(:pause_ongoing, state)
+    {:noreply, %{state | flow: schedule_feedback(state.flow)}}
+  end
+
+  def handle_info(
+        {:flow_feedback, epoch, token},
         %{flow: %{epoch: epoch, paused: true, timer: {_timer, token}}} = state
       ) do
+    flow_event(:pause_ongoing, state)
     flow = schedule_feedback(state.flow)
     {:noreply, [encode_status_update(state.checkpoint_lsn)], %{state | flow: flow}}
   end
@@ -1812,8 +1858,10 @@ defmodule Replicant.Connection do
         state = forward_each_message(messages, payload, state)
 
         if FlowControl.full?(state.flow, state.max_inflight_lag) do
+          flow = %{state.flow | paused: true, paused_at: System.monotonic_time(:millisecond)}
+          state = %{state | flow: flow}
           flow_event(:paused, state)
-          {:pause, %{state | flow: schedule_feedback(%{state.flow | paused: true})}}
+          {:pause, %{state | flow: schedule_feedback(flow)}}
         else
           {:noreply, state}
         end
@@ -1834,7 +1882,8 @@ defmodule Replicant.Connection do
 
       GenServer.cast(
         AssemblerServer.via(state.slot_name),
-        {:message, message, bytes, self(), {flow.epoch, flow.sent_bytes, flow.sent_messages}}
+        {:message, message, bytes, self(),
+         {flow.epoch, flow.sent_bytes, flow.sent_messages, flow.queue}}
       )
 
       %{acc | flow: flow} |> update_in_stream(message) |> track_txn(message)
@@ -1852,7 +1901,12 @@ defmodule Replicant.Connection do
       [:replicant, :connection, event],
       %{
         byte_size: FlowControl.queued_bytes(state.flow),
-        change_count: FlowControl.queued_messages(state.flow)
+        change_count: FlowControl.queued_messages(state.flow),
+        duration:
+          if(state.flow.paused_at,
+            do: max(System.monotonic_time(:millisecond) - state.flow.paused_at, 0),
+            else: 0
+          )
       },
       %{slot_name: state.slot_name}
     )
@@ -1993,6 +2047,7 @@ defmodule Replicant.Connection do
     # and the fresh reader resumes from durable progress. Ordering: retire → reset → spawn.
     state = retire_reader(state)
     server = AssemblerServer.via(state.slot_name)
+    GenServer.cast(server, {:flow_queue, state.flow.queue})
     GenServer.cast(server, {:reset_snapshot_window, frontier_epoch(state) + 1})
     GenServer.cast(server, {:snapshot_floor, floor})
 
@@ -2026,6 +2081,8 @@ defmodule Replicant.Connection do
   # batch (reset) so a transient reconnect re-buffers a fresh batch (spec §9; the span base
   # lib_checkpoint is left to the assembler). Per-transaction sink-owned mode: no-op.
   defp prime_assembler(state, seed_lsn) do
+    GenServer.cast(AssemblerServer.via(state.slot_name), {:flow_queue, state.flow.queue})
+
     # Streaming is orthogonal to the checkpoint mode: on every (re)connect discard any
     # partially-buffered streamed transactions (spec §9) so a mid-stream reconnect never
     # replays a half-received in-progress txn. Runs before the mode-specific seed/reset.

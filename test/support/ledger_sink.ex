@@ -111,11 +111,9 @@ end
 defmodule Replicant.Test.StuckLedgerSink do
   @moduledoc """
   A sink whose `handle_transaction/1` blocks forever, so the AssemblerServer never
-  drains and the durable checkpoint never advances. Used to prove the fail-closed
-  sink-lag halt: with the checkpoint pinned, the Connection's in-flight lag
-  (`received_lsn - max(checkpoint_lsn, stream_floor_lsn)`) grows monotonically past
-  the ceiling and trips `:sink_too_slow` instead of OOMing. `checkpoint/0` delegates
-  to `LedgerSink` (a real durable read).
+  drains and the durable checkpoint never advances. Used to prove bounded intake:
+  queued payload fills the budget and pauses socket delivery without acknowledging
+  undelivered WAL. `checkpoint/0` delegates to `LedgerSink` (a real durable read).
   """
   @behaviour Replicant.Sink
 

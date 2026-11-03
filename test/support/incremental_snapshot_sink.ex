@@ -348,10 +348,9 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   end
 
   @doc """
-  Sets a per-`handle_transaction/1` delay (ms) in the shared control ETS — the §4 `:sink_too_slow`
-  halt-resume marquee (§12.5): a positive delay makes the applier fall behind so the in-flight lag
-  trips the bound; a restart with `set_txn_delay(0)` is normal-speed. Persists across pipeline
-  restarts (the flag lives on the sink-owned Agent, not the pipeline).
+  Sets a per-`handle_transaction/1` delay (ms) in the shared control ETS. A positive
+  delay makes queued work fill the intake budget and pause delivery. Setting zero
+  restores normal speed. The setting persists across pipeline restarts.
   """
   @spec set_txn_delay(non_neg_integer()) :: :ok
   def set_txn_delay(ms) when is_integer(ms) and ms >= 0 do
@@ -405,10 +404,9 @@ end
 defmodule Replicant.Test.SlowIncrementalSnapshotSink do
   @moduledoc """
   `IncrementalSnapshotSink` with a configurable per-txn delay (`IncrementalSnapshotSink.set_txn_delay/1`)
-  — the §4 `:sink_too_slow` halt-then-resume marquee (§12.5). Snapshot / progress / checkpoint
-  delegate to the base sink (shared ETS); `handle_transaction/1` sleeps the configured delay before
-  applying, so under a tiny `max_inflight_lag` + a heavy writer the in-flight lag trips the §4 bound.
-  A restart with delay 0 is normal-speed and resumes the backfill from durable progress.
+  for pause/resume coverage. Snapshot / progress / checkpoint delegate to the base
+  sink. A tiny payload budget plus a heavy writer pauses intake until the sink
+  drains; setting delay to zero restores normal speed.
   """
   @behaviour Replicant.Sink
 

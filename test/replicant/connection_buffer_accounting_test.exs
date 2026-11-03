@@ -16,7 +16,7 @@ defmodule Replicant.ConnectionBufferAccountingTest do
     }
 
     assert {:pause, state} = Connection.handle_data(frame(payload), state)
-    assert_receive {:"$gen_cast", {:message, _, _, _, {epoch, bytes, messages}}}
+    assert_receive {:"$gen_cast", {:message, _, _, _, {epoch, bytes, messages, _queue}}}
     assert state.flow.paused
     assert state.checkpoint_lsn == 1_000
 
@@ -57,7 +57,7 @@ defmodule Replicant.ConnectionBufferAccountingTest do
     assert Replicant.FlowControl.queued_messages(state.flow) == 512
     assert {:noreply, state} = Connection.handle_disconnect(state)
     refute state.flow.paused
-    assert Replicant.FlowControl.queued_messages(state.flow) == 0
+    assert Replicant.FlowControl.queued_messages(state.flow) == 512
   end
 
   test "a WAL segment gap is not buffered transaction data" do
@@ -139,10 +139,11 @@ defmodule Replicant.ConnectionBufferAccountingTest do
 
     assert_receive {:"$gen_cast",
                     {:message, %Replicant.Decoder.Messages.Relation{}, ^bytes, _,
-                     {epoch, ^bytes, 1}}}
+                     {epoch, ^bytes, 1, queue}}}
 
     assert_receive {:"$gen_cast",
-                    {:message, %Replicant.Decoder.Messages.Insert{}, 0, _, {^epoch, ^bytes, 2}}}
+                    {:message, %Replicant.Decoder.Messages.Insert{}, 0, _,
+                     {^epoch, ^bytes, 2, ^queue}}}
 
     assert Replicant.FlowControl.queued_bytes(state.flow) == bytes
     assert Replicant.FlowControl.queued_messages(state.flow) == 2

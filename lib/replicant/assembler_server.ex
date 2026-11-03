@@ -29,8 +29,7 @@ defmodule Replicant.AssemblerServer do
 
   @doc """
   Open the drop-set tracking window for a table BEFORE the reader captures LW
-  (spec §2 R1). The reply is DEFERRED while retained transaction/batch payloads
-  exceed max_inflight_lag ÷ 2 — the pacing gate
+  (spec §2 R1). The reply is DEFERRED while queued WAL work remains — the pacing gate
   (spec §4 R2): stream drain gets priority, chunks fill idle capacity.
 
   Replies `{:ok, epoch}` — the window GENERATION the reader now operates under. The
@@ -110,6 +109,7 @@ defmodule Replicant.AssemblerServer do
        asm: asm,
        halted: false,
        conn_pid: nil,
+       flow_queue: nil,
        batch_timer: nil,
        window: snapshot_window,
        floor_lsn: 0,
@@ -224,6 +224,28 @@ defmodule Replicant.AssemblerServer do
   # Post-halt: drop WAL. The pipeline teardown (Supervisor.halt) is in flight and
   # will terminate this process; reprocessing here would be wasted and unsafe.
   @impl true
+  def handle_cast({:flow_queue, queue}, state), do: {:noreply, %{state | flow_queue: queue}}
+
+  def handle_cast({:drain_before_reconnect, from, token}, state) do
+    unless state.halted, do: send(from, {:assembler_drained, token})
+    {:noreply, state}
+  end
+
+  def handle_cast(
+        {:message, message, bytes, from, {epoch, total_bytes, total_messages, queue}},
+        state
+      ) do
+    {:noreply, state} =
+      handle_cast({:message, message, bytes, from}, %{state | flow_queue: queue})
+
+    :atomics.sub(queue, 1, 1)
+
+    unless state.halted,
+      do: send(from, {:assembler_processed, epoch, total_bytes, total_messages})
+
+    {:noreply, if(state.halted, do: state, else: release_capacity(state))}
+  end
+
   def handle_cast({:message, message, bytes, from, {epoch, total_bytes, total_messages}}, state) do
     {:noreply, state} = handle_cast({:message, message, bytes, from}, state)
 
@@ -436,7 +458,7 @@ defmodule Replicant.AssemblerServer do
     check_buffer({:ok, asm}, asm)
   end
 
-  defp account_after_handle({:buffered, asm} = result, _bytes), do: check_buffer(result, asm)
+  defp account_after_handle({:buffered, _asm} = result, _bytes), do: result
   defp account_after_handle(result, _bytes), do: result
 
   defp check_buffer(result, asm) do
@@ -444,11 +466,25 @@ defmodule Replicant.AssemblerServer do
 
     cond do
       asm.spill_fault != nil -> {:halt, asm.spill_fault, asm}
-      Assembler.buffered_bytes(asm) <= limit -> result
-      asm.batch_txns != [] -> {:flush, :max_buffer_bytes, asm}
+      within_buffer_limit?(asm, limit) -> result
+      asm.batch_txns != [] -> {:flush_buffer, asm}
       true -> {:halt, %Replicant.Error{reason: :buffer_limit_exceeded}, asm}
     end
   end
+
+  # Non-streamed transactions cannot use the stream spill reader. Preserve the
+  # historical spill-enabled allowance for them, while independently bounding
+  # the remaining streamed/batched payload. This allowance is resident memory.
+  defp within_buffer_limit?(%{txn: %{byte_size: bytes}, spill: spill} = asm, limit)
+       when is_list(spill) do
+    retained = Assembler.buffered_bytes(asm)
+    retained - bytes <= limit and retained <= limit + Keyword.fetch!(spill, :max_spill_bytes)
+  end
+
+  defp within_buffer_limit?(asm, limit), do: Assembler.buffered_bytes(asm) <= limit
+
+  defp dispatch({:flush_buffer, asm}, _from, state),
+    do: do_flush(%{state | asm: asm}, :max_buffer_bytes)
 
   defp dispatch({:ok, asm}, _from, state), do: {:noreply, %{state | asm: asm}}
 
@@ -530,7 +566,11 @@ defmodule Replicant.AssemblerServer do
     # Track the just-buffered txn's PKs at RECEIPT (convergence-safe) so a colliding snapshot
     # chunk row is dropped — a no-op when incremental is off.
     state = track_window(%{state | asm: asm}, buffered_changes(asm), buffered_lsn(asm))
-    {:noreply, ensure_batch_timer(state)}
+
+    case check_buffer({:ok, asm}, asm) do
+      {:ok, _} -> {:noreply, ensure_batch_timer(state)}
+      result -> dispatch(result, state.conn_pid, state)
+    end
   end
 
   defp dispatch({:flush, reason, asm}, _from, state) do
@@ -858,10 +898,8 @@ defmodule Replicant.AssemblerServer do
   defp release_deferred(%{deferred_drain: {from, _, _}}, reply), do: GenServer.reply(from, reply)
   defp release_deferred(_state, _reply), do: :ok
 
-  # Let retained stream work drain before opening another snapshot window.
-  # Unrelated WAL-position gaps must never strand the reader.
-  defp paced?(%{asm: asm}) do
-    max_lag = asm.max_inflight_lag || Replicant.Connection.default_max_inflight_lag()
-    Assembler.buffered_bytes(asm) > div(max_lag, 2)
-  end
+  # Give queued WAL priority. Retained open transactions cannot drain until the
+  # producer commits, so they must not indefinitely starve independent backfill.
+  defp paced?(%{flow_queue: nil}), do: false
+  defp paced?(%{flow_queue: queue}), do: :atomics.get(queue, 1) > 0
 end

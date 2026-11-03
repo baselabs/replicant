@@ -7,6 +7,9 @@ defmodule Replicant.FlowControl do
 
   @type t :: %__MODULE__{
           epoch: reference() | nil,
+          reconnect_barrier: reference() | nil,
+          queue: :atomics.atomics_ref() | nil,
+          paused_at: integer() | nil,
           sent_bytes: non_neg_integer(),
           sent_messages: non_neg_integer(),
           processed_bytes: non_neg_integer(),
@@ -16,6 +19,9 @@ defmodule Replicant.FlowControl do
         }
 
   defstruct epoch: nil,
+            reconnect_barrier: nil,
+            queue: nil,
+            paused_at: nil,
             sent_bytes: 0,
             sent_messages: 0,
             processed_bytes: 0,
@@ -23,11 +29,12 @@ defmodule Replicant.FlowControl do
             paused: false,
             timer: nil
 
-  def new, do: %__MODULE__{epoch: make_ref()}
+  def new, do: %__MODULE__{epoch: make_ref(), queue: :atomics.new(1, [])}
 
   def push(%{epoch: nil}, bytes), do: push(new(), bytes)
 
   def push(flow, bytes) do
+    :atomics.add(flow.queue, 1, 1)
     %{flow | sent_bytes: flow.sent_bytes + bytes, sent_messages: flow.sent_messages + 1}
   end
 

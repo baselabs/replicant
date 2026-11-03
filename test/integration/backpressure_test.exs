@@ -20,7 +20,7 @@ defmodule Replicant.BackpressureTest do
         receive do
           :release_sink -> :ok
         after
-          20_000 -> raise "test sink was not released"
+          60_000 -> raise "test sink was not released"
         end
       end
 
@@ -32,7 +32,7 @@ defmodule Replicant.BackpressureTest do
     end
   end
 
-  @tag timeout: 40_000
+  @tag timeout: 90_000
   test "a blocked sink pauses input, keeps its slot alive, then drains every transaction in order" do
     owner = self()
 
@@ -42,6 +42,19 @@ defmodule Replicant.BackpressureTest do
         {Agent, :start_link,
          [fn -> %{owner: owner, lsn: nil, transactions: []} end, [name: SlowSink]]}
     })
+
+    telemetry_id = {__MODULE__, make_ref()}
+
+    :telemetry.attach(
+      telemetry_id,
+      [:replicant, :connection, :pause_ongoing],
+      fn _, measurements, metadata, owner ->
+        send(owner, {:pause_ongoing, measurements, metadata})
+      end,
+      owner
+    )
+
+    on_exit(fn -> :telemetry.detach(telemetry_id) end)
 
     ctrl = start_supervised!({Postgrex, PG16.pg_opts()})
     slot = "rep_pressure_#{System.unique_integer([:positive])}"
@@ -73,12 +86,14 @@ defmodule Replicant.BackpressureTest do
 
     {:ok, _pipeline} =
       Replicant.start_link(
-        connection: PG16.pg_opts() ++ [parameters: [wal_sender_timeout: "8000"]],
+        connection:
+          PG16.pg_opts() ++ [parameters: [wal_sender_timeout: "8000", application_name: slot]],
         slot_name: slot,
         publication: publication,
         sink: SlowSink,
         go_forward_only: true,
-        max_inflight_lag: 2048
+        max_inflight_lag: 2048,
+        max_command_retries: 10
       )
 
     PG16.wait_until(fn -> connection_state(slot).step == :streaming end)
@@ -103,11 +118,32 @@ defmodule Replicant.BackpressureTest do
     assert [[^backend, ^initial_flush]] = slot_status(ctrl, slot)
     assert connection_state(slot).flow.paused
     assert connection_state(slot).flow.sent_bytes == paused.flow.sent_bytes
+    assert_receive {:pause_ongoing, %{duration: duration, byte_size: queued}, %{slot_name: ^slot}}
+    assert duration >= 4900
+    assert queued > 0
+
+    # Repeated socket failures must not admit another full queue while the sink
+    # remains blocked. The replacement connection waits before starting replay.
+    for _ <- 1..3 do
+      [[true]] =
+        Postgrex.query!(
+          ctrl,
+          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name=$1",
+          [slot]
+        ).rows
+
+      PG16.wait_until(fn -> connection_state(slot).step == :draining_assembler end, 1000)
+      assert connection_state(slot).flow.sent_bytes == paused.flow.sent_bytes
+      refute connection_state(slot).flow.paused
+      assert [[nil, ^initial_flush]] = slot_status(ctrl, slot)
+    end
 
     send(assembler, :release_sink)
     PG16.wait_until(fn -> Agent.get(SlowSink, &(length(&1.transactions) == 100)) end)
     PG16.wait_until(fn -> not connection_state(slot).flow.paused end)
-    assert [[^backend, _flush]] = slot_status(ctrl, slot)
+    PG16.wait_until(fn -> connection_state(slot).step == :streaming end)
+    assert [[new_backend, _flush]] = slot_status(ctrl, slot)
+    assert new_backend != backend
 
     transactions = Agent.get(SlowSink, &Enum.reverse(&1.transactions))
 
@@ -121,7 +157,7 @@ defmodule Replicant.BackpressureTest do
     Postgrex.query!(ctrl, "SELECT pg_switch_wal()", [])
     Postgrex.query!(ctrl, "INSERT INTO #{table} VALUES (101, 'after switch')", [])
     PG16.wait_until(fn -> Agent.get(SlowSink, &(length(&1.transactions) == 101)) end)
-    assert [[^backend, _flush]] = slot_status(ctrl, slot)
+    assert [[^new_backend, _flush]] = slot_status(ctrl, slot)
   end
 
   defp connection_state(slot) do

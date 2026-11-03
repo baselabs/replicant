@@ -86,6 +86,7 @@ defmodule Replicant.Assembler do
           batch: keyword() | nil,
           batch_count: non_neg_integer(),
           batch_txns: [Transaction.t()],
+          batch_bytes: non_neg_integer(),
           batch_spill_paths: [String.t()],
           last_buffered_changes: [Change.t()] | :spilled,
           pending_lsn: lsn() | nil,
@@ -112,6 +113,8 @@ defmodule Replicant.Assembler do
           messages: [Message.t()],
           byte_size: non_neg_integer(),
           resident_bytes: non_neg_integer(),
+          change_bytes: %{non_neg_integer() => non_neg_integer()},
+          message_bytes: %{non_neg_integer() => non_neg_integer()},
           spilled_bytes: non_neg_integer(),
           spilled_by_subxid: %{non_neg_integer() => non_neg_integer()},
           aborted: MapSet.t(non_neg_integer()),
@@ -136,6 +139,7 @@ defmodule Replicant.Assembler do
     batch: nil,
     batch_count: 0,
     batch_txns: [],
+    batch_bytes: 0,
     batch_spill_paths: [],
     last_buffered_changes: [],
     pending_lsn: nil,
@@ -176,10 +180,10 @@ defmodule Replicant.Assembler do
   end
 
   @doc """
-  Accumulate the raw WAL payload byte-size of the message about to be handled into
+  Accumulate the raw WAL payload byte-size of the message just handled into
   the open transaction buffer, for the `byte_size` metadata on
   `[:replicant, :transaction, :assembled]` (spec §10). `Replicant.AssemblerServer`
-  calls this with `byte_size(payload)` before each `handle_message/2`. It is a
+  calls this with `byte_size(payload)` after each non-terminal `handle_message/2`. It is a
   no-op before any `Begin` (bytes arriving outside a transaction — a lone
   Relation/Type/Origin — have no buffer to attribute to), so a stray pre-Begin
   payload never crashes here.
@@ -193,7 +197,7 @@ defmodule Replicant.Assembler do
   def observe_bytes(%__MODULE__{current_stream_xid: xid, stream_txns: streams} = asm, bytes)
       when is_integer(xid) and is_integer(bytes) and bytes >= 0 and is_map_key(streams, xid) do
     buf = Map.fetch!(streams, xid)
-    buf = %{buf | byte_size: buf.byte_size + bytes, resident_bytes: buf.resident_bytes + bytes}
+    buf = __MODULE__.Streaming.account_bytes(buf, xid, bytes)
     asm = %{asm | stream_txns: Map.put(streams, xid, buf)}
 
     case __MODULE__.Streaming.maybe_spill(asm) do
@@ -216,8 +220,7 @@ defmodule Replicant.Assembler do
     streamed_bytes =
       Enum.reduce(asm.stream_txns, 0, fn {_xid, buf}, n -> n + buf.resident_bytes end)
 
-    batch_bytes = Enum.reduce(asm.batch_txns, 0, fn txn, n -> n + :erlang.external_size(txn) end)
-    transaction_bytes + streamed_bytes + batch_bytes
+    transaction_bytes + streamed_bytes + asm.batch_bytes
   end
 
   @doc """
@@ -1056,6 +1059,7 @@ defmodule Replicant.Assembler do
       | batch_count: 0,
         pending_lsn: nil,
         batch_txns: [],
+        batch_bytes: 0,
         batch_spill_paths: [],
         last_buffered_changes: []
     }
