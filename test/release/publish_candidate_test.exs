@@ -70,7 +70,7 @@ defmodule Replicant.PublishCandidateTest do
 
     File.write!(env_file, """
     # plain credential + substrate file (parsed, never sourced)
-    REPLICANT_TEST_URL=postgres://replicant@127.0.0.1:18433/replicant_test
+    REPLICANT_TEST_URL=postgres://postgres@localhost:5599/postgres
     HEX_API_KEY=file-key
     """)
 

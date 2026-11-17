@@ -20,7 +20,9 @@
 # is copied over the base. The plugins compile against server headers of exactly
 # the base's server build ($PG_VERSION, set by the official image), fetched from
 # PGDG's archive suite, which keeps every published build after the live suite
-# moves on. Copying the build stage's whole lib directory instead put apt's newer
+# moves on. The archive is served over HTTPS only, so ca-certificates goes in from
+# the base's own sources first (the bookworm-based 12 image ships without it).
+# Copying the build stage's whole lib directory instead put apt's newer
 # minor-release server libraries (15.20) under the base's 15.19 server, and the
 # server never started (CI, November 2026).
 
@@ -43,11 +45,13 @@ RUN set -eux; \
         libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev; \
       ;; \
     *) \
-      sed -E 's#apt\.postgresql\.org#apt-archive.postgresql.org#; s#-pgdg main.*$#-pgdg-archive main#' \
-        /etc/apt/sources.list.d/pgdg.list > /etc/apt/sources.list.d/pgdg-archive.list; \
-      grep -q 'apt-archive.postgresql.org' /etc/apt/sources.list.d/pgdg-archive.list; \
       apt-get update; \
-      apt-get install -y --no-install-recommends build-essential git ca-certificates \
+      apt-get install -y --no-install-recommends ca-certificates; \
+      sed -E 's#https?://apt\.postgresql\.org#https://apt-archive.postgresql.org#; s#-pgdg main.*$#-pgdg-archive main#' \
+        /etc/apt/sources.list.d/pgdg.list > /etc/apt/sources.list.d/pgdg-archive.list; \
+      grep -q 'https://apt-archive.postgresql.org' /etc/apt/sources.list.d/pgdg-archive.list; \
+      apt-get update; \
+      apt-get install -y --no-install-recommends build-essential git \
         libkrb5-dev libselinux1-dev libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev \
         libzstd-dev liblz4-dev \
         "postgresql-server-dev-$PG_MAJOR=$PG_VERSION"; \
