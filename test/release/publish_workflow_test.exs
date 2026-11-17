@@ -646,7 +646,8 @@ defmodule Replicant.PublishWorkflowTest do
     script = step["run"] || ""
 
     script =~ ~r/\bgh\s+(?:api|run\s+download)\b/ or
-      script =~ ~r{scripts/release/(?:build_candidate\.sh|package_identity\.exs|upload_candidate\.exs)\b}
+      script =~
+        ~r{scripts/release/(?:build_candidate\.sh|package_identity\.exs|upload_candidate\.exs)\b}
   end
 
   defp assert_script_credentials!(script, env) do
