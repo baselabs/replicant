@@ -2,7 +2,7 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
   @moduledoc """
   Executes `notebooks/getting_started.livemd` end to end against a LIVE PostgreSQL so the
   notebook can never silently rot: this test IS the notebook's CI (it rides `mix test` on every
-  PG15+ matrix row — see `.github/workflows/ci.yml`; the plugin-decoder rows 9/12 skip it with a
+  PG15+ matrix row — see `.github/workflows/qualification.yml`; the plugin-decoder rows 9/12 skip it with a
   logged reason: the notebook's column-list + row-filter publication needs PG15+, and its
   `messages: true` demo needs the PG14+ pgoutput option).
 

@@ -19,19 +19,14 @@ mix deps.get
 mix test
 ```
 
-Optionally install the pre-commit hook (runs `mix format --check-formatted` +
-`mix credo --strict`, blocks the commit on red):
-
-```bash
-cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
-```
+There is no pre-commit hook. Every check runs in CI on your pull request (see
+[CI](#ci) below); running them locally first is up to you.
 
 ## Development Workflow
 
-1. Work directly on `main` (or a short-lived branch if required by your
-   workflow).
+1. Fork the repository and work on a short-lived branch.
 2. Make your changes with clear, descriptive commit messages.
-3. Ensure all checks pass before opening a PR:
+3. These are the checks CI runs on your pull request; running them first saves a round trip:
 
 ```bash
 mix format                        # Format code
@@ -43,6 +38,9 @@ mix audit                         # Dependency + Hex advisory audit
 # or all quality gates at once:
 mix quality
 ```
+
+4. Update `CHANGELOG.md` under `[Unreleased]`.
+5. Open a Pull Request against `main`.
 
 ### The reference example
 
@@ -63,8 +61,17 @@ can still red there. The repo-root `.dockerignore` is a whitelist (the
 example's build context is the repo root); extend it only by adding a
 specific `!path`.
 
-4. Update `CHANGELOG.md` under `[Unreleased]`.
-5. Open a Pull Request against `main`.
+## CI
+
+Every check above, `mix test` on all six PostgreSQL majors, and the docs and
+package build are jobs in
+[`.github/workflows/qualification.yml`](.github/workflows/qualification.yml).
+A pull request runs them through
+[`pull-request.yml`](.github/workflows/pull-request.yml), with each check name
+prefixed `pull request /` and a final `pull request checked`. A maintainer then
+lands the change through a `kci/<commit>` branch, where
+[`ci.yml`](.github/workflows/ci.yml) runs the same jobs once and `main` moves
+only on its `qualified` check.
 
 ## Code Style
 

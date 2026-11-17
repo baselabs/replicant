@@ -244,8 +244,8 @@ across the range. `decoder:` selects the output plugin
 | Failover slots (`failover: true`) | PostgreSQL 17+; halts `{:config, :failover_unsupported}` below |
 | Slot-invalidation columns consulted | `wal_status` from 13, `conflicting` from 16, `invalidation_reason` and `synced` from 17; none below 13 |
 
-The [CI matrix](https://github.com/baselabs/replicant/blob/main/.github/workflows/ci.yml)
-runs the full suite on every push against PostgreSQL 9.6, 12, 15, 15 with plugins, 16, 17
+The [CI matrix](https://github.com/baselabs/replicant/blob/main/.github/workflows/qualification.yml)
+runs the full suite on every landed commit and every pull request against PostgreSQL 9.6, 12, 15, 15 with plugins, 16, 17
 and 18, each a real digest-pinned server with `wal_level=logical`. The 9.6, 12 and
 15-plugin rows build `pglogical` 2.4.8 and `wal2json` into the image and run a
 parity test that delivers one fixture transaction byte-identically across pgoutput,

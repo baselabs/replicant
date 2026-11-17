@@ -7,7 +7,7 @@ defmodule Replicant.ReleaseContractTest do
 
   @changelog Path.expand("../../CHANGELOG.md", __DIR__)
   @mixfile Path.expand("../../mix.exs", __DIR__)
-  @workflow Path.expand("../../.github/workflows/ci.yml", __DIR__)
+  @workflow Path.expand("../../.github/workflows/qualification.yml", __DIR__)
   @builder Path.expand("../../scripts/release/build_candidate.sh", __DIR__)
   @uploader Path.expand("../../scripts/release/upload_candidate.exs", __DIR__)
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)

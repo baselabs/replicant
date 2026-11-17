@@ -83,25 +83,22 @@ separate.
     # `mix compile --warnings-as-errors` and `mix test` are NOT in it:
     mix quality
 
-CI runs these (`mix test` on all six PostgreSQL majors); run the ones that cover your change.
 Update `CHANGELOG.md` under `[Unreleased]`.
 
-**Pre-commit hook (one-time install per clone):** `.githooks/pre-commit` runs
-`mix format --check-formatted` + `mix credo --strict` and **blocks the commit on
-red** — a backstop for the two silent gates whose drift won't otherwise surface
-until CI (`.github/workflows/ci.yml`). It installs into the default hook dir
-alongside graphify's `post-commit`; it does **not** set `core.hooksPath`, so
-graphify is unaffected.
-
-    cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
-
-Bypass with `git commit --no-verify` (CI still enforces both on push).
+**Checks run in CI, through the landing.** The repository has no pre-commit hook. Every check
+(format, credo, compile warnings, the dependency audit, dialyzer, `mix test` on all six
+PostgreSQL majors, docs and package, the reference example) is a job in
+`.github/workflows/qualification.yml`. Maintainers land a commit through a `kci/<commit>`
+branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qualified` job
+(which fails unless every job succeeded) is the verdict that moves `main`. A push to `main`
+runs nothing. Pull requests run the same jobs from `.github/workflows/pull-request.yml` under
+other check names. Contributors may run any of the commands above on their own machines first.
 
 ## Workflow
 
-Make the change, run the tests that cover it, commit with named paths, and push to `main`. CI runs
-once on `main`; if it goes red, fix forward. Publishing, deploying and pushes to mirrors need the
-owner's approval for that action.
+Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only
+on that commit's `qualified` check. If it goes red, fix forward in the next commit. Publishing,
+deploying and pushes to mirrors need the owner's approval for that action.
 
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.
