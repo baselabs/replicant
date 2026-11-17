@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- CI no longer caches dependencies, builds, or Dialyzer PLTs. Candidate runs
+  could never restore caches from earlier candidates, and a cache written on
+  `main` would be restorable by candidates.
+
 ## [1.5.1] - 2026-10-10
 
 ### Fixed

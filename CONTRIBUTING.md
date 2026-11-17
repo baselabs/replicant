@@ -73,6 +73,9 @@ lands the change through a `kci/<commit>` branch, where
 [`ci.yml`](.github/workflows/ci.yml) runs the same jobs once and `main` moves
 only on its `qualified` check.
 
+Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
+has a new cache scope, and a cache written on `main` would be restorable by candidates.
+
 ## Code Style
 
 - Use `mix format` — `.formatter.exs` holds the config.

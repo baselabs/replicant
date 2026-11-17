@@ -94,6 +94,9 @@ branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qu
 runs nothing. Pull requests run the same jobs from `.github/workflows/pull-request.yml` under
 other check names. Contributors may run any of the commands above on their own machines first.
 
+Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
+a new cache scope, and a cache written on `main` would be restorable by candidates.
+
 ## Workflow
 
 Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only

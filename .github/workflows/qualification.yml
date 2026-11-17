@@ -4,6 +4,7 @@ name: Qualification
 # candidate (its `qualified` job is the landing verdict, kimosabe ADR 0043) and
 # pull-request.yml on an outside pull request (other check names, not the verdict).
 # Neither caller passes secrets, and no job here reads one.
+# Jobs fetch dependencies, build, and generate Dialyzer PLTs without Actions caches.
 on:
   workflow_call:
 
@@ -34,18 +35,6 @@ jobs:
           # lets the formatter list-wrap heuristic pass in one and fail in the other.
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
-
-      - name: Cache deps, build and PLTs
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            deps
-            _build
-            priv/plts
-          # Key binds the cache to the pinned toolchain + mix.lock + .tool-versions,
-          # so a toolchain or dep bump invalidates a stale PLT/build cache.
-          key: ${{ runner.os }}-static-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
-          restore-keys: ${{ runner.os }}-static-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       - run: mix deps.get
       - name: Assert release runtime
@@ -203,16 +192,6 @@ jobs:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
 
-      - name: Cache deps and build
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            deps
-            _build
-          # Key binds the cache to the pinned toolchain + mix.lock + .tool-versions.
-          key: ${{ runner.os }}-test-pg${{ matrix.pg.major }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
-          restore-keys: ${{ runner.os }}-test-pg${{ matrix.pg.major }}-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
-
       - run: mix deps.get
       - name: Run tests and prove this matrix row ran integration against PG${{ matrix.pg.major }}
         # R05 CI discovery: the integration suite emits `R05-SUBSTRATE-RECEIPT pg=<major>` from a
@@ -245,14 +224,6 @@ jobs:
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
-
-      - name: Cache dependencies and build
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-release-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('mix.lock', '.tool-versions') }}
 
       - run: mix deps.get
       - run: mix audit
@@ -288,21 +259,9 @@ jobs:
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
         with:
-          # Same toolchain as the main jobs (.tool-versions) so the example's
-          # dialyzer PLT matches the library's.
+          # Same pinned toolchain as the library jobs (.tool-versions).
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
-
-      - name: Cache example deps and build
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          # The example sets no dialyzer plt_local_path — its PLTs land under
-          # _build/dev, so caching _build covers them.
-          path: |
-            examples/replication_pipeline/deps
-            examples/replication_pipeline/_build
-          key: example-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-${{ hashFiles('examples/replication_pipeline/mix.lock') }}
-          restore-keys: example-otp${{ env.OTP_VERSION }}-ex${{ env.ELIXIR_VERSION }}-
 
       # Static gates for the example project: the "sink API canary" catches
       # static contract drift too — a wrong callback shape or type is red here

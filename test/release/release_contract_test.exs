@@ -107,6 +107,16 @@ defmodule Replicant.ReleaseContractTest do
     assert body =~ ~S(git push origin v#{@version})
   end
 
+  test "workflows never restore or save Actions caches" do
+    workflows = Path.wildcard(Path.expand("../../.github/workflows/*.{yml,yaml}", __DIR__))
+    assert workflows != []
+
+    for path <- workflows do
+      refute File.read!(path) =~ ~r{actions/cache(?:/|@)}i,
+             "#{Path.basename(path)} must not restore or save Actions caches"
+    end
+  end
+
   test "post-release package checks fetch tags without weakening mint identity" do
     workflow = File.read!(@workflow)
     builder = File.read!(@builder)
