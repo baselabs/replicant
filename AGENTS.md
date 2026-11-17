@@ -97,17 +97,22 @@ other check names. Contributors may run any of the commands above on their own m
 ## Workflow
 
 Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only
-on that commit's `qualified` check. If it goes red, fix forward in the next commit. Publishing,
-deploying and pushes to mirrors need the owner's approval for that action.
+on that commit's `qualified` check. If it goes red, fix forward in the next commit.
+
+An agent working in this repository never releases, deploys or publishes: no `mix hex.publish`,
+no `scripts/release/publish_candidate.sh`, no version tag, no GitHub release, no release
+workflow dispatch, and no handling of publish credentials. Its work ends with the commit on
+`main`; the maintainers' release operator ships it.
 
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
-- A release is finished only when its tag, its Hex package and docs, and its GitHub release all
-  exist. `scripts/release/publish_candidate.sh` does only Hex and docs, so finish with
-  `gh release create vX.Y.Z --verify-tag --target <tag's full commit SHA>`. While the GitHub release
-  is missing, the package check fails on every CI run, pull requests included.
+- For the release operator: a release is finished only when its tag, its Hex package and docs,
+  and its GitHub release all exist. `scripts/release/publish_candidate.sh` does only Hex and
+  docs, so finish with `gh release create vX.Y.Z --verify-tag --target <tag's full commit SHA>`.
+  While the GitHub release is missing, the package check fails on every CI run, pull requests
+  included.
 
 ## Testing
 
