@@ -618,23 +618,20 @@ defmodule Replicant.PublishWorkflowTest do
 
   defp assert_github_auth!(workflow) do
     refute_tokens!(workflow["env"])
+    for {_name, job} <- workflow["jobs"], do: refute_tokens!(job["env"])
 
-    for {_name, job} <- workflow["jobs"] do
-      refute_tokens!(job["env"])
+    for {_name, job} <- workflow["jobs"], step <- job["steps"] || [] do
+      env = step["env"] || %{}
+      refute Map.has_key?(env, "GITHUB_TOKEN")
 
-      for step <- job["steps"] || [] do
-        env = step["env"] || %{}
-        refute Map.has_key?(env, "GITHUB_TOKEN")
-
-        if github_read?(step) do
-          assert job["permissions"]["contents"] == "read"
-          assert env["GH_TOKEN"] == "${{ github.token }}"
-        else
-          refute Map.has_key?(env, "GH_TOKEN")
-        end
-
-        assert_script_credentials!(step["run"] || "", env)
+      if github_read?(step) do
+        assert job["permissions"]["contents"] == "read"
+        assert env["GH_TOKEN"] == "${{ github.token }}"
+      else
+        refute Map.has_key?(env, "GH_TOKEN")
       end
+
+      assert_script_credentials!(step["run"] || "", env)
     end
   end
 
