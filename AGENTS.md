@@ -72,7 +72,7 @@ separate.
 
 ## Development workflow
 
-    mix deps.get
+    mix deps.get --check-locked
     mix format
     mix credo --strict
     mix compile --warnings-as-errors
@@ -91,8 +91,9 @@ PostgreSQL majors, docs and package, the reference example) is a job in
 `.github/workflows/qualification.yml`. Maintainers land a commit through a `kci/<commit>`
 branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qualified` job
 (which fails unless every job succeeded) is the verdict that moves `main`. A push to `main`
-runs nothing. Pull requests run the same jobs from `.github/workflows/pull-request.yml` under
-other check names. Contributors may run any of the commands above on their own machines first.
+runs nothing. No workflow runs repository code from a pull request. A fork's change is qualified
+when a maintainer submits it through the `kci/` landing. Contributors may run any of the commands
+above on their own machines first.
 
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
@@ -121,7 +122,7 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   `gh release create vX.Y.Z --verify-tag --target <full sha>`. Record the verified package
   digest in `scripts/release/published_packages.sha256` through the normal landing process.
   A release is finished only when its tag, Hex package and docs, and GitHub release all exist.
-  Partial publication fails the package check on subsequent CI runs, including pull requests.
+  Partial publication fails the package check on subsequent landing candidates.
 
 ## CI/CD and releases
 

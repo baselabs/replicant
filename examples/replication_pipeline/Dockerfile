@@ -28,7 +28,7 @@ WORKDIR /build/examples/replication_pipeline
 ENV MIX_ENV=prod
 
 RUN mix local.hex --force && mix local.rebar --force \
-    && mix deps.get --only prod \
+    && mix deps.get --only prod --check-locked \
     && mix compile --warnings-as-errors
 
 RUN mix release

@@ -149,7 +149,7 @@ defmodule Replicant.UploadDocs do
       {"REPLICANT_PUBLISH_AUTHORIZED", nil}
     ]
 
-    with_cmd(build_tree, docs_env, "mix", ["deps.get", "--check-locked"], "mix deps.get")
+    with_cmd(build_tree, docs_env, "mix", ["deps.get", "--check-locked"], "locked dependency fetch")
     with_cmd(build_tree, docs_env, "mix", ["docs", "--warnings-as-errors"], "mix docs")
 
     doc_dir = Path.join(build_tree, "doc")

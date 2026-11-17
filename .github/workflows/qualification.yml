@@ -1,10 +1,11 @@
 name: Qualification
 
-# Every qualification job, defined once. Two callers run it: ci.yml on a kci/<commit>
-# candidate (its `qualified` job is the landing verdict, kimosabe ADR 0043) and
-# pull-request.yml on an outside pull request (other check names, not the verdict).
-# Neither caller passes secrets, and no job here reads one.
+# Every qualification job, defined once. ci.yml calls it on a kci/<commit>
+# candidate; its `qualified` job is the landing verdict (kimosabe ADR 0043).
+# The caller passes no secrets, and no job here reads one.
 # Jobs fetch dependencies, build, and generate Dialyzer PLTs without Actions caches.
+# Timeout rule for all workflows: 3x the measured green duration, rounded up to
+# whole minutes, with a 3-minute minimum. Each limit cites its measurement.
 on:
   workflow_call:
 
@@ -22,6 +23,7 @@ jobs:
   static:
     name: static (format, credo, compile, audit, dialyzer)
     runs-on: ubuntu-24.04
+    timeout-minutes: 8 # Green run 44183333538: static 2m35s
     env:
       MIX_ENV: test
     steps:
@@ -38,16 +40,22 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           version-type: strict
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - name: Assert release runtime
         run: |
           mix run --no-start -e '
-          unless System.version() == "1.20.3" and :erlang.system_info(:otp_release) == ~c"29" do
+          otp_version =
+            Path.join([to_string(:code.root_dir()), "releases", to_string(:erlang.system_info(:otp_release)), "OTP_VERSION"])
+            |> File.read!()
+            |> String.trim()
+          unless System.version() == System.fetch_env!("ELIXIR_VERSION") and otp_version == System.fetch_env!("OTP_VERSION") do
             raise "unexpected release runtime"
           end'
       # Supply-chain gate (declared in mix.exs `audit` alias: unused-dep + hex advisory +
       # deps audit). Runs before build so a vulnerable/unpinned dep reds before compile.
       - run: mix audit
+      # Use the root's locked audit tool to inspect the example's own lockfile.
+      - run: mix deps.audit --path examples/replication_pipeline
       - run: mix format --check-formatted
       - run: mix compile --warnings-as-errors
       - run: mix credo --strict
@@ -56,6 +64,7 @@ jobs:
   test:
     name: test (PG${{ matrix.pg.major }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 11 # Green run 44183333538: test PG12 (slowest matrix row) 3m24s
     strategy:
       fail-fast: false
       # R05 supported-version matrix: PostgreSQL 9.6, 12, 15, 16, 17, 18. The 15-18
@@ -195,7 +204,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           version-type: strict
 
-      - run: mix deps.get
+      - run: mix deps.get --check-locked
       - name: Run tests and prove this matrix row ran integration against PG${{ matrix.pg.major }}
         # R05 CI discovery: the integration suite emits `R05-SUBSTRATE-RECEIPT pg=<major>` from a
         # live-server test. Grepping for THIS row's major proves the row actually exercised the
@@ -214,6 +223,7 @@ jobs:
   release-artifact:
     name: docs and package
     runs-on: ubuntu-24.04
+    timeout-minutes: 6 # Green run 44183333538: release-artifact 1m44s
     env:
       MIX_ENV: dev
 
@@ -263,7 +273,7 @@ jobs:
   reference-example:
     name: Reference example (docker)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 11 # Green run 44183333538: reference-example 3m24s
     defaults:
       run:
         working-directory: examples/replication_pipeline
@@ -282,10 +292,11 @@ jobs:
       # Static gates for the example project: the "sink API canary" catches
       # static contract drift too — a wrong callback shape or type is red here
       # before the docker build runs.
-      - name: Example static gates (format, compile, credo, dialyzer)
+      - name: Example static gates (audit, format, compile, credo, dialyzer)
         working-directory: examples/replication_pipeline
         run: |
-          mix deps.get
+          mix deps.get --check-locked
+          mix hex.audit
           mix format --check-formatted
           mix compile --warnings-as-errors
           mix credo --strict

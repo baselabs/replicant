@@ -245,8 +245,9 @@ across the range. `decoder:` selects the output plugin
 | Slot-invalidation columns consulted | `wal_status` from 13, `conflicting` from 16, `invalidation_reason` and `synced` from 17; none below 13 |
 
 The [CI matrix](https://github.com/baselabs/replicant/blob/main/.github/workflows/qualification.yml)
-runs the full suite on every landed commit and every pull request against PostgreSQL 9.6, 12, 15, 15 with plugins, 16, 17
-and 18, each a real digest-pinned server with `wal_level=logical`. The 9.6, 12 and
+runs the full suite on each maintainer-submitted landing candidate against
+PostgreSQL 9.6, 12, 15, 15 with plugins, 16, 17 and 18, each a real digest-pinned
+server with `wal_level=logical`. The 9.6, 12 and
 15-plugin rows build `pglogical` 2.4.8 and `wal2json` into the image and run a
 parity test that delivers one fixture transaction byte-identically across pgoutput,
 pglogical and wal2json. PostgreSQL 10, 11, 13 and 14 are inside the pgoutput range but not in the matrix, and the
@@ -315,7 +316,7 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
 ## Development
 
 ```bash
-mix deps.get
+mix deps.get --check-locked
 mix test                 # unit suite; set REPLICANT_TEST_URL for the integration suite
 mix quality              # format --check-formatted + credo --strict + dialyzer
 ```

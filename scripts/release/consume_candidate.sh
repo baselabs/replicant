@@ -3,7 +3,7 @@
 # extracted package bytes — not the repository checkout, not the repo's _build.
 #
 # Steps: Hex-checksum-validate + unpack the exact retained tar -> build a brand-new Mix consumer
-# whose only Replicant source is the extraction -> clear MIX_PATH/ERL_LIBS -> deps.get -> compile
+# whose only Replicant source is the extraction -> clear MIX_PATH/ERL_LIBS -> locked fetch -> compile
 # with warnings-as-errors -> run a semantic R01-R05 smoke that asserts the loaded Replicant BEAM
 # resolves under the scratch tree. A missing/corrupt packaged file is invisible from the checkout;
 # it is caught here.
@@ -46,9 +46,12 @@ fi
 
 # --- 2. Audit, compile, and render docs from the exact extracted package source. ---------------
 log "auditing and building the extracted package source"
+# Hex packages omit mix.lock. Reuse the qualified source lock for both isolated
+# projects so fetching cannot resolve a different graph during qualification.
+cp "$repo_root/mix.lock" "$src/mix.lock"
 (
   cd "$src"
-  env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix deps.get >&2
+  env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix deps.get --check-locked >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix audit >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix compile --warnings-as-errors >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix docs --warnings-as-errors >&2
@@ -83,12 +86,13 @@ defmodule ReplicantConsumerSmoke do
 end
 EOF
 
-# --- 4. Fresh resolve + compile from a clean environment (no repo _build, no MIX_PATH). -------
+# --- 4. Locked fetch + compile from a clean environment (no repo _build, no MIX_PATH). -------
 log "building fresh consumer against extracted source $src"
+cp "$src/mix.lock" "$consumer/mix.lock"
 (
   cd "$consumer"
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
-    mix deps.get >&2
+    mix deps.get --check-locked >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
     mix compile --warnings-as-errors >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \

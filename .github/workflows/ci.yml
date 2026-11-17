@@ -2,8 +2,8 @@ name: CI
 
 # One qualification run per landing candidate (kimosabe ADR 0043). kimosabe-land pushes
 # kci/<commit>; this run is the only verdict, and main moves to that commit only on its
-# `qualified` check. A push to main, a tag or a release starts nothing here. Outside pull
-# requests run the same jobs from pull-request.yml under other check names.
+# `qualified` check. A push to main, a tag or a release starts nothing here.
+# Fork changes are qualified only when a maintainer submits a landing candidate.
 on:
   push:
     branches: ['kci/**']
@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   qualification:
+    # GitHub forbids timeout-minutes on reusable-workflow calls; each called job
+    # has its measured timeout in qualification.yml, which also defines the rule.
     uses: ./.github/workflows/qualification.yml
 
   # The verdict. Always runs, and fails unless every qualification job succeeded; a
@@ -25,6 +27,7 @@ jobs:
     if: always()
     needs: [qualification]
     runs-on: ubuntu-24.04
+    timeout-minutes: 3 # Green run 44183333538: qualified 0m02s
     steps:
       - name: Require every qualification job to succeed
         env:

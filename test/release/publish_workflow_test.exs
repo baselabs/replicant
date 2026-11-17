@@ -65,6 +65,89 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
+  test "every executable job has a measured timeout and rejects missing or invalid limits" do
+    for path <- Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}")) do
+      source = File.read!(path)
+      assert_timeouts!(source)
+      lines = Regex.scan(~r/^    timeout-minutes: .+$/m, source)
+      assert lines != []
+
+      for [line] <- lines,
+          replacement <- [
+            "",
+            line |> String.split(" #") |> hd(),
+            String.replace(line, "44183333538", "unknown"),
+            String.replace(line, ~r/\d+m\d+s/, "unmeasured"),
+            String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 1")
+          ] do
+        mutated = String.replace(source, line, replacement)
+        refute mutated == source
+        assert_raise ExUnit.AssertionError, fn -> assert_timeouts!(mutated) end
+      end
+    end
+  end
+
+  test "dependency fetches in workflows, shell scripts, and Dockerfiles are locked" do
+    paths =
+      Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}")) ++
+        Path.wildcard(Path.join(@repo_root, "scripts/**/*.sh")) ++
+        [Path.join(@repo_root, "examples/replication_pipeline/Dockerfile")]
+
+    for path <- paths do
+      source = File.read!(path)
+      assert_locked_fetches!(source)
+
+      for [command] <- Regex.scan(~r/\bmix\s+deps\.get\b[^\n]*/, source) do
+        mutated = String.replace(source, command, String.replace(command, " --check-locked", ""))
+        refute mutated == source
+        assert_raise ExUnit.AssertionError, fn -> assert_locked_fetches!(mutated) end
+      end
+    end
+
+    docs = File.read!(Path.join(@repo_root, "scripts/release/upload_docs.exs"))
+    assert_docs_fetch!(docs)
+    mutated = String.replace(docs, ~s(["deps.get", "--check-locked"]), ~s(["deps.get"]))
+    refute mutated == docs
+    assert_raise ExUnit.AssertionError, fn -> assert_docs_fetch!(mutated) end
+  end
+
+  test "example audits inspect its lockfile using the root's locked dependency audit tool" do
+    original = read_yaml!(@qualification)
+    assert_example_audits!(original)
+
+    for {name, job} <- original["jobs"],
+        {step, index} <- Enum.with_index(job["steps"]),
+        is_binary(step["run"]),
+        audit <- ["mix deps.audit --path examples/replication_pipeline", "mix hex.audit"],
+        String.contains?(step["run"], audit) do
+      path = ["jobs", name, "steps", Access.at(index), "run"]
+      mutated = put_in(original, path, String.replace(step["run"], audit, "true"))
+      assert_raise ExUnit.AssertionError, fn -> assert_example_audits!(mutated) end
+    end
+
+    mutated =
+      put_in(original, ["jobs", "static", "defaults"], %{
+        "run" => %{"working-directory" => "examples/replication_pipeline"}
+      })
+
+    assert_raise ExUnit.AssertionError, fn -> assert_example_audits!(mutated) end
+  end
+
+  test "the release runtime check rejects either version changing, including OTP patches" do
+    steps = read_yaml!(@qualification)["jobs"]["static"]["steps"]
+    script = Enum.find(steps, &(&1["name"] == "Assert release runtime"))["run"]
+    assert_runtime_check!(script)
+
+    for guard <- [
+          ~S|System.version() == System.fetch_env!("ELIXIR_VERSION")|,
+          ~S|otp_version == System.fetch_env!("OTP_VERSION")|
+        ] do
+      mutated = String.replace(script, guard, "true")
+      refute mutated == script
+      assert_raise ExUnit.AssertionError, fn -> assert_runtime_check!(mutated) end
+    end
+  end
+
   test "publish is owner-dispatched with one environment secret and guarded exact-byte upload" do
     assert_publish!(read_yaml!(@workflow))
   end
@@ -136,10 +219,12 @@ defmodule Replicant.PublishWorkflowTest do
         {"loose version", ["jobs", "publish", "steps", 2, "with", "version-type"], "loose"},
         {"Elixir override", ["jobs", "publish", "steps", 2, "with", "elixir-version"], "1.20.2"},
         {"literal OTP override", ["jobs", "publish", "steps", 2, "with", "otp-version"], "29"},
-        {"moving runner", ["jobs", "publish", "runs-on"], "ubuntu-latest"},
+        {"moving runner", ["jobs", "publish", "runs-on"], "ubuntu-" <> "latest"},
         {"self-hosted runner", ["jobs", "publish", "runs-on"], ["self-hosted", "linux"]},
         {"build-box runner", ["jobs", "publish", "runs-on"], "devbox-ovh"},
-        {"cache action", ["jobs", "publish", "steps", 3, "uses"], "actions/cache@v4"}
+        {"cache action", ["jobs", "publish", "steps", 3, "uses"], "actions/cache@v4"},
+        {"pull request trigger", ["on", "pull_request"], nil},
+        {"privileged pull request trigger", ["on", "pull_request_target"], nil}
       ] do
     test "every workflow contract refuses #{name}" do
       original = read_yaml!(@workflow)
@@ -349,13 +434,21 @@ defmodule Replicant.PublishWorkflowTest do
     [_, otp, major] = Regex.run(~r/^erlang ((\d+)\.\d+\.\d+)$/m, tools)
     assert suffix == major
     maps = maps(workflow)
+    events = workflow["on"]
+    events = if is_map(events), do: Map.keys(events), else: List.wrap(events)
+    refute Enum.any?(events, &String.starts_with?(&1, "pull_request"))
 
     for map <- maps, {key, expected} <- [{"ELIXIR_VERSION", elixir}, {"OTP_VERSION", otp}] do
       if Map.has_key?(map, key), do: assert(map[key] == expected)
     end
 
-    for {_name, job} <- workflow["jobs"], not Map.has_key?(job, "uses") do
-      assert job["runs-on"] == "ubuntu-24.04"
+    for {_name, job} <- workflow["jobs"] do
+      if Map.has_key?(job, "uses") do
+        assert job == %{"uses" => "./.github/workflows/qualification.yml"}
+      else
+        assert job["runs-on"] == "ubuntu-24.04"
+        assert is_integer(job["timeout-minutes"]) and job["timeout-minutes"] >= 3
+      end
     end
 
     for map <- maps do
@@ -392,7 +485,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert job["if"] == @owners
     assert job["environment"] == "publish"
     assert job["permissions"] == %{"contents" => "read", "actions" => "read"}
-    assert job["timeout-minutes"] == 15
+    assert job["timeout-minutes"] == 6
     steps = job["steps"]
     assert length(steps) == 10
     assert Enum.at(steps, 0)["run"] == ~s(test "$GITHUB_REF" = refs/heads/main)
@@ -465,6 +558,85 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
+  defp assert_timeouts!(source) do
+    workflow = parse_yaml!(source)
+
+    for {name, job} <- workflow["jobs"], not Map.has_key?(job, "uses") do
+      [_, body] = Regex.run(~r/^  #{Regex.escape(name)}:\n(.*?)(?=^  [\w-]+:|\z)/ms, source)
+
+      measurement =
+        Regex.run(
+          ~r/^    timeout-minutes: (\d+) # Green run 44183333538: .+? (\d+)m(\d{2})s(?:;.*)?$/m,
+          body
+        )
+
+      assert measurement, "#{name} needs a timeout with its green run and duration"
+      [_, limit, minutes, seconds] = measurement
+      duration = String.to_integer(minutes) * 60 + String.to_integer(seconds)
+      assert job["timeout-minutes"] == String.to_integer(limit)
+      assert job["timeout-minutes"] == max(3, div(3 * duration + 59, 60))
+    end
+  end
+
+  defp assert_locked_fetches!(source) do
+    for [_, arguments] <- Regex.scan(~r/\bmix\s+deps\.get\b([^\n]*)/, source) do
+      assert "--check-locked" in String.split(arguments)
+    end
+  end
+
+  defp assert_docs_fetch!(source) do
+    assert source =~ ~s(["deps.get", "--check-locked"])
+  end
+
+  defp assert_example_audits!(workflow) do
+    static = workflow["jobs"]["static"]
+    refute get_in(static, ["defaults", "run", "working-directory"])
+    steps = static["steps"]
+    fetch = Enum.find_index(steps, &(&1["run"] == "mix deps.get --check-locked"))
+
+    audit =
+      Enum.find_index(steps, fn step ->
+        step["run"] == "mix deps.audit --path examples/replication_pipeline"
+      end)
+
+    assert is_integer(fetch) and is_integer(audit) and fetch < audit
+    refute Enum.at(steps, audit)["working-directory"]
+    example = workflow["jobs"]["reference-example"]
+    assert get_in(example, ["defaults", "run", "working-directory"]) ==
+             "examples/replication_pipeline"
+
+    assert Enum.any?(example["steps"], fn step ->
+             lines = String.split(step["run"] || "", "\n")
+             fetch = Enum.find_index(lines, &(&1 == "mix deps.get --check-locked"))
+             audit = Enum.find_index(lines, &(&1 == "mix hex.audit"))
+             is_integer(fetch) and is_integer(audit) and fetch < audit
+           end)
+  end
+
+  defp assert_runtime_check!(script) do
+    workflow = read_yaml!(@qualification)
+    elixir = workflow["env"]["ELIXIR_VERSION"]
+    otp = workflow["env"]["OTP_VERSION"]
+    [major, minor, patch] = String.split(otp, ".")
+    wrong_patch = Enum.join([major, minor, String.to_integer(patch) + 1], ".")
+
+    for {expected_elixir, expected_otp, success?} <- [
+          {elixir, otp, true},
+          {elixir <> ".wrong", otp, false},
+          {elixir, wrong_patch, false},
+          {elixir, major, false}
+        ] do
+      {_output, status} =
+        System.cmd("bash", ["--noprofile", "--norc", "-euo", "pipefail", "-c", script],
+          cd: @repo_root,
+          env: [{"ELIXIR_VERSION", expected_elixir}, {"OTP_VERSION", expected_otp}],
+          stderr_to_stdout: true
+        )
+
+      assert (status == 0) == success?
+    end
+  end
+
   defp maps(map) when is_map(map), do: [map | Enum.flat_map(Map.values(map), &maps/1)]
   defp maps(list) when is_list(list), do: Enum.flat_map(list, &maps/1)
   defp maps(_value), do: []
@@ -489,13 +661,17 @@ defmodule Replicant.PublishWorkflowTest do
   # Ruby's standard YAML parser is present on the hosted runner. Use a real
   # parser without adding a YAML runtime dependency to this Elixir library.
   defp read_yaml!(path) do
+    parse_yaml!(File.read!(path))
+  end
+
+  defp parse_yaml!(source) do
     parser = """
-    data = YAML.safe_load(File.read(ARGV.fetch(0)), aliases: true)
+    data = YAML.safe_load(ARGV.fetch(0), aliases: true)
     data['on'] = data.delete(true) if data.key?(true)
     puts JSON.generate(data)
     """
 
-    {json, 0} = System.cmd("ruby", ["-ryaml", "-rjson", "-e", parser, path])
+    {json, 0} = System.cmd("ruby", ["-ryaml", "-rjson", "-e", parser, source])
     Jason.decode!(json)
   end
 end

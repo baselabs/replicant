@@ -27,7 +27,8 @@ jobs:
     if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
     environment: publish
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Uses the timeout rule in qualification.yml; publishing has never run.
+    timeout-minutes: 6 # Green run 44183333538: release-artifact 1m44s; same mint as publish
     permissions:
       contents: read
       actions: read

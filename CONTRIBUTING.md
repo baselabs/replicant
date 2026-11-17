@@ -15,18 +15,18 @@ Thank you for your interest in contributing to Replicant!
 ```bash
 git clone https://github.com/baselabs/replicant.git
 cd replicant
-mix deps.get
+mix deps.get --check-locked
 mix test
 ```
 
-There is no pre-commit hook. Every check runs in CI on your pull request (see
-[CI](#ci) below); running them locally first is up to you.
+There is no pre-commit hook. Checks run when a maintainer submits your change
+through the `kci/` landing (see [CI](#ci) below); running them locally first is up to you.
 
 ## Development Workflow
 
 1. Fork the repository and work on a short-lived branch.
 2. Make your changes with clear, descriptive commit messages.
-3. These are the checks CI runs on your pull request; running them first saves a round trip:
+3. These are the checks CI runs on a maintainer's landing candidate:
 
 ```bash
 mix format                        # Format code
@@ -46,16 +46,22 @@ mix quality
 
 [`examples/replication_pipeline`](examples/replication_pipeline/README.md) is a
 separate nested Mix project (it path-depends on this library), so it has its
-own gates — run them from its directory:
+own lockfile and gates. From the repository root, audit that lock with the
+root project's locked audit tool, then run the example's own gates:
 
 ```bash
+mix deps.get --check-locked
+mix deps.audit --path examples/replication_pipeline
 cd examples/replication_pipeline
+mix deps.get --check-locked
+mix hex.audit
 mix format --check-formatted && mix compile --warnings-as-errors \
   && mix credo --strict && mix dialyzer
 docker compose up -d --build       # the full stack (source → pipeline → dest)
 ```
 
-CI runs exactly this as the `reference-example` job — the public sink API's
+CI runs the dependency audit in `static` and the remaining example gates in
+the `reference-example` job — the public sink API's
 end-to-end canary — so a change to the sink surface that compiles clean here
 can still red there. The repo-root `.dockerignore` is a whitelist (the
 example's build context is the repo root); extend it only by adding a
@@ -66,12 +72,10 @@ specific `!path`.
 Every check above, `mix test` on all six PostgreSQL majors, and the docs and
 package build are jobs in
 [`.github/workflows/qualification.yml`](.github/workflows/qualification.yml).
-A pull request runs them through
-[`pull-request.yml`](.github/workflows/pull-request.yml), with each check name
-prefixed `pull request /` and a final `pull request checked`. A maintainer then
-lands the change through a `kci/<commit>` branch, where
-[`ci.yml`](.github/workflows/ci.yml) runs the same jobs once and `main` moves
-only on its `qualified` check.
+No workflow runs repository code from a pull request. A fork's change is
+qualified when a maintainer lands it through a `kci/<commit>` branch.
+[`ci.yml`](.github/workflows/ci.yml) runs the checks once on that candidate,
+and `main` moves only on its `qualified` check.
 
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
 has a new cache scope, and a cache written on `main` would be restorable by candidates.
@@ -88,7 +92,7 @@ owner (`corepay` or `palermo-git`) dispatches **Publish to Hex** on `main` with 
 inputs. The job reads the package authorization artifact that **docs and package**
 recorded for that exact commit's successful `ci.yml` push run on `kci/<commit>`.
 It verifies the run's `qualified` job succeeded and refuses missing, malformed,
-or conflicting records. Pull request qualification runs cannot authorize publishing.
+or conflicting records. Only the successful landing run can authorize publishing.
 The owner must also be the triggering actor on a rerun. The release operator
 creates the GitHub `publish` environment and its `HEX_API_KEY` secret. That secret
 is available only to the publish step, never the candidate build or inspection.
