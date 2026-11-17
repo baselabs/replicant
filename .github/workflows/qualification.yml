@@ -13,14 +13,15 @@ permissions:
 
 env:
   ELIXIR_VERSION: "1.20.3"
-  OTP_VERSION: "29"
+  OTP_VERSION: "29.0.3"
+  HEX_VERSION: "2.7.0"
 
 jobs:
   # Format, lint, compile warnings, the dependency audit and dialyzer read no database,
   # so they run once here instead of in every matrix row.
   static:
     name: static (format, credo, compile, audit, dialyzer)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MIX_ENV: test
     steps:
@@ -35,6 +36,7 @@ jobs:
           # lets the formatter list-wrap heuristic pass in one and fail in the other.
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-type: strict
 
       - run: mix deps.get
       - name: Assert release runtime
@@ -53,7 +55,7 @@ jobs:
 
   test:
     name: test (PG${{ matrix.pg.major }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       # R05 supported-version matrix: PostgreSQL 9.6, 12, 15, 16, 17, 18. The 15-18
@@ -191,6 +193,7 @@ jobs:
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-type: strict
 
       - run: mix deps.get
       - name: Run tests and prove this matrix row ran integration against PG${{ matrix.pg.major }}
@@ -210,7 +213,7 @@ jobs:
 
   release-artifact:
     name: docs and package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       MIX_ENV: dev
 
@@ -224,8 +227,12 @@ jobs:
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-type: strict
 
-      - run: mix deps.get
+      # Match the publisher: Hex records its own version in the package bytes.
+      - run: mix local.hex "$HEX_VERSION" --force
+      - run: mix local.rebar --force
+      - run: mix deps.get --check-locked
       - run: mix audit
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
@@ -235,7 +242,8 @@ jobs:
       # fresh-consumer provenance + semantic smoke, immutable witness, free-or-coherent published
       # identity checks, and
       # credential-free exact-byte uploader dry-run. The real candidate is minted once, from merged
-      # main, after this review set and all matrix rows settle.
+      # main, after this review set and all matrix rows settle. The builder logs
+      # authorization: <version>:<sha256> for the owner to copy into publish.yml.
       - name: Prove the complete package workflow without minting a candidate
         run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check
 
@@ -247,7 +255,7 @@ jobs:
   # .dockerignore whitelist is the containment barrier for the build context.
   reference-example:
     name: Reference example (docker)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -262,6 +270,7 @@ jobs:
           # Same pinned toolchain as the library jobs (.tool-versions).
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-type: strict
 
       # Static gates for the example project: the "sink API canary" catches
       # static contract drift too — a wrong callback shape or type is red here

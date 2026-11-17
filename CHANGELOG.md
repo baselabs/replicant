@@ -7,11 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Owner-dispatched **Publish to Hex** workflow on GitHub-hosted Ubuntu 24.04,
+  using the `publish` environment and exposing its `HEX_API_KEY` secret only to
+  the publish step. Required version:digest authorization comes from the green
+  qualification run and must match the minted candidate before either upload.
+- Release contract tests with mutation cases for the workflow trigger, owners,
+  permissions, credential scope, authorization order, runtime pins, strict
+  setup-beam versions, hosted runners, and absence of Actions caches.
+
 ### Changed
 
 - CI no longer caches dependencies, builds, or Dialyzer PLTs. Candidate runs
   could never restore caches from earlier candidates, and a cache written on
   `main` would be restorable by candidates.
+- Qualification and publishing use Elixir 1.20.3 and OTP 29.0.3 with strict
+  setup-beam selection. Every workflow uses `ubuntu-24.04`. Package qualification
+  and minting pin Hex 2.7.0, compare two isolated builds byte for byte, and log
+  the copyable version:digest authorization.
+- Candidate minting accepts a detached checkout of exact live `origin/main`.
+  The publish guard re-proves the clean witnessed source at live main and a
+  free release namespace. The operator creates the tag and GitHub release after
+  Hex read-back and docs upload, then records the digest in the existing ledger.
+
+### Fixed
+
+- Docs uploads now verify the immutable package receipt and Git witness before
+  building from the witnessed commit. Child builds use locked dependencies,
+  receive no publish credential, and remove their temporary tree on failure.
+
+### Removed
+
+- Workstation package and docs publish scripts and the `.env` Hex credential
+  loader. Publishing is owned by the dispatched GitHub Actions workflow.
 
 ## [1.5.1] - 2026-10-10
 

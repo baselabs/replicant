@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build and prove package bytes from an exact commit. `--check` uses only throwaway bytes;
-# the default mint mode is allowed only on clean main equal to live origin/main.
+# the default mint mode requires a clean tree at live origin/main, including a
+# detached Actions checkout of that exact commit.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -33,7 +34,8 @@ if [[ -n "$published_digest" && ! "$published_digest" =~ ^[0-9a-f]{64}$ ]]; then
 fi
 
 if [[ "$mode" == "mint" ]]; then
-  [[ "$(git branch --show-current)" == "main" ]] || die "candidate mint is allowed only on main"
+  branch="$(git branch --show-current)"
+  [[ -z "$branch" || "$branch" == "main" ]] || die "candidate mint is allowed only on main or its detached commit"
 
   if remote_main="$(git ls-remote --exit-code origin refs/heads/main 2>/dev/null)"; then
     remote_main="$(printf '%s' "$remote_main" | awk '{print $1}')"
@@ -104,6 +106,14 @@ staged_tar="$build_tree/replicant-$version.tar"
 ( cd "$build_tree" && MIX_ENV=dev MIX_BUILD_PATH="$build_tree/_build" mix hex.build --output "$staged_tar" >/dev/null )
 [[ -f "$staged_tar" ]] || die "mix hex.build produced no tarball"
 
+# Check and mint share this exact build path. Prove byte reproducibility from a
+# second extraction with a separate build path before retaining any evidence.
+rebuild_tree="$build_tree/reproducibility"
+mkdir "$rebuild_tree"
+tar -xf "$source_archive" -C "$rebuild_tree"
+( cd "$rebuild_tree" && MIX_ENV=dev MIX_BUILD_PATH="$rebuild_tree/_build" mix hex.build --output "$rebuild_tree/replicant-$version.tar" >/dev/null )
+cmp -s "$staged_tar" "$rebuild_tree/replicant-$version.tar" || die "package build is not byte-reproducible"
+
 digest="$(sha256_of "$staged_tar")"
 size="$(wc -c < "$staged_tar" | tr -d ' ')"
 lock_digest="$(sha256_of "$build_tree/mix.lock")"
@@ -143,6 +153,7 @@ receipt_tmp="$build_tree/receipt.txt"
   echo "size_bytes: $size"
   echo "sha256: $digest"
   echo "source_mix_lock_sha256: $lock_digest"
+  echo "package_reproducibility: PASS"
   echo "elixir: $(elixir --version 2>/dev/null | tail -1)"
   echo "built_at: ${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
   echo "published: NO"
@@ -182,8 +193,9 @@ mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" "${upload_a
 mint_complete=1
 
 if [[ "$mode" == "check" ]]; then
-  log "CHECK PASS — throwaway package built, audited, documented, consumed, and uploader dry-run verified"
+  log "CHECK PASS - throwaway package built twice identically, audited, documented, consumed, and uploader dry-run verified"
 else
-  log "MINT PASS — immutable candidate retained and witnessed at $witness_ref"
+  log "MINT PASS - immutable candidate retained and witnessed at $witness_ref"
 fi
+log "authorization: $version:$digest"
 echo "$digest  $primary"

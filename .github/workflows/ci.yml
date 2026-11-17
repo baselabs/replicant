@@ -24,7 +24,7 @@ jobs:
   qualified:
     if: always()
     needs: [qualification]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require every qualification job to succeed
         env:

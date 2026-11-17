@@ -87,10 +87,10 @@ defmodule Replicant.MixProject do
       # The README is the front page on HexDocs: value proposition, quick start,
       # guarantees, compatibility. The `Replicant` module page carries the API.
       main: "readme",
-      # HexDocs source links resolve against the exact v#{@version} tag. Release
-      # publication uses `git push origin v#{@version}` for only that tag, then uploads
-      # the witnessed bytes through scripts/release/upload_candidate.exs; never rebuild
-      # them at publish time.
+      # HexDocs source links resolve against the exact v#{@version} tag.
+      # .github/workflows/publish.yml uploads the witnessed bytes through
+      # scripts/release/upload_candidate.exs. The operator creates the tag and
+      # GitHub release after Hex read-back; never rebuild package bytes at upload.
       source_ref: "v#{@version}",
       source_url: @source_url,
       # Four extras are named README.md; without explicit filenames ex_doc emits

@@ -64,18 +64,47 @@ defmodule Replicant.PackageIdentityTest do
     assert message =~ "GitHub release check returned HTTP 503"
   end
 
-  test "publish requires the local and remote tag to dereference to the recorded commit" do
-    runner = fn
-      "git", ["rev-parse", "refs/tags/v1.2.0^{}"] ->
-        {@commit <> "\n", 0}
+  test "publish requires clean exact main and a free namespace before the operator tags" do
+    assert :ok == PackageIdentity.check_publish(@version, @commit, &publish_runner/2)
+  end
 
-      "git",
-      ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/v1.2.0", "refs/tags/v1.2.0^{}"] ->
-        {String.duplicate("b", 40) <> "\trefs/tags/v1.2.0\n", 0}
+  test "publish refuses moved main, a different HEAD, a dirty tree, and an unavailable origin" do
+    for {command, args, response} <- [
+          {"git", ["rev-parse", "HEAD"], {String.duplicate("b", 40), 0}},
+          {"git", ["status", "--porcelain"], {" M README.md\n", 0}},
+          {"git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"],
+           {String.duplicate("b", 40) <> "\trefs/heads/main\n", 0}},
+          {"git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"], {"", 128}}
+        ] do
+      runner = fn
+        ^command, ^args -> response
+        cmd, argv -> publish_runner(cmd, argv)
+      end
+
+      assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
+      assert message =~ "clean checkout of the witnessed commit at live origin/main"
     end
+  end
 
-    assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
-    assert message =~ "remote tag v1.2.0 resolves to"
+  test "publish refuses every occupied release identity and ambiguous release reads" do
+    for {command, args, response} <- [
+          {"git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"], {@commit, 0}},
+          {"git", ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/v1.2.0"],
+           {@commit <> "\trefs/tags/v1.2.0\n", 0}},
+          {"curl", :github, {"200", 0}},
+          {"curl", :hex, {"200", 0}},
+          {"curl", :hex, {"503", 0}}
+        ] do
+      runner = fn cmd, argv ->
+        target = if cmd == "curl", do: release_endpoint(argv), else: argv
+
+        if cmd == command and target == args,
+          do: response,
+          else: publish_runner(cmd, argv)
+      end
+
+      assert {:error, _message} = PackageIdentity.check_publish(@version, @commit, runner)
+    end
   end
 
   test "package check accepts a coherent published release behind the current main commit" do
@@ -225,5 +254,26 @@ defmodule Replicant.PackageIdentityTest do
              PackageIdentity.run("sh", ["-c", "sleep 1"], 25)
 
     assert System.monotonic_time(:millisecond) - started < 500
+  end
+
+  defp publish_runner("git", ["rev-parse", "HEAD"]), do: {@commit <> "\n", 0}
+  defp publish_runner("git", ["status", "--porcelain"]), do: {"", 0}
+
+  defp publish_runner("git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"]),
+    do: {@commit <> "\trefs/heads/main\n", 0}
+
+  defp publish_runner("git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"]),
+    do: {"", 1}
+
+  defp publish_runner(
+         "git",
+         ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/v1.2.0"]
+       ),
+       do: {"", 2}
+
+  defp publish_runner("curl", _args), do: {"404", 0}
+
+  defp release_endpoint(args) do
+    if String.starts_with?(List.last(args), "https://api.github.com/"), do: :github, else: :hex
   end
 end

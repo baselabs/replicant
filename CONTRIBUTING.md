@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Replicant!
 
 ## Prerequisites
 
-- **Elixir** 1.20.3 and **Erlang/OTP** 29 (the exact local/CI toolchain is in `.tool-versions`)
+- **Elixir** 1.20.3 and **Erlang/OTP** 29.0.3 (the exact local/CI toolchain is in `.tool-versions`)
 - **PostgreSQL 15, 16, 17, or 18** with `wal_level=logical` (for integration tests).
   Use the approved host ports PG15 `5615`, PG16 `5599`, PG17 `5617`, or PG18 `5618` — e.g.
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 \
@@ -75,6 +75,49 @@ only on its `qualified` check.
 
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
 has a new cache scope, and a cache written on `main` would be restorable by candidates.
+
+## Publishing (release operator only)
+
+Publishing runs in [`.github/workflows/publish.yml`](.github/workflows/publish.yml),
+on GitHub-hosted Ubuntu 24.04 with the exact `.tool-versions` runtime. Qualification
+and publishing pin the same Hex version because Hex records its version in package
+metadata. No workstation publish command or credential-file loader remains.
+
+After the version commit has landed on `main` and its `qualified` run is green, an
+owner (`corepay` or `palermo-git`) dispatches **Publish to Hex** on `main`. Copy the
+`authorization: <version>:<sha256>` line from that commit's **docs and package**
+qualification log into the required `authorization` input, omitting the label.
+The owner must also be the triggering actor on a rerun. The release operator
+creates the GitHub `publish` environment and its `HEX_API_KEY` secret. That secret
+is available only to the publish step, never the candidate build or inspection.
+
+The workflow checks out the dispatched SHA without persisted Git credentials.
+Minting requires a clean tree at live `origin/main` and a free version namespace.
+Both check and mint build from `git archive`, compare two isolated builds byte for
+byte, audit and consume the package, and create a receipt and immutable Git witness.
+The authorization must equal the minted version and SHA-256 before either upload.
+The receipt, copies, and witness ref stay in the runner workspace; uploaders verify
+them locally, and the read-only repository permission never pushes the witness.
+
+The package uploader sends exactly the witnessed bytes without rebuilding and
+reads back Hex's public checksum. The docs uploader verifies the same witness and
+builds docs from its source commit with locked dependencies. After Hex read-back
+and successful docs upload, the operator creates and pushes only the `v<version>`
+tag at the witnessed full SHA, then creates the GitHub release:
+
+```bash
+gh release create vX.Y.Z --verify-tag --target <full sha>
+```
+
+Record the verified package digest in `scripts/release/published_packages.sha256`
+through the normal landing process. All four release identities (tag, Hex package,
+HexDocs, GitHub release) and the ledger must agree for subsequent package checks.
+An interrupted or ambiguous upload requires the operator to inspect public state
+before retrying; a partially published version is refused by a fresh mint.
+
+Agents never release, deploy, publish, tag, create a GitHub release, dispatch the
+publish workflow, or handle publish credentials. Their work ends at the commit on
+`main`.
 
 ## Code Style
 

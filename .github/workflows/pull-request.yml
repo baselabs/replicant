@@ -23,7 +23,7 @@ jobs:
     name: pull request checked
     if: always()
     needs: [checks]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Require every qualification job to succeed
         env:

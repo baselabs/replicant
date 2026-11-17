@@ -17,13 +17,23 @@ defmodule Replicant.PackageIdentity do
   end
 
   def check_publish(version, source_commit, runner \\ &run/2) do
-    tag = "v#{version}"
-
-    with :ok <- matching_local_tag(tag, source_commit, runner),
-         :ok <- matching_remote_tag(tag, source_commit, runner),
-         :ok <- absent_http(@github_release_url <> tag, "GitHub release", runner),
-         :ok <- absent_http(@hex_release_url <> version, "Hex release", runner) do
+    # Tags and the GitHub release follow successful Hex read-back. Re-prove the
+    # minted source immediately before uploading, with the namespace still free.
+    with :ok <- matching_main(source_commit, runner),
+         :ok <- check_candidate(version, runner) do
       :ok
+    end
+  end
+
+  defp matching_main(source_commit, runner) do
+    with {head, 0} <- runner.("git", ["rev-parse", "HEAD"]),
+         true <- String.trim(head) == source_commit,
+         {"", 0} <- runner.("git", ["status", "--porcelain"]),
+         {remote, 0} <- runner.("git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"]),
+         [^source_commit, "refs/heads/main"] <- String.split(String.trim(remote)) do
+      :ok
+    else
+      _ -> {:error, "publish requires a clean checkout of the witnessed commit at live origin/main"}
     end
   end
 
@@ -146,16 +156,6 @@ defmodule Replicant.PackageIdentity do
 
       {output, status} ->
         {:error, "remote tag check failed (exit #{status}): #{structural(output)}"}
-    end
-  end
-
-  defp matching_local_tag(tag, commit, runner) do
-    case runner.("git", ["rev-parse", "refs/tags/#{tag}^{}"]) do
-      {output, 0} ->
-        compare_tag("local", tag, String.trim(output), commit)
-
-      {output, status} ->
-        {:error, "local tag #{tag} is unavailable (exit #{status}): #{structural(output)}"}
     end
   end
 

@@ -1,8 +1,6 @@
 # Guarded exact-tree docs uploader for a witnessed Replicant package candidate.
-# The release scripts build and AUDIT docs (consume_candidate.sh runs `mix docs
-# --warnings-as-errors`) but never UPLOADED them — a release published without
-# hexdocs fails this repo's own check_build ("Hex release documentation is
-# unavailable"), so the upload is part of publishing, not an optional extra.
+# The publish workflow uploads docs after the package checksum read-back.
+# A release without HexDocs fails the published-identity check.
 #
 # Docs are BUILT FROM THE WITNESSED SOURCE COMMIT (git archive), never from the
 # working tree, and the upload is gated on the same exact version:digest
@@ -30,7 +28,21 @@ defmodule Replicant.UploadDocs do
     version = read_version()
     receipt = Path.join([@repo_root, ".kimosabe", "artifacts", "replicant-#{version}-receipt.txt"])
 
-    receipt_bytes = read!(receipt)
+    artifact = Path.join([@repo_root, ".kimosabe", "artifacts", "replicant-#{version}.tar"])
+    witness_ref = "refs/attestations/packages/replicant/#{version}"
+
+    receipt_bytes = immutable!(receipt)
+    artifact_bytes = immutable!(artifact)
+
+    case Replicant.PackageWitness.verify_content(
+           @repo_root,
+           witness_ref,
+           artifact_bytes,
+           receipt_bytes
+         ) do
+      :ok -> :ok
+      {:error, message} -> abort(message)
+    end
 
     source_commit =
       case Replicant.PackageWitness.receipt_source_commit_content(receipt_bytes) do
@@ -39,7 +51,7 @@ defmodule Replicant.UploadDocs do
       end
 
     # --commit pins the witnessed source explicitly (the default resolves it from
-    # the receipt); a mismatch is a hard stop — docs must describe the exact
+    # the receipt); a mismatch is a hard stop. Docs must describe the exact
     # published tree.
     if opts[:commit] && opts[:commit] != source_commit do
       abort("witnessed source commit is #{source_commit}, not #{opts[:commit]}")
@@ -47,8 +59,7 @@ defmodule Replicant.UploadDocs do
 
     digest =
       receipt_bytes
-      |> String.split("
-")
+      |> String.split("\n")
       |> Enum.find_value(&Regex.run(~r/^sha256: ([0-9a-f]{64})$/, &1))
       |> case do
         [_, d] -> d
@@ -78,20 +89,22 @@ defmodule Replicant.UploadDocs do
 
             IO.puts("upload_docs: location: #{location}")
 
-          {:ok, {status, _headers, body}} ->
-            abort("docs publish failed with HTTP #{status}: #{inspect(body)}")
+          {:ok, {status, _headers, _body}} ->
+            abort("docs publish failed with HTTP #{status}")
 
-          {:error, reason} ->
-            abort("docs publish error: #{inspect(reason)}")
+          {:error, _reason} ->
+            abort("docs publish response was ambiguous; verify public state before retry")
         end
       else
         IO.puts("""
-        upload_docs: DRY-RUN — docs tarball built from witnessed commit #{source_commit} (#{byte_size(tar_bytes)} bytes), nothing uploaded.
+        upload_docs: DRY-RUN - docs tarball built from witnessed commit #{source_commit} (#{byte_size(tar_bytes)} bytes), nothing uploaded.
           would call: Hex.API.ReleaseDocs.publish("hexpm", #{@package}, #{version}, <#{byte_size(tar_bytes)} bytes>, [key: <credential>])
           credential: NOT read
           publication additionally requires --publish and exact version:digest authorization
         """)
       end
+    else
+      {:error, message} -> abort(message)
     end
   end
 
@@ -100,6 +113,17 @@ defmodule Replicant.UploadDocs do
       Path.join(System.tmp_dir!(), "replicant-docs-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(build_tree)
+
+    try do
+      render_docs_tarball(build_tree, source_commit, version)
+    rescue
+      error -> {:error, Exception.message(error)}
+    after
+      File.rm_rf!(build_tree)
+    end
+  end
+
+  defp render_docs_tarball(build_tree, source_commit, version) do
     source_tar = Path.join(build_tree, "source.tar")
 
     case System.cmd("git", ["archive", "--format=tar", "--output", source_tar, source_commit],
@@ -107,12 +131,12 @@ defmodule Replicant.UploadDocs do
            stderr_to_stdout: true
          ) do
       {_out, 0} -> :ok
-      {out, code} -> abort("git archive #{source_commit} failed (#{code}): #{out}")
+      {_out, code} -> raise "git archive failed with exit #{code}"
     end
 
     case System.cmd("tar", ["-xf", source_tar, "-C", build_tree], stderr_to_stdout: true) do
       {_out, 0} -> :ok
-      {out, code} -> abort("tar extract failed (#{code}): #{out}")
+      {_out, code} -> raise "tar extract failed with exit #{code}"
     end
 
     # Docs render from the exact witnessed tree, deps resolved from the same
@@ -120,18 +144,19 @@ defmodule Replicant.UploadDocs do
     docs_env = [
       {"MIX_ENV", "dev"},
       {"MIX_BUILD_PATH", Path.join(build_tree, "_build")},
-      {"MIX_DEPS_PATH", Path.join(build_tree, "deps")}
+      {"MIX_DEPS_PATH", Path.join(build_tree, "deps")},
+      {"HEX_API_KEY", nil},
+      {"REPLICANT_PUBLISH_AUTHORIZED", nil}
     ]
 
-    base = System.get_env() |> Enum.map(fn {k, v} -> {to_string(k), to_string(v)} end)
-    with_cmd(build_tree, docs_env, "mix", ["deps.get"], "mix deps.get", base)
-    with_cmd(build_tree, docs_env, "mix", ["docs", "--warnings-as-errors"], "mix docs", base)
+    with_cmd(build_tree, docs_env, "mix", ["deps.get", "--check-locked"], "mix deps.get")
+    with_cmd(build_tree, docs_env, "mix", ["docs", "--warnings-as-errors"], "mix docs")
 
     doc_dir = Path.join(build_tree, "doc")
     index = Path.join(doc_dir, "index.html")
 
     unless File.exists?(index) do
-      abort("ex_doc produced no doc/index.html for #{version} at #{source_commit}")
+      raise "ex_doc produced no doc/index.html for #{version} at #{source_commit}"
     end
 
     files =
@@ -145,26 +170,19 @@ defmodule Replicant.UploadDocs do
 
     case :mix_hex_tarball.create_docs(files) do
       {:ok, data} ->
-        File.rm_rf!(build_tree)
         {:ok, data}
 
-      {:error, reason} ->
-        abort("docs tarball creation failed: #{inspect(reason)}")
+      {:error, _reason} ->
+        raise "docs tarball creation failed"
     end
   end
 
-  # System.cmd/4's :env REPLACES the environment wholesale; the docs build needs
-  # PATH (mix, elixir) and MIX_HOME alongside the isolation vars, so the base
-  # environment is carried over with the isolating overrides applied on top.
-  defp with_cmd(cwd, overrides, cmd, args, label, base_env) do
-    env =
-      base_env
-      |> Kernel.++(overrides)
-      |> Enum.map(fn {k, v} -> {to_string(k), to_string(v)} end)
-
+  # System.cmd inherits the environment; nil removes publish credentials from
+  # child builds while retaining PATH and the isolated dependency/build paths.
+  defp with_cmd(cwd, env, cmd, args, label) do
     case System.cmd(cmd, args, cd: cwd, env: env, stderr_to_stdout: false) do
       {_out, 0} -> :ok
-      {out, code} -> abort("#{label} failed with exit #{code}: #{out}")
+      {_out, code} -> raise "#{label} failed with exit #{code}"
     end
   end
 
@@ -189,10 +207,10 @@ defmodule Replicant.UploadDocs do
     end
   end
 
-  defp read!(path) do
-    case File.read(path) do
+  defp immutable!(path) do
+    case Replicant.PackageWitness.read_immutable(path) do
       {:ok, binary} -> binary
-      {:error, reason} -> abort("could not read #{path}: #{inspect(reason)}")
+      {:error, message} -> abort(message)
     end
   end
 

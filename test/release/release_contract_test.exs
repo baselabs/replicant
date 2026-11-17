@@ -104,7 +104,8 @@ defmodule Replicant.ReleaseContractTest do
 
     refute body =~ "mix hex.publish"
     assert body =~ "scripts/release/upload_candidate.exs"
-    assert body =~ ~S(git push origin v#{@version})
+    assert body =~ ".github/workflows/publish.yml"
+    assert body =~ "after Hex read-back"
   end
 
   test "workflows never restore or save Actions caches" do
@@ -139,7 +140,7 @@ defmodule Replicant.ReleaseContractTest do
   end
 
   test "publish authorization tests never write retained package evidence" do
-    source = File.read!(Path.expand("publish_candidate_test.exs", __DIR__))
+    source = File.read!(Path.expand("publish_workflow_test.exs", __DIR__))
 
     refute source =~
              ~r/Path\.join\(\[@repo_root,\s*"\.kimosabe",\s*"artifacts"/

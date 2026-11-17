@@ -1,0 +1,81 @@
+name: Publish to Hex
+
+# An owner dispatches this on main after the version commit has landed and its
+# qualified run is green. Copy authorization from that run's docs and package log.
+# The v<version> tag and GitHub release follow the Hex read-back and belong to the
+# release operator. This workflow never pushes refs or creates releases.
+on:
+  workflow_dispatch:
+    inputs:
+      authorization:
+        description: "Qualified package authorization (<version>:<sha256>)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  ELIXIR_VERSION: "1.20.3"
+  OTP_VERSION: "29.0.3"
+  # Hex records its version in package metadata, so check and mint must match.
+  HEX_VERSION: "2.7.0"
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish
+    if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
+    environment: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Require a dispatch on main
+        run: test "$GITHUB_REF" = refs/heads/main
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+          version-type: strict
+
+      - run: mix local.hex "$HEX_VERSION" --force
+      - run: mix local.rebar --force
+      - run: mix deps.get --check-locked
+
+      # The receipt and immutable witness ref stay in this runner workspace.
+      # Both uploaders verify them locally; contents: read cannot push the ref.
+      - name: Mint the exact main candidate
+        run: bash scripts/release/build_candidate.sh
+
+      - name: Check the qualified authorization before upload
+        env:
+          REPLICANT_PUBLISH_AUTHORIZED: ${{ inputs.authorization }}
+        run: |
+          version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
+          receipt=".kimosabe/artifacts/replicant-$version-receipt.txt"
+          digest="$(sed -n 's/^sha256: //p' "$receipt")"
+          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$REPLICANT_PUBLISH_AUTHORIZED" == "$version:$digest" ]] || {
+            echo "::error::publish requires exact version:digest authorization from the qualified run"
+            exit 1
+          }
+
+      - name: Publish the witnessed package and docs
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+          REPLICANT_PUBLISH_AUTHORIZED: ${{ inputs.authorization }}
+        run: |
+          mix run --no-start scripts/release/upload_candidate.exs --publish
+          mix run --no-start scripts/release/upload_docs.exs --publish

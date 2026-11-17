@@ -102,20 +102,30 @@ a new cache scope, and a cache written on `main` would be restorable by candidat
 Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only
 on that commit's `qualified` check. If it goes red, fix forward in the next commit.
 
-An agent working in this repository never releases, deploys or publishes: no `mix hex.publish`,
-no `scripts/release/publish_candidate.sh`, no version tag, no GitHub release, no release
-workflow dispatch, and no handling of publish credentials. Its work ends with the commit on
-`main`; the maintainers' release operator ships it.
+An agent working in this repository never releases, deploys or publishes: no package or docs
+upload, no version tag, no GitHub release, no dispatch of `.github/workflows/publish.yml`,
+and no handling of publish credentials. Its work ends with the commit on `main`; the
+maintainers' release operator ships it.
 
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
-- For the release operator: a release is finished only when its tag, its Hex package and docs,
-  and its GitHub release all exist. `scripts/release/publish_candidate.sh` does only Hex and
-  docs, so finish with `gh release create vX.Y.Z --verify-tag --target <tag's full commit SHA>`.
-  While the GitHub release is missing, the package check fails on every CI run, pull requests
-  included.
+- For the release operator: an owner (`corepay` or `palermo-git`, including the triggering
+  actor on reruns) dispatches `.github/workflows/publish.yml` on `main` after the version
+  commit lands and its `qualified` run is green. Copy `authorization: <version>:<sha256>`
+  from that run's docs and package log into the required `authorization` input. The workflow
+  mints from clean, exact live `origin/main`, proves two package builds byte-identical,
+  and refuses an authorization that differs from the minted version and digest.
+  It uploads the witnessed package bytes, reads back Hex's checksum, and uploads docs from
+  the witnessed commit. The release operator creates the `publish` environment with its
+  `HEX_API_KEY` secret; only the publish step receives it. No workstation publish path exists.
+  After Hex read-back and successful docs upload, the operator creates and pushes only the
+  `v<version>` tag at that full source SHA, then runs
+  `gh release create vX.Y.Z --verify-tag --target <full sha>`. Record the verified package
+  digest in `scripts/release/published_packages.sha256` through the normal landing process.
+  A release is finished only when its tag, Hex package and docs, and GitHub release all exist.
+  Partial publication fails the package check on subsequent CI runs, including pull requests.
 
 ## Testing
 
