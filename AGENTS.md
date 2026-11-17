@@ -113,10 +113,11 @@ maintainers' release operator ships it.
   a contract changes.
 - For the release operator: an owner (`corepay` or `palermo-git`, including the triggering
   actor on reruns) dispatches `.github/workflows/publish.yml` on `main` after the version
-  commit lands and its `qualified` run is green. Copy `authorization: <version>:<sha256>`
-  from that run's docs and package log into the required `authorization` input. The workflow
-  mints from clean, exact live `origin/main`, proves two package builds byte-identical,
-  and refuses an authorization that differs from the minted version and digest.
+  commit lands and its `qualified` run is green, with no inputs. The workflow reads the
+  package authorization artifact from that exact commit's successful `ci.yml` push run
+  on `kci/<commit>` and verifies its `qualified` verdict. It mints from clean, exact live
+  `origin/main`, proves two package builds byte-identical, and refuses if its minted
+  version and digest differ from the recorded authorization.
   It uploads the witnessed package bytes, reads back Hex's checksum, and uploads docs from
   the witnessed commit. The release operator creates the `publish` environment with its
   `HEX_API_KEY` secret; only the publish step receives it. No workstation publish path exists.

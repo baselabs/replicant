@@ -7,12 +7,28 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
 
+usage() {
+  echo "usage: build_candidate.sh [--check] [--authorization-out <path>]" >&2
+  exit 2
+}
+
 mode="mint"
-if [[ "${1:-}" == "--check" ]]; then
-  mode="check"
-  shift
-fi
-[[ $# -eq 0 ]] || { echo "usage: build_candidate.sh [--check]" >&2; exit 2; }
+authorization_out=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)
+      [[ "$mode" == "mint" ]] || usage
+      mode="check"
+      shift
+      ;;
+    --authorization-out)
+      [[ $# -ge 2 && -n "$2" && "$2" != -* && -z "$authorization_out" ]] || usage
+      authorization_out="$2"
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
 
 log() { echo "build_candidate: $*" >&2; }
 die() { echo "::error::build_candidate: $*" >&2; exit 1; }
@@ -61,6 +77,7 @@ primary=""
 by_digest=""
 backup=""
 receipt=""
+authorization_tmp=""
 artifacts_retained=0
 receipt_retained=0
 witness_owned=0
@@ -91,6 +108,9 @@ cleanup() {
     fi
   fi
 
+  if [[ -n "$authorization_tmp" ]]; then
+    rm -f -- "$authorization_tmp"
+  fi
   rm -rf "$build_tree"
   if [[ $status -eq 0 && $cleanup_failed -eq 1 ]]; then
     status=1
@@ -190,12 +210,16 @@ if [[ "$mode" == "check" ]]; then
 fi
 mix run --no-start "$repo_root/scripts/release/upload_candidate.exs" "${upload_args[@]}"
 
-mint_complete=1
-
 if [[ "$mode" == "check" ]]; then
   log "CHECK PASS - throwaway package built twice identically, audited, documented, consumed, and uploader dry-run verified"
 else
   log "MINT PASS - immutable candidate retained and witnessed at $witness_ref"
 fi
+if [[ -n "$authorization_out" ]]; then
+  authorization_tmp="$(mktemp "${authorization_out}.XXXXXX")"
+  printf 'commit: %s\nversion: %s\nsha256: %s\n' "$commit" "$version" "$digest" > "$authorization_tmp"
+  mv -- "$authorization_tmp" "$authorization_out"
+fi
+mint_complete=1
 log "authorization: $version:$digest"
 echo "$digest  $primary"

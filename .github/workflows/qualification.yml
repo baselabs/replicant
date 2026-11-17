@@ -25,11 +25,11 @@ jobs:
     env:
       MIX_ENV: test
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           # Pinned to the dev toolchain (.tool-versions) so the format check,
           # dialyzer PLT, and CI run on the same Elixir/OTP — a version skew here
@@ -89,7 +89,7 @@ jobs:
       # a pre-15 plugin row). The 9 row's own server backs the value there.
       REPLICANT_PG96_URL: ${{ (matrix.pg.major == '9' && format('postgres://postgres@localhost:{0}/postgres', matrix.pg.port)) || (matrix.pg.major == '12' && 'postgres://postgres@localhost:5609/postgres') || '' }}
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -189,7 +189,7 @@ jobs:
           test "$major" = "${{ matrix.pg.major }}" \
             || { echo "::error::started PG$major but the matrix row expects PG${{ matrix.pg.major }}"; exit 1; }
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -218,12 +218,12 @@ jobs:
       MIX_ENV: dev
 
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           # Published check mode verifies the local tag and its ancestry against main.
           fetch-depth: 0
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
@@ -242,10 +242,17 @@ jobs:
       # fresh-consumer provenance + semantic smoke, immutable witness, free-or-coherent published
       # identity checks, and
       # credential-free exact-byte uploader dry-run. The real candidate is minted once, from merged
-      # main, after this review set and all matrix rows settle. The builder logs
-      # authorization: <version>:<sha256> for the owner to copy into publish.yml.
+      # main, after this review set and all matrix rows settle. Record the exact
+      # commit, version, and digest for the owner-dispatched publisher to read.
       - name: Prove the complete package workflow without minting a candidate
-        run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check
+        run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check --authorization-out "$RUNNER_TEMP/package-authorization.txt"
+
+      - name: Record the qualified package authorization
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-authorization
+          path: ${{ runner.temp }}/package-authorization.txt
+          if-no-files-found: error
 
   # The REFERENCE EXAMPLE (examples/replication_pipeline): a docker stack
   # (source PG → replicant release container → destination PG) that is the
@@ -261,11 +268,11 @@ jobs:
       run:
         working-directory: examples/replication_pipeline
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           # Same pinned toolchain as the library jobs (.tool-versions).
           otp-version: ${{ env.OTP_VERSION }}

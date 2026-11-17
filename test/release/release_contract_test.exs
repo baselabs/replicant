@@ -145,4 +145,79 @@ defmodule Replicant.ReleaseContractTest do
     refute source =~
              ~r/Path\.join\(\[@repo_root,\s*"\.kimosabe",\s*"artifacts"/
   end
+
+  test "candidate arguments accept an authorization path with or without check mode" do
+    [_, parser] = Regex.run(~r/(usage\(\).*?)\nlog\(\)/s, File.read!(@builder))
+    script = parser <> ~S(printf '%s\n%s\n' "$mode" "$authorization_out")
+
+    for {args, expected} <- [
+          {[], "mint\n\n"},
+          {["--check"], "check\n\n"},
+          {["--authorization-out", "record path.txt"], "mint\nrecord path.txt\n"},
+          {["--check", "--authorization-out", "record.txt"], "check\nrecord.txt\n"},
+          {["--authorization-out", "record.txt", "--check"], "check\nrecord.txt\n"}
+        ] do
+      assert {expected, 0} == candidate_arguments(script, args)
+    end
+  end
+
+  test "candidate arguments refuse missing paths, duplicates, and unknown options" do
+    [_, parser] = Regex.run(~r/(usage\(\).*?)\nlog\(\)/s, File.read!(@builder))
+
+    for args <- [
+          ["--authorization-out"],
+          ["--authorization-out", ""],
+          ["--authorization-out", "--check"],
+          ["--check", "--check"],
+          ["--authorization-out", "one", "--authorization-out", "two"],
+          ["--unknown"],
+          ["--check", "other"]
+        ] do
+      {output, status} = candidate_arguments(parser, args)
+      assert status == 2
+      assert output =~ "usage: build_candidate.sh [--check] [--authorization-out <path>]"
+    end
+  end
+
+  test "candidate writes exactly three authorization lines atomically after passing" do
+    builder = File.read!(@builder)
+    start = ~s(if [[ -n "$authorization_out" ]]; then\n)
+    [before_write, after_write] = String.split(builder, start, parts: 2)
+    assert before_write =~ "CHECK PASS"
+    assert before_write =~ "MINT PASS"
+    assert before_write =~ ~s(rm -f -- "$authorization_tmp")
+    [writer, _rest] = String.split(after_write, "\nmint_complete=1", parts: 2)
+    assert writer =~ ~s(mktemp "${authorization_out}.XXXXXX")
+    assert writer =~ ~s(mv -- "$authorization_tmp" "$authorization_out")
+    root = Path.join(System.tmp_dir!(), "replicant-record-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+    File.mkdir_p!(root)
+    path = Path.join(root, "authorization record.txt")
+    File.write!(path, "stale record\n")
+    commit = String.duplicate("a", 40)
+    digest = String.duplicate("b", 64)
+
+    {_output, status} =
+      System.cmd("bash", ["--noprofile", "--norc", "-euo", "pipefail", "-c", start <> writer],
+        env: [
+          {"authorization_out", path},
+          {"commit", commit},
+          {"version", "1.2.0"},
+          {"digest", digest}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0
+    assert File.read!(path) == "commit: #{commit}\nversion: 1.2.0\nsha256: #{digest}\n"
+    assert File.ls!(root) == ["authorization record.txt"]
+  end
+
+  defp candidate_arguments(script, args) do
+    System.cmd(
+      "bash",
+      ["--noprofile", "--norc", "-euo", "pipefail", "-c", script, "builder" | args],
+      stderr_to_stdout: true
+    )
+  end
 end

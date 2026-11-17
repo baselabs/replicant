@@ -84,9 +84,11 @@ and publishing pin the same Hex version because Hex records its version in packa
 metadata. No workstation publish command or credential-file loader remains.
 
 After the version commit has landed on `main` and its `qualified` run is green, an
-owner (`corepay` or `palermo-git`) dispatches **Publish to Hex** on `main`. Copy the
-`authorization: <version>:<sha256>` line from that commit's **docs and package**
-qualification log into the required `authorization` input, omitting the label.
+owner (`corepay` or `palermo-git`) dispatches **Publish to Hex** on `main` with no
+inputs. The job reads the package authorization artifact that **docs and package**
+recorded for that exact commit's successful `ci.yml` push run on `kci/<commit>`.
+It verifies the run's `qualified` job succeeded and refuses missing, malformed,
+or conflicting records. Pull request qualification runs cannot authorize publishing.
 The owner must also be the triggering actor on a rerun. The release operator
 creates the GitHub `publish` environment and its `HEX_API_KEY` secret. That secret
 is available only to the publish step, never the candidate build or inspection.
@@ -95,7 +97,7 @@ The workflow checks out the dispatched SHA without persisted Git credentials.
 Minting requires a clean tree at live `origin/main` and a free version namespace.
 Both check and mint build from `git archive`, compare two isolated builds byte for
 byte, audit and consume the package, and create a receipt and immutable Git witness.
-The authorization must equal the minted version and SHA-256 before either upload.
+The recorded version and SHA-256 must equal the minted candidate before either upload.
 The receipt, copies, and witness ref stay in the runner workspace; uploaders verify
 them locally, and the read-only repository permission never pushes the witness.
 
