@@ -361,7 +361,7 @@ defmodule Replicant.PublishWorkflowTest do
     content = "commit: #{commit}\nversion: 1.2.0\nsha256: #{digest}\n"
     read = read_yaml!(@workflow) |> get_in(["jobs", "publish", "steps"]) |> Enum.at(6)
     [die | _rest] = String.split(read["run"], "\n")
-    start = ~s(commit="$(sed -n 's/^commit: //p' "$record")")
+    start = ~S|commit="$(sed -n 's/^commit: //p' "$record")"|
     [_, after_start] = String.split(read["run"], start, parts: 2)
     [validation, _rest] = String.split(after_start, ~s(authorization="$candidate"), parts: 2)
     script = die <> "\n" <> start <> validation
