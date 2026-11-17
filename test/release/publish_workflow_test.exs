@@ -433,38 +433,44 @@ defmodule Replicant.PublishWorkflowTest do
     [_, otp, major] = Regex.run(~r/^erlang ((\d+)\.\d+\.\d+)$/m, tools)
     assert suffix == major
     maps = maps(workflow)
-    events = workflow["on"]
-    events = if is_map(events), do: Map.keys(events), else: List.wrap(events)
-    refute Enum.any?(events, &String.starts_with?(&1, "pull_request"))
+    refute_pull_request_trigger!(workflow)
 
     for map <- maps, {key, expected} <- [{"ELIXIR_VERSION", elixir}, {"OTP_VERSION", otp}] do
       if Map.has_key?(map, key), do: assert(map[key] == expected)
     end
 
-    for {_name, job} <- workflow["jobs"] do
-      if Map.has_key?(job, "uses") do
-        assert job == %{"uses" => "./.github/workflows/qualification.yml"}
-      else
-        assert job["runs-on"] == "ubuntu-24.04"
-        assert is_integer(job["timeout-minutes"]) and job["timeout-minutes"] >= 3
-      end
-    end
+    for {_name, job} <- workflow["jobs"], do: assert_job_host!(job)
+    for map <- maps, do: assert_action_pins!(map, workflow, elixir, otp)
+  end
 
-    for map <- maps do
-      refute to_string(map["uses"] || "") =~ ~r{actions/cache(?:/|@)}i
+  defp refute_pull_request_trigger!(workflow) do
+    events = workflow["on"]
+    events = if is_map(events), do: Map.keys(events), else: List.wrap(events)
+    refute Enum.any?(events, &String.starts_with?(&1, "pull_request"))
+  end
 
-      if String.starts_with?(map["uses"] || "", "actions/checkout@") do
-        assert map["uses"] == @checkout
-      end
+  defp assert_job_host!(%{"uses" => _} = job) do
+    assert job == %{"uses" => "./.github/workflows/qualification.yml"}
+  end
 
-      if String.starts_with?(map["uses"] || "", "erlef/setup-beam@") do
-        assert map["uses"] == @beam
-        assert workflow["env"]["ELIXIR_VERSION"] == elixir
-        assert workflow["env"]["OTP_VERSION"] == otp
-        assert map["with"]["elixir-version"] == "${{ env.ELIXIR_VERSION }}"
-        assert map["with"]["otp-version"] == "${{ env.OTP_VERSION }}"
-        assert map["with"]["version-type"] == "strict"
-      end
+  defp assert_job_host!(job) do
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert is_integer(job["timeout-minutes"]) and job["timeout-minutes"] >= 3
+  end
+
+  defp assert_action_pins!(map, workflow, elixir, otp) do
+    uses = to_string(map["uses"] || "")
+    refute uses =~ ~r{actions/cache(?:/|@)}i
+
+    if String.starts_with?(uses, "actions/checkout@"), do: assert(uses == @checkout)
+
+    if String.starts_with?(uses, "erlef/setup-beam@") do
+      assert uses == @beam
+      assert workflow["env"]["ELIXIR_VERSION"] == elixir
+      assert workflow["env"]["OTP_VERSION"] == otp
+      assert map["with"]["elixir-version"] == "${{ env.ELIXIR_VERSION }}"
+      assert map["with"]["otp-version"] == "${{ env.OTP_VERSION }}"
+      assert map["with"]["version-type"] == "strict"
     end
   end
 
