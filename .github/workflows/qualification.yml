@@ -3,6 +3,8 @@ name: Qualification
 # Every qualification job, defined once. ci.yml calls it on a kci/<commit>
 # candidate; its `qualified` job is the landing verdict (kimosabe ADR 0043).
 # The caller passes no secrets, and no job here reads one.
+# The package-check step uses its job token only for read-only GitHub release
+# identity lookups through gh api; it receives no repository or environment secret.
 # Jobs fetch dependencies, build, and generate Dialyzer PLTs without Actions caches.
 # Timeout rule for all workflows: 3x the measured green duration, rounded up to
 # whole minutes, with a 3-minute minimum. Each limit cites its measurement.
@@ -103,6 +105,11 @@ jobs:
           persist-credentials: false
 
       - name: Start PostgreSQL ${{ matrix.pg.major }} with logical replication
+        env:
+          PG_DIGEST: ${{ matrix.pg.digest }}
+          PG_PLUGINS: ${{ matrix.pg.plugins }}
+          PG_PLUGIN_GUCS: ${{ matrix.pg.plugin_gucs }}
+          PG_PORT: ${{ matrix.pg.port }}
         # A `services:` block cannot pass `-c wal_level=logical` to the container, so run
         # Postgres directly with the flags (mirrors AGENTS.md). Without wal_level=logical the
         # integration suite would silently skip and CI would be green-but-vacuous. The
@@ -111,25 +118,25 @@ jobs:
         # additionally starts the 9.6 secondary that backs REPLICANT_PG96_URL (the parity
         # marquee's 9.6 legs run against it; without it the marquee flunks, not narrows).
         run: |
-          if [ "${{ matrix.pg.plugins }}" = "true" ]; then
+          if [ "$PG_PLUGINS" = "true" ]; then
             docker build -f test/support/pg_old.dockerfile \
-              --build-arg BASE=postgres:${{ matrix.pg.major }}@${{ matrix.pg.digest }} \
-              -t replicant-pg${{ matrix.pg.major }}-plugins:ci .
-            IMAGE=replicant-pg${{ matrix.pg.major }}-plugins:ci
+              --build-arg "BASE=postgres:$EXPECTED_PG_MAJOR@$PG_DIGEST" \
+              -t "replicant-pg$EXPECTED_PG_MAJOR-plugins:ci" .
+            IMAGE="replicant-pg$EXPECTED_PG_MAJOR-plugins:ci"
           else
-            IMAGE=postgres:${{ matrix.pg.major }}@${{ matrix.pg.digest }}
+            IMAGE="postgres:$EXPECTED_PG_MAJOR@$PG_DIGEST"
           fi
           server_args=(-c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10)
-          if [ "${{ matrix.pg.plugins }}" = "true" ]; then
+          if [ "$PG_PLUGINS" = "true" ]; then
             server_args+=(-c shared_preload_libraries=pglogical)
           fi
-          if [ -n "${{ matrix.pg.plugin_gucs }}" ]; then
-            read -r -a plugin_gucs <<< "${{ matrix.pg.plugin_gucs }}"
+          if [ -n "$PG_PLUGIN_GUCS" ]; then
+            read -r -a plugin_gucs <<< "$PG_PLUGIN_GUCS"
             server_args+=("${plugin_gucs[@]}")
           fi
           docker run -d --name pg \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
-            -p ${{ matrix.pg.port }}:5432 \
+            -p "$PG_PORT:5432" \
             "$IMAGE" \
             "${server_args[@]}"
           # STABLE readiness: a fresh postgres container runs a TEMP server first and
@@ -150,7 +157,7 @@ jobs:
             sleep 1
           done
           [ "$pg_ready" = "1" ] || { echo "Postgres never became ready"; docker logs pg; exit 1; }
-          if [ "${{ matrix.pg.plugins }}" = "true" ]; then
+          if [ "$PG_PLUGINS" = "true" ]; then
             # the dsn is registration metadata (replicant's read path never dials it);
             # in-container the server listens on 5432, not the host-mapped port
             docker exec pg psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pglogical" \
@@ -159,7 +166,7 @@ jobs:
             # them by default; OBSERVED on the substrate)
             docker exec pg sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
           fi
-          if [ "${{ matrix.pg.major }}" = "12" ]; then
+          if [ "$EXPECTED_PG_MAJOR" = "12" ]; then
             docker build -f test/support/pg_old.dockerfile \
               --build-arg BASE=postgres:9.6@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698 \
               -t replicant-pg9-plugins:ci .
@@ -195,8 +202,8 @@ jobs:
           got=$(docker exec pg psql -U postgres -tAc "SELECT current_setting('server_version_num')")
           echo "server_version_num=$got"
           major=$(( got / 10000 ))
-          test "$major" = "${{ matrix.pg.major }}" \
-            || { echo "::error::started PG$major but the matrix row expects PG${{ matrix.pg.major }}"; exit 1; }
+          test "$major" = "$EXPECTED_PG_MAJOR" \
+            || { echo "::error::started PG$major but the matrix row expects PG$EXPECTED_PG_MAJOR"; exit 1; }
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -217,13 +224,15 @@ jobs:
           # No `^` anchor: ExUnit prints inline progress dots with no trailing newline, so the
           # receipt from IO.puts lands mid-line (`....R05-SUBSTRATE-RECEIPT ...`). The pattern is
           # specific enough that a substring match anywhere is unambiguous.
-          grep -qE "R05-SUBSTRATE-RECEIPT pg=${{ matrix.pg.major }} version_num=" test-output.log \
-            || { echo "::error::integration did not run against PG${{ matrix.pg.major }} (no R05-SUBSTRATE-RECEIPT)"; exit 1; }
+          grep -qE "R05-SUBSTRATE-RECEIPT pg=$EXPECTED_PG_MAJOR version_num=" test-output.log \
+            || { echo "::error::integration did not run against PG$EXPECTED_PG_MAJOR (no R05-SUBSTRATE-RECEIPT)"; exit 1; }
 
   release-artifact:
     name: docs and package
     runs-on: ubuntu-24.04
     timeout-minutes: 6 # Green run 44183333538: release-artifact 1m44s
+    permissions:
+      contents: read
     env:
       MIX_ENV: dev
 
@@ -251,10 +260,13 @@ jobs:
       # retaining a candidate: exact manifest, Hex validation, artifact-derived audit/compile/docs,
       # fresh-consumer provenance + semantic smoke, immutable witness, free-or-coherent published
       # identity checks, and
-      # credential-free exact-byte uploader dry-run. The real candidate is minted once, from merged
+      # exact-byte uploader dry-run without a publish credential. GitHub release
+      # lookups use only this step's read-only job token. The real candidate is minted once, from merged
       # main, after this review set and all matrix rows settle. Record the exact
       # commit, version, and digest for the owner-dispatched publisher to read.
       - name: Prove the complete package workflow without minting a candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check --authorization-out "$RUNNER_TEMP/package-authorization.txt"
 
       - name: Record the qualified package authorization

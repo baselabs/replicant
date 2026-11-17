@@ -80,6 +80,14 @@ and `main` moves only on its `qualified` check.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
 has a new cache scope, and a cache written on `main` would be restorable by candidates.
 
+Release scripts read GitHub through `gh api`. The package-check step receives only
+its read-only job token as `GH_TOKEN: ${{ github.token }}`, with job-level
+`contents: read`; qualification reads no repository or environment secret. Release
+absence requires the HTTP 404 status line from `gh api -i` (exit 1); HTTP 200 means
+the release exists. Other statuses, transport errors, missing authentication, or
+failed metadata reads refuse the check without including response values in errors.
+Hex metadata still uses public unauthenticated reads.
+
 ## Publishing (release operator only)
 
 Publishing runs in [`.github/workflows/publish.yml`](.github/workflows/publish.yml),
@@ -96,6 +104,9 @@ or conflicting records. Only the successful landing run can authorize publishing
 The owner must also be the triggering actor on a rerun. The release operator
 creates the GitHub `publish` environment and its `HEX_API_KEY` secret. That secret
 is available only to the publish step, never the candidate build or inspection.
+The qualified-run reader, candidate mint, and upload steps each receive the job
+token through `GH_TOKEN` for their GitHub reads. Tokens never go in command
+arguments, logs, or files.
 
 The workflow checks out the dispatched SHA without persisted Git credentials.
 Minting requires a clean tree at live `origin/main` and a free version namespace.

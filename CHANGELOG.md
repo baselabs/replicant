@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Release identity checks use authenticated `gh api` reads with the calling step's
+  read-only job token, avoiding shared anonymous GitHub API quotas in CI. Only a
+  confirmed HTTP 404 proves absence; authentication, transport, status, and metadata
+  failures refuse without exposing response values. Workflow mutation tests guard
+  token scope and prevent credentials in run scripts or command arguments.
 - Docs uploads now verify the immutable package receipt and Git witness before
   building from the witnessed commit. Child builds use locked dependencies,
   receive no publish credential, and remove their temporary tree on failure.

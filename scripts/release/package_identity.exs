@@ -2,7 +2,7 @@ defmodule Replicant.PackageIdentity do
   @moduledoc false
 
   @repo_root Path.expand("../..", __DIR__)
-  @github_release_url "https://api.github.com/repos/baselabs/replicant/releases/tags/"
+  @github_release_path "repos/baselabs/replicant/releases/tags/"
   @hex_release_url "https://hex.pm/api/packages/replicant/releases/"
 
   def check_candidate(version, runner \\ &run/2) do
@@ -10,7 +10,7 @@ defmodule Replicant.PackageIdentity do
 
     with :ok <- absent_local_tag(tag, runner),
          :ok <- absent_remote_tag(tag, runner),
-         :ok <- absent_http(@github_release_url <> tag, "GitHub release", runner),
+         :ok <- absent_github(tag, runner),
          :ok <- absent_http(@hex_release_url <> version, "Hex release", runner) do
       :ok
     end
@@ -230,8 +230,25 @@ defmodule Replicant.PackageIdentity do
     end
   end
 
+  defp absent_github(tag, runner) do
+    {output, status} = runner.("gh", ["api", "-i", @github_release_path <> tag])
+
+    # gh exits 1 for HTTP errors, including the only response proving absence.
+    # Read the status line, never a status-looking string in the response body.
+    case {Regex.run(~r/\AHTTP\/\d+(?:\.\d+)? (\d{3})(?:[ \r\n]|\z)/, output), status} do
+      {[_, "404"], 1} ->
+        :ok
+
+      {[_, "200"], 0} ->
+        {:error, "GitHub release already exists"}
+
+      _other ->
+        {:error, "GitHub release check failed (exit #{status}): #{structural(output)}"}
+    end
+  end
+
   defp published_github(tag, tag_commit, runner) do
-    with {:ok, metadata} <- fetch_json(@github_release_url <> tag, "GitHub release", runner) do
+    with {:ok, metadata} <- fetch_github_json(tag, runner) do
       cond do
         metadata["tag_name"] != tag ->
           {:error, "GitHub release tag does not match #{tag}"}
@@ -248,6 +265,16 @@ defmodule Replicant.PackageIdentity do
         true ->
           :ok
       end
+    end
+  end
+
+  defp fetch_github_json(tag, runner) do
+    case runner.("gh", ["api", @github_release_path <> tag]) do
+      {body, 0} ->
+        decode_json(body, "GitHub release")
+
+      {output, status} ->
+        {:error, "GitHub release check failed (exit #{status}): #{structural(output)}"}
     end
   end
 

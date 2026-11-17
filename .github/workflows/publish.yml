@@ -105,6 +105,8 @@ jobs:
       # The receipt and immutable witness ref stay in this runner workspace.
       # Both uploaders verify them locally; contents: read cannot push the ref.
       - name: Mint the exact main candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/release/build_candidate.sh
 
       - name: Check the qualified authorization before upload
@@ -122,6 +124,7 @@ jobs:
 
       - name: Publish the witnessed package and docs
         env:
+          GH_TOKEN: ${{ github.token }}
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
           REPLICANT_PUBLISH_AUTHORIZED: ${{ steps.qualified.outputs.authorization }}
         run: |

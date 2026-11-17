@@ -98,6 +98,14 @@ above on their own machines first.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
 
+GitHub REST lookups in release scripts use `gh api`, with the calling step's
+`GH_TOKEN: ${{ github.token }}` and job-level `contents: read`. Only steps that
+read GitHub receive that job token; qualification reads no repository or environment
+secret. Absence requires `gh api -i`'s HTTP 404 status line (exit 1); HTTP 200 means
+occupied, and every other response, transport or authentication failure refuses.
+Metadata reads require successful JSON from `gh api`. Tokens stay in the environment,
+never arguments, logs, or files. Hex lookups remain unauthenticated public reads.
+
 ## Workflow
 
 Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only

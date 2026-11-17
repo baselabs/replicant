@@ -1,5 +1,6 @@
 # Guarded exact-byte uploader for a witnessed Replicant package candidate.
-# Dry-run is the default and never reads a credential or sends package bytes.
+# Dry-run is the default and never reads a publish credential or sends package bytes.
+# GitHub identity reads use gh's token from the calling step's environment.
 Mix.ensure_application!(:hex)
 
 Code.require_file("package_identity.exs", __DIR__)
@@ -76,7 +77,7 @@ defmodule Replicant.UploadCandidate do
         IO.puts("""
         upload_candidate: DRY-RUN — all guards passed, nothing uploaded.
           would call: Hex.API.Release.publish("hexpm", <#{bytes} exact witnessed bytes>, [key: <credential>], <progress>, false)
-          credential: NOT read
+          publish credential: NOT read
           publication additionally requires --publish and exact version:digest authorization
         """)
       end

@@ -65,6 +65,64 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
+  test "GitHub caller steps alone receive the job token and require read permission" do
+    for path <- [@workflow, @qualification] do
+      original = read_yaml!(path)
+      assert_github_auth!(original)
+
+      for {name, job} <- original["jobs"] do
+        for scope <- [["env", "GH_TOKEN"], ["jobs", name, "env", "GH_TOKEN"]] do
+          mutated = replace(original, scope, "${{ github.token }}")
+          assert_raise ExUnit.AssertionError, fn -> assert_github_auth!(mutated) end
+        end
+
+        for {step, index} <- Enum.with_index(job["steps"]) do
+          scope = ["jobs", name, "steps", index, "env", "GH_TOKEN"]
+          value = if github_read?(step), do: nil, else: "${{ github.token }}"
+          mutated = replace(original, scope, value)
+          assert_raise ExUnit.AssertionError, fn -> assert_github_auth!(mutated) end
+
+          if github_read?(step) do
+            for value <- ["ignored", "${{ secrets.OTHER_KEY }}"] do
+              mutated = replace(original, scope, value)
+              assert_raise ExUnit.AssertionError, fn -> assert_github_auth!(mutated) end
+            end
+
+            for permissions <- [nil, %{"contents" => "write"}] do
+              mutated = replace(original, ["jobs", name, "permissions"], permissions)
+              assert_raise ExUnit.AssertionError, fn -> assert_github_auth!(mutated) end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  test "run scripts reject expressions and credentials in arguments, logs, or files" do
+    for path <- [@workflow, @qualification] do
+      original = read_yaml!(path)
+      assert_github_auth!(original)
+
+      for {_name, job} <- original["jobs"],
+          step <- job["steps"],
+          is_binary(step["run"]),
+          command <- [
+            "echo ${{ github.token }}",
+            "echo ${{ secrets.HEX_API_KEY }}",
+            ~S(gh api -H "Authorization: Bearer $GH_TOKEN" repos/baselabs/replicant),
+            ~S(gh api -H "Authorization: Bearer ${GITHUB_TOKEN}" repos/baselabs/replicant),
+            ~S(mix hex.publish --key "$HEX_API_KEY"),
+            ~S(printf '%s' "$GH_TOKEN" > token.txt)
+          ] do
+        env = step["env"] || %{}
+        assert_script_credentials!(step["run"], env)
+        mutated = step["run"] <> "\n" <> command
+
+        assert_raise ExUnit.AssertionError, fn -> assert_script_credentials!(mutated, env) end
+      end
+    end
+  end
+
   test "every executable job has a measured timeout and rejects missing or invalid limits" do
     for path <- Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}")) do
       source = File.read!(path)
@@ -434,6 +492,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert suffix == major
     maps = maps(workflow)
     refute_pull_request_trigger!(workflow)
+    assert_github_auth!(workflow)
 
     for map <- maps, {key, expected} <- [{"ELIXIR_VERSION", elixir}, {"OTP_VERSION", otp}] do
       if Map.has_key?(map, key), do: assert(map[key] == expected)
@@ -514,6 +573,7 @@ defmodule Replicant.PublishWorkflowTest do
 
     for {_name, guard} <- @qualified_guards, do: assert(read["run"] =~ guard)
     assert Enum.at(steps, 7)["run"] == "bash scripts/release/build_candidate.sh"
+    assert Enum.at(steps, 7)["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
     assert Enum.at(steps, 8)["run"] == @authorization
 
     assert Enum.at(steps, 8)["env"] == %{
@@ -523,6 +583,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert Enum.at(steps, 9)["run"] == @upload
 
     assert Enum.at(steps, 9)["env"] == %{
+             "GH_TOKEN" => "${{ github.token }}",
              "HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}",
              "REPLICANT_PUBLISH_AUTHORIZED" => "${{ steps.qualified.outputs.authorization }}"
            }
@@ -536,6 +597,7 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   defp assert_qualification!(workflow) do
+    assert_github_auth!(workflow)
     steps = workflow["jobs"]["release-artifact"]["steps"]
     assert length(steps) == 10
 
@@ -543,6 +605,7 @@ defmodule Replicant.PublishWorkflowTest do
              "BUILD_DATE=ci bash scripts/release/build_candidate.sh --check " <>
                ~s(--authorization-out "$RUNNER_TEMP/package-authorization.txt")
 
+    assert Enum.at(steps, 8)["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
     upload = Enum.at(steps, 9)
     assert upload["uses"] == @artifact
 
@@ -551,6 +614,48 @@ defmodule Replicant.PublishWorkflowTest do
              "path" => "${{ runner.temp }}/package-authorization.txt",
              "if-no-files-found" => "error"
            }
+  end
+
+  defp assert_github_auth!(workflow) do
+    refute_tokens!(workflow["env"])
+
+    for {_name, job} <- workflow["jobs"] do
+      refute_tokens!(job["env"])
+
+      for step <- job["steps"] || [] do
+        env = step["env"] || %{}
+        refute Map.has_key?(env, "GITHUB_TOKEN")
+
+        if github_read?(step) do
+          assert job["permissions"]["contents"] == "read"
+          assert env["GH_TOKEN"] == "${{ github.token }}"
+        else
+          refute Map.has_key?(env, "GH_TOKEN")
+        end
+
+        assert_script_credentials!(step["run"] || "", env)
+      end
+    end
+  end
+
+  defp refute_tokens!(env) do
+    for key <- ["GH_TOKEN", "GITHUB_TOKEN"], do: refute(Map.has_key?(env || %{}, key))
+  end
+
+  defp github_read?(step) do
+    script = step["run"] || ""
+
+    script =~ ~r/\bgh\s+(?:api|run\s+download)\b/ or
+      script =~ ~r{scripts/release/(?:build_candidate\.sh|package_identity\.exs|upload_candidate\.exs)\b}
+  end
+
+  defp assert_script_credentials!(script, env) do
+    refute script =~ "${{"
+    refute script =~ ~r/\$\{?(?:GH_TOKEN|GITHUB_TOKEN|HEX_API_KEY)\b/
+
+    for {name, value} <- env, is_binary(value), String.contains?(value, "secrets.") do
+      refute script =~ Regex.compile!("\\$\\{?" <> Regex.escape(name) <> "\\b")
+    end
   end
 
   defp assert_hex!(publish, qualification) do
@@ -650,7 +755,7 @@ defmodule Replicant.PublishWorkflowTest do
   defp replace(workflow, path, value) do
     access =
       Enum.map(path, fn key ->
-        if is_integer(key), do: Access.at(key), else: Access.key(key)
+        if is_integer(key), do: Access.at(key), else: Access.key(key, %{})
       end)
 
     put_in(workflow, access, value)
