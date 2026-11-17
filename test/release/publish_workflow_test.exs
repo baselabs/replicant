@@ -184,8 +184,7 @@ defmodule Replicant.PublishWorkflowTest do
          "bash scripts/release/build_candidate.sh --check"},
         {"missing authorization check", ["jobs", "publish", "steps", 8, "run"], "true"},
         {"wrong comparison source",
-         ["jobs", "publish", "steps", 8, "env", "REPLICANT_PUBLISH_AUTHORIZED"],
-         "ignored"},
+         ["jobs", "publish", "steps", 8, "env", "REPLICANT_PUBLISH_AUTHORIZED"], "ignored"},
         {"wrong upload authorization", ["jobs", "publish", "steps", 9, "env"],
          %{
            "HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}",
@@ -602,6 +601,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert is_integer(fetch) and is_integer(audit) and fetch < audit
     refute Enum.at(steps, audit)["working-directory"]
     example = workflow["jobs"]["reference-example"]
+
     assert get_in(example, ["defaults", "run", "working-directory"]) ==
              "examples/replication_pipeline"
 
@@ -633,7 +633,7 @@ defmodule Replicant.PublishWorkflowTest do
           stderr_to_stdout: true
         )
 
-      assert (status == 0) == success?
+      assert status == 0 == success?
     end
   end
 
