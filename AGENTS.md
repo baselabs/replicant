@@ -102,11 +102,6 @@ a new cache scope, and a cache written on `main` would be restorable by candidat
 Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only
 on that commit's `qualified` check. If it goes red, fix forward in the next commit.
 
-An agent working in this repository never releases, deploys or publishes: no `mix hex.publish`,
-no `scripts/release/publish_candidate.sh`, no version tag, no GitHub release, no release
-workflow dispatch, and no handling of publish credentials. Its work ends with the commit on
-`main`; the maintainers' release operator ships it.
-
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
@@ -116,6 +111,32 @@ workflow dispatch, and no handling of publish credentials. Its work ends with th
   docs, so finish with `gh release create vX.Y.Z --verify-tag --target <tag's full commit SHA>`.
   While the GitHub release is missing, the package check fails on every CI run, pull requests
   included.
+
+## CI/CD and releases
+
+infra-1, the DevOps session, owns CI/CD, the build box, releases and their keys for every
+BaseLabs product, and its requirements bind this repository. They are written once in the infra
+repository at `baselabs/docs/ci.md`, section "What infra requires of every product". Read them
+from infra's default branch (`git -C ~/Developer/infra fetch -q origin`, then
+`git -C ~/Developer/infra show origin/main:baselabs/docs/ci.md`), not from a local checkout,
+and reread them whenever you touch a workflow, a Dockerfile, a release script or a secret.
+
+- An agent's work ends at `main`, and it lands through `kimosabe-land` and nothing else. It never
+  releases, deploys, publishes, tags a version, dispatches a workflow, pushes an image by hand,
+  or handles a release, publish or CI key. When something should go out, it sends infra-1 one
+  message: the repository, the full commit, what goes out, and anything infra-1 needs.
+- An agent writes its own workflow changes. Before landing a change to `.github/`, a Dockerfile,
+  a release script or anything that touches a secret, it sends infra-1 the branch and head and
+  waits for infra-1's review. Any CI/CD, runner, box or key problem goes to infra-1, not around
+  it.
+- On the build box, gate work on `kimosabe-remote where` and your own routed run, never on
+  `doctor`. Never list process arguments: no `ps` with `args` or `-f`, no `/proc/*/cmdline`;
+  use `ps -eo pid,etimes,pcpu,comm`. Nothing that compiles or tests runs on the owner's Mac.
+- A secret never appears on a command line, in a log or in a message. If you see one exposed,
+  tell infra-1 where it sits without copying the value.
+- Messages to infra-1 carry one result each and are complete enough to act on without a reply.
+  No acknowledgements and no status notes.
+- Every brief given to a child agent carries these same rules.
 
 ## Testing
 
