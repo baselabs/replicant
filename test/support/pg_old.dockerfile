@@ -14,6 +14,15 @@
 #
 # The build context is the repo root. Plugin sources are pinned by commit (not a
 # moving branch) so a rebuild reproduces the same bytes.
+#
+# The final image is the base image plus the plugin files and nothing else. Every
+# `make install` writes into the DESTDIR staging tree /plugins, and only that tree
+# is copied over the base. The plugins compile against server headers of exactly
+# the base's server build ($PG_VERSION, set by the official image), fetched from
+# PGDG's archive suite, which keeps every published build after the live suite
+# moves on. Copying the build stage's whole lib directory instead put apt's newer
+# minor-release server libraries (15.20) under the base's 15.19 server, and the
+# server never started (CI, November 2026).
 
 ARG BASE=postgres:12@sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c
 FROM ${BASE} AS build
@@ -34,11 +43,14 @@ RUN set -eux; \
         libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev; \
       ;; \
     *) \
+      sed -E 's#apt\.postgresql\.org#apt-archive.postgresql.org#; s#-pgdg main.*$#-pgdg-archive main#' \
+        /etc/apt/sources.list.d/pgdg.list > /etc/apt/sources.list.d/pgdg-archive.list; \
+      grep -q 'apt-archive.postgresql.org' /etc/apt/sources.list.d/pgdg-archive.list; \
       apt-get update; \
       apt-get install -y --no-install-recommends build-essential git ca-certificates \
         libkrb5-dev libselinux1-dev libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev \
         libzstd-dev liblz4-dev \
-        postgresql-server-dev-$PG_MAJOR; \
+        "postgresql-server-dev-$PG_MAJOR=$PG_VERSION"; \
       ;; \
     esac
 
@@ -49,7 +61,7 @@ RUN set -eux; \
     cd /tmp/pglogical; \
     git checkout --quiet 9a0e182745885ad0152ea387988c95a483396a81; \
     make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
-    make install PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+    make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
 
 # wal2json is pinned PER MAJOR, both pins commit-exact and carrying
 # numeric-data-types-as-string (coverage verified live on the built images):
@@ -70,18 +82,17 @@ RUN set -eux; \
       *) git checkout --quiet 75a4b494 ;; \
     esac; \
     make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
-    make install PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
+    make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
     case "$PG_MAJOR" in \
       9.*|10|11|12|13|14) \
-        mv /usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so /usr/lib/postgresql/$PG_MAJOR/lib/wal2json_head.so; \
+        mv /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json_head.so; \
         git checkout --quiet wal2json_2_4; \
         make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
-        make install PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
-        mv /usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so /usr/lib/postgresql/$PG_MAJOR/lib/wal2json2_4.so; \
-        mv /usr/lib/postgresql/$PG_MAJOR/lib/wal2json_head.so /usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so \
+        make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
+        mv /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json2_4.so; \
+        mv /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json_head.so /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so \
         ;; \
     esac
 
 FROM ${BASE}
-COPY --from=build /usr/lib/postgresql/$PG_MAJOR/lib/ /usr/lib/postgresql/$PG_MAJOR/lib/
-COPY --from=build /usr/share/postgresql/$PG_MAJOR/extension/ /usr/share/postgresql/$PG_MAJOR/extension/
+COPY --from=build /plugins/ /

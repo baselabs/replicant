@@ -99,7 +99,7 @@ jobs:
             fi
             sleep 1
           done
-          [ "$pg_ready" = "1" ] || { echo "Postgres never became ready"; exit 1; }
+          [ "$pg_ready" = "1" ] || { echo "Postgres never became ready"; docker logs pg; exit 1; }
           if [ "${{ matrix.pg.plugins }}" = "true" ]; then
             # the dsn is registration metadata (replicant's read path never dials it);
             # in-container the server listens on 5432, not the host-mapped port
@@ -131,7 +131,7 @@ jobs:
               fi
               sleep 1
             done
-            [ "$pg96_ready" = "1" ] || { echo "PostgreSQL 9.6 never became ready"; exit 1; }
+            [ "$pg96_ready" = "1" ] || { echo "PostgreSQL 9.6 never became ready"; docker logs pg96; exit 1; }
             docker exec pg96 psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pglogical" \
               -c "SELECT * FROM pglogical.create_node(node_name := 'ci_src96', dsn := 'postgres://postgres@localhost:5432/postgres')"
             docker exec pg96 sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
