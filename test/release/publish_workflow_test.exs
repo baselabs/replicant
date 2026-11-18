@@ -201,6 +201,7 @@ defmodule Replicant.PublishWorkflowTest do
 
     mutated = Regex.replace(~r/^erlang \S+$/m, tools, "erlang 0.0.0")
     refute mutated == tools
+
     assert_raise ExUnit.AssertionError, fn ->
       assert_example_image_runtime!(dockerfile, mutated)
     end
