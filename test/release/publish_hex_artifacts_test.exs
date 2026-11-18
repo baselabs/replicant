@@ -104,6 +104,7 @@ defmodule Replicant.PublishHexArtifactsTest do
     [before_upload, _rest] = String.split(source, "Hex.API.Release.publish", parts: 2)
     assert before_upload =~ guards
     assert source =~ ~s|Hex.API.Release.publish("hexpm", package_bytes, auth)|
+
     assert source =~
              ~s|Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth)|
   end

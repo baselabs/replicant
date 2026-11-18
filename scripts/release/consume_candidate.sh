@@ -8,7 +8,7 @@
 # resolves under the scratch tree. A missing/corrupt packaged file is invisible from the checkout;
 # it is caught here.
 #
-# Usage: consume_candidate.sh [TARBALL] [DOCS_ARCHIVE] [EXPECTED_SHA256]
+# Usage: consume_candidate.sh TARBALL [DOCS_ARCHIVE] [EXPECTED_SHA256]
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

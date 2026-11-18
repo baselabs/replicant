@@ -469,6 +469,7 @@ defmodule Replicant.PublishWorkflowTest do
 
   defp assert_job_host!(job) do
     assert job["runs-on"] == "ubuntu-24.04"
+
     assert is_integer(job["timeout-minutes"]) and job["timeout-minutes"] >= 5 and
              job["timeout-minutes"] <= 90
   end
@@ -537,8 +538,10 @@ defmodule Replicant.PublishWorkflowTest do
     build = Enum.at(steps, 8)
     assert build["id"] == "archives"
     assert build["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
+
     assert build["run"] =~
              ~s(bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release")
+
     assert build["run"] =~ ~s(printf 'version=%s\\n' "$version" >> "$GITHUB_OUTPUT")
     upload = Enum.at(steps, 9)
     assert upload["run"] == @upload
