@@ -68,8 +68,8 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert_isolated_upload!(source)
 
     for {before, after_change} <- [
-          {~s(existing_package!(Hex.API.Package.get("hexpm", "replicant"))), ":ok"},
-          {~s(absent_release!(Hex.API.Release.get("hexpm", "replicant", version))), ":ok"},
+          {~s|existing_package!(Hex.API.Package.get("hexpm", "replicant"))|, ":ok"},
+          {~s|absent_release!(Hex.API.Release.get("hexpm", "replicant", version))|, ":ok"},
           {"Hex.API.Release.publish(\"hexpm\", package_bytes, auth)", "mix hex.publish"},
           {"Hex.API.ReleaseDocs.publish(\"hexpm\", \"replicant\", version, docs_bytes, auth)",
            "mix docs"}
@@ -97,14 +97,14 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert source =~ "docs_bytes = File.read!(docs)"
 
     guards =
-      ~s(existing_package!(Hex.API.Package.get("hexpm", "replicant"))) <>
-        "\n    " <> ~s(absent_release!(Hex.API.Release.get("hexpm", "replicant", version)))
+      ~s|existing_package!(Hex.API.Package.get("hexpm", "replicant"))| <>
+        "\n    " <> ~s|absent_release!(Hex.API.Release.get("hexpm", "replicant", version))|
 
     assert source =~ guards
     [before_upload, _rest] = String.split(source, "Hex.API.Release.publish", parts: 2)
     assert before_upload =~ guards
-    assert source =~ ~s(Hex.API.Release.publish("hexpm", package_bytes, auth))
+    assert source =~ ~s|Hex.API.Release.publish("hexpm", package_bytes, auth)|
     assert source =~
-             ~s(Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth))
+             ~s|Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth)|
   end
 end
