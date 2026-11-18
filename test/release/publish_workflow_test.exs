@@ -8,6 +8,7 @@ defmodule Replicant.PublishWorkflowTest do
   @checkout "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
   @beam "erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124"
   @artifact "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+  @example_image ~r/\Ahexpm\/elixir:(\d+\.\d+\.\d+)-erlang-(\d+\.\d+\.\d+)-\S+@sha256:[0-9a-f]{64}\z/
   @qualified_guards [
     {"workflow", ~S|"repos/$GH_REPO/actions/workflows/ci.yml/runs"|},
     {"pagination", "--paginate"},
@@ -177,6 +178,32 @@ defmodule Replicant.PublishWorkflowTest do
     mutated = String.replace(docs, ~s(["deps.get", "--check-locked"]), ~s(["deps.get"]))
     refute mutated == docs
     assert_raise ExUnit.AssertionError, fn -> assert_docs_fetch!(mutated) end
+  end
+
+  test "the example image runs the exact .tool-versions runtime" do
+    dockerfile = File.read!(Path.join(@repo_root, "examples/replication_pipeline/Dockerfile"))
+    tools = File.read!(@tools)
+    assert_example_image_runtime!(dockerfile, tools)
+
+    for mutated <- [
+          Regex.replace(~r/(hexpm\/elixir:)\d+\.\d+\.\d+/, dockerfile, "\\g{1}0.0.0"),
+          Regex.replace(~r/(-erlang-)\d+\.\d+\.\d+/, dockerfile, "\\g{1}0.0.0"),
+          Regex.replace(~r/^FROM hexpm\/elixir:/m, dockerfile, "FROM elixir:"),
+          Regex.replace(
+            ~r/^FROM base AS runtime$/m,
+            dockerfile,
+            "FROM debian:bookworm-slim AS runtime"
+          )
+        ] do
+      refute mutated == dockerfile
+      assert_raise ExUnit.AssertionError, fn -> assert_example_image_runtime!(mutated, tools) end
+    end
+
+    mutated = Regex.replace(~r/^erlang \S+$/m, tools, "erlang 0.0.0")
+    refute mutated == tools
+    assert_raise ExUnit.AssertionError, fn ->
+      assert_example_image_runtime!(dockerfile, mutated)
+    end
   end
 
   test "example audits inspect its lockfile using the root's locked dependency audit tool" do
@@ -743,6 +770,26 @@ defmodule Replicant.PublishWorkflowTest do
       duration = String.to_integer(minutes) * 60 + String.to_integer(seconds)
       assert job["timeout-minutes"] == String.to_integer(limit)
       assert job["timeout-minutes"] == max(2, div(2 * duration + 59, 60))
+    end
+  end
+
+  # Every external base image is the official Elixir image whose Elixir and OTP
+  # versions equal .tool-versions; every other stage derives from it.
+  defp assert_example_image_runtime!(dockerfile, tools) do
+    versions = tools |> String.split() |> Enum.chunk_every(2) |> Map.new(&List.to_tuple/1)
+    [elixir, _otp_major] = String.split(Map.fetch!(versions, "elixir"), "-otp-")
+    otp = Map.fetch!(versions, "erlang")
+    stages = Regex.scan(~r/^FROM\s+\S+\s+AS\s+(\S+)$/m, dockerfile, capture: :all_but_first)
+    sources = Regex.scan(~r/^FROM\s+(\S+)/m, dockerfile, capture: :all_but_first)
+    stage_names = MapSet.new(List.flatten(stages))
+    external = for [source] <- sources, not MapSet.member?(stage_names, source), do: source
+
+    assert external != []
+
+    for source <- external do
+      assert [_, image_elixir, image_otp] = Regex.run(@example_image, source)
+      assert image_elixir == elixir
+      assert image_otp == otp
     end
   end
 

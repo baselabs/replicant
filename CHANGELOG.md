@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly and refuses any Elixir, full OTP patch, or Elixir OTP build-suffix
   difference before fetching dependencies. Mutation tests cover each installation
   and execute the refusal against the real runtime with mismatched tool files.
+- The development and CI runtime moves from Erlang/OTP 29.0.3 to 29.0.5, the OTP
+  patch of the only official `hexpm/elixir` images for Elixir 1.20.3, so the
+  reference example container runs the same runtime as qualification. A test
+  refuses an example image whose Elixir or OTP version differs from `.tool-versions`.
 - CI no longer caches dependencies, builds, or Dialyzer PLTs. Candidate runs
   could never restore caches from earlier candidates, and a cache written on
   `main` would be restorable by candidates.

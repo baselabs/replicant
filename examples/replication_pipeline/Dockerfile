@@ -4,10 +4,8 @@
 #
 # Builder and runtime use the same base so the release's ERTS always matches.
 # Docker resolves FROM before COPY, so this immutable image reference cannot
-# read .tool-versions. It is a separately pinned published container toolchain
-# with a different OTP patch; it does not select the hosted CI runtime.
-# Hosted example gates use .tool-versions and refuse runtime differences;
-# the container's release is exercised by the end-to-end reference canary.
+# read .tool-versions. Its Elixir and OTP versions must equal .tool-versions;
+# test/release/publish_workflow_test.exs refuses any difference.
 # The image is digest-pinned — hexpm/elixir date-suffixed tags have observed registry churn
 # (policy says "never removed"; live probes show gaps), so the digest is the
 # stable pin and the CI canary build is the daily pull-check.
