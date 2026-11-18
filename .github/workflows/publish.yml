@@ -12,8 +12,6 @@ permissions:
   contents: read
 
 env:
-  ELIXIR_VERSION: "1.20.3"
-  OTP_VERSION: "29.0.3"
   # Hex records its version in package metadata, so check and mint must match.
   HEX_VERSION: "2.7.0"
 
@@ -28,7 +26,7 @@ jobs:
     environment: publish
     runs-on: ubuntu-24.04
     # Uses the timeout rule in qualification.yml; publishing has never run.
-    timeout-minutes: 6 # Green run 44183333538: release-artifact 1m44s; same mint as publish
+    timeout-minutes: 4 # Green run 44200086214: release-artifact 1m43s; mirrors its package build and inspection
     permissions:
       contents: read
       actions: read
@@ -44,9 +42,12 @@ jobs:
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          elixir-version: ${{ env.ELIXIR_VERSION }}
-          otp-version: ${{ env.OTP_VERSION }}
+          version-file: .tool-versions
           version-type: strict
+
+      - name: Assert release runtime
+        working-directory: .
+        run: elixir scripts/ci/assert_runtime.exs
 
       - run: mix local.hex "$HEX_VERSION" --force
       - run: mix local.rebar --force

@@ -94,6 +94,10 @@ cp "$src/mix.lock" "$consumer/mix.lock"
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
     mix deps.get --check-locked >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
+    mix hex.audit >&2
+  # The consumer has no audit-tool dependency; use the root's locked tool on its lockfile.
+  ( cd "$repo_root" && MIX_ENV=dev mix deps.audit --path "$consumer" ) >&2
+  env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
     mix compile --warnings-as-errors >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
     mix deps.tree --format plain > "$scratch/consumer-deps.txt"

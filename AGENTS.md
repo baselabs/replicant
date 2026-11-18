@@ -98,6 +98,12 @@ above on their own machines first.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
 
+The timeout rule in `qualification.yml` is twice the measured green duration, rounded up to
+whole minutes with a two-minute floor for short jobs; each comment names the run and duration.
+All runtime installers use `.tool-versions` with strict selection and immediately refuse any
+Elixir, full OTP patch, or Elixir OTP build-suffix mismatch. The example Dockerfile documents
+why its immutable container toolchain is pinned separately.
+
 GitHub REST lookups in release scripts use `gh api`, with the calling step's
 `GH_TOKEN: ${{ github.token }}` and job-level `contents: read`. Only steps that
 read GitHub receive that job token; qualification reads no repository or environment
@@ -136,7 +142,7 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
 
 infra-1, the DevOps session, owns CI/CD, the build box, releases and their keys for every
 BaseLabs product, and its requirements bind this repository. They are written once in the infra
-repository at `baselabs/docs/ci.md`, section "What infra requires of every product". Read them
+repository at [`baselabs/docs/ci.md`, section "What infra requires of every product"](https://github.com/baselabs/infra/blob/main/baselabs/docs/ci.md#what-infra-requires-of-every-product). Read them
 from infra's default branch (`git -C ~/Developer/infra fetch -q origin`, then
 `git -C ~/Developer/infra show origin/main:baselabs/docs/ci.md`), not from a local checkout,
 and reread them whenever you touch a workflow, a Dockerfile, a release script or a secret.

@@ -4,7 +4,7 @@ Thank you for your interest in contributing to Replicant!
 
 ## Prerequisites
 
-- **Elixir** 1.20.3 and **Erlang/OTP** 29.0.3 (the exact local/CI toolchain is in `.tool-versions`)
+- **Elixir** and **Erlang/OTP** at the exact versions in [`.tool-versions`](.tool-versions).
 - **PostgreSQL 15, 16, 17, or 18** with `wal_level=logical` (for integration tests).
   Use the approved host ports PG15 `5615`, PG16 `5599`, PG17 `5617`, or PG18 `5618` — e.g.
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 \
@@ -69,6 +69,10 @@ specific `!path`.
 
 ## CI
 
+Infra's binding requirements live in
+[`baselabs/docs/ci.md`, "What infra requires of every product"](https://github.com/baselabs/infra/blob/main/baselabs/docs/ci.md#what-infra-requires-of-every-product).
+Read that section from infra's default branch before changing workflows or release scripts.
+
 Every check above, `mix test` on all six PostgreSQL majors, and the docs and
 package build are jobs in
 [`.github/workflows/qualification.yml`](.github/workflows/qualification.yml).
@@ -79,6 +83,13 @@ and `main` moves only on its `qualified` check.
 
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
 has a new cache scope, and a cache written on `main` would be restorable by candidates.
+
+Workflow timeouts follow the measured rule in `qualification.yml`: twice the
+green job duration, rounded up to whole minutes, with a two-minute floor for
+short jobs. Comments name the run and duration; publishing mirrors the package job.
+Every runtime installer reads `.tool-versions` with strict selection and immediately
+refuses a differing Elixir version, full OTP patch version, or Elixir OTP build suffix.
+The example Dockerfile explains its separately pinned container toolchain.
 
 Release scripts read GitHub through `gh api`. The package-check step receives only
 its read-only job token as `GH_TOKEN: ${{ github.token }}`, with job-level

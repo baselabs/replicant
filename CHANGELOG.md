@@ -22,17 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Every executable CI and publish job has a timeout derived from green run
-  44183333538, using three times the measured duration rounded up, with a
-  three-minute minimum. Publishing uses the package job's same-mint measurement.
+  44200086214, using twice the measured duration rounded up, with a
+  two-minute floor. Publishing mirrors the package job's measurement.
 - Every dependency fetch is locked, including the example image and isolated
   package consumers. The reference example receives both Hex and dependency
   advisory audits using its existing lockfile and the root's locked audit tool.
-- Qualification refuses any difference in the exact Elixir and OTP version pair,
-  including an OTP patch change.
+  The fresh external package consumer also receives both audits.
+- Every runtime-installing qualification and publish job reads `.tool-versions`
+  directly and refuses any Elixir, full OTP patch, or Elixir OTP build-suffix
+  difference before fetching dependencies. Mutation tests cover each installation
+  and execute the refusal against the real runtime with mismatched tool files.
 - CI no longer caches dependencies, builds, or Dialyzer PLTs. Candidate runs
   could never restore caches from earlier candidates, and a cache written on
   `main` would be restorable by candidates.
-- Qualification and publishing use Elixir 1.20.3 and OTP 29.0.3 with strict
+- Qualification and publishing use the exact `.tool-versions` runtime with strict
   setup-beam selection. Every workflow uses `ubuntu-24.04`. Package qualification
   and minting pin Hex 2.7.0 and compare two isolated builds byte for byte.
   Qualification uploads a three-line commit, version, and SHA-256 authorization

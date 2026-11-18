@@ -127,6 +127,15 @@ defmodule Replicant.PublishWorkflowTest do
     for path <- Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}")) do
       source = File.read!(path)
       assert_timeouts!(source)
+
+      if path == @qualification do
+        for {before, after_rule} <- [{"2x", "3x"}, {"2-minute", "3-minute"}] do
+          mutated = String.replace(source, before, after_rule)
+          refute mutated == source
+          assert_raise ExUnit.AssertionError, fn -> assert_timeouts!(mutated) end
+        end
+      end
+
       lines = Regex.scan(~r/^    timeout-minutes: .+$/m, source)
       assert lines != []
 
@@ -134,9 +143,10 @@ defmodule Replicant.PublishWorkflowTest do
           replacement <- [
             "",
             line |> String.split(" #") |> hd(),
-            String.replace(line, "44183333538", "unknown"),
+            String.replace(line, "44200086214", "unknown"),
             String.replace(line, ~r/\d+m\d+s/, "unmeasured"),
-            String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 1")
+            String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 1"),
+            String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 30")
           ] do
         mutated = String.replace(source, line, replacement)
         refute mutated == source
@@ -191,14 +201,48 @@ defmodule Replicant.PublishWorkflowTest do
     assert_raise ExUnit.AssertionError, fn -> assert_example_audits!(mutated) end
   end
 
-  test "the release runtime check rejects either version changing, including OTP patches" do
-    steps = read_yaml!(@qualification)["jobs"]["static"]["steps"]
-    script = Enum.find(steps, &(&1["name"] == "Assert release runtime"))["run"]
+  test "every runtime installation refuses duplicated versions and missing guards" do
+    tools = File.read!(@tools)
+
+    for path <- [@workflow, @qualification] do
+      original = read_yaml!(path)
+      assert_workflow!(original, tools)
+
+      for {name, job} <- original["jobs"],
+          {step, index} <- Enum.with_index(job["steps"]),
+          step["uses"] == @beam do
+        for {keys, value} <- [
+              {["with", "elixir-version"], "1.20.3"},
+              {["with", "otp-version"], "29.0.3"},
+              {["with", "version-file"], nil},
+              {["with", "version-file"], "other/.tool-versions"},
+              {["with", "version-type"], nil},
+              {["with", "version-type"], "loose"}
+            ] do
+          mutated = replace(original, ["jobs", name, "steps", index] ++ keys, value)
+          assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+        end
+
+        mutated = update_in(original, ["jobs", name, "steps"], &List.delete_at(&1, index + 1))
+
+        assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+
+        for {key, value} <- [{"run", "true"}, {"working-directory", "examples"}] do
+          mutated = replace(original, ["jobs", name, "steps", index + 1, key], value)
+          assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+        end
+      end
+    end
+  end
+
+  test "the runtime refusal rejects either version or OTP suffix changing in the tools file" do
+    script = File.read!(Path.join(@repo_root, "scripts/ci/assert_runtime.exs"))
     assert_runtime_check!(script)
 
     for guard <- [
-          ~S|System.version() == System.fetch_env!("ELIXIR_VERSION")|,
-          ~S|otp_version == System.fetch_env!("OTP_VERSION")|
+          "System.version() == elixir_version",
+          ~S|otp_version == Map.fetch!(tools, "erlang")|,
+          "to_string(:erlang.system_info(:otp_release)) == otp_major"
         ] do
       mutated = String.replace(script, guard, "true")
       refute mutated == script
@@ -232,30 +276,30 @@ defmodule Replicant.PublishWorkflowTest do
         {"unpinned checkout", ["jobs", "publish", "steps", 1, "uses"], "actions/checkout@main"},
         {"unpinned source", ["jobs", "publish", "steps", 1, "with", "ref"], "main"},
         {"branch dispatch", ["jobs", "publish", "steps", 0, "run"], "true"},
-        {"missing read step", ["jobs", "publish", "steps", 6, "run"], "true"},
-        {"wrong read id", ["jobs", "publish", "steps", 6, "id"], "other"},
-        {"wrong read token", ["jobs", "publish", "steps", 6, "env", "GH_TOKEN"], "ignored"},
-        {"wrong read commit", ["jobs", "publish", "steps", 6, "env", "SOURCE_SHA"], "main"},
-        {"wrong read repository", ["jobs", "publish", "steps", 6, "env", "GH_REPO"],
+        {"missing read step", ["jobs", "publish", "steps", 7, "run"], "true"},
+        {"wrong read id", ["jobs", "publish", "steps", 7, "id"], "other"},
+        {"wrong read token", ["jobs", "publish", "steps", 7, "env", "GH_TOKEN"], "ignored"},
+        {"wrong read commit", ["jobs", "publish", "steps", 7, "env", "SOURCE_SHA"], "main"},
+        {"wrong read repository", ["jobs", "publish", "steps", 7, "env", "GH_REPO"],
          "other/repo"},
-        {"check instead of mint", ["jobs", "publish", "steps", 7, "run"],
+        {"check instead of mint", ["jobs", "publish", "steps", 8, "run"],
          "bash scripts/release/build_candidate.sh --check"},
-        {"missing authorization check", ["jobs", "publish", "steps", 8, "run"], "true"},
+        {"missing authorization check", ["jobs", "publish", "steps", 9, "run"], "true"},
         {"wrong comparison source",
-         ["jobs", "publish", "steps", 8, "env", "REPLICANT_PUBLISH_AUTHORIZED"], "ignored"},
-        {"wrong upload authorization", ["jobs", "publish", "steps", 9, "env"],
+         ["jobs", "publish", "steps", 9, "env", "REPLICANT_PUBLISH_AUTHORIZED"], "ignored"},
+        {"wrong upload authorization", ["jobs", "publish", "steps", 10, "env"],
          %{
            "HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}",
            "REPLICANT_PUBLISH_AUTHORIZED" => "other"
          }},
-        {"rebuilding upload", ["jobs", "publish", "steps", 9, "run"], "mix hex.publish --yes"},
-        {"missing docs upload", ["jobs", "publish", "steps", 9, "run"],
+        {"rebuilding upload", ["jobs", "publish", "steps", 10, "run"], "mix hex.publish --yes"},
+        {"missing docs upload", ["jobs", "publish", "steps", 10, "run"],
          "mix run --no-start scripts/release/upload_candidate.exs --publish"},
-        {"wrong secret", ["jobs", "publish", "steps", 9, "env", "HEX_API_KEY"],
+        {"wrong secret", ["jobs", "publish", "steps", 10, "env", "HEX_API_KEY"],
          "${{ secrets.OTHER_KEY }}"},
         {"job credential", ["jobs", "publish", "env"],
          %{"HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}"}},
-        {"step credential leak", ["jobs", "publish", "steps", 7, "env"],
+        {"step credential leak", ["jobs", "publish", "steps", 8, "env"],
          %{"HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}"}}
       ] do
     test "publish contract refuses #{name}" do
@@ -279,7 +323,7 @@ defmodule Replicant.PublishWorkflowTest do
         {"moving runner", ["jobs", "publish", "runs-on"], "ubuntu-" <> "latest"},
         {"self-hosted runner", ["jobs", "publish", "runs-on"], ["self-hosted", "linux"]},
         {"build-box runner", ["jobs", "publish", "runs-on"], "devbox-ovh"},
-        {"cache action", ["jobs", "publish", "steps", 3, "uses"], "actions/cache@v4"},
+        {"cache action", ["jobs", "publish", "steps", 4, "uses"], "actions/cache@v4"},
         {"pull request trigger", ["on", "pull_request"], nil},
         {"privileged pull request trigger", ["on", "pull_request_target"], nil}
       ] do
@@ -302,9 +346,9 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   for {name, first, second} <- [
-        {"read after mint", 6, 7},
-        {"read after upload", 6, 9},
-        {"upload before comparison", 8, 9}
+        {"read after mint", 7, 8},
+        {"read after upload", 7, 10},
+        {"upload before comparison", 9, 10}
       ] do
     test "publish contract refuses #{name}" do
       original = read_yaml!(@workflow)
@@ -324,7 +368,7 @@ defmodule Replicant.PublishWorkflowTest do
     test "qualification read refuses missing #{name}" do
       original = read_yaml!(@workflow)
       assert_publish!(original)
-      path = ["jobs", "publish", "steps", Access.at(6), "run"]
+      path = ["jobs", "publish", "steps", Access.at(7), "run"]
       script = get_in(original, path)
       mutated = put_in(original, path, String.replace(script, unquote(guard), ""))
       refute mutated == original
@@ -337,12 +381,12 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   for {name, path, value} <- [
-        {"missing output option", [8, "run"],
+        {"missing output option", [9, "run"],
          "BUILD_DATE=ci bash scripts/release/build_candidate.sh --check"},
-        {"wrong artifact", [9, "with", "name"], "other"},
-        {"wrong record path", [9, "with", "path"], "other.txt"},
-        {"ignored missing record", [9, "with", "if-no-files-found"], "ignore"},
-        {"unpinned artifact upload", [9, "uses"], "actions/upload-artifact@main"}
+        {"wrong artifact", [10, "with", "name"], "other"},
+        {"wrong record path", [10, "with", "path"], "other.txt"},
+        {"ignored missing record", [10, "with", "if-no-files-found"], "ignore"},
+        {"unpinned artifact upload", [10, "uses"], "actions/upload-artifact@main"}
       ] do
     test "qualification contract refuses #{name}" do
       original = read_yaml!(@qualification)
@@ -359,8 +403,8 @@ defmodule Replicant.PublishWorkflowTest do
 
     mutated =
       update_in(original, ["jobs", "release-artifact", "steps"], fn steps ->
-        List.replace_at(steps, 8, Enum.at(steps, 9))
-        |> List.replace_at(9, Enum.at(steps, 8))
+        List.replace_at(steps, 9, Enum.at(steps, 10))
+        |> List.replace_at(10, Enum.at(steps, 9))
       end)
 
     assert_raise ExUnit.AssertionError, fn -> assert_qualification!(mutated) end
@@ -374,7 +418,7 @@ defmodule Replicant.PublishWorkflowTest do
     mutated = put_in(publish, ["env", "HEX_VERSION"], "0.0.0")
     assert_raise ExUnit.AssertionError, fn -> assert_hex!(mutated, qualification) end
 
-    mutated = replace(publish, ["jobs", "publish", "steps", 3, "run"], "mix local.hex --force")
+    mutated = replace(publish, ["jobs", "publish", "steps", 4, "run"], "mix local.hex --force")
     assert_raise ExUnit.AssertionError, fn -> assert_hex!(mutated, qualification) end
   end
 
@@ -387,7 +431,7 @@ defmodule Replicant.PublishWorkflowTest do
     receipt = Path.join(artifacts, "replicant-1.2.0-receipt.txt")
     digest = String.duplicate("a", 64)
     File.write!(receipt, "sha256: #{digest}\n")
-    script = read_yaml!(@workflow) |> get_in(["jobs", "publish", "steps"]) |> Enum.at(8)
+    script = read_yaml!(@workflow) |> get_in(["jobs", "publish", "steps"]) |> Enum.at(9)
 
     for {authorization, expected_status} <- [
           {"1.2.0:#{digest}", 0},
@@ -416,7 +460,7 @@ defmodule Replicant.PublishWorkflowTest do
     commit = String.duplicate("a", 40)
     digest = String.duplicate("b", 64)
     content = "commit: #{commit}\nversion: 1.2.0\nsha256: #{digest}\n"
-    read = read_yaml!(@workflow) |> get_in(["jobs", "publish", "steps"]) |> Enum.at(6)
+    read = read_yaml!(@workflow) |> get_in(["jobs", "publish", "steps"]) |> Enum.at(7)
     [die | _rest] = String.split(read["run"], "\n")
     start = ~S|commit="$(sed -n 's/^commit: //p' "$record")"|
     [_, after_start] = String.split(read["run"], start, parts: 2)
@@ -487,19 +531,18 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   defp assert_workflow!(workflow, tools) do
-    [_, elixir, suffix] = Regex.run(~r/^elixir (\d+\.\d+\.\d+)-otp-(\d+)$/m, tools)
-    [_, otp, major] = Regex.run(~r/^erlang ((\d+)\.\d+\.\d+)$/m, tools)
+    [_, suffix] = Regex.run(~r/^elixir \d+\.\d+\.\d+-otp-(\d+)$/m, tools)
+    [_, major] = Regex.run(~r/^erlang (\d+)\.\d+\.\d+$/m, tools)
     assert suffix == major
     maps = maps(workflow)
     refute_pull_request_trigger!(workflow)
     assert_github_auth!(workflow)
 
-    for map <- maps, {key, expected} <- [{"ELIXIR_VERSION", elixir}, {"OTP_VERSION", otp}] do
-      if Map.has_key?(map, key), do: assert(map[key] == expected)
-    end
+    for map <- maps, key <- ["ELIXIR_VERSION", "OTP_VERSION"], do: refute(Map.has_key?(map, key))
 
     for {_name, job} <- workflow["jobs"], do: assert_job_host!(job)
-    for map <- maps, do: assert_action_pins!(map, workflow, elixir, otp)
+    for {_name, job} <- workflow["jobs"], do: assert_runtime_steps!(job)
+    for map <- maps, do: assert_action_pins!(map)
   end
 
   defp refute_pull_request_trigger!(workflow) do
@@ -514,22 +557,34 @@ defmodule Replicant.PublishWorkflowTest do
 
   defp assert_job_host!(job) do
     assert job["runs-on"] == "ubuntu-24.04"
-    assert is_integer(job["timeout-minutes"]) and job["timeout-minutes"] >= 3
+    assert is_integer(job["timeout-minutes"]) and job["timeout-minutes"] >= 2
   end
 
-  defp assert_action_pins!(map, workflow, elixir, otp) do
+  defp assert_runtime_steps!(job) do
+    steps = job["steps"] || []
+
+    for {step, index} <- Enum.with_index(steps), step["uses"] == @beam do
+      refusal = Enum.at(steps, index + 1)
+      assert refusal["name"] == "Assert release runtime"
+      assert refusal["working-directory"] == "."
+      assert refusal["run"] == "elixir scripts/ci/assert_runtime.exs"
+    end
+  end
+
+  defp assert_action_pins!(map) do
     uses = to_string(map["uses"] || "")
     refute uses =~ ~r{actions/cache(?:/|@)}i
 
-    if String.starts_with?(uses, "actions/checkout@"), do: assert(uses == @checkout)
+    if uses != "" and not String.starts_with?(uses, "./"), do: assert(uses =~ ~r/@[0-9a-f]{40}$/)
+
+    if String.starts_with?(uses, "actions/checkout@") do
+      assert uses == @checkout
+      assert map["with"]["persist-credentials"] == false
+    end
 
     if String.starts_with?(uses, "erlef/setup-beam@") do
       assert uses == @beam
-      assert workflow["env"]["ELIXIR_VERSION"] == elixir
-      assert workflow["env"]["OTP_VERSION"] == otp
-      assert map["with"]["elixir-version"] == "${{ env.ELIXIR_VERSION }}"
-      assert map["with"]["otp-version"] == "${{ env.OTP_VERSION }}"
-      assert map["with"]["version-type"] == "strict"
+      assert map["with"] == %{"version-file" => ".tool-versions", "version-type" => "strict"}
     end
   end
 
@@ -549,9 +604,9 @@ defmodule Replicant.PublishWorkflowTest do
     assert job["if"] == @owners
     assert job["environment"] == "publish"
     assert job["permissions"] == %{"contents" => "read", "actions" => "read"}
-    assert job["timeout-minutes"] == 6
+    assert job["timeout-minutes"] == 4
     steps = job["steps"]
-    assert length(steps) == 10
+    assert length(steps) == 11
     assert Enum.at(steps, 0)["run"] == ~s(test "$GITHUB_REF" = refs/heads/main)
     checkout = Enum.at(steps, 1)
     assert checkout["uses"] == @checkout
@@ -560,9 +615,9 @@ defmodule Replicant.PublishWorkflowTest do
     assert checkout["with"]["fetch-depth"] == 0
     assert Enum.at(steps, 2)["uses"] == @beam
 
-    assert Enum.at(steps, 4)["run"] == "mix local.rebar --force"
-    assert Enum.at(steps, 5)["run"] == "mix deps.get --check-locked"
-    read = Enum.at(steps, 6)
+    assert Enum.at(steps, 5)["run"] == "mix local.rebar --force"
+    assert Enum.at(steps, 6)["run"] == "mix deps.get --check-locked"
+    read = Enum.at(steps, 7)
     assert read["id"] == "qualified"
 
     assert read["env"] == %{
@@ -572,24 +627,24 @@ defmodule Replicant.PublishWorkflowTest do
            }
 
     for {_name, guard} <- @qualified_guards, do: assert(read["run"] =~ guard)
-    assert Enum.at(steps, 7)["run"] == "bash scripts/release/build_candidate.sh"
-    assert Enum.at(steps, 7)["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
-    assert Enum.at(steps, 8)["run"] == @authorization
+    assert Enum.at(steps, 8)["run"] == "bash scripts/release/build_candidate.sh"
+    assert Enum.at(steps, 8)["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
+    assert Enum.at(steps, 9)["run"] == @authorization
 
-    assert Enum.at(steps, 8)["env"] == %{
+    assert Enum.at(steps, 9)["env"] == %{
              "REPLICANT_PUBLISH_AUTHORIZED" => "${{ steps.qualified.outputs.authorization }}"
            }
 
-    assert Enum.at(steps, 9)["run"] == @upload
+    assert Enum.at(steps, 10)["run"] == @upload
 
-    assert Enum.at(steps, 9)["env"] == %{
+    assert Enum.at(steps, 10)["env"] == %{
              "GH_TOKEN" => "${{ github.token }}",
              "HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}",
              "REPLICANT_PUBLISH_AUTHORIZED" => "${{ steps.qualified.outputs.authorization }}"
            }
 
     without_secret =
-      update_in(workflow, ["jobs", "publish", "steps", Access.at(9), "env"], fn env ->
+      update_in(workflow, ["jobs", "publish", "steps", Access.at(10), "env"], fn env ->
         Map.delete(env, "HEX_API_KEY")
       end)
 
@@ -599,14 +654,14 @@ defmodule Replicant.PublishWorkflowTest do
   defp assert_qualification!(workflow) do
     assert_github_auth!(workflow)
     steps = workflow["jobs"]["release-artifact"]["steps"]
-    assert length(steps) == 10
+    assert length(steps) == 11
 
-    assert Enum.at(steps, 8)["run"] ==
+    assert Enum.at(steps, 9)["run"] ==
              "BUILD_DATE=ci bash scripts/release/build_candidate.sh --check " <>
                ~s(--authorization-out "$RUNNER_TEMP/package-authorization.txt")
 
-    assert Enum.at(steps, 8)["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
-    upload = Enum.at(steps, 9)
+    assert Enum.at(steps, 9)["env"] == %{"GH_TOKEN" => "${{ github.token }}"}
+    upload = Enum.at(steps, 10)
     assert upload["uses"] == @artifact
 
     assert upload["with"] == %{
@@ -669,12 +724,17 @@ defmodule Replicant.PublishWorkflowTest do
   defp assert_timeouts!(source) do
     workflow = parse_yaml!(source)
 
+    if workflow["name"] == "Qualification" do
+      assert source =~ "# Timeout rule for all workflows: 2x the measured green duration"
+      assert source =~ "# whole minutes, with a 2-minute floor for short jobs."
+    end
+
     for {name, job} <- workflow["jobs"], not Map.has_key?(job, "uses") do
       [_, body] = Regex.run(~r/^  #{Regex.escape(name)}:\n(.*?)(?=^  [\w-]+:|\z)/ms, source)
 
       measurement =
         Regex.run(
-          ~r/^    timeout-minutes: (\d+) # Green run 44183333538: .+? (\d+)m(\d{2})s(?:;.*)?$/m,
+          ~r/^    timeout-minutes: (\d+) # Green run 44200086214: .+? (\d+)m(\d{2})s(?:;.*)?$/m,
           body
         )
 
@@ -682,7 +742,7 @@ defmodule Replicant.PublishWorkflowTest do
       [_, limit, minutes, seconds] = measurement
       duration = String.to_integer(minutes) * 60 + String.to_integer(seconds)
       assert job["timeout-minutes"] == String.to_integer(limit)
-      assert job["timeout-minutes"] == max(3, div(3 * duration + 59, 60))
+      assert job["timeout-minutes"] == max(2, div(2 * duration + 59, 60))
     end
   end
 
@@ -723,24 +783,29 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   defp assert_runtime_check!(script) do
-    workflow = read_yaml!(@qualification)
-    elixir = workflow["env"]["ELIXIR_VERSION"]
-    otp = workflow["env"]["OTP_VERSION"]
+    tools = File.read!(@tools)
+    [_, elixir] = Regex.run(~r/^elixir (\S+)$/m, tools)
+    [_, otp] = Regex.run(~r/^erlang (\S+)$/m, tools)
     [major, minor, patch] = String.split(otp, ".")
     wrong_patch = Enum.join([major, minor, String.to_integer(patch) + 1], ".")
+    root = Path.join(System.tmp_dir!(), "replicant-runtime-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+    runtime = Path.join(root, "scripts/ci/assert_runtime.exs")
+    File.mkdir_p!(Path.dirname(runtime))
+    File.write!(runtime, script)
 
     for {expected_elixir, expected_otp, success?} <- [
           {elixir, otp, true},
-          {elixir <> ".wrong", otp, false},
+          {String.replace(elixir, ~r/^\d+\.\d+\.\d+/, "0.0.0"), otp, false},
           {elixir, wrong_patch, false},
-          {elixir, major, false}
+          {elixir, major, false},
+          {String.replace(elixir, "-otp-" <> major, "-otp-0"), otp, false}
         ] do
+      expected = "elixir #{expected_elixir}\nerlang #{expected_otp}\n"
+      File.write!(Path.join(root, ".tool-versions"), expected)
+
       {_output, status} =
-        System.cmd("bash", ["--noprofile", "--norc", "-euo", "pipefail", "-c", script],
-          cd: @repo_root,
-          env: [{"ELIXIR_VERSION", expected_elixir}, {"OTP_VERSION", expected_otp}],
-          stderr_to_stdout: true
-        )
+        System.cmd("elixir", [runtime], cd: root, stderr_to_stdout: true)
 
       assert status == 0 == success?
     end

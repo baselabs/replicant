@@ -3,13 +3,18 @@
 #   docker compose build   (from examples/replication_pipeline)
 #
 # Builder and runtime use the same base so the release's ERTS always matches.
-# The base tracks the repo toolchain (elixir 1.20.3 / OTP 29; the image's
-# 29.0.5 patch is the closest published tag to .tool-versions' 29.0.3) AND is
-# digest-pinned — hexpm/elixir date-suffixed tags have observed registry churn
+# Docker resolves FROM before COPY, so this immutable image reference cannot
+# read .tool-versions. It is a separately pinned published container toolchain
+# with a different OTP patch; it does not select the hosted CI runtime.
+# Hosted example gates use .tool-versions and refuse runtime differences;
+# the container's release is exercised by the end-to-end reference canary.
+# The image is digest-pinned — hexpm/elixir date-suffixed tags have observed registry churn
 # (policy says "never removed"; live probes show gaps), so the digest is the
 # stable pin and the CI canary build is the daily pull-check.
 
-FROM hexpm/elixir:1.20.3-erlang-29.0.5-debian-bookworm-20260803-slim@sha256:f2e721ffbb64a60cd56979c2d4e9651cf89c202c4a55466d979bf71b262802a3 AS builder
+FROM hexpm/elixir:1.20.3-erlang-29.0.5-debian-bookworm-20260803-slim@sha256:f2e721ffbb64a60cd56979c2d4e9651cf89c202c4a55466d979bf71b262802a3 AS base
+
+FROM base AS builder
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends build-essential git ca-certificates && apt-get clean
 
@@ -33,7 +38,7 @@ RUN mix local.hex --force && mix local.rebar --force \
 
 RUN mix release
 
-FROM hexpm/elixir:1.20.3-erlang-29.0.5-debian-bookworm-20260803-slim@sha256:f2e721ffbb64a60cd56979c2d4e9651cf89c202c4a55466d979bf71b262802a3
+FROM base AS runtime
 
 RUN apt-get update -y && apt-get install -y --no-install-recommends libssl3 ca-certificates && apt-get clean
 

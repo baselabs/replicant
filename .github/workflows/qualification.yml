@@ -6,8 +6,8 @@ name: Qualification
 # The package-check step uses its job token only for read-only GitHub release
 # identity lookups through gh api; it receives no repository or environment secret.
 # Jobs fetch dependencies, build, and generate Dialyzer PLTs without Actions caches.
-# Timeout rule for all workflows: 3x the measured green duration, rounded up to
-# whole minutes, with a 3-minute minimum. Each limit cites its measurement.
+# Timeout rule for all workflows: 2x the measured green duration, rounded up to
+# whole minutes, with a 2-minute floor for short jobs. Each limit cites its measurement.
 on:
   workflow_call:
 
@@ -15,8 +15,6 @@ permissions:
   contents: read
 
 env:
-  ELIXIR_VERSION: "1.20.3"
-  OTP_VERSION: "29.0.3"
   HEX_VERSION: "2.7.0"
 
 jobs:
@@ -25,7 +23,7 @@ jobs:
   static:
     name: static (format, credo, compile, audit, dialyzer)
     runs-on: ubuntu-24.04
-    timeout-minutes: 8 # Green run 44183333538: static 2m35s
+    timeout-minutes: 5 # Green run 44200086214: static 2m28s
     env:
       MIX_ENV: test
     steps:
@@ -35,24 +33,14 @@ jobs:
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          # Pinned to the dev toolchain (.tool-versions) so the format check,
-          # dialyzer PLT, and CI run on the same Elixir/OTP — a version skew here
-          # lets the formatter list-wrap heuristic pass in one and fail in the other.
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-file: .tool-versions
           version-type: strict
 
-      - run: mix deps.get --check-locked
       - name: Assert release runtime
-        run: |
-          mix run --no-start -e '
-          otp_version =
-            Path.join([to_string(:code.root_dir()), "releases", to_string(:erlang.system_info(:otp_release)), "OTP_VERSION"])
-            |> File.read!()
-            |> String.trim()
-          unless System.version() == System.fetch_env!("ELIXIR_VERSION") and otp_version == System.fetch_env!("OTP_VERSION") do
-            raise "unexpected release runtime"
-          end'
+        working-directory: .
+        run: elixir scripts/ci/assert_runtime.exs
+
+      - run: mix deps.get --check-locked
       # Supply-chain gate (declared in mix.exs `audit` alias: unused-dep + hex advisory +
       # deps audit). Runs before build so a vulnerable/unpinned dep reds before compile.
       - run: mix audit
@@ -66,7 +54,7 @@ jobs:
   test:
     name: test (PG${{ matrix.pg.major }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 11 # Green run 44183333538: test PG12 (slowest matrix row) 3m24s
+    timeout-minutes: 8 # Green run 44200086214: test PG12 (slowest matrix row) 3m59s
     strategy:
       fail-fast: false
       # R05 supported-version matrix: PostgreSQL 9.6, 12, 15, 16, 17, 18. The 15-18
@@ -207,9 +195,12 @@ jobs:
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-file: .tool-versions
           version-type: strict
+
+      - name: Assert release runtime
+        working-directory: .
+        run: elixir scripts/ci/assert_runtime.exs
 
       - run: mix deps.get --check-locked
       - name: Run tests and prove this matrix row ran integration against PG${{ matrix.pg.major }}
@@ -230,7 +221,7 @@ jobs:
   release-artifact:
     name: docs and package
     runs-on: ubuntu-24.04
-    timeout-minutes: 6 # Green run 44183333538: release-artifact 1m44s
+    timeout-minutes: 4 # Green run 44200086214: release-artifact 1m43s
     permissions:
       contents: read
     env:
@@ -244,9 +235,12 @@ jobs:
           fetch-depth: 0
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-file: .tool-versions
           version-type: strict
+
+      - name: Assert release runtime
+        working-directory: .
+        run: elixir scripts/ci/assert_runtime.exs
 
       # Match the publisher: Hex records its own version in the package bytes.
       - run: mix local.hex "$HEX_VERSION" --force
@@ -285,7 +279,7 @@ jobs:
   reference-example:
     name: Reference example (docker)
     runs-on: ubuntu-24.04
-    timeout-minutes: 11 # Green run 44183333538: reference-example 3m24s
+    timeout-minutes: 7 # Green run 44200086214: reference-example 3m14s
     defaults:
       run:
         working-directory: examples/replication_pipeline
@@ -296,10 +290,12 @@ jobs:
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
-          # Same pinned toolchain as the library jobs (.tool-versions).
-          otp-version: ${{ env.OTP_VERSION }}
-          elixir-version: ${{ env.ELIXIR_VERSION }}
+          version-file: .tool-versions
           version-type: strict
+
+      - name: Assert release runtime
+        working-directory: .
+        run: elixir scripts/ci/assert_runtime.exs
 
       # Static gates for the example project: the "sink API canary" catches
       # static contract drift too — a wrong callback shape or type is red here
