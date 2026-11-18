@@ -4,7 +4,8 @@ Thank you for your interest in contributing to Replicant!
 
 ## Prerequisites
 
-- **Elixir** and **Erlang/OTP** at the exact versions in [`.tool-versions`](.tool-versions).
+- **Elixir** and **Erlang/OTP** at the exact versions in
+  [`.tool-versions`](https://github.com/baselabs/replicant/blob/main/.tool-versions).
 - **PostgreSQL 15, 16, 17, or 18** with `wal_level=logical` (for integration tests).
   Use the approved host ports PG15 `5615`, PG16 `5599`, PG17 `5617`, or PG18 `5618` — e.g.
   `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 \
