@@ -117,8 +117,8 @@ Only the archive upload step receives that secret.
 An early anonymous Hex lookup refuses a package name that does not already exist:
 a first publication of `replicant` is the owner's decision. All lookup errors fail
 closed. The workflow checks out the dispatched SHA without persisted credentials.
-Building requires a clean checkout of live `origin/main` and refuses an existing
-version, Git tag, or GitHub release. Only the keyless build step receives the job
+Building requires a clean checkout of live `origin/main` and refuses a local or
+remote version tag or GitHub release. Only the keyless build step receives the job
 token through `GH_TOKEN` for GitHub reads; tokens never enter arguments or files.
 
 Both qualification and publication build the package twice from `git archive`
@@ -133,22 +133,47 @@ The single credentialed step runs `mix run --no-mix-exs` from the runner's tempo
 directory, which holds no `mix.exs`, with those two inspected file paths. Its
 standalone script uses only Hex's APIs and file reads: it refuses to run inside a
 Mix project, loads no project code, fetches no dependencies, and rebuilds nothing.
-Immediately before uploading, it rechecks that the package name exists and the
-version is absent.
-It uploads the exact inspected files, then verifies Hex's package checksum.
-Temporary archives are removed even after failure. After Hex read-back and
-successful docs upload, infra creates the `v<version>` tag at that full source SHA
-and the GitHub release:
+Immediately before uploading, it rechecks that the package name exists. A version
+already served by Hex without a tag is a held or partial release: the job compares
+its checksum with the package it just built, both before and inside the keyed
+step. A different checksum, retirement, malformed metadata, or lookup failure
+refuses publication. Identical bytes skip the package upload. Docs upload only
+when missing. A second owner dispatch on the same commit finishes an approved
+hold or interrupted upload; neither package nor docs are replaced.
+
+Read-back requires the exact package checksum, `has_docs: true`, and a served
+gzip docs archive. Docs verification is presence-only. The locked ExDoc 0.40.3
+renderer calls Makeup's lexer without a fixed grouping prefix; the locked
+Makeup Elixir 1.0.1 lexer generates `random_prefix(10)`, so rendered HTML can
+differ across builds. `consume_candidate.sh` also retains build-time file
+metadata in `tar -czf`. Normalizing tar headers alone would not make rendered
+docs reproducible. The docs checksum below identifies the inspected build's
+archive, not a promise of equality with previously served docs.
+
+After successful read-back, the workflow retains one `release-assets` artifact:
+`replicant-<version>.tar`, `replicant-<version>-docs.tar.gz`, and `SHA256SUMS`.
+The package uses Hex's filename; the docs suffix distinguishes the gzip docs
+archive from the package. Temporary archives are removed even after failure.
+Infra tags `v<version>` at the full source SHA, compares the artifact's package
+archive with Hex's served bytes, and creates the GitHub release from those assets.
+No workflow creates a release or runs on a tag.
+
+Consumers verify the permanent [GitHub release](https://github.com/baselabs/replicant/releases)
+for `v<version>`, downloading its archives and `SHA256SUMS`:
 
 ```bash
-gh release create vX.Y.Z --verify-tag --target <full sha>
+gh release download vX.Y.Z --repo baselabs/replicant --pattern 'replicant-*' --pattern SHA256SUMS
+sha256sum --check SHA256SUMS
+curl --fail --silent --show-error https://repo.hex.pm/tarballs/replicant-X.Y.Z.tar -o hex.tar
+cmp replicant-X.Y.Z.tar hex.tar
 ```
 
 Record the verified package digest in `scripts/release/published_packages.sha256`
 through the normal landing process. All four release identities (tag, Hex package,
 HexDocs, GitHub release) and the ledger must agree for subsequent package checks.
-An interrupted or ambiguous upload requires the operator to inspect public state
-before retrying; a partially published version is refused by a new publication attempt.
+Held versions never add or alter manifest entries speculatively. An interrupted
+or ambiguous upload requires infra to inspect public state before the owner
+retries the same commit. A tagged version or existing GitHub release always refuses.
 
 Agents never release, deploy, publish, tag, create a GitHub release, dispatch the
 publish workflow, or handle publish credentials. Their work ends at the commit on

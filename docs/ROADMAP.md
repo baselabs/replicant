@@ -12,6 +12,21 @@
 
 ## Current package snapshot
 
+Publication builds and inspects package and docs without a registry key. A second
+owner dispatch on the same commit can finish a held, untagged Hex release only
+when the package checksum matches the freshly built archive and the release is
+not retired. It uploads only missing archives, reads both back, and retains the
+versioned archives plus `SHA256SUMS` in one `release-assets` artifact. Docs
+read-back is presence-only because the locked renderer generates random
+highlighting IDs and the tar preserves build-time metadata; existing docs are
+never replaced. Infra tags after read-back, compares the retained package with
+Hex's bytes, and creates the GitHub release from those assets. Consumers use the
+[GitHub release](https://github.com/baselabs/replicant/releases) for verification;
+the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only)
+describes the checksum checks and permanent download paths. Infra records
+published package digests through normal landing; held versions do not rewrite
+`scripts/release/published_packages.sha256`.
+
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:
 

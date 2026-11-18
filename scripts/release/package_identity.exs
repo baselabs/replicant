@@ -13,14 +13,15 @@ defmodule Replicant.PackageIdentity do
          :ok <- absent_local_tag(tag, runner),
          :ok <- absent_remote_tag(tag, runner),
          :ok <- absent_github(tag, runner),
-         :ok <- absent_http(@hex_release_url <> version, "Hex release", runner) do
+         {:ok, _state} <- check_archive(version, nil, runner) do
       :ok
     end
   end
 
   def check_publish(version, source_commit, runner \\ &run/2) do
     # Tags and the GitHub release follow successful Hex read-back. Re-prove the
-    # source before building the archives, with the namespace still free.
+    # source before building. An untagged Hex version may be held; its checksum
+    # must match the built archive before the credentialed step can run.
     with :ok <- matching_main(source_commit, runner),
          :ok <- check_candidate(version, runner) do
       :ok
@@ -72,6 +73,66 @@ defmodule Replicant.PackageIdentity do
 
   def verify_publish!(version, source_commit),
     do: check_publish(version, source_commit) |> unwrap!()
+
+  def verify_publish_archive!(version, source_commit, archive, runner \\ &run/2) do
+    digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
+    :ok = check_publish(version, source_commit, runner) |> unwrap!()
+    {:ok, _state} = check_archive(version, digest, runner) |> unwrap!()
+    :ok
+  end
+
+  # A nil digest is only the pre-build identity check. Publication always repeats
+  # this decision with the SHA256 of the inspected package, before exposing a key.
+  def check_archive(version, digest, runner \\ &run/2) do
+    args = [
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "10",
+      "--max-time",
+      "30",
+      "--write-out",
+      "\n%{http_code}",
+      @hex_release_url <> version
+    ]
+
+    case runner.("curl", args) do
+      {response, 0} ->
+        case String.split(response, "\n") |> Enum.reverse() do
+          ["404" | _body] -> {:ok, :fresh}
+          ["200" | body] -> held_release(Enum.reverse(body), version, digest)
+          _other -> {:error, "Hex release lookup failed; publication refused"}
+        end
+
+      _other ->
+        {:error, "Hex release lookup failed; publication refused"}
+    end
+  end
+
+  defp held_release(body, version, digest) do
+    with {:ok, metadata} <- decode_json(Enum.join(body, "\n"), "Hex release") do
+      case metadata do
+        %{"version" => ^version, "checksum" => checksum, "retirement" => nil,
+          "has_docs" => docs?} when is_binary(checksum) and is_boolean(docs?) ->
+          cond do
+            not Regex.match?(~r/\A[0-9a-f]{64}\z/, checksum) ->
+              {:error, "Hex release checksum is invalid"}
+
+            digest != nil and checksum != digest ->
+              {:error, "Hex release checksum differs from the built package; publication refused"}
+
+            true ->
+              {:ok, {:held, docs?}}
+          end
+
+        %{"retirement" => retirement} when not is_nil(retirement) ->
+          {:error, "Hex release is retired; publication refused"}
+
+        _other ->
+          {:error, "Hex release metadata is invalid; publication refused"}
+      end
+    end
+  end
 
   def verify_build!(version, source_commit, published_digest),
     do: check_build(version, source_commit, published_digest) |> unwrap!()
@@ -202,19 +263,6 @@ defmodule Replicant.PackageIdentity do
     {:error, "#{location} tag #{tag} resolves to #{actual}, expected recorded source #{expected}"}
   end
 
-  defp absent_http(url, label, runner) do
-    case http_status(url, runner) do
-      {"404", 0} ->
-        :ok
-
-      {"200", 0} ->
-        {:error, "#{label} already exists"}
-
-      _ ->
-        {:error, "#{label} check failed"}
-    end
-  end
-
   defp existing_package(runner) do
     case http_status(@hex_package_url, runner) do
       {"200", 0} ->
@@ -303,6 +351,9 @@ defmodule Replicant.PackageIdentity do
         metadata["checksum"] != published_digest ->
           {:error, "Hex release checksum does not match the tracked published digest"}
 
+        Map.fetch(metadata, "retirement") != {:ok, nil} ->
+          {:error, "Hex release is retired or retirement metadata is unavailable"}
+
         metadata["has_docs"] != true ->
           {:error, "Hex release documentation is unavailable"}
 
@@ -372,5 +423,6 @@ defmodule Replicant.PackageIdentity do
   end
 
   defp unwrap!(:ok), do: :ok
+  defp unwrap!({:ok, _state} = result), do: result
   defp unwrap!({:error, message}), do: raise(message)
 end

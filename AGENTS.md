@@ -134,12 +134,21 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
   it: `mix run --no-mix-exs`, run from the runner's temporary directory where no `mix.exs`
   exists, runs `scripts/release/publish_hex_artifacts.exs`. The script refuses to run inside a
-  Mix project, reads the two inspected archive paths, rechecks package existence and version
-  absence, and uses Hex's APIs to upload those bytes and verify the package checksum. It loads
-  no project code and builds nothing.
-  Archives are removed even on failure. After Hex read-back and successful docs upload, infra
-  creates the `v<version>` tag at that full source SHA and the GitHub release. It records the
-  verified package digest in `scripts/release/published_packages.sha256` through normal landing.
+  Mix project, reads the two inspected archive paths, and rechecks package existence. Local
+  or remote version tags and GitHub releases refuse publication. An untagged Hex version can
+  finish only when its checksum matches the built package and it is not retired; the keyless
+  build and the keyed script both check this. Only missing package or docs uploads run. Both
+  are read back. Docs presence is checked through metadata and the served archive, without
+  byte comparison: the locked renderer generates random highlighting IDs and the tar retains
+  build-time file metadata. Existing docs are never replaced. The script loads no project
+  code and builds nothing.
+  After successful read-back, one `release-assets` artifact retains the versioned package,
+  docs archive, and `SHA256SUMS`. Temporary archives are removed even on failure. Infra creates
+  the `v<version>` tag at that full source SHA, compares the artifact's package with Hex's
+  bytes, and creates the GitHub release from those assets. Consumer verification uses that
+  GitHub release. Infra records the verified package digest in
+  `scripts/release/published_packages.sha256` through normal landing; held versions do not
+  change the ledger.
   A release is finished only when its tag, Hex package and docs, and GitHub release all exist.
 
 ## CI/CD and releases

@@ -21,8 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Package and docs archives are built and inspected without the publish key.
   Docs build with warnings as errors before anything uploads. One isolated
   `mix run --no-mix-exs` step uploads those exact file paths through Hex's APIs,
-  rechecking package existence and version absence immediately before upload.
-  Hex's package checksum is read back; temporary archives are always removed.
+  rechecking package existence and release identity immediately before upload.
+  Untagged held releases resume only with the same package checksum and no
+  retirement, uploading only missing archives. Tags and GitHub releases refuse
+  publication. Package checksums and served docs presence are read back; docs
+  are presence-only because rendering and tar metadata are not reproducible.
+  Temporary archives are always removed.
+- Successful read-back retains versioned package and docs archives plus
+  `SHA256SUMS` in one `release-assets` artifact. Infra tags, compares the package
+  with Hex's bytes, and creates the GitHub release from it. Consumer verification
+  downloads the GitHub release assets.
 - Publication relies on the default-branch ruleset for qualification, with only
   `contents: read` permission. It performs no qualification lookup or download.
 - Job timeouts follow infra's CI rule using the slowest durations across green

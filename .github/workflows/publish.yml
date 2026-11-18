@@ -1,7 +1,7 @@
 name: Publish to Hex
 
 # Infra dispatches on main. Its ruleset is the publication prerequisite.
-# The operator creates the tag and GitHub release after Hex read-back.
+# After Hex read-back, infra tags and creates the GitHub release from release-assets.
 on:
   workflow_dispatch:
 
@@ -72,6 +72,11 @@ jobs:
           bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"
           version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          assets="$RUNNER_TEMP/replicant-release/release-assets"
+          mkdir "$assets"
+          cp "$RUNNER_TEMP/replicant-release/package.tar" "$assets/replicant-$version.tar"
+          cp "$RUNNER_TEMP/replicant-release/docs.tar.gz" "$assets/replicant-$version-docs.tar.gz"
+          (cd "$assets" && sha256sum -- *.tar *.tar.gz > SHA256SUMS)
 
       # Run from a directory without mix.exs: from the checkout, Mix would load and
       # compile the project under the key, and Hex's modules would leave the code path.
@@ -83,6 +88,13 @@ jobs:
         run: >-
           mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" "$PACKAGE_VERSION"
           "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/docs.tar.gz"
+
+      - name: Retain verified release assets for infra
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/replicant-release/release-assets/
+          if-no-files-found: error
 
       - name: Remove built release archives
         if: always()

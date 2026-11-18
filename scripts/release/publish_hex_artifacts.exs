@@ -16,21 +16,34 @@ defmodule Replicant.PublishHexArtifacts do
 
     # A missing release alone cannot prove the package name already exists.
     existing_package!(Hex.API.Package.get("hexpm", "replicant"))
-    absent_release!(Hex.API.Release.get("hexpm", "replicant", version))
-    package_state = accepted!(Hex.API.Release.publish("hexpm", package_bytes, auth), "Hex package")
+    digest = :crypto.hash(:sha256, package_bytes) |> Base.encode16(case: :lower)
 
-    docs_state =
-      accepted!(
-        Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth),
-        "Hex docs"
-      )
+    case release_state!(Hex.API.Release.get("hexpm", "replicant", version), version, digest) do
+      :fresh ->
+        Hex.API.Release.publish("hexpm", package_bytes, auth)
+        |> accepted!("Hex package")
+        |> approved!()
 
-    if :staged in [package_state, docs_state] do
-      raise "Hex approval pending; inspect public state before any retry"
+      {:held, _docs?} ->
+        :ok
     end
 
-    digest = :crypto.hash(:sha256, package_bytes) |> Base.encode16(case: :lower)
-    checksum!(Hex.API.Release.get("hexpm", "replicant", version), digest)
+    # Re-read after the package decision: docs may have appeared in the meantime.
+    case release_state!(Hex.API.Release.get("hexpm", "replicant", version), version, digest) do
+      {:held, false} ->
+        Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth)
+        |> accepted!("Hex docs")
+        |> approved!()
+
+      {:held, true} ->
+        :ok
+
+      :fresh ->
+        raise "Hex package is not served yet; inspect public state before retrying"
+    end
+
+    read_back!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)
+    docs_present!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version))
   end
 
   def main(_argv),
@@ -44,13 +57,28 @@ defmodule Replicant.PublishHexArtifacts do
   def existing_package!(_result),
     do: raise("Hex package lookup failed; publication refused")
 
-  def absent_release!({:ok, {404, _headers, _body}}), do: :ok
+  def release_state!({:ok, {404, _headers, _body}}, _version, _digest), do: :fresh
 
-  def absent_release!({:ok, {200, _headers, _body}}),
-    do: raise("Hex already has this replicant version; publication refused")
+  def release_state!({:ok, {200, _headers, metadata}}, version, digest) do
+    case metadata do
+      %{"version" => ^version, "checksum" => ^digest, "retirement" => nil,
+        "has_docs" => docs?} when is_boolean(docs?) ->
+        if is_binary(digest) and Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) do
+          {:held, docs?}
+        else
+          raise "Hex release checksum is invalid; publication refused"
+        end
 
-  def absent_release!(_result),
-    do: raise("could not confirm the replicant version is absent; publication refused")
+      %{"retirement" => retirement} when not is_nil(retirement) ->
+        raise "Hex release is retired; publication refused"
+
+      _other ->
+        raise "Hex release identity does not match the built package; publication refused"
+    end
+  end
+
+  def release_state!(_result, _version, _digest),
+    do: raise("Hex release lookup failed; publication refused")
 
   def accepted!({:ok, {code, _headers, body}}, label) when code in 200..299 do
     IO.puts("#{label}: archive accepted")
@@ -60,10 +88,25 @@ defmodule Replicant.PublishHexArtifacts do
   def accepted!(_result, label),
     do: raise("#{label} upload failed or ambiguous; inspect public state before retrying")
 
-  def checksum!({:ok, {200, _headers, %{"checksum" => digest}}}, digest), do: :ok
+  def approved!(:published), do: :ok
 
-  def checksum!(_result, _digest),
-    do: raise("Hex checksum does not match uploaded bytes; inspect public state before retrying")
+  def approved!(:staged),
+    do: raise("Hex approval pending; inspect public state before retrying the same commit")
+
+  def read_back!(response, version, digest) do
+    case release_state!(response, version, digest) do
+      {:held, true} -> :ok
+      _other -> raise "Hex package or docs are not served; inspect public state before retrying"
+    end
+  end
+
+  # Presence only: the locked docs renderer generates random highlighting IDs,
+  # and the inspected tar retains file timestamps. A retry's docs bytes can differ.
+  # Hex follows the docs API redirect to its served archive; never replace it.
+  def docs_present!({:ok, {200, _headers, <<0x1F, 0x8B, _rest::binary>>}}), do: :ok
+
+  def docs_present!(_response),
+    do: raise("Hex docs archive is unavailable; inspect public state before retrying")
 end
 
 Replicant.PublishHexArtifacts.main(System.argv())

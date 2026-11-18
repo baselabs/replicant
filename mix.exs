@@ -89,8 +89,8 @@ defmodule Replicant.MixProject do
       main: "readme",
       # HexDocs source links resolve against the exact v#{@version} tag.
       # .github/workflows/publish.yml uploads the inspected bytes through
-      # scripts/release/publish_hex_artifacts.exs. The operator creates the tag and
-      # GitHub release after Hex read-back; never rebuild package bytes at upload.
+      # scripts/release/publish_hex_artifacts.exs. Infra creates the tag and
+      # GitHub release from release-assets after Hex read-back; never rebuild at upload.
       source_ref: "v#{@version}",
       source_url: @source_url,
       # Four extras are named README.md; without explicit filenames ex_doc emits

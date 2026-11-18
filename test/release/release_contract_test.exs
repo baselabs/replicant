@@ -13,8 +13,8 @@ defmodule Replicant.ReleaseContractTest do
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
   @previous_release "1.5.0"
-  # Coordinator replaces this only after check-building and binding the 1.5.1 bytes.
-  # Until that authorized step, the current-release binding test intentionally fails.
+  # Immutable registry digest, recorded after read-back. Held versions are compared
+  # with freshly built bytes before upload; they do not rewrite this ledger.
   @published_digest "a09c0a7b6d47dc9ca63f84267a2b668ecde72309b161fdcd239585a4ad6bc869"
 
   defp version, do: Mix.Project.config()[:version]
@@ -160,6 +160,31 @@ defmodule Replicant.ReleaseContractTest do
     assert source =~ ~s(consume_candidate.sh" "$package" "$output_dir/docs.tar.gz")
     assert source =~ ~s(chmod a-w "$package" "$output_dir/docs.tar.gz")
     refute source =~ ~r/authorization|witness|receipt/
+  end
+
+  test "publication compares the inspected package with held Hex bytes before the keyed step" do
+    source = File.read!(@builder)
+    assert_held_check!(source)
+
+    for {before, replacement} <- [
+          {"Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)", ":ok"},
+          {~s|[version, commit, archive] = System.argv()|, ":ok"},
+          {~s|' -- "$version" "$commit" "$package"|, ~s|' -- "$version" "$commit" other.tar|}
+        ] do
+      mutated = String.replace(source, before, replacement)
+      refute mutated == source
+      assert_raise ExUnit.AssertionError, fn -> assert_held_check!(mutated) end
+    end
+  end
+
+  defp assert_held_check!(source) do
+    [_build, after_inspection] = String.split(source, "consume_candidate.sh\"", parts: 2)
+    [checked, _retained] = String.split(after_inspection, "chmod a-w", parts: 2)
+    assert checked =~ ~s|if [[ "$mode" == "publish" ]]; then|
+    call = "Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)"
+    assert checked =~ call
+    assert checked =~ "[version, commit, archive] = System.argv()"
+    assert checked =~ ~s|' -- "$version" "$commit" "$package"|
   end
 
   defp candidate_arguments(script, args) do
