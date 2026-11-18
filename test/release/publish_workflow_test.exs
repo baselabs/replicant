@@ -15,7 +15,7 @@ defmodule Replicant.PublishWorkflowTest do
             ],
             " && "
           )
-  @upload ~S|mix run --no-mix-exs scripts/release/publish_hex_artifacts.exs "$PACKAGE_VERSION" "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/docs.tar.gz"|
+  @upload ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" "$PACKAGE_VERSION" "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/docs.tar.gz"|
 
   test "all workflows enforce the exact toolchain, hosted runners, and no caches" do
     paths = Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}"))
@@ -318,6 +318,38 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
+  test "the upload step runs outside the checkout, where no mix.exs exists" do
+    original = read_yaml!(@workflow)
+    assert_publish!(original)
+
+    removed =
+      update_in(
+        original,
+        ["jobs", "publish", "steps", Access.at(9)],
+        &Map.delete(&1, "working-directory")
+      )
+
+    assert_raise ExUnit.AssertionError, fn -> assert_publish!(removed) end
+
+    for directory <- [".", "${{ github.workspace }}", "scripts/release"] do
+      mutated = replace(original, ["jobs", "publish", "steps", 9, "working-directory"], directory)
+      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
+    end
+
+    relative =
+      replace(
+        original,
+        ["jobs", "publish", "steps", 9, "run"],
+        String.replace(
+          @upload,
+          ~s("$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs"),
+          "scripts/release/publish_hex_artifacts.exs"
+        )
+      )
+
+    assert_raise ExUnit.AssertionError, fn -> assert_publish!(relative) end
+  end
+
   test "publication refuses qualification lookups anywhere in the workflow" do
     original = read_yaml!(@workflow)
     assert_publish!(original)
@@ -545,6 +577,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert build["run"] =~ ~s(printf 'version=%s\\n' "$version" >> "$GITHUB_OUTPUT")
     upload = Enum.at(steps, 9)
     assert upload["run"] == @upload
+    assert upload["working-directory"] == "${{ runner.temp }}"
 
     assert upload["env"] == %{
              "PACKAGE_VERSION" => "${{ steps.archives.outputs.version }}",

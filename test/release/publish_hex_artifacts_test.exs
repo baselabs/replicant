@@ -35,6 +35,14 @@ defmodule Replicant.PublishHexArtifactsTest do
     end
   end
 
+  test "the uploader refuses to run inside a Mix project before reading anything" do
+    assert Mix.Project.get()
+
+    assert_raise RuntimeError, ~r/without a Mix project/, fn ->
+      PublishHexArtifacts.main(["0.0.0", "missing-package.tar", "missing-docs.tar.gz"])
+    end
+  end
+
   test "checksum read-back accepts only the digest of the uploaded bytes" do
     assert :ok ==
              PublishHexArtifacts.checksum!({:ok, {200, [], %{"checksum" => @digest}}}, @digest)

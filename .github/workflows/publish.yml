@@ -73,12 +73,15 @@ jobs:
           version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
+      # Run from a directory without mix.exs: from the checkout, Mix would load and
+      # compile the project under the key, and Hex's modules would leave the code path.
       - name: Upload the inspected archives
+        working-directory: ${{ runner.temp }}
         env:
           PACKAGE_VERSION: ${{ steps.archives.outputs.version }}
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
         run: >-
-          mix run --no-mix-exs scripts/release/publish_hex_artifacts.exs "$PACKAGE_VERSION"
+          mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" "$PACKAGE_VERSION"
           "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/docs.tar.gz"
 
       - name: Remove built release archives

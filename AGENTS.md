@@ -132,9 +132,11 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   consumer starts without a lock and runs both audits on its new resolution; projects with
   committed locks fetch with `--check-locked`.
   Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
-  it: `mix run --no-mix-exs scripts/release/publish_hex_artifacts.exs` reads the two inspected
-  archive paths, rechecks package existence and version absence, and uses Hex's APIs to upload
-  those bytes and verify the package checksum. It loads no project code and builds nothing.
+  it: `mix run --no-mix-exs`, run from the runner's temporary directory where no `mix.exs`
+  exists, runs `scripts/release/publish_hex_artifacts.exs`. The script refuses to run inside a
+  Mix project, reads the two inspected archive paths, rechecks package existence and version
+  absence, and uses Hex's APIs to upload those bytes and verify the package checksum. It loads
+  no project code and builds nothing.
   Archives are removed even on failure. After Hex read-back and successful docs upload, infra
   creates the `v<version>` tag at that full source SHA and the GitHub release. It records the
   verified package digest in `scripts/release/published_packages.sha256` through normal landing.

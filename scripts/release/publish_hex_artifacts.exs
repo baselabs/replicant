@@ -4,6 +4,8 @@ defmodule Replicant.PublishHexArtifacts do
   @moduledoc false
 
   def main([version, archive, docs]) do
+    if Mix.Project.get(), do: raise("publication must run without a Mix project")
+
     # Read both files before uploading anything. The keyless build inspected these paths.
     package_bytes = File.read!(archive)
     docs_bytes = File.read!(docs)

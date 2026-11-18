@@ -129,10 +129,12 @@ both audits on that resolution, compiles, and exercises the public API.
 Documentation builds with warnings as errors before any upload. Its archive is
 inspected alongside the package archive.
 
-The single credentialed step runs `mix run --no-mix-exs` with those two inspected
-file paths. Its standalone script uses only Hex's APIs and file reads: it loads no
-project code, fetches no dependencies, and rebuilds nothing. Immediately before
-uploading, it rechecks that the package name exists and the version is absent.
+The single credentialed step runs `mix run --no-mix-exs` from the runner's temporary
+directory, which holds no `mix.exs`, with those two inspected file paths. Its
+standalone script uses only Hex's APIs and file reads: it refuses to run inside a
+Mix project, loads no project code, fetches no dependencies, and rebuilds nothing.
+Immediately before uploading, it rechecks that the package name exists and the
+version is absent.
 It uploads the exact inspected files, then verifies Hex's package checksum.
 Temporary archives are removed even after failure. After Hex read-back and
 successful docs upload, infra creates the `v<version>` tag at that full source SHA
