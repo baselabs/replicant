@@ -151,6 +151,26 @@ defmodule Replicant.IncrementalSnapshotTest do
     if PG16.enabled?() do
       setup_int_table(ctrl, "inc_orders", "inc_pub", 5_000)
 
+      failed = attach_snapshot_failed(slot)
+      fault = {__MODULE__, :resume_fault, make_ref()}
+      chunks = :atomics.new(1, [])
+
+      :telemetry.attach(
+        fault,
+        [:replicant, :snapshot, :chunk_completed],
+        fn _event, _measurements, metadata, _config ->
+          if metadata.table == "public.inc_orders" and :atomics.add_get(chunks, 1, 1) == 10 do
+            IncrementalSnapshotSink.set_fail_next_chunk(true)
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn ->
+        detach(fault)
+        detach(failed)
+      end)
+
       start_incremental(slot, "inc_pub", chunk_rows: 200, max_pending_chunks: 2)
 
       # A concurrent writer for the whole backfill (started AFTER the pipeline is streaming,
@@ -160,17 +180,13 @@ defmodule Replicant.IncrementalSnapshotTest do
       # streamed value) + INSERT ids 5001..5200. This is what makes the drop-set RED-able.
       {writer, go} = start_writer(fn w, n -> write_orders(w, n, "inc_orders", 5_000) end)
 
-      # Arm the fault after ~10 chunk ledger entries → the NEXT chunk halts fail-closed.
-      wait_chunks(10, 4_000)
-      failed = attach_snapshot_failed(slot)
-      IncrementalSnapshotSink.set_fail_next_chunk(true)
-
-      # Halt occurred: the snapshot :failed telemetry fired AND the pipeline tore down. Generous
-      # timeout: the fault lands on the NEXT chunk, but under full-suite load on the shared PG16 the
-      # applier can be starved (the documented "TIMEOUT ≠ logic bug" trap) — 30s absorbs that jitter.
+      # The synchronous tenth-chunk event armed the fault before the next callback.
+      # Polling the ledger first could let a fast backfill finish before fault injection.
       assert_receive {:snapshot_failed, _reason}, 30_000
+      detach(fault)
       detach(failed)
       PG16.wait_until(fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end, 800)
+      assert chunk_count() == 10
 
       # Progress token is non-nil and NOT complete at the halt (backfill is genuinely partial).
       assert {:ok, token} = IncrementalSnapshotSink.snapshot_progress()

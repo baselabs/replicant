@@ -112,7 +112,10 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
     test "#{inspect(mode)} pglogical #{label} row filters match snapshot and stream", ctx do
       Postgrex.query!(
         ctx.db,
-        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'before' FROM generate_series(2,6) i",
+        """
+        INSERT INTO #{ctx.table}
+        SELECT i, 'test-only-secret', 'before' FROM generate_series(2,6) i
+        """,
         []
       )
 
@@ -145,7 +148,10 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
 
       Postgrex.query!(
         ctx.db,
-        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'after' FROM generate_series(7,12) i",
+        """
+        INSERT INTO #{ctx.table}
+        SELECT i, 'test-only-secret', 'after' FROM generate_series(7,12) i
+        """,
         []
       )
 
@@ -157,7 +163,8 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
 
   for mode <- [true, [mode: :incremental, chunk_rows: 1]] do
     @mode mode
-    test "#{inspect(mode)} ignores predicates from sets that do not replicate INSERT", ctx do
+    test "#{inspect(mode)} pglogical applies every set predicate when any set enables INSERT",
+         ctx do
       [a, b] = ctx.sets
 
       Postgrex.query!(
@@ -166,7 +173,8 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
         [a]
       )
 
-      for {set, filter} <- [{a, "id % 2 = 1"}, {b, "id % 2 = 0"}] do
+      # pglogical 2.4.8 collects every selected set's predicate, including set a's.
+      for {set, filter} <- [{a, "id % 3 = 0"}, {b, "id % 2 = 0"}] do
         Postgrex.query!(
           ctx.db,
           """
@@ -180,7 +188,10 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
 
       Postgrex.query!(
         ctx.db,
-        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'before' FROM generate_series(2,4) i",
+        """
+        INSERT INTO #{ctx.table}
+        SELECT i, 'test-only-secret', 'before' FROM generate_series(2,6) i
+        """,
         []
       )
 
@@ -197,17 +208,20 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
       wait_snapshot()
 
       assert Enum.sort(Enum.map(SnapshotRecordingSink.recorded().snapshot, & &1.record["id"])) ==
-               [2, 4]
+               [6]
 
       Postgrex.query!(
         ctx.db,
-        "INSERT INTO #{ctx.table} SELECT i, 'test-only-secret', 'after' FROM generate_series(5,8) i",
+        """
+        INSERT INTO #{ctx.table}
+        SELECT i, 'test-only-secret', 'after' FROM generate_series(7,12) i
+        """,
         []
       )
 
       PG16.wait_until(fn -> SnapshotRecordingSink.recorded().txns != [] end)
       ids = for txn <- SnapshotRecordingSink.recorded().txns, c <- txn.changes, do: c.record["id"]
-      assert Enum.sort(ids) == [6, 8]
+      assert Enum.sort(ids) == [12]
     end
   end
 

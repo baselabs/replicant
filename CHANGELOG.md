@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Plugin snapshot tests bind table names as text before PostgreSQL resolves their
   relation OIDs. Idle snapshot assertions allow the documented first keepalive;
   skipped targets and the standalone Hex script compile without test warnings.
+- The mixed-INSERT pglogical snapshot test matches the plugin's all-set predicates,
+  and resume fault injection runs synchronously after ten chunks so a fast backfill
+  cannot finish before the test arms its fault.
 - GitHub release identity reads use `gh api` with the keyless calling step's
   read-only job token. Only a definitive HTTP 404 proves absence; other errors
   fail closed without printing response values.
