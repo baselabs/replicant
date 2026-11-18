@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Publication relies on the default-branch ruleset for qualification, with only
   `contents: read` permission. It performs no qualification lookup or download.
 - Job timeouts follow infra's CI rule using the slowest durations across green
-  runs 44200086214, 44220063612, and 44222373059. Publish uses the unmeasured
-  limit until it has its own green run.
+  runs 44200086214, 44220063612, 44222373059, and 44265557928. Publish uses
+  the unmeasured limit until it has its own green run.
 - Projects with committed locks fetch with `--check-locked`. The generated
   external consumer has no borrowed lock, resolves fresh, and runs both audits.
   The reference example's committed lock receives both audits as well.

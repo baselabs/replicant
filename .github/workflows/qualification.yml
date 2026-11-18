@@ -267,7 +267,7 @@ jobs:
   reference-example:
     name: Reference example (docker)
     runs-on: ubuntu-24.04
-    timeout-minutes: 7 # Green run 44220063612: reference-example 3m20s
+    timeout-minutes: 8 # Green run 44265557928: reference-example 3m33s
     defaults:
       run:
         working-directory: examples/replication_pipeline
