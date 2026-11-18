@@ -34,6 +34,26 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
+  test "test output pipelines cannot turn failed tests into a successful integration job" do
+    original = read_yaml!(@qualification)
+    tools = File.read!(@tools)
+    assert_workflow!(original, tools)
+
+    pipelines =
+      for {name, job} <- original["jobs"],
+          {step, index} <- Enum.with_index(job["steps"]),
+          (step["run"] || "") =~ ~r/\|\s*tee\b/,
+          do: {name, index}
+
+    assert pipelines != []
+
+    for {name, index} <- pipelines,
+        shell <- [nil, "sh", "bash {0}"] do
+      mutated = replace(original, ["jobs", name, "steps", index, "shell"], shell)
+      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+    end
+  end
+
   test "GitHub caller steps alone receive the job token and require read permission" do
     for path <- [@workflow, @qualification] do
       original = read_yaml!(path)
@@ -520,6 +540,12 @@ defmodule Replicant.PublishWorkflowTest do
 
     for {_name, job} <- workflow["jobs"], do: assert_job_host!(job)
     for {_name, job} <- workflow["jobs"], do: assert_runtime_steps!(job)
+
+    for {_name, job} <- workflow["jobs"],
+        step <- job["steps"] || [],
+        (step["run"] || "") =~ ~r/\|\s*tee\b/,
+        do: assert(step["shell"] == "bash")
+
     for map <- maps, do: assert_action_pins!(map)
   end
 

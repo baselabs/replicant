@@ -110,10 +110,16 @@ defmodule Replicant.PackageIdentity do
   end
 
   defp held_release(body, version, digest) do
+    # OTP's JSON decoder uses :null; Hex's Erlang API uses nil in the uploader.
     with {:ok, metadata} <- decode_json(Enum.join(body, "\n"), "Hex release") do
       case metadata do
-        %{"version" => ^version, "checksum" => checksum, "retirement" => nil,
-          "has_docs" => docs?} when is_binary(checksum) and is_boolean(docs?) ->
+        %{
+          "version" => ^version,
+          "checksum" => checksum,
+          "retirement" => :null,
+          "has_docs" => docs?
+        }
+        when is_binary(checksum) and is_boolean(docs?) ->
           cond do
             not Regex.match?(~r/\A[0-9a-f]{64}\z/, checksum) ->
               {:error, "Hex release checksum is invalid"}
@@ -125,7 +131,7 @@ defmodule Replicant.PackageIdentity do
               {:ok, {:held, docs?}}
           end
 
-        %{"retirement" => retirement} when not is_nil(retirement) ->
+        %{"retirement" => retirement} when retirement != :null ->
           {:error, "Hex release is retired; publication refused"}
 
         _other ->
@@ -351,7 +357,7 @@ defmodule Replicant.PackageIdentity do
         metadata["checksum"] != published_digest ->
           {:error, "Hex release checksum does not match the tracked published digest"}
 
-        Map.fetch(metadata, "retirement") != {:ok, nil} ->
+        Map.fetch(metadata, "retirement") != {:ok, :null} ->
           {:error, "Hex release is retired or retirement metadata is unavailable"}
 
         metadata["has_docs"] != true ->

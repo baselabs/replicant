@@ -208,8 +208,9 @@ jobs:
         # live-server test. Grepping for THIS row's major proves the row actually exercised the
         # integration suite against the version it claims — a skipped or mis-wired row (which
         # would print nothing, or a different major) reds here rather than passing vacuously.
-        # (pipefail is on in the default Actions bash shell, so a `mix test` failure still fails
-        # the step before the grep.)
+        # Explicit bash enables -eo pipefail; the implicit Linux shell only uses -e
+        # and would let tee hide test failures before the receipt grep.
+        shell: bash
         run: |
           mix test --warnings-as-errors 2>&1 | tee test-output.log
           # No `^` anchor: ExUnit prints inline progress dots with no trailing newline, so the

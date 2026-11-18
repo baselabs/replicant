@@ -61,8 +61,13 @@ defmodule Replicant.PublishHexArtifacts do
 
   def release_state!({:ok, {200, _headers, metadata}}, version, digest) do
     case metadata do
-      %{"version" => ^version, "checksum" => ^digest, "retirement" => nil,
-        "has_docs" => docs?} when is_boolean(docs?) ->
+      %{
+        "version" => ^version,
+        "checksum" => ^digest,
+        "retirement" => nil,
+        "has_docs" => docs?
+      }
+      when is_boolean(docs?) ->
         if is_binary(digest) and Regex.match?(~r/\A[0-9a-f]{64}\z/, digest) do
           {:held, docs?}
         else

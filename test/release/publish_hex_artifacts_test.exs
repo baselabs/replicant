@@ -125,6 +125,7 @@ defmodule Replicant.PublishHexArtifactsTest do
     end)
 
     assert :ok == PublishHexArtifacts.approved!(:published)
+
     assert_raise RuntimeError, ~r/approval pending/, fn ->
       PublishHexArtifacts.approved!(:staged)
     end
