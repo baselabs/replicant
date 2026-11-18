@@ -98,8 +98,8 @@ above on their own machines first.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
 
-The timeout rule in `qualification.yml` is twice the measured green duration, rounded up to
-whole minutes with a two-minute floor for short jobs; each comment names the run and duration.
+Timeouts follow infra's CI requirements linked below. Comments name each job's slowest
+measured green run and duration; publishing uses the unmeasured limit until its own first run.
 All runtime installers use `.tool-versions` with strict selection and immediately refuse any
 Elixir, full OTP patch, or Elixir OTP build-suffix mismatch. The example Dockerfile documents
 why its immutable container toolchain is pinned separately.
@@ -121,22 +121,24 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
-- For the release operator: an owner (`corepay` or `palermo-git`, including the triggering
-  actor on reruns) dispatches `.github/workflows/publish.yml` on `main` after the version
-  commit lands and its `qualified` run is green, with no inputs. The workflow reads the
-  package authorization artifact from that exact commit's successful `ci.yml` push run
-  on `kci/<commit>` and verifies its `qualified` verdict. It mints from clean, exact live
-  `origin/main`, proves two package builds byte-identical, and refuses if its minted
-  version and digest differ from the recorded authorization.
-  It uploads the witnessed package bytes, reads back Hex's checksum, and uploads docs from
-  the witnessed commit. The release operator creates the `publish` environment with its
-  `HEX_API_KEY` secret; only the publish step receives it. No workstation publish path exists.
-  After Hex read-back and successful docs upload, the operator creates and pushes only the
-  `v<version>` tag at that full source SHA, then runs
-  `gh release create vX.Y.Z --verify-tag --target <full sha>`. Record the verified package
-  digest in `scripts/release/published_packages.sha256` through the normal landing process.
+- For the release operator: after the version commit lands on `main`, infra asks an owner
+  (`corepay` or `palermo-git`, including the triggering actor on reruns) to dispatch
+  `.github/workflows/publish.yml` on `main` with no inputs. The default-branch ruleset is the
+  qualification guarantee; publication performs no qualification lookup or artifact download.
+  An early anonymous Hex read refuses a missing `replicant` package name: a first publication
+  is the owner's decision. Lookup errors fail closed. Keyless steps build the package twice
+  from the exact live `origin/main` commit, compare and inspect its bytes, audit and consume
+  it, build docs with warnings as errors, and inspect the docs archive. The fresh generated
+  consumer starts without a lock and runs both audits on its new resolution; projects with
+  committed locks fetch with `--check-locked`.
+  Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
+  it: `mix run --no-mix-exs scripts/release/publish_hex_artifacts.exs` reads the two inspected
+  archive paths, rechecks package existence and version absence, and uses Hex's APIs to upload
+  those bytes and verify the package checksum. It loads no project code and builds nothing.
+  Archives are removed even on failure. After Hex read-back and successful docs upload, infra
+  creates the `v<version>` tag at that full source SHA and the GitHub release. It records the
+  verified package digest in `scripts/release/published_packages.sha256` through normal landing.
   A release is finished only when its tag, Hex package and docs, and GitHub release all exist.
-  Partial publication fails the package check on subsequent landing candidates.
 
 ## CI/CD and releases
 

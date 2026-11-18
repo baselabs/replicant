@@ -88,8 +88,8 @@ defmodule Replicant.MixProject do
       # guarantees, compatibility. The `Replicant` module page carries the API.
       main: "readme",
       # HexDocs source links resolve against the exact v#{@version} tag.
-      # .github/workflows/publish.yml uploads the witnessed bytes through
-      # scripts/release/upload_candidate.exs. The operator creates the tag and
+      # .github/workflows/publish.yml uploads the inspected bytes through
+      # scripts/release/publish_hex_artifacts.exs. The operator creates the tag and
       # GitHub release after Hex read-back; never rebuild package bytes at upload.
       source_ref: "v#{@version}",
       source_url: @source_url,

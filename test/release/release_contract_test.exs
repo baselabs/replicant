@@ -9,7 +9,6 @@ defmodule Replicant.ReleaseContractTest do
   @mixfile Path.expand("../../mix.exs", __DIR__)
   @workflow Path.expand("../../.github/workflows/qualification.yml", __DIR__)
   @builder Path.expand("../../scripts/release/build_candidate.sh", __DIR__)
-  @uploader Path.expand("../../scripts/release/upload_candidate.exs", __DIR__)
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
@@ -99,11 +98,11 @@ defmodule Replicant.ReleaseContractTest do
            "docs source_ref must be v#{version()} so HexDocs source links resolve to the release tag"
   end
 
-  test "shipped release guidance preserves the witnessed package bytes" do
+  test "shipped release guidance preserves the inspected package bytes" do
     body = File.read!(@mixfile)
 
     refute body =~ "mix hex.publish"
-    assert body =~ "scripts/release/upload_candidate.exs"
+    assert body =~ "scripts/release/publish_hex_artifacts.exs"
     assert body =~ ".github/workflows/publish.yml"
     assert body =~ "after Hex read-back"
   end
@@ -118,18 +117,14 @@ defmodule Replicant.ReleaseContractTest do
     end
   end
 
-  test "post-release package checks fetch tags without weakening mint identity" do
+  test "post-release package checks keep the published identity and clean main guards" do
     workflow = File.read!(@workflow)
     builder = File.read!(@builder)
-    uploader = File.read!(@uploader)
     [_, release_job] = String.split(workflow, "  release-artifact:", parts: 2)
 
     assert release_job =~ "fetch-depth: 0"
-    assert builder =~ "--published-check"
-    assert uploader =~ "Replicant.PackageIdentity.check_candidate(version)"
-
-    assert uploader =~
-             "Replicant.PackageIdentity.check_build(version, source_commit, published_digest)"
+    assert builder =~ "Replicant.PackageIdentity.verify_publish!"
+    assert builder =~ "Replicant.PackageIdentity.verify_build!"
   end
 
   test "published package digest manifest binds the current release bytes" do
@@ -139,78 +134,32 @@ defmodule Replicant.ReleaseContractTest do
              "#{@published_digest}  replicant-#{version()}.tar"
   end
 
-  test "publish authorization tests never write retained package evidence" do
-    source = File.read!(Path.expand("publish_workflow_test.exs", __DIR__))
-
-    refute source =~
-             ~r/Path\.join\(\[@repo_root,\s*"\.kimosabe",\s*"artifacts"/
-  end
-
-  test "candidate arguments accept an authorization path with or without check mode" do
+  test "candidate accepts only check mode or one output directory" do
     [_, parser] = Regex.run(~r/(usage\(\).*?)\nlog\(\)/s, File.read!(@builder))
-    script = parser <> ~S(printf '%s\n%s\n' "$mode" "$authorization_out")
+    script = parser <> ~S(printf '%s\n%s\n' "$mode" "$output_dir")
 
     for {args, expected} <- [
-          {[], "mint\n\n"},
-          {["--check"], "check\n\n"},
-          {["--authorization-out", "record path.txt"], "mint\nrecord path.txt\n"},
-          {["--check", "--authorization-out", "record.txt"], "check\nrecord.txt\n"},
-          {["--authorization-out", "record.txt", "--check"], "check\nrecord.txt\n"}
+          {["--check"], "check\n--check\n"},
+          {["output path"], "publish\noutput path\n"}
         ] do
       assert {expected, 0} == candidate_arguments(script, args)
     end
-  end
 
-  test "candidate arguments refuse missing paths, duplicates, and unknown options" do
-    [_, parser] = Regex.run(~r/(usage\(\).*?)\nlog\(\)/s, File.read!(@builder))
-
-    for args <- [
-          ["--authorization-out"],
-          ["--authorization-out", ""],
-          ["--authorization-out", "--check"],
-          ["--check", "--check"],
-          ["--authorization-out", "one", "--authorization-out", "two"],
-          ["--unknown"],
-          ["--check", "other"]
-        ] do
+    for args <- [[], [""], ["--unknown"], ["--check", "other"], ["one", "two"]] do
       {output, status} = candidate_arguments(parser, args)
       assert status == 2
-      assert output =~ "usage: build_candidate.sh [--check] [--authorization-out <path>]"
+      assert output =~ "usage: build_candidate.sh --check | <output-directory>"
     end
   end
 
-  test "candidate writes exactly three authorization lines atomically after passing" do
-    builder = File.read!(@builder)
-    start = ~s(if [[ -n "$authorization_out" ]]; then\n)
-    [before_write, after_write] = String.split(builder, start, parts: 2)
-    assert before_write =~ "CHECK PASS"
-    assert before_write =~ "MINT PASS"
-    assert before_write =~ ~s(rm -f -- "$authorization_tmp")
-    [writer, _rest] = String.split(after_write, "\nmint_complete=1", parts: 2)
-    assert writer =~ ~s(mktemp "${authorization_out}.XXXXXX")
-    assert writer =~ ~s(mv -- "$authorization_tmp" "$authorization_out")
-    root = Path.join(System.tmp_dir!(), "replicant-record-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf!(root) end)
-    File.mkdir_p!(root)
-    path = Path.join(root, "authorization record.txt")
-    File.write!(path, "stale record\n")
-    commit = String.duplicate("a", 40)
-    digest = String.duplicate("b", 64)
-
-    {_output, status} =
-      System.cmd("bash", ["--noprofile", "--norc", "-euo", "pipefail", "-c", start <> writer],
-        env: [
-          {"authorization_out", path},
-          {"commit", commit},
-          {"version", "1.2.0"},
-          {"digest", digest}
-        ],
-        stderr_to_stdout: true
-      )
-
-    assert status == 0
-    assert File.read!(path) == "commit: #{commit}\nversion: 1.2.0\nsha256: #{digest}\n"
-    assert File.ls!(root) == ["authorization record.txt"]
+  test "candidate builds and inspects the same two paths the workflow uploads" do
+    source = File.read!(@builder)
+    assert source =~ ~s(package="$output_dir/package.tar")
+    assert source =~ ~s(cmp -s "$package" "$rebuild_tree/package.tar")
+    assert source =~ ~s(verify_package.sh" "$package")
+    assert source =~ ~s(consume_candidate.sh" "$package" "$output_dir/docs.tar.gz")
+    assert source =~ ~s(chmod a-w "$package" "$output_dir/docs.tar.gz")
+    refute source =~ ~r/authorization|witness|receipt/
   end
 
   defp candidate_arguments(script, args) do

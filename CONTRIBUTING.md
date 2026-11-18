@@ -85,9 +85,9 @@ and `main` moves only on its `qualified` check.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
 has a new cache scope, and a cache written on `main` would be restorable by candidates.
 
-Workflow timeouts follow the measured rule in `qualification.yml`: twice the
-green job duration, rounded up to whole minutes, with a two-minute floor for
-short jobs. Comments name the run and duration; publishing mirrors the package job.
+Workflow timeouts follow infra's rule in the linked CI requirements. Each comment
+names its slowest measured green run and duration; an unmeasured publish job uses
+the unmeasured limit until its own first green run.
 Every runtime installer reads `.tool-versions` with strict selection and immediately
 refuses a differing Elixir version, full OTP patch version, or Elixir OTP build suffix.
 The example Dockerfile explains its separately pinned container toolchain.
@@ -107,32 +107,36 @@ on GitHub-hosted Ubuntu 24.04 with the exact `.tool-versions` runtime. Qualifica
 and publishing pin the same Hex version because Hex records its version in package
 metadata. No workstation publish command or credential-file loader remains.
 
-After the version commit has landed on `main` and its `qualified` run is green, an
-owner (`corepay` or `palermo-git`) dispatches **Publish to Hex** on `main` with no
-inputs. The job reads the package authorization artifact that **docs and package**
-recorded for that exact commit's successful `ci.yml` push run on `kci/<commit>`.
-It verifies the run's `qualified` job succeeded and refuses missing, malformed,
-or conflicting records. Only the successful landing run can authorize publishing.
-The owner must also be the triggering actor on a rerun. The release operator
-creates the GitHub `publish` environment and its `HEX_API_KEY` secret. That secret
-is available only to the publish step, never the candidate build or inspection.
-The qualified-run reader, candidate mint, and upload steps each receive the job
-token through `GH_TOKEN` for their GitHub reads. Tokens never go in command
-arguments, logs, or files.
+After the version commit lands on `main`, infra asks an owner (`corepay` or
+`palermo-git`) to dispatch **Publish to Hex** on `main` with no inputs. The default
+branch ruleset guarantees qualification; publishing makes no run lookup or
+artifact download. The owner must also be the triggering actor on a rerun.
+Infra declares the GitHub `publish` environment and its `HEX_API_KEY` secret.
+Only the archive upload step receives that secret.
 
-The workflow checks out the dispatched SHA without persisted Git credentials.
-Minting requires a clean tree at live `origin/main` and a free version namespace.
-Both check and mint build from `git archive`, compare two isolated builds byte for
-byte, audit and consume the package, and create a receipt and immutable Git witness.
-The recorded version and SHA-256 must equal the minted candidate before either upload.
-The receipt, copies, and witness ref stay in the runner workspace; uploaders verify
-them locally, and the read-only repository permission never pushes the witness.
+An early anonymous Hex lookup refuses a package name that does not already exist:
+a first publication of `replicant` is the owner's decision. All lookup errors fail
+closed. The workflow checks out the dispatched SHA without persisted credentials.
+Building requires a clean checkout of live `origin/main` and refuses an existing
+version, Git tag, or GitHub release. Only the keyless build step receives the job
+token through `GH_TOKEN` for GitHub reads; tokens never enter arguments or files.
 
-The package uploader sends exactly the witnessed bytes without rebuilding and
-reads back Hex's public checksum. The docs uploader verifies the same witness and
-builds docs from its source commit with locked dependencies. After Hex read-back
-and successful docs upload, the operator creates and pushes only the `v<version>`
-tag at the witnessed full SHA, then creates the GitHub release:
+Both qualification and publication build the package twice from `git archive`
+and compare its bytes, inspect the exact package manifest and Hex checksum, then
+audit and compile its extracted source using the committed producer lock.
+The generated external consumer starts without a lock and resolves fresh, runs
+both audits on that resolution, compiles, and exercises the public API.
+Documentation builds with warnings as errors before any upload. Its archive is
+inspected alongside the package archive.
+
+The single credentialed step runs `mix run --no-mix-exs` with those two inspected
+file paths. Its standalone script uses only Hex's APIs and file reads: it loads no
+project code, fetches no dependencies, and rebuilds nothing. Immediately before
+uploading, it rechecks that the package name exists and the version is absent.
+It uploads the exact inspected files, then verifies Hex's package checksum.
+Temporary archives are removed even after failure. After Hex read-back and
+successful docs upload, infra creates the `v<version>` tag at that full source SHA
+and the GitHub release:
 
 ```bash
 gh release create vX.Y.Z --verify-tag --target <full sha>
@@ -142,7 +146,7 @@ Record the verified package digest in `scripts/release/published_packages.sha256
 through the normal landing process. All four release identities (tag, Hex package,
 HexDocs, GitHub release) and the ledger must agree for subsequent package checks.
 An interrupted or ambiguous upload requires the operator to inspect public state
-before retrying; a partially published version is refused by a fresh mint.
+before retrying; a partially published version is refused by a new publication attempt.
 
 Agents never release, deploy, publish, tag, create a GitHub release, dispatch the
 publish workflow, or handle publish credentials. Their work ends at the commit on

@@ -27,7 +27,7 @@ jobs:
     if: always()
     needs: [qualification]
     runs-on: ubuntu-24.04
-    timeout-minutes: 2 # Green run 44200086214: qualified 0m06s
+    timeout-minutes: 5 # Green run 44200086214: qualified 0m06s
     steps:
       - name: Require every qualification job to succeed
         env:

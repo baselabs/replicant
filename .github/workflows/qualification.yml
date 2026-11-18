@@ -7,7 +7,7 @@ name: Qualification
 # identity lookups through gh api; it receives no repository or environment secret.
 # Jobs fetch dependencies, build, and generate Dialyzer PLTs without Actions caches.
 # Timeout rule for all workflows: 2x the measured green duration, rounded up to
-# whole minutes, with a 2-minute floor for short jobs. Each limit cites its measurement.
+# whole minutes; jobs measured under 2.5 minutes get 5. See infra baselabs/docs/ci.md.
 on:
   workflow_call:
 
@@ -23,7 +23,7 @@ jobs:
   static:
     name: static (format, credo, compile, audit, dialyzer)
     runs-on: ubuntu-24.04
-    timeout-minutes: 5 # Green run 44200086214: static 2m28s
+    timeout-minutes: 7 # Green run 44220063612: static 3m15s
     env:
       MIX_ENV: test
     steps:
@@ -54,7 +54,7 @@ jobs:
   test:
     name: test (PG${{ matrix.pg.major }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 8 # Green run 44200086214: test PG12 (slowest matrix row) 3m59s
+    timeout-minutes: 9 # Green run 44222373059: test PG12 (slowest matrix row) 4m23s
     strategy:
       fail-fast: false
       # R05 supported-version matrix: PostgreSQL 9.6, 12, 15, 16, 17, 18. The 15-18
@@ -221,7 +221,7 @@ jobs:
   release-artifact:
     name: docs and package
     runs-on: ubuntu-24.04
-    timeout-minutes: 4 # Green run 44200086214: release-artifact 1m43s
+    timeout-minutes: 5 # Green run 44222373059: release-artifact 1m57s
     permissions:
       contents: read
     env:
@@ -250,25 +250,13 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
 
-      # Build throwaway bytes from the exact commit and run the complete package workflow without
-      # retaining a candidate: exact manifest, Hex validation, artifact-derived audit/compile/docs,
-      # fresh-consumer provenance + semantic smoke, immutable witness, free-or-coherent published
-      # identity checks, and
-      # exact-byte uploader dry-run without a publish credential. GitHub release
-      # lookups use only this step's read-only job token. The real candidate is minted once, from merged
-      # main, after this review set and all matrix rows settle. Record the exact
-      # commit, version, and digest for the owner-dispatched publisher to read.
-      - name: Prove the complete package workflow without minting a candidate
+      # Build twice from the exact commit, inspect and consume the package, build
+      # docs with warnings as errors, and inspect their archive before any upload.
+      # GitHub identity reads receive only this step's read-only job token.
+      - name: Prove both release archives without retaining them
         env:
           GH_TOKEN: ${{ github.token }}
-        run: BUILD_DATE=ci bash scripts/release/build_candidate.sh --check --authorization-out "$RUNNER_TEMP/package-authorization.txt"
-
-      - name: Record the qualified package authorization
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: package-authorization
-          path: ${{ runner.temp }}/package-authorization.txt
-          if-no-files-found: error
+        run: bash scripts/release/build_candidate.sh --check
 
   # The REFERENCE EXAMPLE (examples/replication_pipeline): a docker stack
   # (source PG → replicant release container → destination PG) that is the
@@ -279,7 +267,7 @@ jobs:
   reference-example:
     name: Reference example (docker)
     runs-on: ubuntu-24.04
-    timeout-minutes: 7 # Green run 44200086214: reference-example 3m14s
+    timeout-minutes: 7 # Green run 44220063612: reference-example 3m20s
     defaults:
       run:
         working-directory: examples/replication_pipeline

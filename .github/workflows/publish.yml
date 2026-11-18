@@ -1,10 +1,7 @@
 name: Publish to Hex
 
-# An owner dispatches this on main after the version commit has landed and its
-# qualified run is green. Dispatch says yes to publishing what main qualified;
-# the workflow reads that exact commit's recorded digest without manual input.
-# The v<version> tag and GitHub release follow the Hex read-back and belong to the
-# release operator. This workflow never pushes refs or creates releases.
+# Infra dispatches on main. Its ruleset is the publication prerequisite.
+# The operator creates the tag and GitHub release after Hex read-back.
 on:
   workflow_dispatch:
 
@@ -12,7 +9,6 @@ permissions:
   contents: read
 
 env:
-  # Hex records its version in package metadata, so check and mint must match.
   HEX_VERSION: "2.7.0"
 
 concurrency:
@@ -25,14 +21,29 @@ jobs:
     if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
     environment: publish
     runs-on: ubuntu-24.04
-    # Uses the timeout rule in qualification.yml; publishing has never run.
-    timeout-minutes: 4 # Green run 44200086214: release-artifact 1m43s; mirrors its package build and inspection
+    timeout-minutes: 90 # no green run yet
     permissions:
       contents: read
-      actions: read
     steps:
       - name: Require a dispatch on main
         run: test "$GITHUB_REF" = refs/heads/main
+
+      - name: Refuse a first publication
+        run: |
+          status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
+            --output /dev/null --write-out '%{http_code}' https://hex.pm/api/packages/replicant)" || {
+            echo "::error::Could not read the Hex package; publication refused"
+            exit 1
+          }
+          case "$status" in
+            200) ;;
+            404)
+              echo "::error::The name replicant is not on Hex; a first publication is the owner's decision"
+              exit 1 ;;
+            *)
+              echo "::error::Hex package lookup failed; publication refused"
+              exit 1 ;;
+          esac
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,81 +64,23 @@ jobs:
       - run: mix local.rebar --force
       - run: mix deps.get --check-locked
 
-      - name: Read the authorization recorded by the qualified run
-        id: qualified
+      - name: Build and inspect the package and docs archives
+        id: archives
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          SOURCE_SHA: ${{ github.sha }}
         run: |
-          die() { echo "::error::publish: $*" >&2; exit 1; }
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die "invalid source commit"
+          bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"
           version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
-          [[ -n "$version" ]] || die "could not read package version"
-          records="$(mktemp -d "$RUNNER_TEMP/qualified-authorization.XXXXXX")"
-          trap 'rm -rf -- "$records"' EXIT
-          runs="$(gh api --method GET --paginate "repos/$GH_REPO/actions/workflows/ci.yml/runs" \
-            -f head_sha="$SOURCE_SHA" -f event=push -f status=success -f per_page=100)" \
-            || die "could not read qualification runs"
-          run_ids="$(jq -r --arg sha "$SOURCE_SHA" '.workflow_runs[] |
-            select(.head_sha == $sha and .head_branch == ("kci/" + $sha) and
-              .event == "push" and .conclusion == "success") | .id' <<< "$runs")" \
-            || die "could not select qualification runs"
-          authorization=""
-          while IFS= read -r run_id; do
-            [[ -n "$run_id" ]] || continue
-            [[ "$run_id" =~ ^[0-9]+$ ]] || die "invalid qualification run id"
-            jobs="$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100")" \
-              || die "could not read qualification jobs"
-            qualified="$(jq -s '[.[].jobs[] | select(.name == "qualified")] |
-              length == 1 and all(.[]; .conclusion == "success")' <<< "$jobs")" \
-              || die "could not inspect the qualified verdict"
-            [[ "$qualified" == "true" ]] || continue
-            directory="$(mktemp -d "$records/run-$run_id.XXXXXX")"
-            gh run download "$run_id" -n package-authorization -D "$directory" \
-              || die "qualified run has no downloadable package authorization"
-            record="$directory/package-authorization.txt"
-            [[ -f "$record" && ! -L "$record" ]] || die "package authorization record is missing"
-            commit="$(sed -n 's/^commit: //p' "$record")"
-            record_version="$(sed -n 's/^version: //p' "$record")"
-            digest="$(sed -n 's/^sha256: //p' "$record")"
-            [[ "$commit" == "$SOURCE_SHA" && "$record_version" == "$version" &&
-              "$digest" =~ ^[0-9a-f]{64}$ ]] || die "invalid package authorization identity"
-            cmp -s "$record" <(printf 'commit: %s\nversion: %s\nsha256: %s\n' \
-              "$commit" "$version" "$digest") || die "invalid package authorization format"
-            candidate="$version:$digest"
-            [[ -z "$authorization" || "$authorization" == "$candidate" ]] \
-              || die "qualified runs disagree on package authorization"
-            authorization="$candidate"
-          done <<< "$run_ids"
-          [[ -n "$authorization" ]] || die "no qualified run recorded this commit's package authorization"
-          printf 'authorization=%s\n' "$authorization" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
 
-      # The receipt and immutable witness ref stay in this runner workspace.
-      # Both uploaders verify them locally; contents: read cannot push the ref.
-      - name: Mint the exact main candidate
+      - name: Upload the inspected archives
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/release/build_candidate.sh
-
-      - name: Check the qualified authorization before upload
-        env:
-          REPLICANT_PUBLISH_AUTHORIZED: ${{ steps.qualified.outputs.authorization }}
-        run: |
-          version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
-          receipt=".kimosabe/artifacts/replicant-$version-receipt.txt"
-          digest="$(sed -n 's/^sha256: //p' "$receipt")"
-          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$REPLICANT_PUBLISH_AUTHORIZED" == "$version:$digest" ]] || {
-            echo "::error::publish requires exact version:digest authorization from the qualified run"
-            exit 1
-          }
-
-      - name: Publish the witnessed package and docs
-        env:
-          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ steps.archives.outputs.version }}
           HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
-          REPLICANT_PUBLISH_AUTHORIZED: ${{ steps.qualified.outputs.authorization }}
-        run: |
-          mix run --no-start scripts/release/upload_candidate.exs --publish
-          mix run --no-start scripts/release/upload_docs.exs --publish
+        run: >-
+          mix run --no-mix-exs scripts/release/publish_hex_artifacts.exs "$PACKAGE_VERSION"
+          "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/docs.tar.gz"
+
+      - name: Remove built release archives
+        if: always()
+        run: rm -rf -- "$RUNNER_TEMP/replicant-release"

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Prove the retained Replicant candidate from a FRESH, external consumer that touches only the
+# Prove the Replicant archive from a FRESH, external consumer that touches only the
 # extracted package bytes — not the repository checkout, not the repo's _build.
 #
 # Steps: Hex-checksum-validate + unpack the exact retained tar -> build a brand-new Mix consumer
-# whose only Replicant source is the extraction -> clear MIX_PATH/ERL_LIBS -> locked fetch -> compile
+# whose only Replicant source is the extraction -> clear MIX_PATH/ERL_LIBS -> fresh resolution -> compile
 # with warnings-as-errors -> run a semantic R01-R05 smoke that asserts the loaded Replicant BEAM
 # resolves under the scratch tree. A missing/corrupt packaged file is invisible from the checkout;
 # it is caught here.
 #
-# Usage: consume_candidate.sh [TARBALL] [VERIFICATION_RECEIPT] [EXPECTED_SHA256]
+# Usage: consume_candidate.sh [TARBALL] [DOCS_ARCHIVE] [EXPECTED_SHA256]
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -16,8 +16,9 @@ log() { echo "consume_candidate: $*" >&2; }
 die() { echo "::error::consume_candidate: $*" >&2; exit 1; }
 
 version="$(grep -oE '@version "[^"]+"' "$repo_root/mix.exs" | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
-tarball="${1:-$repo_root/.kimosabe/artifacts/replicant-$version.tar}"
-verification_receipt="${2:-}"
+[[ $# -ge 1 && $# -le 3 ]] || die "usage: consume_candidate.sh TARBALL [DOCS_ARCHIVE] [EXPECTED_SHA256]"
+tarball="$1"
+docs_archive="${2:-}"
 expected_digest="${3:-}"
 [[ -f "$tarball" ]] || die "candidate tarball not found: $tarball (build it first with build_candidate.sh)"
 
@@ -46,8 +47,8 @@ fi
 
 # --- 2. Audit, compile, and render docs from the exact extracted package source. ---------------
 log "auditing and building the extracted package source"
-# Hex packages omit mix.lock. Reuse the qualified source lock for both isolated
-# projects so fetching cannot resolve a different graph during qualification.
+# Reproduce the producer build with its committed lock. The separate consumer
+# below deliberately starts without a lock to prove a fresh downstream install.
 cp "$repo_root/mix.lock" "$src/mix.lock"
 (
   cd "$src"
@@ -55,11 +56,39 @@ cp "$repo_root/mix.lock" "$src/mix.lock"
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix audit >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix compile --warnings-as-errors >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix docs --warnings-as-errors >&2
-  env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev mix deps.tree --format plain > "$scratch/package-deps.txt"
 )
 
-package_lock_digest="$(sha256_of "$src/mix.lock")"
-package_deps_digest="$(sha256_of "$scratch/package-deps.txt")"
+# Archive and inspect the rendered docs before the credentialed step can run.
+if [[ -n "$docs_archive" ]]; then
+  [[ -f "$src/doc/index.html" ]] || die "docs have no index.html"
+  [[ -z "$(find "$src/doc" ! -type f ! -type d -print -quit)" ]] || die "docs contain a link or special entry"
+  tar -czf "$docs_archive" -C "$src/doc" .
+  python3 - "$docs_archive" "$src/doc" <<'PYTHON'
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+root = Path(sys.argv[2])
+expected = {path.relative_to(root).as_posix(): path for path in root.rglob('*') if path.is_file()}
+seen = set()
+with tarfile.open(sys.argv[1], 'r:gz') as archive:
+    for member in archive:
+        path = PurePosixPath(member.name)
+        if path.is_absolute() or '..' in path.parts or not (member.isfile() or member.isdir()):
+            raise SystemExit('docs archive contains an unsafe entry')
+        if member.isdir():
+            continue
+        name = path.as_posix()
+        if name not in expected or name in seen:
+            raise SystemExit('docs archive has an unexpected or duplicate file')
+        if archive.extractfile(member).read() != expected[name].read_bytes():
+            raise SystemExit('docs archive bytes differ from the rendered documentation')
+        seen.add(name)
+if seen != expected.keys() or 'index.html' not in seen:
+    raise SystemExit('docs archive is missing rendered documentation')
+print('consume_candidate: docs archive matches every rendered file')
+PYTHON
+fi
 
 # --- 3. A brand-new consumer that depends ONLY on the extracted source. ----------------------
 mkdir -p "$consumer/lib"
@@ -86,21 +115,19 @@ defmodule ReplicantConsumerSmoke do
 end
 EOF
 
-# --- 4. Locked fetch + compile from a clean environment (no repo _build, no MIX_PATH). -------
+# --- 4. Fresh resolution + compile from a clean environment (no repo _build, no MIX_PATH). -------
 log "building fresh consumer against extracted source $src"
-cp "$src/mix.lock" "$consumer/mix.lock"
+[[ ! -e "$consumer/mix.lock" ]] || die "fresh consumer must start without a lock"
 (
   cd "$consumer"
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
-    mix deps.get --check-locked >&2
+    mix deps.get >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
     mix hex.audit >&2
   # The consumer has no audit-tool dependency; use the root's locked tool on its lockfile.
   ( cd "$repo_root" && MIX_ENV=dev mix deps.audit --path "$consumer" ) >&2
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
     mix compile --warnings-as-errors >&2
-  env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev \
-    mix deps.tree --format plain > "$scratch/consumer-deps.txt"
 
   # Provenance: the resolved dependency source must be the scratch extraction, never the repo.
   dep_path="$(env -u MIX_PATH mix run --no-start -e 'IO.puts(Path.expand(Mix.Project.deps_paths()[:replicant]))')"
@@ -114,29 +141,5 @@ cp "$src/mix.lock" "$consumer/mix.lock"
   env -u MIX_PATH -u ERL_LIBS -u REPLICANT_TEST_URL MIX_ENV=dev SMOKE_SCRATCH="$scratch" \
     mix run --no-start "$repo_root/scripts/release/consumer_smoke.exs" >&2
 )
-
-consumer_lock_digest="$(sha256_of "$consumer/mix.lock")"
-consumer_deps_digest="$(sha256_of "$scratch/consumer-deps.txt")"
-artifact_digest="$(sha256_of "$tarball")"
-
-if [[ -n "$verification_receipt" ]]; then
-  {
-    echo "artifact_sha256: $artifact_digest"
-    echo "package_lock_sha256: $package_lock_digest"
-    echo "package_dependency_tree_sha256: $package_deps_digest"
-    echo "consumer_lock_sha256: $consumer_lock_digest"
-    echo "consumer_dependency_tree_sha256: $consumer_deps_digest"
-    echo "package_audit: PASS"
-    echo "package_compile: PASS"
-    echo "package_docs: PASS"
-    echo "consumer_compile: PASS"
-    echo "consumer_smoke: PASS"
-    echo ""
-    echo "package_dependency_tree:"
-    sed 's/^/  /' "$scratch/package-deps.txt"
-    echo "consumer_dependency_tree:"
-    sed 's/^/  /' "$scratch/consumer-deps.txt"
-  } > "$verification_receipt"
-fi
 
 log "OK — candidate $version consumed from a fresh external project ($tarball)"

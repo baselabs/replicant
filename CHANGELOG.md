@@ -9,66 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Owner-dispatched **Publish to Hex** workflow on GitHub-hosted Ubuntu 24.04,
-  using the `publish` environment and exposing its `HEX_API_KEY` secret only to
-  the publish step. Dispatch takes no inputs. The job reads version:digest
-  authorization recorded for the exact commit by its green `ci.yml` landing run
-  and refuses if the minted candidate differs before either upload.
-- Release contract tests with mutation cases for the workflow trigger, owners,
-  permissions, credential scope, authorization order, runtime pins, strict
-  setup-beam versions, hosted runners, measured job timeouts, locked dependency
-  fetches, example audits, rejection of pull request triggers, and absence of Actions caches.
+- Owner-dispatched **Publish to Hex** workflow, restricted to `main` and the
+  `publish` environment. An anonymous package lookup refuses first publication
+  of a missing name and fails closed on lookup errors.
+- Mutation checks for credential isolation, the standalone archive upload,
+  forbidden qualification lookups, package-existence refusal, fresh consumer
+  resolution, runtime pins, action pins, audits, and timeout measurements.
 
 ### Changed
 
-- Every executable CI and publish job has a timeout derived from green run
-  44200086214, using twice the measured duration rounded up, with a
-  two-minute floor. Publishing mirrors the package job's measurement.
-- Every dependency fetch is locked, including the example image and isolated
-  package consumers. The reference example receives both Hex and dependency
-  advisory audits using its existing lockfile and the root's locked audit tool.
-  The fresh external package consumer also receives both audits.
-- Every runtime-installing qualification and publish job reads `.tool-versions`
-  directly and refuses any Elixir, full OTP patch, or Elixir OTP build-suffix
-  difference before fetching dependencies. Mutation tests cover each installation
-  and execute the refusal against the real runtime with mismatched tool files.
-- The development and CI runtime moves from Erlang/OTP 29.0.3 to 29.0.5, the OTP
-  patch of the only official `hexpm/elixir` images for Elixir 1.20.3, so the
-  reference example container runs the same runtime as qualification. A test
-  refuses an example image whose Elixir or OTP version differs from `.tool-versions`.
-- CI no longer caches dependencies, builds, or Dialyzer PLTs. Candidate runs
-  could never restore caches from earlier candidates, and a cache written on
-  `main` would be restorable by candidates.
-- Qualification and publishing use the exact `.tool-versions` runtime with strict
-  setup-beam selection. Every workflow uses `ubuntu-24.04`. Package qualification
-  and minting pin Hex 2.7.0 and compare two isolated builds byte for byte.
-  Qualification uploads a three-line commit, version, and SHA-256 authorization
-  record only after the package checks pass. Publishing checks the landing branch
-  and `qualified` verdict and refuses missing, malformed, or conflicting records.
-- Checkout actions use v7.0.1. Setup-beam pins are labeled v1.24.1, and the new
-  package authorization upload uses upload-artifact v7.0.2, all at full commit SHAs.
-- Candidate minting accepts a detached checkout of exact live `origin/main`.
-  The publish guard re-proves the clean witnessed source at live main and a
-  free release namespace. The operator creates the tag and GitHub release after
-  Hex read-back and docs upload, then records the digest in the existing ledger.
+- Package and docs archives are built and inspected without the publish key.
+  Docs build with warnings as errors before anything uploads. One isolated
+  `mix run --no-mix-exs` step uploads those exact file paths through Hex's APIs,
+  rechecking package existence and version absence immediately before upload.
+  Hex's package checksum is read back; temporary archives are always removed.
+- Publication relies on the default-branch ruleset for qualification, with only
+  `contents: read` permission. It performs no qualification lookup or download.
+- Job timeouts follow infra's CI rule using the slowest durations across green
+  runs 44200086214, 44220063612, and 44222373059. Publish uses the unmeasured
+  limit until it has its own green run.
+- Projects with committed locks fetch with `--check-locked`. The generated
+  external consumer has no borrowed lock, resolves fresh, and runs both audits.
+  The reference example's committed lock receives both audits as well.
+- Every workflow uses GitHub-hosted Ubuntu 24.04 and the exact `.tool-versions`
+  runtime, refusing Elixir, full OTP patch, and Elixir OTP build-suffix drift.
+  Erlang/OTP moves to 29.0.5 to match the reference example's immutable image.
+  Package builds pin Hex 2.7.0 and compare two isolated builds byte for byte.
+- Checkout actions pin v7.0.1 and setup-beam pins v1.24.1 by full commit SHA.
 
 ### Fixed
 
-- Release identity checks use authenticated `gh api` reads with the calling step's
-  read-only job token, avoiding shared anonymous GitHub API quotas in CI. Only a
-  confirmed HTTP 404 proves absence; authentication, transport, status, and metadata
-  failures refuse without exposing response values. Workflow mutation tests guard
-  token scope and prevent credentials in run scripts or command arguments.
-- Docs uploads now verify the immutable package receipt and Git witness before
-  building from the witnessed commit. Child builds use locked dependencies,
-  receive no publish credential, and remove their temporary tree on failure.
+- GitHub release identity reads use `gh api` with the keyless calling step's
+  read-only job token. Only a definitive HTTP 404 proves absence; other errors
+  fail closed without printing response values.
 
 ### Removed
 
-- Pull request CI. No workflow runs repository code from a pull request; fork
-  changes are qualified when a maintainer submits them through the `kci/` landing.
-- Workstation package and docs publish scripts and the `.env` Hex credential
-  loader. Publishing is owned by the dispatched GitHub Actions workflow.
+- Qualification authorization artifacts, candidate receipts and Git witnesses,
+  and the former package and docs upload scripts.
+- Workstation publishing and credential-file loading. Publication belongs to
+  infra through the owner-dispatched workflow.
+- Pull request CI and Actions caches. Fork changes qualify through a maintainer's
+  `kci/` landing candidate; no repository code runs on a pull request trigger.
 
 ## [1.5.1] - 2026-10-10
 

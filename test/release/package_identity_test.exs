@@ -9,6 +9,7 @@ defmodule Replicant.PackageIdentityTest do
   @commit String.duplicate("a", 40)
   @digest String.duplicate("d", 64)
   @github_path "repos/baselabs/replicant/releases/tags/v1.2.0"
+  @package_url "https://hex.pm/api/packages/replicant"
   @hex_url "https://hex.pm/api/packages/replicant/releases/1.2.0"
   @absent "HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{}"
 
@@ -26,8 +27,11 @@ defmodule Replicant.PackageIdentityTest do
       "curl", args when is_list(args) ->
         assert Enum.chunk_every(args, 2, 1, :discard) |> Enum.member?(["--connect-timeout", "10"])
         assert Enum.chunk_every(args, 2, 1, :discard) |> Enum.member?(["--max-time", "30"])
-        assert List.last(args) == @hex_url
-        {"404", 0}
+
+        case List.last(args) do
+          @package_url -> {"200", 0}
+          @hex_url -> {"404", 0}
+        end
     end
 
     assert :ok == PackageIdentity.check_candidate(@version, runner)
@@ -35,6 +39,9 @@ defmodule Replicant.PackageIdentityTest do
 
   test "remote tag lookup errors fail closed instead of becoming absence" do
     runner = fn
+      "curl", args ->
+        publish_runner("curl", args)
+
       "git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"] ->
         {"", 1}
 
@@ -98,8 +105,11 @@ defmodule Replicant.PackageIdentityTest do
   test "Hex responses still require a definitive absence" do
     for response <- [{"200", 0}, {"503", 0}, {"private-response-value", 22}] do
       runner = fn
-        "curl", _args -> response
-        command, args -> publish_runner(command, args)
+        "curl", args ->
+          if List.last(args) == @hex_url, do: response, else: publish_runner("curl", args)
+
+        command, args ->
+          publish_runner(command, args)
       end
 
       assert {:error, message} = PackageIdentity.check_candidate(@version, runner)
@@ -126,7 +136,7 @@ defmodule Replicant.PackageIdentityTest do
       end
 
       assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
-      assert message =~ "clean checkout of the witnessed commit at live origin/main"
+      assert message =~ "clean checkout of the source commit at live origin/main"
     end
   end
 
@@ -325,8 +335,10 @@ defmodule Replicant.PackageIdentityTest do
   defp publish_runner("gh", ["api", "-i", @github_path]), do: {@absent, 1}
 
   defp publish_runner("curl", args) do
-    assert List.last(args) == @hex_url
-    {"404", 0}
+    case List.last(args) do
+      @package_url -> {"200", 0}
+      @hex_url -> {"404", 0}
+    end
   end
 
   defp published_runner(tag_commit) do

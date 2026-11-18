@@ -3,12 +3,14 @@ defmodule Replicant.PackageIdentity do
 
   @repo_root Path.expand("../..", __DIR__)
   @github_release_path "repos/baselabs/replicant/releases/tags/"
+  @hex_package_url "https://hex.pm/api/packages/replicant"
   @hex_release_url "https://hex.pm/api/packages/replicant/releases/"
 
   def check_candidate(version, runner \\ &run/2) do
     tag = "v#{version}"
 
-    with :ok <- absent_local_tag(tag, runner),
+    with :ok <- existing_package(runner),
+         :ok <- absent_local_tag(tag, runner),
          :ok <- absent_remote_tag(tag, runner),
          :ok <- absent_github(tag, runner),
          :ok <- absent_http(@hex_release_url <> version, "Hex release", runner) do
@@ -18,7 +20,7 @@ defmodule Replicant.PackageIdentity do
 
   def check_publish(version, source_commit, runner \\ &run/2) do
     # Tags and the GitHub release follow successful Hex read-back. Re-prove the
-    # minted source immediately before uploading, with the namespace still free.
+    # source before building the archives, with the namespace still free.
     with :ok <- matching_main(source_commit, runner),
          :ok <- check_candidate(version, runner) do
       :ok
@@ -33,7 +35,7 @@ defmodule Replicant.PackageIdentity do
          [^source_commit, "refs/heads/main"] <- String.split(String.trim(remote)) do
       :ok
     else
-      _ -> {:error, "publish requires a clean checkout of the witnessed commit at live origin/main"}
+      _ -> {:error, "publish requires a clean checkout of the source commit at live origin/main"}
     end
   end
 
@@ -201,6 +203,32 @@ defmodule Replicant.PackageIdentity do
   end
 
   defp absent_http(url, label, runner) do
+    case http_status(url, runner) do
+      {"404", 0} ->
+        :ok
+
+      {"200", 0} ->
+        {:error, "#{label} already exists"}
+
+      _ ->
+        {:error, "#{label} check failed"}
+    end
+  end
+
+  defp existing_package(runner) do
+    case http_status(@hex_package_url, runner) do
+      {"200", 0} ->
+        :ok
+
+      {"404", 0} ->
+        {:error, "the name replicant is not on Hex; a first publication is the owner's decision"}
+
+      _ ->
+        {:error, "Hex package lookup failed; publication refused"}
+    end
+  end
+
+  defp http_status(url, runner) do
     args = [
       "--silent",
       "--show-error",
@@ -215,19 +243,7 @@ defmodule Replicant.PackageIdentity do
       url
     ]
 
-    case runner.("curl", args) do
-      {"404", 0} ->
-        :ok
-
-      {"200", 0} ->
-        {:error, "#{label} already exists"}
-
-      {status, 0} ->
-        {:error, "#{label} check returned HTTP #{String.trim(status)}"}
-
-      {output, exit_status} ->
-        {:error, "#{label} check failed (exit #{exit_status}): #{structural(output)}"}
-    end
+    runner.("curl", args)
   end
 
   defp absent_github(tag, runner) do
