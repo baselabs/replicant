@@ -23,8 +23,9 @@ never replaced. Infra tags after read-back, compares the retained package with
 Hex's bytes, and creates the GitHub release from those assets. Consumers use the
 [GitHub release](https://github.com/baselabs/replicant/releases) for verification;
 the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only)
-describes the checksum checks and permanent download paths. Infra records
-published package digests through normal landing; held versions do not rewrite
+describes the checksum checks and permanent download paths. After infra reports
+the read-back and tag, this repository records the published package digest
+through normal landing; held versions do not rewrite
 `scripts/release/published_packages.sha256`.
 
 The initial sequencing plan below is complete, and both packages have continued

@@ -146,9 +146,9 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   docs archive, and `SHA256SUMS`. Temporary archives are removed even on failure. Infra creates
   the `v<version>` tag at that full source SHA, compares the artifact's package with Hex's
   bytes, and creates the GitHub release from those assets. Consumer verification uses that
-  GitHub release. Infra records the verified package digest in
-  `scripts/release/published_packages.sha256` through normal landing; held versions do not
-  change the ledger.
+  GitHub release. Once infra reports the read-back and tag, this repository's session records
+  the verified package digest in `scripts/release/published_packages.sha256` through normal
+  landing; held versions do not change the ledger.
   A release is finished only when its tag, Hex package and docs, and GitHub release all exist.
 
 ## CI/CD and releases
