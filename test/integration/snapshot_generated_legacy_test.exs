@@ -1,7 +1,7 @@
 defmodule Replicant.SnapshotGeneratedLegacyTest do
   use ExUnit.Case, async: false
   @moduletag :integration
-  @moduletag timeout: 30_000
+  @moduletag timeout: 120_000
   unless Replicant.TestHelper.server_version_num() in 120_000..159_999,
     do: @moduletag(skip: "legacy generated-column regression requires PG12-15")
 
@@ -60,7 +60,8 @@ defmodule Replicant.SnapshotGeneratedLegacyTest do
                  snapshot: @mode
                )
 
-      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+      # An idle incremental snapshot can await the first walsender keepalive (about 30s).
+      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end, 2_400)
       assert [%{record: %{"id" => 1} = record}] = SnapshotRecordingSink.recorded().snapshot
       assert Map.keys(record) == ["id"]
       Postgrex.query!(ctx.db, "INSERT INTO #{ctx.table} (id) VALUES (2)", [])

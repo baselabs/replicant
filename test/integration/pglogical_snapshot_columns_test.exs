@@ -1,7 +1,7 @@
 defmodule Replicant.PglogicalSnapshotColumnsTest do
   use ExUnit.Case, async: false
   @moduletag :integration
-  @moduletag timeout: 30_000
+  @moduletag timeout: 120_000
   unless Replicant.TestHelper.primary_carries_plugins?(),
     do: @moduletag(skip: "pglogical is unavailable on the configured server")
 
@@ -70,7 +70,7 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
                  snapshot: @mode
                )
 
-      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+      wait_snapshot()
       [snapshot] = SnapshotRecordingSink.recorded().snapshot
       assert Enum.sort(Map.keys(snapshot.record)) == ["id", "visible"]
 
@@ -119,7 +119,11 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
       for {set, filter} <- Enum.zip(ctx.sets, @filters) do
         Postgrex.query!(
           ctx.db,
-          "SELECT pglogical.replication_set_add_table($1, $2::regclass, false, $3::text[], $4::text)",
+          """
+          SELECT pglogical.replication_set_add_table(
+            $1, $2::text::regclass, false, $3::text[], $4::text
+          )
+          """,
           [set, ctx.table, ["id", "visible"], filter]
         )
       end
@@ -134,7 +138,7 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
                  snapshot: @mode
                )
 
-      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+      wait_snapshot()
 
       assert Enum.map(SnapshotRecordingSink.recorded().snapshot, & &1.record["id"]) |> Enum.sort() ==
                @expected
@@ -165,7 +169,11 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
       for {set, filter} <- [{a, "id % 2 = 1"}, {b, "id % 2 = 0"}] do
         Postgrex.query!(
           ctx.db,
-          "SELECT pglogical.replication_set_add_table($1, $2::regclass, false, $3::text[], $4::text)",
+          """
+          SELECT pglogical.replication_set_add_table(
+            $1, $2::text::regclass, false, $3::text[], $4::text
+          )
+          """,
           [set, ctx.table, ["id", "visible"], filter]
         )
       end
@@ -186,7 +194,7 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
                  snapshot: @mode
                )
 
-      PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end)
+      wait_snapshot()
 
       assert Enum.sort(Enum.map(SnapshotRecordingSink.recorded().snapshot, & &1.record["id"])) ==
                [2, 4]
@@ -206,9 +214,14 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
   defp add_table(ctx, set, names) do
     Postgrex.query!(
       ctx.db,
-      "SELECT pglogical.replication_set_add_table($1, $2::regclass, false, $3::text[])",
+      "SELECT pglogical.replication_set_add_table($1, $2::text::regclass, false, $3::text[])",
       [set, ctx.table, names]
     )
+  end
+
+  # An idle incremental snapshot can await the first walsender keepalive (about 30s).
+  defp wait_snapshot do
+    PG16.wait_until(fn -> SnapshotRecordingSink.recorded().complete? end, 2_400)
   end
 
   defp columns(ctx) do

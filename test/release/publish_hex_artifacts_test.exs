@@ -1,4 +1,11 @@
 # Load only the script's module, leaving its command-line entry point unexecuted.
+# Mix prunes archive paths during compilation; restore the real installed Hex APIs.
+Mix.Local.append_archives()
+
+for api <- [Hex.API.Package, Hex.API.Release, Hex.API.ReleaseDocs] do
+  Code.ensure_loaded!(api)
+end
+
 source = File.read!(Path.expand("../../scripts/release/publish_hex_artifacts.exs", __DIR__))
 {:__block__, _, [module, _entry_point]} = Code.string_to_quoted!(source)
 Code.compile_quoted(module)

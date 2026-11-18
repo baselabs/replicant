@@ -41,8 +41,10 @@ defmodule Replicant.PluginSnapshotPg96Test do
 
   if is_nil(@target), do: @moduletag(skip: "no pre-10 server on this row")
 
-  test "a wal2json snapshot on 9.6 back-fills under the two-part exported name, then streams exactly after it" do
-    snapshot_then_stream(@target)
+  @tag target: @target
+  test "a wal2json snapshot on 9.6 back-fills under its two-part name, then streams after it",
+       %{target: url} do
+    snapshot_then_stream(url)
   end
 
   defp snapshot_then_stream(url) do

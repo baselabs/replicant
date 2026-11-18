@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Integration test pipelines explicitly select Bash with `pipefail`, so a
   failing test run cannot be hidden by a successful output capture or receipt grep.
+- Plugin snapshot tests bind table names as text before PostgreSQL resolves their
+  relation OIDs. Idle snapshot assertions allow the documented first keepalive;
+  skipped targets and the standalone Hex script compile without test warnings.
 - GitHub release identity reads use `gh api` with the keyless calling step's
   read-only job token. Only a definitive HTTP 404 proves absence; other errors
   fail closed without printing response values.
