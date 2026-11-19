@@ -149,8 +149,10 @@ If CI goes red, fix forward in the next commit.
   or remote version tags and GitHub releases refuse publication. An untagged Hex version can
   finish only when its checksum matches the built package and it is not retired; the keyless
   build and the keyed script both check this. Only missing package or docs uploads run. Both
-  are read back and compared by SHA-256 with the inspected archives. ExDoc 0.40.4 fixes the
-  highlighting group prefix; only HTML and Markdown ship, with no timestamped EPUB. Hex
+  are read back from Hex's repository and compared by SHA-256 with the inspected archives.
+  Qualification runs the same reads against live Hex for a published version, without a key.
+  ExDoc 0.40.4 fixes the highlighting group prefix; only HTML and Markdown ship, with no
+  timestamped EPUB. Hex
   constructs sorted archives with fixed metadata and a gzip header without a name or mtime.
   Served docs must match before the upload decision and on read-back; they are never replaced.
   The script loads no project code and builds nothing.

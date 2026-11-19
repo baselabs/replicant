@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Mutation checks for credential isolation, the standalone archive upload,
   forbidden qualification lookups, package-existence refusal, fresh consumer
   resolution, runtime pins, action pins, audits, and timeout measurements.
+- Qualification runs the uploader's registry reads against live Hex without a
+  key: package existence, release identity, and the served package and docs
+  bytes of a published version, including the absent-docs response that permits
+  an upload. The uploader reads served archives from Hex's repository, because
+  the docs API returns no body for the served docs archive.
 
 ### Changed
 
