@@ -64,6 +64,13 @@ defmodule Replicant.PublishWorkflowTest do
         assert_raise ExUnit.AssertionError, fn -> assert_bash_shell!(mutated) end
       end
 
+      for {name, job} <- original["jobs"], Map.has_key?(job, "steps") do
+        mutated =
+          replace(original, ["jobs", name, "defaults", "run"], %{"working-directory" => "."})
+
+        assert_raise ExUnit.AssertionError, fn -> assert_bash_shell!(mutated) end
+      end
+
       for {name, job} <- original["jobs"],
           {step, index} <- Enum.with_index(job["steps"] || []),
           Map.has_key?(step, "run"),
@@ -610,8 +617,13 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   # A bare run: is `bash -e` without pipefail; the workflow default is `bash -eo pipefail`.
+  # A job's own defaults.run replaces the workflow's entirely, so it must name bash too.
   defp assert_bash_shell!(workflow) do
     assert workflow["defaults"]["run"]["shell"] == "bash"
+
+    for {_name, job} <- workflow["jobs"], Map.has_key?(job, "defaults") do
+      assert job["defaults"]["run"]["shell"] == "bash"
+    end
 
     for {_name, job} <- workflow["jobs"],
         step <- job["steps"] || [],

@@ -280,8 +280,10 @@ jobs:
     name: Reference example (docker)
     runs-on: ubuntu-24.04
     timeout-minutes: 8 # Green run 44265557928: reference-example 3m33s
+    # A job's defaults.run replaces the workflow's, so it repeats the bash shell.
     defaults:
       run:
+        shell: bash
         working-directory: examples/replication_pipeline
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
