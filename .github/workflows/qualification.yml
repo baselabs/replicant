@@ -251,8 +251,8 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
 
-      # Build twice from the exact commit, inspect and consume the package, build
-      # docs with warnings as errors, and inspect their archive before any upload.
+      # Build both archives twice from independent trees at the exact commit and
+      # compare their bytes. Audit and consume the package; inspect both archives.
       # GitHub identity reads receive only this step's read-only job token.
       - name: Prove both release archives without retaining them
         env:

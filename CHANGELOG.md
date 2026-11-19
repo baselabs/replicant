@@ -18,14 +18,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- ExDoc moves to 0.40.4 for deterministic highlighting, with its required Earmark
+  Parser 1.4.46. Docs use HTML and Markdown without EPUB. The Hex archive builder
+  fixes entry order, ownership, timestamps, and the gzip header. Qualification
+  and publication compare docs archives from two independent renders and inspect
+  every rendered file; consumer verification compares release docs with Hex.
 - Package and docs archives are built and inspected without the publish key.
   Docs build with warnings as errors before anything uploads. One isolated
   `mix run --no-mix-exs` step uploads those exact file paths through Hex's APIs,
   rechecking package existence and release identity immediately before upload.
   Untagged held releases resume only with the same package checksum and no
   retirement, uploading only missing archives. Tags and GitHub releases refuse
-  publication. Package checksums and served docs presence are read back; docs
-  are presence-only because rendering and tar metadata are not reproducible.
+  publication. Package and served docs checksums must match the inspected bytes
+  before upload and on read-back; differing docs refuse publication.
   Temporary archives are always removed.
 - Successful read-back retains versioned package and docs archives plus
   `SHA256SUMS` in one `release-assets` artifact. Infra tags, compares the package

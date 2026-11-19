@@ -64,7 +64,7 @@ jobs:
       - run: mix local.rebar --force
       - run: mix deps.get --check-locked
 
-      - name: Build and inspect the package and docs archives
+      - name: Build twice, compare and inspect the package and docs archives
         id: archives
         env:
           GH_TOKEN: ${{ github.token }}

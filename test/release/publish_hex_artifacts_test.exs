@@ -18,6 +18,10 @@ defmodule Replicant.PublishHexArtifactsTest do
   @script Path.expand("../../scripts/release/publish_hex_artifacts.exs", __DIR__)
   @version "1.2.0"
   @digest String.duplicate("a", 64)
+  @docs_bytes <<0x1F, 0x8B, 0xFF, "inspected docs">>
+  @docs_digest :crypto.hash(:sha256, @docs_bytes) |> Base.encode16(case: :lower)
+  @docs_read ~s|docs_read_back!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version), docs_digest)|
+  @docs_action ~s|docs_action!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version), docs_digest, docs?)|
   @read ~s|release_state!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)|
   @package ~s|Hex.API.Release.publish("hexpm", package_bytes, auth)|
   @docs ~s|Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth)|
@@ -104,16 +108,45 @@ defmodule Replicant.PublishHexArtifactsTest do
         PublishHexArtifacts.read_back!(result, @version, @digest)
       end
     end
+  end
 
-    # Docs are presence-only: different rendered bytes are legitimate on a retry.
-    for archive <- [<<0x1F, 0x8B, "first">>, <<0x1F, 0x8B, "different">>] do
-      assert :ok == PublishHexArtifacts.docs_present!(response(200, archive))
+  test "served docs skip only on byte identity, while authoritative absence uploads" do
+    for required? <- [false, true] do
+      assert :skip ==
+               PublishHexArtifacts.docs_action!(
+                 response(200, @docs_bytes),
+                 @docs_digest,
+                 required?
+               )
+
+      assert_raise RuntimeError, ~r/docs checksum differs/, fn ->
+        PublishHexArtifacts.docs_action!(
+          response(200, <<0x1F, 0x8B, "different">>),
+          @docs_digest,
+          required?
+        )
+      end
     end
+
+    assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}), @docs_digest, false)
+    assert :ok == PublishHexArtifacts.docs_read_back!(response(200, @docs_bytes), @docs_digest)
 
     missing = [response(404, %{}), response(200, ""), response(200, "not gzip") | failures()]
 
     for result <- missing do
-      assert_raise RuntimeError, fn -> PublishHexArtifacts.docs_present!(result) end
+      error =
+        assert_raise RuntimeError, fn ->
+          PublishHexArtifacts.docs_read_back!(result, @docs_digest)
+        end
+
+      refute Exception.message(error) =~ "private-response-value"
+    end
+
+    assert_raise RuntimeError, ~r/docs checksum differs/, fn ->
+      PublishHexArtifacts.docs_read_back!(
+        response(200, <<0x1F, 0x8B, "different">>),
+        @docs_digest
+      )
     end
   end
 
@@ -148,11 +181,15 @@ defmodule Replicant.PublishHexArtifactsTest do
           {@package, "mix hex.publish"},
           {@docs, "mix docs"},
           {"{:held, _docs?} ->", ":fresh ->"},
-          {"{:held, false} ->", "{:held, true} ->"},
+          {":upload ->", ":skip ->"},
+          {@docs_action, ":skip"},
+          {"docs_digest = :crypto.hash(:sha256, docs_bytes)",
+           "docs_digest = :crypto.hash(:sha256, package_bytes)"},
+          {"== digest", "!= digest"},
           {"|> approved!()", "|> then(fn _ -> :ok end)"},
           {~s|read_back!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)|,
            ":ok"},
-          {~s|docs_present!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version))|, ":ok"},
+          {@docs_read, ":ok"},
           {~s|"checksum" => ^digest|, ~s|"checksum" => _checksum|},
           {~s|"retirement" => nil|, ~s|"retirement" => _retirement|}
         ] do
@@ -184,14 +221,19 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert package_case =~ ":fresh ->\n        " <> @package
     assert package_case =~ "{:held, _docs?} ->\n        :ok"
     assert package_case =~ "|> accepted!(\"Hex package\")\n        |> approved!()"
-    assert docs_case =~ "{:held, false} ->\n        " <> @docs
-    assert docs_case =~ "{:held, true} ->\n        :ok"
-    assert docs_case =~ "|> accepted!(\"Hex docs\")\n        |> approved!()"
+    assert docs_case =~ "{:held, docs?} ->"
+    assert docs_case =~ "case " <> @docs_action <> " do"
+    assert docs_case =~ ":upload ->\n            " <> @docs
+    assert docs_case =~ ":skip ->\n            :ok"
+    assert docs_case =~ "|> accepted!(\"Hex docs\")\n            |> approved!()"
 
     assert docs_case =~
              ~s|read_back!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)|
 
-    assert docs_case =~ ~s|docs_present!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version))|
+    assert docs_case =~ @docs_read
+    assert source =~ "docs_digest = :crypto.hash(:sha256, docs_bytes)"
+    assert source =~ "Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest"
+    assert source =~ ":skip = docs_action!(response, digest, true)"
   end
 
   defp metadata(docs?) do

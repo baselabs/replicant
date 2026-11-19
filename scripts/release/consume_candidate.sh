@@ -62,32 +62,9 @@ cp "$repo_root/mix.lock" "$src/mix.lock"
 if [[ -n "$docs_archive" ]]; then
   [[ -f "$src/doc/index.html" ]] || die "docs have no index.html"
   [[ -z "$(find "$src/doc" ! -type f ! -type d -print -quit)" ]] || die "docs contain a link or special entry"
-  tar -czf "$docs_archive" -C "$src/doc" .
-  python3 - "$docs_archive" "$src/doc" <<'PYTHON'
-import sys
-import tarfile
-from pathlib import Path, PurePosixPath
-
-root = Path(sys.argv[2])
-expected = {path.relative_to(root).as_posix(): path for path in root.rglob('*') if path.is_file()}
-seen = set()
-with tarfile.open(sys.argv[1], 'r:gz') as archive:
-    for member in archive:
-        path = PurePosixPath(member.name)
-        if path.is_absolute() or '..' in path.parts or not (member.isfile() or member.isdir()):
-            raise SystemExit('docs archive contains an unsafe entry')
-        if member.isdir():
-            continue
-        name = path.as_posix()
-        if name not in expected or name in seen:
-            raise SystemExit('docs archive has an unexpected or duplicate file')
-        if archive.extractfile(member).read() != expected[name].read_bytes():
-            raise SystemExit('docs archive bytes differ from the rendered documentation')
-        seen.add(name)
-if seen != expected.keys() or 'index.html' not in seen:
-    raise SystemExit('docs archive is missing rendered documentation')
-print('consume_candidate: docs archive matches every rendered file')
-PYTHON
+  ( cd "$scratch" && mix run --no-mix-exs "$repo_root/scripts/release/build_docs_archive.exs" \
+      "$src/doc" "$docs_archive" ) >&2
+  python3 -I "$repo_root/scripts/release/check_docs_archive.py" "$docs_archive" "$src/doc" >&2
 fi
 
 # --- 3. A brand-new consumer that depends ONLY on the extracted source. ----------------------

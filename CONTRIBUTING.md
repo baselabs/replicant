@@ -126,8 +126,13 @@ and compare its bytes, inspect the exact package manifest and Hex checksum, then
 audit and compile its extracted source using the committed producer lock.
 The generated external consumer starts without a lock and resolves fresh, runs
 both audits on that resolution, compiles, and exercises the public API.
-Documentation builds with warnings as errors before any upload. Its archive is
-inspected alongside the package archive.
+Each consumer renders documentation with warnings as errors from an independent
+extraction using the producer lock. The two docs archives must compare byte for
+byte; inspection checks every visible rendered file and refuses EPUB. ExDoc
+0.40.4 supplies a fixed Makeup grouping prefix. Only HTML and Markdown ship;
+EPUB embeds build time by default. Hex 2.7.0 builds the docs tar with sorted
+entries, fixed times, uid/gid zero, empty owner/group names, and a gzip header
+without a filename or mtime, matching the archive mechanism used by ash_hooks.
 
 The single credentialed step runs `mix run --no-mix-exs` from the runner's temporary
 directory, which holds no `mix.exs`, with those two inspected file paths. Its
@@ -135,20 +140,19 @@ standalone script uses only Hex's APIs and file reads: it refuses to run inside 
 Mix project, loads no project code, fetches no dependencies, and rebuilds nothing.
 Immediately before uploading, it rechecks that the package name exists. A version
 already served by Hex without a tag is a held or partial release: the job compares
-its checksum with the package it just built, both before and inside the keyed
-step. A different checksum, retirement, malformed metadata, or lookup failure
+its package and served docs checksums with the archives it just built, both
+before and inside the keyed step. A different checksum, retirement, malformed
+metadata, or lookup failure
 refuses publication. Identical bytes skip the package upload. Docs upload only
-when missing. A second owner dispatch on the same commit finishes an approved
+when missing; already served docs must match the built archive, even when release
+metadata has not yet reported them. A second owner dispatch on the same commit
+finishes an approved
 hold or interrupted upload; neither package nor docs are replaced.
 
 Read-back requires the exact package checksum, `has_docs: true`, and a served
-gzip docs archive. Docs verification is presence-only. The locked ExDoc 0.40.3
-renderer calls Makeup's lexer without a fixed grouping prefix; the locked
-Makeup Elixir 1.0.1 lexer generates `random_prefix(10)`, so rendered HTML can
-differ across builds. `consume_candidate.sh` also retains build-time file
-metadata in `tar -czf`. Normalizing tar headers alone would not make rendered
-docs reproducible. The docs checksum below identifies the inspected build's
-archive, not a promise of equality with previously served docs.
+gzip docs archive whose SHA-256 equals the inspected docs archive. The anonymous
+docs API redirects to `https://repo.hex.pm/docs/replicant-<version>.tar.gz`.
+A different served docs digest refuses publication, including on a retry.
 
 After successful read-back, the workflow retains one `release-assets` artifact:
 `replicant-<version>.tar`, `replicant-<version>-docs.tar.gz`, and `SHA256SUMS`.
@@ -166,6 +170,9 @@ gh release download vX.Y.Z --repo baselabs/replicant --pattern 'replicant-*' --p
 sha256sum --check SHA256SUMS
 curl --fail --silent --show-error https://repo.hex.pm/tarballs/replicant-X.Y.Z.tar -o hex.tar
 cmp replicant-X.Y.Z.tar hex.tar
+curl --fail --silent --show-error https://repo.hex.pm/docs/replicant-X.Y.Z.tar.gz -o hex-docs.tar.gz
+cmp replicant-X.Y.Z-docs.tar.gz hex-docs.tar.gz
+rm hex.tar hex-docs.tar.gz
 ```
 
 Record the verified package digest in `scripts/release/published_packages.sha256`

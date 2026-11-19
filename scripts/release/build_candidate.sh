@@ -80,16 +80,19 @@ cmp -s "$package" "$rebuild_tree/package.tar" || die "package build is not byte-
 
 EXPECTED_VERSION="$version" bash "$repo_root/scripts/release/verify_package.sh" "$package" >&2
 bash "$repo_root/scripts/release/consume_candidate.sh" "$package" "$output_dir/docs.tar.gz" >&2
+# Each consumer extracts into its own fresh tree and resolves the committed lock.
+bash "$repo_root/scripts/release/consume_candidate.sh" "$rebuild_tree/package.tar" "$rebuild_tree/docs.tar.gz" >&2
+cmp -s "$output_dir/docs.tar.gz" "$rebuild_tree/docs.tar.gz" || die "docs build is not byte-reproducible"
 if [[ "$mode" == "publish" ]]; then
   # A held version is resumable only with these exact bytes, never with a rebuild
   # that differs from the registry. Repeat tag/release refusals after the build.
   elixir -r "$repo_root/scripts/release/package_identity.exs" \
     -e '
-      [version, commit, archive] = System.argv()
-      Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)
-    ' -- "$version" "$commit" "$package"
+      [version, commit, archive, docs] = System.argv()
+      Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive, docs)
+    ' -- "$version" "$commit" "$package" "$output_dir/docs.tar.gz"
 fi
 # The upload step receives these same inspected file paths, with no intervening rebuild.
 chmod a-w "$package" "$output_dir/docs.tar.gz"
 complete=1
-log "PASS - package built twice identically, inspected, audited, consumed; docs built and inspected"
+log "PASS - package built twice identically, inspected, audited, consumed; docs built twice identically and inspected"

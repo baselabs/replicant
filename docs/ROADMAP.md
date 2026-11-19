@@ -14,12 +14,14 @@
 
 Publication builds and inspects package and docs without a registry key. A second
 owner dispatch on the same commit can finish a held, untagged Hex release only
-when the package checksum matches the freshly built archive and the release is
+when both package and served docs checksums match the freshly built archives and the release is
 not retired. It uploads only missing archives, reads both back, and retains the
-versioned archives plus `SHA256SUMS` in one `release-assets` artifact. Docs
-read-back is presence-only because the locked renderer generates random
-highlighting IDs and the tar preserves build-time metadata; existing docs are
-never replaced. Infra tags after read-back, compares the retained package with
+versioned archives plus `SHA256SUMS` in one `release-assets` artifact. Both
+qualification and publication compare two independent docs renders byte for byte.
+ExDoc 0.40.4 fixes highlighting IDs; HTML and Markdown ship without EPUB, in a
+sorted Hex archive with fixed ownership, timestamps, and gzip header. Served docs
+must match that archive before the upload decision and on read-back; existing
+docs are never replaced. Infra tags after read-back, compares the retained package with
 Hex's bytes, and creates the GitHub release from those assets. Consumers use the
 [GitHub release](https://github.com/baselabs/replicant/releases) for verification;
 the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only)

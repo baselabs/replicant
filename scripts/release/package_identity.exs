@@ -5,6 +5,7 @@ defmodule Replicant.PackageIdentity do
   @github_release_path "repos/baselabs/replicant/releases/tags/"
   @hex_package_url "https://hex.pm/api/packages/replicant"
   @hex_release_url "https://hex.pm/api/packages/replicant/releases/"
+  @hex_docs_url "https://repo.hex.pm/docs/replicant-"
 
   def check_candidate(version, runner \\ &run/2) do
     tag = "v#{version}"
@@ -13,7 +14,7 @@ defmodule Replicant.PackageIdentity do
          :ok <- absent_local_tag(tag, runner),
          :ok <- absent_remote_tag(tag, runner),
          :ok <- absent_github(tag, runner),
-         {:ok, _state} <- check_archive(version, nil, runner) do
+         {:ok, _state} <- check_archive(version, nil, nil, runner) do
       :ok
     end
   end
@@ -74,16 +75,17 @@ defmodule Replicant.PackageIdentity do
   def verify_publish!(version, source_commit),
     do: check_publish(version, source_commit) |> unwrap!()
 
-  def verify_publish_archive!(version, source_commit, archive, runner \\ &run/2) do
+  def verify_publish_archive!(version, source_commit, archive, docs, runner \\ &run/2) do
     digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
+    docs_digest = :crypto.hash(:sha256, File.read!(docs)) |> Base.encode16(case: :lower)
     :ok = check_publish(version, source_commit, runner) |> unwrap!()
-    {:ok, _state} = check_archive(version, digest, runner) |> unwrap!()
+    {:ok, _state} = check_archive(version, digest, docs_digest, runner) |> unwrap!()
     :ok
   end
 
   # A nil digest is only the pre-build identity check. Publication always repeats
-  # this decision with the SHA256 of the inspected package, before exposing a key.
-  def check_archive(version, digest, runner \\ &run/2) do
+  # this decision with both inspected SHA256s, before exposing a key.
+  def check_archive(version, digest, docs_digest, runner \\ &run/2) do
     args = [
       "--silent",
       "--show-error",
@@ -99,8 +101,14 @@ defmodule Replicant.PackageIdentity do
     case runner.("curl", args) do
       {response, 0} ->
         case String.split(response, "\n") |> Enum.reverse() do
-          ["404" | _body] -> {:ok, :fresh}
-          ["200" | body] -> held_release(Enum.reverse(body), version, digest)
+          ["404" | _body] ->
+            matching_docs(version, :fresh, docs_digest, runner)
+
+          ["200" | body] ->
+            with {:ok, state} <- held_release(Enum.reverse(body), version, digest) do
+              matching_docs(version, state, docs_digest, runner)
+            end
+
           _other -> {:error, "Hex release lookup failed; publication refused"}
         end
 
@@ -108,6 +116,49 @@ defmodule Replicant.PackageIdentity do
         {:error, "Hex release lookup failed; publication refused"}
     end
   end
+
+  defp matching_docs(_version, state, nil, _runner), do: {:ok, state}
+
+  defp matching_docs(version, state, digest, runner) do
+    args = [
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      "10",
+      "--max-time",
+      "30",
+      "--write-out",
+      "\n%{http_code}",
+      @hex_docs_url <> version <> ".tar.gz"
+    ]
+
+    with :ok <- docs_match(runner.("curl", args), digest, state == {:held, true}) do
+      {:ok, state}
+    end
+  end
+
+  # Split the HTTP status by byte offset: the archive is binary, not UTF-8 text.
+  def docs_match({response, 0}, digest, required?) when byte_size(response) >= 4 do
+    size = byte_size(response) - 4
+
+    <<bytes::binary-size(size), status::binary>> = response
+
+    case {status, bytes} do
+      {"\n200", <<0x1F, 0x8B, _rest::binary>>} ->
+        if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest,
+          do: :ok,
+          else: {:error, "Hex docs checksum differs from the built archive; publication refused"}
+
+      {"\n404", _body} when not required? ->
+        :ok
+
+      _other ->
+        {:error, "Hex docs archive is unavailable; publication refused"}
+    end
+  end
+
+  def docs_match(_response, _digest, _required?),
+    do: {:error, "Hex docs archive lookup failed; publication refused"}
 
   defp held_release(body, version, digest) do
     # OTP's JSON decoder uses :null; Hex's Erlang API uses nil in the uploader.

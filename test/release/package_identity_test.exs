@@ -11,6 +11,9 @@ defmodule Replicant.PackageIdentityTest do
   @github_path "repos/baselabs/replicant/releases/tags/v1.2.0"
   @package_url "https://hex.pm/api/packages/replicant"
   @hex_url "https://hex.pm/api/packages/replicant/releases/1.2.0"
+  @docs_url "https://repo.hex.pm/docs/replicant-1.2.0.tar.gz"
+  @docs_bytes <<0x1F, 0x8B, 0xFF, "inspected docs">>
+  @docs_digest :crypto.hash(:sha256, @docs_bytes) |> Base.encode16(case: :lower)
   @absent "HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{}"
 
   test "fresh candidate requires authoritative absence checks and an existing package" do
@@ -29,6 +32,7 @@ defmodule Replicant.PackageIdentityTest do
         assert Enum.chunk_every(args, 2, 1, :discard) |> Enum.member?(["--max-time", "30"])
 
         case List.last(args) do
+          @docs_url -> {@docs_bytes <> "\n200", 0}
           @package_url -> {"200", 0}
           @hex_url -> {"\n404", 0}
         end
@@ -132,17 +136,68 @@ defmodule Replicant.PackageIdentityTest do
   end
 
   test "fresh and held package decisions bind built bytes while docs may be missing or served" do
-    assert {:ok, :fresh} == PackageIdentity.check_archive(@version, @digest, &publish_runner/2)
+    assert {:ok, :fresh} ==
+             PackageIdentity.check_archive(@version, @digest, nil, &publish_runner/2)
 
     for docs? <- [false, true] do
       runner = hex_runner(hex_metadata(docs?))
       assert :ok == PackageIdentity.check_publish(@version, @commit, runner)
-      assert {:ok, {:held, docs?}} == PackageIdentity.check_archive(@version, @digest, runner)
+      assert {:ok, {:held, docs?}} ==
+               PackageIdentity.check_archive(@version, @digest, nil, runner)
 
       assert {:error, message} =
-               PackageIdentity.check_archive(@version, String.duplicate("e", 64), runner)
+               PackageIdentity.check_archive(@version, String.duplicate("e", 64), nil, runner)
 
       assert message =~ "checksum differs from the built package"
+    end
+  end
+
+  test "held docs compare served bytes before accepting either archive" do
+    for docs? <- [false, true] do
+      runner = hex_runner(hex_metadata(docs?))
+
+      assert {:ok, {:held, docs?}} ==
+               PackageIdentity.check_archive(@version, @digest, @docs_digest, runner)
+
+      for response <- [
+            {<<0x1F, 0x8B, "different">> <> "\n200", 0},
+            {"private-response-value\n503", 0},
+            {@docs_bytes <> "\n200", 22}
+          ] do
+        refused = docs_runner(runner, response)
+
+        assert {:error, message} =
+                 PackageIdentity.check_archive(@version, @digest, @docs_digest, refused)
+
+        refute message =~ "private-response-value"
+      end
+
+      absent = docs_runner(runner, {"\n404", 0})
+      result = PackageIdentity.check_archive(@version, @digest, @docs_digest, absent)
+
+      if docs? do
+        assert {:error, _message} = result
+      else
+        assert result == {:ok, {:held, false}}
+      end
+    end
+  end
+
+  test "docs response requires gzip, exact checksum and authoritative absence" do
+    assert :ok == PackageIdentity.docs_match({@docs_bytes <> "\n200", 0}, @docs_digest, true)
+    assert :ok == PackageIdentity.docs_match({"\n404", 0}, @docs_digest, false)
+
+    for response <- [
+          {"\n404", 0},
+          {"\n404", 22},
+          {"not gzip\n200", 0},
+          {"\n200", 0},
+          {"", 0},
+          {"private-response-value", 7},
+          {<<0x1F, 0x8B, "different">> <> "\n200", 0}
+        ] do
+      assert {:error, message} = PackageIdentity.docs_match(response, @docs_digest, true)
+      refute message =~ "private-response-value"
     end
   end
 
@@ -162,13 +217,14 @@ defmodule Replicant.PackageIdentityTest do
       runner = hex_runner(mutated)
       assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
       refute message =~ "private-response-value"
-      assert {:error, _message} = PackageIdentity.check_archive(@version, @digest, runner)
+      assert {:error, _message} = PackageIdentity.check_archive(@version, @digest, nil, runner)
     end
 
     assert {:error, message} =
              PackageIdentity.check_archive(
                @version,
                @digest,
+               nil,
                hex_runner(Map.put(metadata, "retirement", %{"reason" => "other"}))
              )
 
@@ -179,16 +235,32 @@ defmodule Replicant.PackageIdentityTest do
     archive =
       Path.join(System.tmp_dir!(), "replicant-publish-#{System.unique_integer([:positive])}.tar")
 
-    on_exit(fn -> File.rm!(archive) end)
+    docs = archive <> ".docs.tar.gz"
+    File.write!(docs, @docs_bytes)
+
+    on_exit(fn ->
+      File.rm!(archive)
+      File.rm!(docs)
+    end)
+
     File.write!(archive, "inspected-package-bytes")
     digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
     runner = hex_runner(Map.put(hex_metadata(false), "checksum", digest))
-    assert :ok == PackageIdentity.verify_publish_archive!(@version, @commit, archive, runner)
+    assert :ok ==
+             PackageIdentity.verify_publish_archive!(@version, @commit, archive, docs, runner)
+
+    File.write!(docs, <<0x1F, 0x8B, "changed docs">>)
+
+    assert_raise RuntimeError, ~r/docs checksum differs/, fn ->
+      PackageIdentity.verify_publish_archive!(@version, @commit, archive, docs, runner)
+    end
+
+    File.write!(docs, @docs_bytes)
 
     File.write!(archive, "changed-package-bytes")
 
     assert_raise RuntimeError, ~r/checksum differs from the built package/, fn ->
-      PackageIdentity.verify_publish_archive!(@version, @commit, archive, runner)
+      PackageIdentity.verify_publish_archive!(@version, @commit, archive, docs, runner)
     end
 
     for {command, args, response} <- [
@@ -202,7 +274,7 @@ defmodule Replicant.PackageIdentityTest do
       end
 
       assert_raise RuntimeError, fn ->
-        PackageIdentity.verify_publish_archive!(@version, @commit, archive, refused)
+        PackageIdentity.verify_publish_archive!(@version, @commit, archive, docs, refused)
       end
     end
   end
@@ -442,6 +514,7 @@ defmodule Replicant.PackageIdentityTest do
 
   defp publish_runner("curl", args) do
     case List.last(args) do
+      @docs_url -> {@docs_bytes <> "\n200", 0}
       @package_url -> {"200", 0}
       @hex_url -> {"\n404", 0}
     end
@@ -471,6 +544,16 @@ defmodule Replicant.PackageIdentityTest do
           @hex_url ->
             {Jason.encode!(hex_metadata(true)), 0}
         end
+    end
+  end
+
+  defp docs_runner(runner, response) do
+    fn
+      "curl", args ->
+        if List.last(args) == @docs_url, do: response, else: runner.("curl", args)
+
+      command, args ->
+        runner.(command, args)
     end
   end
 

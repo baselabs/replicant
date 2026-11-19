@@ -93,6 +93,9 @@ defmodule Replicant.MixProject do
       # GitHub release from release-assets after Hex read-back; never rebuild at upload.
       source_ref: "v#{@version}",
       source_url: @source_url,
+      # No EPUB: it embeds the build time unless SOURCE_DATE_EPOCH is set.
+      # HTML and Markdown keep rebuilt docs byte-identical to the served archive.
+      formatters: ["html", "markdown"],
       # Four extras are named README.md; without explicit filenames ex_doc emits
       # readme-1.html … readme-4.html and the front page (readme.html) does not exist.
       extras: [

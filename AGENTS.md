@@ -70,7 +70,17 @@ dropped column classifies as `:destructive` and halts fail-closed.
 this lib. That boundary is the whole reason `replicant` and `ash_replicant` are
 separate.
 
-## Development workflow
+## Build and test
+
+All checks run only in GitHub CI on GitHub-hosted runners. This public repository never
+builds on the build box. Nothing that compiles or tests runs on the owner's Mac.
+Covering tests for changed files and their direct dependents run in
+`.github/workflows/qualification.yml`, through the same `kci/` route as all other checks.
+Land changes with `kimosabe-land`, which submits a `kci/<commit>` candidate and moves `main`
+only after its `qualified` check succeeds. Do not push directly to `main`.
+
+The commands below describe the CI gates. See [Testing](#testing) for the test coverage and
+[Workflow](#workflow) for contribution and release responsibilities.
 
     mix deps.get --check-locked
     mix format
@@ -92,8 +102,7 @@ PostgreSQL majors, docs and package, the reference example) is a job in
 branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qualified` job
 (which fails unless every job succeeded) is the verdict that moves `main`. A push to `main`
 runs nothing. No workflow runs repository code from a pull request. A fork's change is qualified
-when a maintainer submits it through the `kci/` landing. Contributors may run any of the commands
-above on their own machines first.
+when a maintainer submits it through the `kci/` landing.
 
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
@@ -114,8 +123,9 @@ never arguments, logs, or files. Hex lookups remain unauthenticated public reads
 
 ## Workflow
 
-Make the change, commit with named paths, and land it through `kci/<commit>`; `main` moves only
-on that commit's `qualified` check. If it goes red, fix forward in the next commit.
+Make the change, commit with named paths, and use the route in [Build and test](#build-and-test).
+`main` moves only on that commit's `qualified` check.
+If CI goes red, fix forward in the next commit.
 
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.
@@ -128,7 +138,8 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   An early anonymous Hex read refuses a missing `replicant` package name: a first publication
   is the owner's decision. Lookup errors fail closed. Keyless steps build the package twice
   from the exact live `origin/main` commit, compare and inspect its bytes, audit and consume
-  it, build docs with warnings as errors, and inspect the docs archive. The fresh generated
+  it, render docs twice from independent extracted trees with warnings as errors, compare
+  both docs archives byte for byte, and inspect every rendered file. The fresh generated
   consumer starts without a lock and runs both audits on its new resolution; projects with
   committed locks fetch with `--check-locked`.
   Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
@@ -138,10 +149,11 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
   or remote version tags and GitHub releases refuse publication. An untagged Hex version can
   finish only when its checksum matches the built package and it is not retired; the keyless
   build and the keyed script both check this. Only missing package or docs uploads run. Both
-  are read back. Docs presence is checked through metadata and the served archive, without
-  byte comparison: the locked renderer generates random highlighting IDs and the tar retains
-  build-time file metadata. Existing docs are never replaced. The script loads no project
-  code and builds nothing.
+  are read back and compared by SHA-256 with the inspected archives. ExDoc 0.40.4 fixes the
+  highlighting group prefix; only HTML and Markdown ship, with no timestamped EPUB. Hex
+  constructs sorted archives with fixed metadata and a gzip header without a name or mtime.
+  Served docs must match before the upload decision and on read-back; they are never replaced.
+  The script loads no project code and builds nothing.
   After successful read-back, one `release-assets` artifact retains the versioned package,
   docs archive, and `SHA256SUMS`. Temporary archives are removed even on failure. Infra creates
   the `v<version>` tag at that full source SHA, compares the artifact's package with Hex's
@@ -155,8 +167,9 @@ on that commit's `qualified` check. If it goes red, fix forward in the next comm
 
 infra-1, the DevOps session, owns CI/CD, the build box, releases and their keys for every
 BaseLabs product, and its requirements bind this repository. They are written once in the infra
-repository at [`baselabs/docs/ci.md`, section "What infra requires of every product"](https://github.com/baselabs/infra/blob/main/baselabs/docs/ci.md#what-infra-requires-of-every-product). Read them
-from infra's default branch (`git -C ~/Developer/infra fetch -q origin`, then
+repository under "What infra requires of every product" in the
+[infra CI requirements](https://github.com/baselabs/infra/blob/main/baselabs/docs/ci.md).
+Read them from infra's default branch (`git -C ~/Developer/infra fetch -q origin`, then
 `git -C ~/Developer/infra show origin/main:baselabs/docs/ci.md`), not from a local checkout,
 and reread them whenever you touch a workflow, a Dockerfile, a release script or a secret.
 
@@ -168,9 +181,8 @@ and reread them whenever you touch a workflow, a Dockerfile, a release script or
   a release script or anything that touches a secret, it sends infra-1 the branch and head and
   waits for infra-1's review. Any CI/CD, runner, box or key problem goes to infra-1, not around
   it.
-- On the build box, gate work on `kimosabe-remote where` and your own routed run, never on
-  `doctor`. Never list process arguments: no `ps` with `args` or `-f`, no `/proc/*/cmdline`;
-  use `ps -eo pid,etimes,pcpu,comm`. Nothing that compiles or tests runs on the owner's Mac.
+- This public repository never builds on the build box. Never list process arguments:
+  no `ps` with `args` or `-f`, no `/proc/*/cmdline`; use `ps -eo pid,etimes,pcpu,comm`.
 - A secret never appears on a command line, in a log or in a message. If you see one exposed,
   tell infra-1 where it sits without copying the value.
 - Messages to infra-1 carry one result each and are complete enough to act on without a reply.
@@ -203,7 +215,8 @@ and reread them whenever you touch a workflow, a Dockerfile, a release script or
 - **Integration + crash-injection tests** (`test/integration/**`): gate on
   `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
   unset. Contributors without a server can spin a major (never on `localhost:5432`) with
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
+  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c
+  wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
   and `export REPLICANT_TEST_URL="postgres://postgres@localhost:<PORT>/postgres"`. A shared
   server needs a `LOGIN REPLICATION CREATEDB` role, its own test database, and
   `GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal()`; tests set
