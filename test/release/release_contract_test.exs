@@ -187,7 +187,7 @@ defmodule Replicant.ReleaseContractTest do
              ~s|consume_candidate.sh" "$rebuild_tree/package.tar" "$rebuild_tree/docs.tar.gz"|
 
     assert source =~
-             ~s|cmp -s "$output_dir/docs.tar.gz" "$rebuild_tree/docs.tar.gz" || die "docs build is not byte-reproducible"|
+             ~s(cmp -s "$output_dir/docs.tar.gz" "$rebuild_tree/docs.tar.gz" || die "docs build is not byte-reproducible")
 
     [_build, after_cmp] = String.split(source, ~s|cmp -s "$output_dir/docs.tar.gz"|, parts: 2)
     assert after_cmp =~ "Replicant.PackageIdentity.verify_publish_archive!"
