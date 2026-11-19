@@ -244,3 +244,11 @@ and reread them whenever you touch a workflow, a Dockerfile, a release script or
   lifecycle artifacts into tracked documentation paths.
 - **Instruction history:** `docs/reference/agent-history.md` (repository-only; not binding).
 - AI-tool state dirs (`.claude/`, `.serena/`, etc.) are gitignored.
+
+## graphify (code knowledge graph)
+
+`graphify-out/graph.json` maps this repo (tree-sitter AST; rebuilt by the git post-commit hook;
+gitignored). Prefer `graphify query`, `graphify explain` and `graphify path` for orientation.
+Graph output is navigation, never evidence: Elixir edges are file-local only, so verify
+load-bearing claims against live code. `graphify update .` refreshes it after large uncommitted
+changes.
