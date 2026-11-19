@@ -497,6 +497,14 @@ defmodule Replicant.PublishWorkflowTest do
     original = read_yaml!(@qualification)
     steps = original["jobs"]["release-artifact"]["steps"]
     assert List.last(steps)["run"] == "bash scripts/release/build_candidate.sh --check"
+
+    live = Enum.find(steps, &(&1["name"] == "Exercise the uploader's Hex reads without a key"))
+    assert live["working-directory"] == "${{ runner.temp }}"
+
+    assert live["run"] ==
+             ~s|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/test_publish_hex_artifacts.exs"|
+
+    refute Map.has_key?(live, "env")
     refute Jason.encode!(original) =~ "authorization"
     refute Jason.encode!(original) =~ "upload-artifact"
   end

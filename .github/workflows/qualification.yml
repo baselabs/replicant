@@ -251,6 +251,12 @@ jobs:
       - run: mix compile --warnings-as-errors
       - run: mix docs --warnings-as-errors
 
+      # The keyed uploader's reads, decided against live Hex without a key. Run
+      # outside the checkout so no project code loads, exactly as publication does.
+      - name: Exercise the uploader's Hex reads without a key
+        working-directory: ${{ runner.temp }}
+        run: mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/test_publish_hex_artifacts.exs"
+
       # Build both archives twice from independent trees at the exact commit and
       # compare their bytes. Audit and consume the package; inspect both archives.
       # GitHub identity reads receive only this step's read-only job token.

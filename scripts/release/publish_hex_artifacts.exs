@@ -15,13 +15,13 @@ defmodule Replicant.PublishHexArtifacts do
     auth = [key: key]
 
     # A missing release alone cannot prove the package name already exists.
-    existing_package!(Hex.API.Package.get("hexpm", "replicant"))
+    existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))
     digest = :crypto.hash(:sha256, package_bytes) |> Base.encode16(case: :lower)
     docs_digest = :crypto.hash(:sha256, docs_bytes) |> Base.encode16(case: :lower)
 
-    case release_state!(Hex.API.Release.get("hexpm", "replicant", version), version, digest) do
+    case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
       :fresh ->
-        Hex.API.Release.publish("hexpm", package_bytes, auth)
+        Hex.API.Release.publish(nil, package_bytes, auth)
         |> accepted!("Hex package")
         |> approved!()
 
@@ -30,11 +30,11 @@ defmodule Replicant.PublishHexArtifacts do
     end
 
     # Re-read after the package decision: docs may have appeared in the meantime.
-    case release_state!(Hex.API.Release.get("hexpm", "replicant", version), version, digest) do
+    case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
       {:held, docs?} ->
-        case docs_action!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version), docs_digest, docs?) do
+        case docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest, docs?) do
           :upload ->
-            Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth)
+            Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs_bytes, auth)
             |> accepted!("Hex docs")
             |> approved!()
 
@@ -46,8 +46,9 @@ defmodule Replicant.PublishHexArtifacts do
         raise "Hex package is not served yet; inspect public state before retrying"
     end
 
-    read_back!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)
-    docs_read_back!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version), docs_digest)
+    read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)
+    package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)
+    docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest)
   end
 
   def main(_argv),
@@ -109,8 +110,21 @@ defmodule Replicant.PublishHexArtifacts do
     end
   end
 
-  # Hex follows the docs API redirect to the anonymously served archive. Check
-  # its bytes even if metadata says docs are absent; never replace served docs.
+  def package_read_back!({:ok, {200, _headers, bytes}}, digest) when is_binary(bytes) do
+    if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) != digest do
+      raise "Hex package archive checksum differs from the built package; publication refused"
+    end
+
+    :ok
+  end
+
+  def package_read_back!(_response, _digest),
+    do: raise("Hex package archive is unavailable; inspect public state before retrying")
+
+  # Read the served archive's raw bytes from the repository. The docs API
+  # (Hex.API.ReleaseDocs.get) decodes responses by content type and returns a nil
+  # body for the served archive. Check the bytes even if metadata says docs are
+  # absent; never replace served docs.
   def docs_action!({:ok, {200, _headers, <<0x1F, 0x8B, _rest::binary>> = bytes}}, digest, _required?) do
     if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest do
       :skip

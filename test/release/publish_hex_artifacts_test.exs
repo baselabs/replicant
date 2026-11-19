@@ -2,7 +2,7 @@
 # Mix prunes archive paths during compilation; restore the real installed Hex APIs.
 Mix.Local.append_archives()
 
-for api <- [Hex.API.Package, Hex.API.Release, Hex.API.ReleaseDocs] do
+for api <- [Hex.API.Package, Hex.API.Release, Hex.API.ReleaseDocs, Hex.Repo] do
   Code.ensure_loaded!(api)
 end
 
@@ -20,11 +20,14 @@ defmodule Replicant.PublishHexArtifactsTest do
   @digest String.duplicate("a", 64)
   @docs_bytes <<0x1F, 0x8B, 0xFF, "inspected docs">>
   @docs_digest :crypto.hash(:sha256, @docs_bytes) |> Base.encode16(case: :lower)
-  @docs_read ~s|docs_read_back!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version), docs_digest)|
-  @docs_action ~s|docs_action!(Hex.API.ReleaseDocs.get("hexpm", "replicant", version), docs_digest, docs?)|
-  @read ~s|release_state!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)|
-  @package ~s|Hex.API.Release.publish("hexpm", package_bytes, auth)|
-  @docs ~s|Hex.API.ReleaseDocs.publish("hexpm", "replicant", version, docs_bytes, auth)|
+  @docs_read ~s|docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest)|
+  @docs_action ~s|docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest, docs?)|
+  @package_read ~s|package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)|
+  @read ~s|release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
+  @read_back ~s|read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
+  @exists ~s|existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))|
+  @package ~s|Hex.API.Release.publish(nil, package_bytes, auth)|
+  @docs ~s|Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs_bytes, auth)|
   @guard ~s|if Mix.Project.get(), do: raise("publication must run without a Mix project")|
 
   test "only an existing package name permits publication" do
@@ -110,6 +113,25 @@ defmodule Replicant.PublishHexArtifactsTest do
     end
   end
 
+  test "package read-back requires the served archive's exact bytes" do
+    package = "served package archive"
+    digest = :crypto.hash(:sha256, package) |> Base.encode16(case: :lower)
+    assert :ok == PublishHexArtifacts.package_read_back!(response(200, package), digest)
+
+    assert_raise RuntimeError, ~r/package archive checksum differs/, fn ->
+      PublishHexArtifacts.package_read_back!(response(200, "different archive"), digest)
+    end
+
+    for result <- [response(404, "private-response-value"), response(200, nil) | failures()] do
+      error =
+        assert_raise RuntimeError, fn ->
+          PublishHexArtifacts.package_read_back!(result, digest)
+        end
+
+      refute Exception.message(error) =~ "private-response-value"
+    end
+  end
+
   test "served docs skip only on byte identity, while authoritative absence uploads" do
     for required? <- [false, true] do
       assert :skip ==
@@ -131,7 +153,12 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}), @docs_digest, false)
     assert :ok == PublishHexArtifacts.docs_read_back!(response(200, @docs_bytes), @docs_digest)
 
-    missing = [response(404, %{}), response(200, ""), response(200, "not gzip") | failures()]
+    missing = [
+      response(404, %{}),
+      response(200, nil),
+      response(200, ""),
+      response(200, "not gzip") | failures()
+    ]
 
     for result <- missing do
       error =
@@ -176,7 +203,7 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert_isolated_upload!(source)
 
     for {before, after_change} <- [
-          {~s|existing_package!(Hex.API.Package.get("hexpm", "replicant"))|, ":ok"},
+          {@exists, ":ok"},
           {@read, ":fresh"},
           {@package, "mix hex.publish"},
           {@docs, "mix docs"},
@@ -187,9 +214,10 @@ defmodule Replicant.PublishHexArtifactsTest do
            "docs_digest = :crypto.hash(:sha256, package_bytes)"},
           {"== digest", "!= digest"},
           {"|> approved!()", "|> then(fn _ -> :ok end)"},
-          {~s|read_back!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)|,
-           ":ok"},
+          {@read_back, ":ok"},
+          {@package_read, ":ok"},
           {@docs_read, ":ok"},
+          {"!= digest do", "== digest do"},
           {~s|"checksum" => ^digest|, ~s|"checksum" => _checksum|},
           {~s|"retirement" => nil|, ~s|"retirement" => _retirement|}
         ] do
@@ -217,7 +245,7 @@ defmodule Replicant.PublishHexArtifactsTest do
     parts = String.split(source, "case " <> @read <> " do")
     assert length(parts) == 3
     [before_package, package_case, docs_case] = parts
-    assert before_package =~ ~s|existing_package!(Hex.API.Package.get("hexpm", "replicant"))|
+    assert before_package =~ @exists
     assert package_case =~ ":fresh ->\n        " <> @package
     assert package_case =~ "{:held, _docs?} ->\n        :ok"
     assert package_case =~ "|> accepted!(\"Hex package\")\n        |> approved!()"
@@ -227,13 +255,13 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert docs_case =~ ":skip ->\n            :ok"
     assert docs_case =~ "|> accepted!(\"Hex docs\")\n            |> approved!()"
 
-    assert docs_case =~
-             ~s|read_back!(Hex.API.Release.get("hexpm", "replicant", version), version, digest)|
-
+    assert docs_case =~ @read_back
+    assert docs_case =~ @package_read
     assert docs_case =~ @docs_read
     assert source =~ "docs_digest = :crypto.hash(:sha256, docs_bytes)"
     assert source =~ "Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest"
     assert source =~ ":skip = docs_action!(response, digest, true)"
+    assert source =~ "Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) != digest do"
   end
 
   defp metadata(docs?) do
