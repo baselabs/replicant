@@ -141,7 +141,7 @@ defmodule Replicant.PackageIdentity do
   def docs_match({response, 0}, digest, required?) when byte_size(response) >= 4 do
     size = byte_size(response) - 4
 
-    <<bytes::binary-size(size), status::binary>> = response
+    <<bytes::binary-size(^size), status::binary>> = response
 
     case {status, bytes} do
       {"\n200", <<0x1F, 0x8B, _rest::binary>>} ->

@@ -183,6 +183,7 @@ defmodule Replicant.ReleaseContractTest do
 
   defp assert_docs_rebuild!(source) do
     assert source =~ ~s|consume_candidate.sh" "$package" "$output_dir/docs.tar.gz"|
+
     assert source =~
              ~s|consume_candidate.sh" "$rebuild_tree/package.tar" "$rebuild_tree/docs.tar.gz"|
 

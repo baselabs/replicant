@@ -142,6 +142,7 @@ defmodule Replicant.PackageIdentityTest do
     for docs? <- [false, true] do
       runner = hex_runner(hex_metadata(docs?))
       assert :ok == PackageIdentity.check_publish(@version, @commit, runner)
+
       assert {:ok, {:held, docs?}} ==
                PackageIdentity.check_archive(@version, @digest, nil, runner)
 
@@ -246,6 +247,7 @@ defmodule Replicant.PackageIdentityTest do
     File.write!(archive, "inspected-package-bytes")
     digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
     runner = hex_runner(Map.put(hex_metadata(false), "checksum", digest))
+
     assert :ok ==
              PackageIdentity.verify_publish_archive!(@version, @commit, archive, docs, runner)
 
