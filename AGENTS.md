@@ -104,6 +104,11 @@ branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qu
 runs nothing. No workflow runs repository code from a pull request. A fork's change is qualified
 when a maintainer submits it through the `kci/` landing.
 
+Every workflow declares `defaults: run: shell: bash`, so each step runs with `pipefail`; every
+script a job calls is bash with `set -euo pipefail`. A command whose output a check reads is
+assigned to a variable first, never hidden by `|| true` or read through `<(...)` or `"$(...)"`
+inside a test, so its failure fails the step.
+
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
 

@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Every workflow runs its steps in bash with `pipefail` by default, so a failure
+  behind a pipe fails its step. Release scripts assign a listing before checking
+  it, so a failing `git`, `find` or `comm` fails the check instead of reading as
+  "none found". Tests reject `|| true`, process substitution and
+  `-z/-n "$(...)"` checks in workflows and scripts.
 - ExDoc moves to 0.40.4 for deterministic highlighting, with its required Earmark
   Parser 1.4.46. Docs use HTML and Markdown without EPUB. The Hex archive builder
   fixes entry order, ownership, timestamps, and the gzip header. Qualification
