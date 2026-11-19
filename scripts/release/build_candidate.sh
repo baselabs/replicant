@@ -23,7 +23,8 @@ fi
 log() { echo "build_candidate: $*" >&2; }
 die() { echo "::error::build_candidate: $*" >&2; exit 1; }
 
-[[ -z "$(git status --porcelain)" ]] || die "working tree is dirty"
+tree_status="$(git status --porcelain)"
+[[ -z "$tree_status" ]] || die "working tree is dirty"
 commit="$(git rev-parse HEAD)"
 version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
 [[ -n "$version" ]] || die "could not read package version"

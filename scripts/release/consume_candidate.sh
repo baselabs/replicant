@@ -61,7 +61,8 @@ cp "$repo_root/mix.lock" "$src/mix.lock"
 # Archive and inspect the rendered docs before the credentialed step can run.
 if [[ -n "$docs_archive" ]]; then
   [[ -f "$src/doc/index.html" ]] || die "docs have no index.html"
-  [[ -z "$(find "$src/doc" ! -type f ! -type d -print -quit)" ]] || die "docs contain a link or special entry"
+  special_entry="$(find "$src/doc" ! -type f ! -type d -print -quit)"
+  [[ -z "$special_entry" ]] || die "docs contain a link or special entry"
   ( cd "$scratch" && mix run --no-mix-exs "$repo_root/scripts/release/build_docs_archive.exs" \
       "$src/doc" "$docs_archive" ) >&2
   python3 -I "$repo_root/scripts/release/check_docs_archive.py" "$docs_archive" "$src/doc" >&2

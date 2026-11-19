@@ -81,14 +81,17 @@ contents="$work/contents"
 mkdir -p "$contents"
 tar -xOf "$tarball" contents.tar.gz | tar -xzf - -C "$contents"
 
-if find "$contents" -type l | grep -q .; then
+# Assign each listing first: a failing find must fail here, never read as "none found".
+symlinks="$(find "$contents" -type l)"
+if [[ -n "$symlinks" ]]; then
   echo "::error::package contains a symlink:" >&2
-  find "$contents" -type l | sed 's|^|  |' >&2
+  printf '  %s\n' "${symlinks//$'\n'/$'\n  '}" >&2
   exit 1
 fi
-if find "$contents" ! -type f ! -type d | grep -q .; then
+special_entries="$(find "$contents" ! -type f ! -type d)"
+if [[ -n "$special_entries" ]]; then
   echo "::error::package contains a special (non-regular, non-directory) entry:" >&2
-  find "$contents" ! -type f ! -type d | sed 's|^|  |' >&2
+  printf '  %s\n' "${special_entries//$'\n'/$'\n  '}" >&2
   exit 1
 fi
 
@@ -99,8 +102,8 @@ actual="$work/actual.manifest"
 expected_sorted="$work/expected.manifest"
 LC_ALL=C sort "$manifest" > "$expected_sorted"
 
-extra="$(LC_ALL=C comm -13 "$expected_sorted" "$actual" || true)"
-missing="$(LC_ALL=C comm -23 "$expected_sorted" "$actual" || true)"
+extra="$(LC_ALL=C comm -13 "$expected_sorted" "$actual")"
+missing="$(LC_ALL=C comm -23 "$expected_sorted" "$actual")"
 
 status=0
 if [[ -n "$extra" ]]; then

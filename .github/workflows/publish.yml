@@ -15,6 +15,12 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
+# Every run step uses bash -eo pipefail, so a failure behind a pipe fails its step
+# (infra baselabs/docs/ci.md). Scripts the jobs call set -euo pipefail themselves.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   publish:
     name: Publish

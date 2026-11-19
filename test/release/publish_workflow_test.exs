@@ -48,9 +48,64 @@ defmodule Replicant.PublishWorkflowTest do
     assert pipelines != []
 
     for {name, index} <- pipelines,
-        shell <- [nil, "sh", "bash {0}"] do
+        shell <- ["sh", "bash {0}"] do
       mutated = replace(original, ["jobs", name, "steps", index, "shell"], shell)
       assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+    end
+  end
+
+  test "every workflow runs its steps in bash with pipefail" do
+    for path <- Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}")) do
+      original = read_yaml!(path)
+      assert_bash_shell!(original)
+
+      for defaults <- [nil, %{"run" => %{"shell" => "sh"}}, %{"run" => %{}}] do
+        mutated = Map.put(original, "defaults", defaults)
+        assert_raise ExUnit.AssertionError, fn -> assert_bash_shell!(mutated) end
+      end
+
+      for {name, job} <- original["jobs"],
+          {step, index} <- Enum.with_index(job["steps"] || []),
+          Map.has_key?(step, "run"),
+          shell <- ["sh", "bash {0}", "pwsh"] do
+        mutated = replace(original, ["jobs", name, "steps", index, "shell"], shell)
+        assert_raise ExUnit.AssertionError, fn -> assert_bash_shell!(mutated) end
+      end
+    end
+  end
+
+  test "release scripts are bash with pipefail and never hide a failing command" do
+    scripts = Path.wildcard(Path.join(@repo_root, "scripts/**/*.sh"))
+    assert scripts != []
+    workflows = Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}"))
+
+    for path <- scripts do
+      source = File.read!(path)
+      assert_strict_script!(source)
+
+      for {before, after_change} <- [
+            {"#!/usr/bin/env bash", "#!/bin/sh"},
+            {"set -euo pipefail", "set -eu"}
+          ] do
+        assert_raise ExUnit.AssertionError, fn ->
+          assert_strict_script!(String.replace(source, before, after_change))
+        end
+      end
+    end
+
+    for path <- scripts ++ workflows do
+      source = File.read!(path)
+      assert_no_lost_status!(source)
+
+      for line <- [
+            "  mix test || true",
+            ~S|  diff -u expected <(find . -type f)|,
+            ~S{  [[ -z "$(git status --porcelain)" ]] || exit 1},
+            ~S|  if [ -n "$(find . -type l)" ]; then exit 1; fi|
+          ] do
+        mutated = source <> "\n" <> line <> "\n"
+        assert_raise ExUnit.AssertionError, fn -> assert_no_lost_status!(mutated) end
+      end
     end
   end
 
@@ -549,12 +604,32 @@ defmodule Replicant.PublishWorkflowTest do
     for {_name, job} <- workflow["jobs"], do: assert_job_host!(job)
     for {_name, job} <- workflow["jobs"], do: assert_runtime_steps!(job)
 
-    for {_name, job} <- workflow["jobs"],
-        step <- job["steps"] || [],
-        (step["run"] || "") =~ ~r/\|\s*tee\b/,
-        do: assert(step["shell"] == "bash")
+    assert_bash_shell!(workflow)
 
     for map <- maps, do: assert_action_pins!(map)
+  end
+
+  # A bare run: is `bash -e` without pipefail; the workflow default is `bash -eo pipefail`.
+  defp assert_bash_shell!(workflow) do
+    assert workflow["defaults"]["run"]["shell"] == "bash"
+
+    for {_name, job} <- workflow["jobs"],
+        step <- job["steps"] || [],
+        Map.has_key?(step, "shell"),
+        do: assert(step["shell"] == "bash")
+  end
+
+  defp assert_strict_script!(source) do
+    assert String.starts_with?(source, "#!/usr/bin/env bash\n")
+    assert source =~ ~r/^set -euo pipefail$/m
+  end
+
+  # A command whose output feeds a check is assigned first, so its failure fails
+  # the step instead of reading as empty output.
+  defp assert_no_lost_status!(source) do
+    refute source =~ ~r/\|\|\s*true\b/
+    refute source =~ ~r/<\(/
+    refute source =~ ~r/(\[\[?|test) +-[zn] +"\$\(/
   end
 
   defp refute_pull_request_trigger!(workflow) do

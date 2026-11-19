@@ -17,6 +17,12 @@ permissions:
 env:
   HEX_VERSION: "2.7.0"
 
+# Every run step uses bash -eo pipefail, so a failure behind a pipe fails its step
+# (infra baselabs/docs/ci.md). Scripts the jobs call set -euo pipefail themselves.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # Format, lint, compile warnings, the dependency audit and dialyzer read no database,
   # so they run once here instead of in every matrix row.
@@ -208,9 +214,8 @@ jobs:
         # live-server test. Grepping for THIS row's major proves the row actually exercised the
         # integration suite against the version it claims — a skipped or mis-wired row (which
         # would print nothing, or a different major) reds here rather than passing vacuously.
-        # Explicit bash enables -eo pipefail; the implicit Linux shell only uses -e
-        # and would let tee hide test failures before the receipt grep.
-        shell: bash
+        # The workflow's bash default runs this with pipefail, so tee cannot hide a failing
+        # `mix test` before the receipt grep.
         run: |
           mix test --warnings-as-errors 2>&1 | tee test-output.log
           # No `^` anchor: ExUnit prints inline progress dots with no trailing newline, so the
