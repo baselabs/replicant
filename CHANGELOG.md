@@ -62,7 +62,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- In-flight-lag integration tests assert halts from telemetry and size their shared bound from the measured WAL span.
+- In-flight-lag integration tests assert halts from telemetry and size their
+  shared bound from the measured WAL span.
+- Incremental snapshot contention tests synchronize a delivered write inside every
+  keyed and keyless attempt and assert exactly two retries before the bounded halt.
+  A continuously running writer can leave a quiescent read window; waiting longer
+  for a halt after successful completion did not establish contention.
 - Integration test pipelines explicitly select Bash with `pipefail`, so a
   failing test run cannot be hidden by a successful output capture or receipt grep.
 - Plugin snapshot tests bind table names as text before PostgreSQL resolves their
