@@ -23,10 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Docs render once and are never compared with a rebuild: a differing rendering
-  could strand immutable served docs despite matching package bytes. Planning
-  keeps readable served docs, uploads only on an authoritative 404, and refuses
-  other statuses or malformed bodies. Every built docs archive carries exact
+- Docs render once. Under infra's release rule, this path never replaces or
+  compares served docs: it keeps them and reads them back by presence and
+  `release.json` provenance. Hex itself allows docs republishing, but replacing
+  docs on resume could rebind their provenance away from the commit infra tags.
+  Comparing a rebuild would refuse a held release whose package bytes match.
+  Planning uploads only when `has_docs: false` and the repository returns 404;
+  `has_docs: true` with a 404, other statuses, or malformed bodies refuse. Every built docs archive carries exact
   `release.json` package/version/CI-commit provenance. Read-back requires it and
   `index.html`, then proves the docs commit equals or precedes the dispatched
   commit on fetched default-branch history; missing history or provenance refuses.

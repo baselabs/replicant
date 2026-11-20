@@ -82,8 +82,9 @@ cmp -s "$package" "$rebuild_tree/package.tar" || die "package build is not byte-
 EXPECTED_VERSION="$version" bash "$repo_root/scripts/release/verify_package.sh" "$package" >&2
 bash "$repo_root/scripts/release/consume_candidate.sh" "$package" "$output_dir/docs.tar.gz" >&2
 if [[ "$mode" == "publish" ]]; then
-  # A held package must match exactly. Served docs are kept: comparing a rebuilt
-  # rendering could strand immutable docs. Repeat tag/release refusals after build.
+  # A held package must match exactly. Infra's rule keeps served docs without
+  # comparison or replacement: comparison could refuse matching package bytes,
+  # and replacement could rebind their published commit. Repeat tag/release refusals.
   elixir -r "$repo_root/scripts/release/package_identity.exs" \
     -e '
       [version, commit, archive] = System.argv()

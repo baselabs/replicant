@@ -156,14 +156,20 @@ If CI goes red, fix forward in the next commit.
   finish only when its checksum matches the built package and it is not retired; the keyless
   build and the keyed script both check this. Only missing package or docs uploads run. Both
   are read back from Hex's repository. The package SHA-256 must match the inspected
-  archive; docs planning keeps a readable served gzip tarball, uploads only on an
-  authoritative 404, and refuses other responses.
+  archive; docs planning keeps a readable served gzip tarball and uploads only
+  when metadata says `has_docs: false` and the repository returns HTTP 404.
+  `has_docs: true` with a repository 404 refuses as a metadata/repository disagreement;
+  other statuses or malformed bodies also refuse.
   Qualification runs the same reads against live Hex for a published version, without a key.
   ExDoc 0.40.4 fixes the highlighting group prefix; only HTML and Markdown ship, with no
   timestamped EPUB. Hex
   constructs sorted archives with fixed metadata and a gzip header without a name or mtime.
-  Docs builds are never compared: a rebuilt rendering could strand immutable served
-  docs. Read-back requires `index.html` and valid `release.json` package/version
+  Under infra's release rule, this path never replaces or compares served docs;
+  it keeps them and reads them back by presence and `release.json` provenance.
+  Hex itself allows docs republishing, but replacing docs on resume could rebind
+  their provenance away from the commit infra tags. Comparing a rebuild would
+  refuse a held release whose package bytes match. Read-back requires `index.html`
+  and valid `release.json` package/version
   fields. A following keyless step proves the docs commit is the dispatched commit
   or its ancestor on fetched, complete default-branch history; missing history or
   provenance refuses. The producer lock is not packaged, so matching package bytes

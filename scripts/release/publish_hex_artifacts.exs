@@ -124,8 +124,10 @@ defmodule Replicant.PublishHexArtifacts do
 
   # Read the served archive's raw bytes from the repository. The docs API
   # (Hex.API.ReleaseDocs.get) decodes responses by content type and returns a nil
-  # body for the served archive. Presence wins even when metadata lags. Comparing
-  # a rebuild could strand immutable served docs; never replace or compare them.
+  # body for the served archive. Presence wins even when metadata lags. Hex allows
+  # republishing docs; infra's rule forbids this path from replacing or comparing
+  # served docs, preserving their published commit. Comparing a rebuild could
+  # refuse a held release whose package bytes match.
   def docs_action!({:ok, {200, _headers, bytes}}, _required?) do
     Replicant.ReleaseDocs.files!(bytes)
     :skip

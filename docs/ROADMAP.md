@@ -19,9 +19,14 @@ with warnings as errors. The builder adds a top-level `release.json` with exactl
 `package`, `version`, and the full CI `GITHUB_SHA` as `commit`, then inspects every
 file and the provenance fields. ExDoc 0.40.4 fixes highlighting IDs; HTML and
 Markdown ship without EPUB in a sorted Hex archive with fixed archive metadata.
-Docs builds are never compared: immutable served docs could strand a matching
-package on a retry. A readable served docs tarball is kept; only an authoritative
-404 permits upload. Other statuses and malformed responses refuse.
+Under infra's release rule, this path never replaces or compares served docs;
+it keeps them and reads them back by presence and `release.json` provenance.
+Hex itself allows docs republishing, but replacing docs on resume could rebind
+their provenance away from the commit infra tags. Comparing a rebuild would
+refuse a held release whose package bytes match. A readable served docs tarball
+is kept. Upload requires both `has_docs: false` and a repository 404; a 404 with
+`has_docs: true` refuses the disagreement. Other statuses and malformed responses
+also refuse.
 
 Read-back compares the package bytes, requires served docs with `index.html` and
 valid package/version provenance, and proves the docs commit equals or precedes

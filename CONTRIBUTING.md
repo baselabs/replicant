@@ -131,9 +131,12 @@ producer lock. After rendering, the builder writes a top-level `release.json`
 with exactly `package`, `version`, and the full CI `GITHUB_SHA` as `commit`.
 Inspection checks those fields and every visible rendered file and refuses EPUB.
 ExDoc 0.40.4 supplies a fixed Makeup grouping prefix. Only HTML and Markdown ship.
-Hex 2.7.0 sorts archive entries and fixes archive metadata; no docs builds are
-compared. A rebuilt rendering could differ from immutable served docs and strand
-an otherwise matching package. The producer lock is not packaged, so equal package
+Hex 2.7.0 sorts archive entries and fixes archive metadata. Under infra's release
+rule, this path never replaces or compares served docs: it keeps them and reads
+them back by presence and `release.json` provenance. Hex itself allows docs
+republishing, but replacing docs on resume could rebind their provenance away
+from the commit infra tags. Comparing a rebuild would refuse a held release whose
+package bytes match. The producer lock is not packaged, so equal package
 bytes alone do not establish which commit rendered served docs.
 
 The single credentialed step runs `mix run --no-mix-exs` from the runner's temporary
@@ -145,9 +148,11 @@ already served by Hex without a tag is a held or partial release: the job compar
 its package checksum with the archive it just built, both before and inside the
 keyed step. A different package checksum, retirement, malformed metadata, or
 lookup failure refuses publication. Identical package bytes skip that upload.
-Docs planning is presence-only: a readable served gzip tarball is kept, an
-authoritative HTTP 404 permits upload, and other statuses or malformed bodies
-refuse. A second owner dispatch on the same commit finishes an approved hold or
+Docs planning keeps a readable served gzip tarball even when metadata says docs
+are absent. Upload requires both `has_docs: false` and an HTTP 404 from the
+repository. If metadata says `has_docs: true` but the repository returns 404,
+publication refuses the disagreement instead of risking replacement during a
+repository/CDN delay. Other statuses or malformed bodies refuse. A second owner dispatch on the same commit finishes an approved hold or
 interrupted upload; neither package nor served docs are replaced.
 
 Read-back requires the exact served package bytes, no retirement, and served docs.
