@@ -8,15 +8,13 @@ defmodule Replicant.CrashInjectionTest do
 
   alias Replicant.Test.{LedgerSink, PauseGate, PausingLedgerSink, PG16}
 
-  # The §4 spike tests drive an EXPLICIT small in-flight ceiling (128 KiB) via the
-  # `:max_inflight_lag` override, sized against the live 25ms/txn slow sink so a
-  # normal 200-txn burst (~40-75 KB peak lag incl. same-server pollution, see below)
-  # drains under it while a pathological 900-txn burst / a stuck sink trip the
-  # fail-closed halt. The PRODUCTION default is
-  # the far-larger backlog ceiling (`Replicant.Connection.default_max_inflight_lag/0`,
-  # 64 MiB) — this small override only makes the mechanism observable at test scale;
-  # it is NOT the shipped default.
-  @spike_bound 131_072
+  # The §4 spikes share a 2 MiB WAL-span ceiling: 200 transactions drain, while a
+  # 24,000-transaction burst at a slow or stuck sink halts. The sizing below budgets
+  # source WAL, same-server sink writes, full-page images and catalog vacuum, and
+  # prints the measured span. Telemetry decides whether a halt occurred; samples
+  # only describe the peak. The production default remains 64 MiB.
+  @spike_bound 2 * 1024 * 1024
+  @spike_burst 24_000
 
   setup do
     unless PG16.enabled?() do
@@ -303,81 +301,69 @@ defmodule Replicant.CrashInjectionTest do
     assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
-  # RISK #2 (spec §4 bounded in-flight window, proven against the live stream). The
-  # prior `max_len < 800` spike was VACUOUS: with no in-flight bound the mailbox scaled
-  # linearly with burst, so a threshold chosen for one burst is meaningless at another.
-  # These three tests encode the REAL §4 property: the in-flight WAL lag ceiling
-  # (`received_lsn - max(checkpoint_lsn, stream_floor_lsn)`) holds INDEPENDENT of burst —
-  # a small burst drains under it, a large one (or a stuck sink) halts fail-closed before
-  # the mailbox grows unbounded. No silent OOM/livelock either way.
+  # RISK #2 (spec §4): at ONE ceiling a small burst drains and a large burst or a
+  # stuck sink halts fail-closed. Lag is a cluster-wide WAL SPAN, not payload size:
+  # `received_lsn` is XLogData's `wal_end` (the decoded record's LSN), so everything
+  # interleaved before that record counts. Here that includes writes to sink_orders,
+  # _replicant_checkpoint and _replicant_calls on the SOURCE server, first-touch
+  # full-page images after checkpoints, and catalog autovacuum after schema churn.
   #
-  # They drive an EXPLICIT `max_inflight_lag: @spike_bound` (128 KiB) so the mechanism is
-  # observable at test scale — NOT the production default (64 MiB backlog ceiling).
+  # Budget A's whole 200-txn window at 512 KiB: ~35 KiB source WAL (200 * 177 B),
+  # 150 KiB for sink upserts/checkpoints/call ledger, 128 KiB for first-touch images
+  # of up to 16 heap/index/sequence pages across all four tables, and ~199 KiB for
+  # catalog vacuum and page-count variance. The shared 2 MiB ceiling is four times
+  # that budget. Record the actual window WAL on every run; unrelated cluster WAL
+  # has no universal upper bound, so telemetry remains the authoritative verdict.
   #
-  # WHY 128 KiB, not the original 64 KiB (de-flake, 2026-07-05, root-caused): `received_lsn`
-  # is pgoutput's `wal_end` = the SERVER's TOTAL WAL position, so it also counts WAL the
-  # TEST sink writes to the SAME PG16 (sink_orders/_replicant_checkpoint/_replicant_calls)
-  # plus post-churn autovacuum — "same-server pollution" of ~30-40 KB on top of the ~35 KB
-  # of real `orders` WAL for a 200-txn burst. At a 64 KiB ceiling the 200-burst peak (~40 KB
-  # baseline) sat only ~24 KB under the bound, and that pollution variance occasionally
-  # crossed it, HALTING the burst this test asserts must DRAIN (reproduced 1/15 under CPU
-  # load; test A alone never halted — only after the 900-txn B/C tests churned the DB). A
-  # real sink writes to a DIFFERENT mirror DB, so this is a test artifact. 128 KiB keeps the
-  # ~65-75 KB polluted 200-burst peak a safe ~55+ KB under the ceiling while the widened
-  # 900-txn bursts (~159 KB orders + pollution) still clear it decisively.
-  # Sizing (live PG16, 25ms/txn slow sink, @spike_bound = 131_072 B):
-  #   * 200-txn burst → peak lag ~40-75 KB (orders ~35 KB + pollution) → UNDER 128 KiB → drains.
-  #   * 900-txn burst → lag ~159 KB+ → OVER 128 KiB → fail-closed halt (fires ~740 txns in).
+  # B/C use the measured ~177 B/txn (128 KiB tripped near txn 740): 24,000 txns
+  # generate ~4.05 MiB, nearly twice the shared ceiling. At 1-2 ms per insert the
+  # burst takes 24-48s; B's 25ms sink drains at most ~1,920 txns in that time, so
+  # the remaining span still clears 2 MiB decisively. A 30s halt wait and teardown
+  # fit within each test's 120s timeout. A keeps the ledger's effect-once assertion.
   @tag :spike
   @tag timeout: 120_000
   test "bounded in-flight window: the lag ceiling holds independent of burst size", %{
     ctrl: ctrl,
     slot: slot
   } do
-    # (A) A NORMAL 200-txn burst drains UNDER the configured ceiling (no halt). The
-    # peak in-flight lag occurs right after the burst lands (frames arrive at wire
-    # speed, the 25ms/txn sink has barely drained), so a dense ~5s sample catches it.
+    # (A) Observe halts from before startup through the drain. A state sample may
+    # miss the crossing and returns zero after teardown, so it cannot prove no halt.
+    attach_sink_too_slow(slot)
     start_pipeline(slot, sink: Replicant.Test.SlowLedgerSink, max_inflight_lag: @spike_bound)
     conn = connection_pid(slot)
+    wal_start = current_wal_lsn(ctrl)
     for i <- 1..200, do: insert(ctrl, i, "n#{i}")
 
-    max_lag_200 =
-      sample(125, 0, fn acc ->
-        max(acc, inflight_lag(conn))
-      end)
+    deadline = System.monotonic_time(:millisecond) + 30_000
+    max_lag_200 = wait_for_spike_drain(ctrl, conn, deadline, 0)
+    window_wal = current_wal_lsn(ctrl) - wal_start
 
     IO.puts(
-      "\n[spike A] 200-txn burst peak in-flight lag = #{max_lag_200} B (ceiling #{@spike_bound} B)"
+      "\n[spike A] 200-txn burst sampled peak in-flight lag = #{max_lag_200} B; " <>
+        "window WAL = #{window_wal} B (ceiling #{@spike_bound} B)"
     )
 
-    assert max_lag_200 <= @spike_bound,
-           "a normal 200-txn burst peaked at #{max_lag_200} B in-flight lag, over the " <>
-             "#{@spike_bound} B ceiling — it should DRAIN under the bound, not halt"
-
-    # And it drains to completion (never halted): all 200 apply exactly once. The
-    # SlowLedgerSink applies serially at ~25ms/txn, so draining 200 txns is INHERENTLY
-    # ~5-6s and balloons under machine load (sink applies + the test's count polls share
-    # the LedgerConn pool). Size this wait generously to that legitimately-slow drain —
-    # 800 polls * 25ms = 20s, well under the test's 120s timeout. A genuinely-halted
-    # pipeline (a real §4 regression) still never reaches 200 and fails here.
-    PG16.wait_until(fn -> count(ctrl, "sink_orders") == 200 end, 800)
+    refute_received {:sink_too_slow, _}
     assert applied_counts(ctrl) |> Map.values() |> Enum.all?(&(&1 == 1))
   end
 
   @tag :spike
   @tag timeout: 120_000
-  test "bounded in-flight window: a 900-txn burst trips the fail-closed :sink_too_slow halt", %{
+  test "bounded in-flight window: a large burst trips the fail-closed :sink_too_slow halt", %{
     ctrl: ctrl,
     slot: slot
   } do
-    # (B) A PATHOLOGICAL 900-txn burst at the same slow sink exceeds the ceiling and
-    # halts fail-closed BEFORE the mailbox grows unbounded (the vacuous RED grew it).
+    # (B) A large burst at the same slow sink exceeds the SAME ceiling.
     attach_sink_too_slow(slot)
     start_pipeline(slot, sink: Replicant.Test.SlowLedgerSink, max_inflight_lag: @spike_bound)
-    for i <- 1..900, do: insert(ctrl, i, "n#{i}")
+    for i <- 1..@spike_burst, do: insert(ctrl, i, "n#{i}")
 
-    assert_receive {:sink_too_slow, %{lag: lag}}, 15_000
-    IO.puts("\n[spike B] 900-txn burst tripped :sink_too_slow at in-flight lag = #{lag} B")
+    assert_receive {:sink_too_slow, %{lag: lag}}, 30_000
+
+    IO.puts(
+      "\n[spike B] #{@spike_burst}-txn burst tripped :sink_too_slow at in-flight lag = #{lag} B"
+    )
+
     assert lag > @spike_bound
 
     # The pipeline is torn down permanently (fail-closed) — not livelocking/OOMing.
@@ -385,8 +371,6 @@ defmodule Replicant.CrashInjectionTest do
       fn -> Registry.lookup(Replicant.Registry, {slot, :pipeline}) == [] end,
       400
     )
-
-    :telemetry.detach({__MODULE__, {:too_slow, slot}})
   end
 
   @tag :spike
@@ -399,9 +383,9 @@ defmodule Replicant.CrashInjectionTest do
     # in-flight lag grows monotonically past the ceiling and MUST fail-closed halt.
     attach_sink_too_slow(slot)
     start_pipeline(slot, sink: Replicant.Test.StuckLedgerSink, max_inflight_lag: @spike_bound)
-    for i <- 1..900, do: insert(ctrl, i, "n#{i}")
+    for i <- 1..@spike_burst, do: insert(ctrl, i, "n#{i}")
 
-    assert_receive {:sink_too_slow, %{lag: lag}}, 15_000
+    assert_receive {:sink_too_slow, %{lag: lag}}, 30_000
     IO.puts("\n[spike C] stuck sink tripped :sink_too_slow at in-flight lag = #{lag} B")
     assert lag > @spike_bound
 
@@ -412,7 +396,6 @@ defmodule Replicant.CrashInjectionTest do
 
     # Nothing was durably applied (the stuck sink never committed) — no partial state.
     assert count(ctrl, "sink_orders") == 0
-    :telemetry.detach({__MODULE__, {:too_slow, slot}})
   end
 
   # R01 (live): an UNKNOWN checkpoint (a raising `sink.checkpoint/0` → read fault, read as
@@ -472,21 +455,43 @@ defmodule Replicant.CrashInjectionTest do
     |> hd()
   end
 
-  # Poll `reader.(acc)` `n` times at 40ms, folding into `acc`.
-  defp sample(0, acc, _reader), do: acc
+  # Race the durable drain against the lossless halt probe. The 40ms state samples
+  # are diagnostics only; teardown can make them miss the actual peak entirely.
+  defp wait_for_spike_drain(ctrl, conn, deadline, peak) do
+    receive do
+      {:sink_too_slow, %{lag: lag}} ->
+        flunk("spike A halted :sink_too_slow at lag #{lag} B (ceiling #{@spike_bound} B)")
+    after
+      40 ->
+        peak = max(peak, inflight_lag(conn))
 
-  defp sample(n, acc, reader) do
-    acc = reader.(acc)
-    Process.sleep(40)
-    sample(n - 1, acc, reader)
+        cond do
+          count(ctrl, "sink_orders") == 200 ->
+            peak
+
+          System.monotonic_time(:millisecond) >= deadline ->
+            flunk("spike A did not drain in 30s")
+
+          true ->
+            wait_for_spike_drain(ctrl, conn, deadline, peak)
+        end
+    end
+  end
+
+  defp current_wal_lsn(c) do
+    [[lsn]] = rows(c, "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '0/0')::bigint")
+    lsn
   end
 
   # The live in-flight WAL lag from the running Connection's state (0 if unreadable,
   # e.g. mid-teardown after a halt).
   defp inflight_lag(conn) do
     case safe_conn_state(conn) do
-      %Replicant.Connection{received_lsn: r, checkpoint_lsn: c} -> r - c
-      _ -> 0
+      %Replicant.Connection{received_lsn: r, checkpoint_lsn: c, stream_floor_lsn: floor} ->
+        r - max(c, floor || r)
+
+      _ ->
+        0
     end
   end
 
@@ -568,14 +573,17 @@ defmodule Replicant.CrashInjectionTest do
   end
 
   defp attach_sink_too_slow(slot) do
-    :telemetry.attach(
-      {__MODULE__, {:too_slow, slot}},
-      [:replicant, :connection, :disconnected],
-      fn _e, meas, meta, pid ->
-        if meta[:reason] == :sink_too_slow, do: send(pid, {:sink_too_slow, meas})
-      end,
-      self()
-    )
+    :ok =
+      :telemetry.attach(
+        {__MODULE__, {:too_slow, slot}},
+        [:replicant, :connection, :disconnected],
+        fn _e, meas, meta, pid ->
+          if meta[:reason] == :sink_too_slow, do: send(pid, {:sink_too_slow, meas})
+        end,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach({__MODULE__, {:too_slow, slot}}) end)
   end
 
   defp start_pipeline(slot, opts \\ []) do

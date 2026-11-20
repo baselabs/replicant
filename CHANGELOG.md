@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- In-flight-lag integration tests assert halts from telemetry and size their shared bound from the measured WAL span.
 - Integration test pipelines explicitly select Bash with `pipefail`, so a
   failing test run cannot be hidden by a successful output capture or receipt grep.
 - Plugin snapshot tests bind table names as text before PostgreSQL resolves their
