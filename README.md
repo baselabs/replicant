@@ -313,6 +313,13 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
   bridge as one `docker compose up`, exercised by CI as the public sink API's canary.
 - [Changelog](CHANGELOG.md).
 
+Release verification uses the exact package bytes and served docs provenance.
+Docs render once; served docs are kept without comparing a rebuild. Their
+`release.json` identifies the package, version, and published commit, which must
+be on the dispatched default-branch history. GitHub release assets retain the
+served archives and their checksums. See the
+[publishing and verification guide](CONTRIBUTING.md#publishing-release-operator-only).
+
 ## Development
 
 ```bash

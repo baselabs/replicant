@@ -1,5 +1,7 @@
 # Runs with --no-mix-exs: only Hex and the already inspected archives are loaded.
 # No dependency fetch, build, project code, credential persistence, or response logging.
+Code.require_file("release_docs.exs", __DIR__)
+
 defmodule Replicant.PublishHexArtifacts do
   @moduledoc false
 
@@ -17,7 +19,6 @@ defmodule Replicant.PublishHexArtifacts do
     # A missing release alone cannot prove the package name already exists.
     existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))
     digest = :crypto.hash(:sha256, package_bytes) |> Base.encode16(case: :lower)
-    docs_digest = :crypto.hash(:sha256, docs_bytes) |> Base.encode16(case: :lower)
 
     case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
       :fresh ->
@@ -31,8 +32,8 @@ defmodule Replicant.PublishHexArtifacts do
 
     # Re-read after the package decision: docs may have appeared in the meantime.
     case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
-      {:held, docs?} ->
-        case docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest, docs?) do
+      {:held, _docs?} ->
+        case docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version)) do
           :upload ->
             Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs_bytes, auth)
             |> accepted!("Hex docs")
@@ -48,7 +49,7 @@ defmodule Replicant.PublishHexArtifacts do
 
     read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)
     package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)
-    docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest)
+    docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), version)
   end
 
   def main(_argv),
@@ -123,25 +124,25 @@ defmodule Replicant.PublishHexArtifacts do
 
   # Read the served archive's raw bytes from the repository. The docs API
   # (Hex.API.ReleaseDocs.get) decodes responses by content type and returns a nil
-  # body for the served archive. Check the bytes even if metadata says docs are
-  # absent; never replace served docs.
-  def docs_action!({:ok, {200, _headers, <<0x1F, 0x8B, _rest::binary>> = bytes}}, digest, _required?) do
-    if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest do
-      :skip
-    else
-      raise "Hex docs checksum differs from the built archive; publication refused"
-    end
+  # body for the served archive. Presence wins even when metadata lags. Comparing
+  # a rebuild could strand immutable served docs; never replace or compare them.
+  def docs_action!({:ok, {200, _headers, bytes}}) do
+    Replicant.ReleaseDocs.files!(bytes)
+    :skip
   end
 
-  def docs_action!({:ok, {404, _headers, _body}}, _digest, false), do: :upload
+  def docs_action!({:ok, {404, _headers, _body}}), do: :upload
 
-  def docs_action!(_response, _digest, _required?),
+  def docs_action!(_response),
     do: raise("Hex docs archive is unavailable; inspect public state before retrying")
 
-  def docs_read_back!(response, digest) do
-    :skip = docs_action!(response, digest, true)
-    :ok
+  # The following keyless retention step proves this commit's default-branch ancestry.
+  def docs_read_back!({:ok, {200, _headers, bytes}}, version) do
+    Replicant.ReleaseDocs.provenance!(bytes, version)
   end
+
+  def docs_read_back!(_response, _version),
+    do: raise("Hex docs archive is unavailable; inspect public state before retrying")
 end
 
 Replicant.PublishHexArtifacts.main(System.argv())

@@ -143,8 +143,9 @@ If CI goes red, fix forward in the next commit.
   An early anonymous Hex read refuses a missing `replicant` package name: a first publication
   is the owner's decision. Lookup errors fail closed. Keyless steps build the package twice
   from the exact live `origin/main` commit, compare and inspect its bytes, audit and consume
-  it, render docs twice from independent extracted trees with warnings as errors, compare
-  both docs archives byte for byte, and inspect every rendered file. The fresh generated
+  it, render docs once with warnings as errors, write `release.json` with exactly
+  `package`, `version`, and the full `GITHUB_SHA` as `commit`, and inspect every
+  rendered file and those provenance fields. The fresh generated
   consumer starts without a lock and runs both audits on its new resolution; projects with
   committed locks fetch with `--check-locked`.
   Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
@@ -154,17 +155,26 @@ If CI goes red, fix forward in the next commit.
   or remote version tags and GitHub releases refuse publication. An untagged Hex version can
   finish only when its checksum matches the built package and it is not retired; the keyless
   build and the keyed script both check this. Only missing package or docs uploads run. Both
-  are read back from Hex's repository and compared by SHA-256 with the inspected archives.
+  are read back from Hex's repository. The package SHA-256 must match the inspected
+  archive; docs planning keeps a readable served gzip tarball, uploads only on an
+  authoritative 404, and refuses other responses.
   Qualification runs the same reads against live Hex for a published version, without a key.
   ExDoc 0.40.4 fixes the highlighting group prefix; only HTML and Markdown ship, with no
   timestamped EPUB. Hex
   constructs sorted archives with fixed metadata and a gzip header without a name or mtime.
-  Served docs must match before the upload decision and on read-back; they are never replaced.
+  Docs builds are never compared: a rebuilt rendering could strand immutable served
+  docs. Read-back requires `index.html` and valid `release.json` package/version
+  fields. A following keyless step proves the docs commit is the dispatched commit
+  or its ancestor on fetched, complete default-branch history; missing history or
+  provenance refuses. The producer lock is not packaged, so matching package bytes
+  alone do not identify the docs commit. Served docs are never replaced.
   The script loads no project code and builds nothing.
   After successful read-back, one `release-assets` artifact retains the versioned package,
-  docs archive, and `SHA256SUMS`. Temporary archives are removed even on failure. Infra creates
-  the `v<version>` tag at that full source SHA, compares the artifact's package with Hex's
-  bytes, and creates the GitHub release from those assets. Consumer verification uses that
+  served docs archive, `SHA256SUMS` over the retained served bytes, and `published_commit`.
+  The keyless read-back exposes `published_commit` as a step output. Temporary archives
+  are removed even on failure. Infra creates the `v<version>` tag at the served docs'
+  published commit, compares the artifact's package with Hex's bytes, and creates the
+  GitHub release from those assets. Consumer verification uses that
   GitHub release. Once infra reports the read-back and tag, this repository's session records
   the verified package digest in `scripts/release/published_packages.sha256` through normal
   landing; held versions do not change the ledger.

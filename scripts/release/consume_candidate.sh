@@ -64,8 +64,9 @@ if [[ -n "$docs_archive" ]]; then
   special_entry="$(find "$src/doc" ! -type f ! -type d -print -quit)"
   [[ -z "$special_entry" ]] || die "docs contain a link or special entry"
   ( cd "$scratch" && mix run --no-mix-exs "$repo_root/scripts/release/build_docs_archive.exs" \
-      "$src/doc" "$docs_archive" ) >&2
-  python3 -I "$repo_root/scripts/release/check_docs_archive.py" "$docs_archive" "$src/doc" >&2
+      "$src/doc" "$docs_archive" "$version" "$GITHUB_SHA" ) >&2
+  python3 -I "$repo_root/scripts/release/check_docs_archive.py" \
+    "$docs_archive" "$src/doc" "$version" "$GITHUB_SHA" >&2
 fi
 
 # --- 3. A brand-new consumer that depends ONLY on the extracted source. ----------------------

@@ -3,7 +3,9 @@
 if Mix.Project.get(), do: raise("upload preconditions must run without a Mix project")
 
 path = Path.join(__DIR__, "publish_hex_artifacts.exs")
-{:ok, {:__block__, _, [module, _entry_point]}} = Code.string_to_quoted(File.read!(path))
+Code.require_file("release_docs.exs", __DIR__)
+{:ok, {:__block__, _, forms}} = Code.string_to_quoted(File.read!(path))
+module = Enum.find(forms, &match?({:defmodule, _, _}, &1))
 Code.compile_quoted(module, path)
 Hex.start()
 
@@ -74,29 +76,22 @@ PublishHexArtifactsSelfTest.reject(
 
 docs = Hex.Repo.get_docs("hexpm", "replicant", version)
 
-docs_digest =
-  case docs do
-    {:ok, {200, _headers, <<0x1F, 0x8B, _rest::binary>> = bytes}} ->
-      :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
-
-    _other ->
-      raise "live Hex docs archive lookup failed"
-  end
-
-:skip = PublishHexArtifacts.docs_action!(docs, docs_digest, true)
-:ok = PublishHexArtifacts.docs_read_back!(docs, docs_digest)
+# Legacy served docs are kept during planning, even without provenance. Read-back
+# refuses them: package equality cannot establish which commit rendered the docs.
+:skip = PublishHexArtifacts.docs_action!(docs)
 
 PublishHexArtifactsSelfTest.reject(
-  "Hex docs checksum differs from the built archive; publication refused",
-  fn -> PublishHexArtifacts.docs_action!(docs, String.duplicate("0", 64), false) end
+  "Hex docs archive has no release.json; publication refused",
+  fn -> PublishHexArtifacts.docs_read_back!(docs, version) end
 )
 
 # Absent docs must read as the authoritative 404 that permits the only upload.
-:upload =
-  PublishHexArtifacts.docs_action!(
-    Hex.Repo.get_docs("hexpm", "replicant", absent),
-    docs_digest,
-    false
-  )
+missing = Hex.Repo.get_docs("hexpm", "replicant", absent)
+:upload = PublishHexArtifacts.docs_action!(missing)
+
+PublishHexArtifactsSelfTest.reject(
+  "Hex docs archive is unavailable; inspect public state before retrying",
+  fn -> PublishHexArtifacts.docs_read_back!(missing, absent) end
+)
 
 IO.puts("upload preconditions: live Hex self-tests PASS (no upload or key)")

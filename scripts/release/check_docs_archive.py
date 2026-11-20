@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import json
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -15,7 +16,7 @@ SEMVER = re.compile(
 )
 
 
-def check(archive, directory):
+def check(archive, directory, version, commit):
     if not directory.is_dir():
         raise ValueError("Documentation source directory is missing.")
     # mix hex.publish lists the tree with Path.wildcard/1, which matches no
@@ -52,8 +53,12 @@ def check(archive, directory):
                 raise ValueError(f"Docs archive member has no source: {member.name!r}")
             if packed.extractfile(member).read() != source[member.name].read_bytes():
                 raise ValueError(f"Docs archive bytes differ from source: {member.name!r}")
-    if not {"index.html", "readme.html"} <= names:
-        raise ValueError("Docs archive requires top-level index.html and readme.html.")
+    if not {"index.html", "readme.html", "release.json"} <= names:
+        raise ValueError("Docs archive requires top-level index.html, readme.html, and release.json.")
+    metadata = json.loads(source["release.json"].read_bytes())
+    if (metadata != {"package": "replicant", "version": version, "commit": commit}
+            or not re.fullmatch(r"[0-9a-f]{40}", commit)):
+        raise ValueError("Docs release.json must name the package, version, and full CI commit.")
     if names != source.keys():
         raise ValueError(f"Docs archive omits source files: {sorted(source.keys() - names)!r}")
     if ordered != sorted(ordered):
@@ -68,9 +73,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archive", type=Path)
     parser.add_argument("directory", type=Path)
+    parser.add_argument("version")
+    parser.add_argument("commit")
     args = parser.parse_args()
     try:
-        check(args.archive, args.directory)
+        check(args.archive, args.directory, args.version, args.commit)
     except (OSError, ValueError, tarfile.TarError) as error:
         print(f"Docs archive refused: {error}", file=sys.stderr)
         return 1

@@ -126,13 +126,15 @@ and compare its bytes, inspect the exact package manifest and Hex checksum, then
 audit and compile its extracted source using the committed producer lock.
 The generated external consumer starts without a lock and resolves fresh, runs
 both audits on that resolution, compiles, and exercises the public API.
-Each consumer renders documentation with warnings as errors from an independent
-extraction using the producer lock. The two docs archives must compare byte for
-byte; inspection checks every visible rendered file and refuses EPUB. ExDoc
-0.40.4 supplies a fixed Makeup grouping prefix. Only HTML and Markdown ship;
-EPUB embeds build time by default. Hex 2.7.0 builds the docs tar with sorted
-entries, fixed times, uid/gid zero, empty owner/group names, and a gzip header
-without a filename or mtime, matching the archive mechanism used by ash_hooks.
+Documentation renders once with warnings as errors from the extracted package and
+producer lock. After rendering, the builder writes a top-level `release.json`
+with exactly `package`, `version`, and the full CI `GITHUB_SHA` as `commit`.
+Inspection checks those fields and every visible rendered file and refuses EPUB.
+ExDoc 0.40.4 supplies a fixed Makeup grouping prefix. Only HTML and Markdown ship.
+Hex 2.7.0 sorts archive entries and fixes archive metadata; no docs builds are
+compared. A rebuilt rendering could differ from immutable served docs and strand
+an otherwise matching package. The producer lock is not packaged, so equal package
+bytes alone do not establish which commit rendered served docs.
 
 The single credentialed step runs `mix run --no-mix-exs` from the runner's temporary
 directory, which holds no `mix.exs`, with those two inspected file paths. Its
@@ -140,25 +142,32 @@ standalone script uses only Hex's APIs and file reads: it refuses to run inside 
 Mix project, loads no project code, fetches no dependencies, and rebuilds nothing.
 Immediately before uploading, it rechecks that the package name exists. A version
 already served by Hex without a tag is a held or partial release: the job compares
-its package and served docs checksums with the archives it just built, both
-before and inside the keyed step. A different checksum, retirement, malformed
-metadata, or lookup failure
-refuses publication. Identical bytes skip the package upload. Docs upload only
-when missing; already served docs must match the built archive, even when release
-metadata has not yet reported them. A second owner dispatch on the same commit
-finishes an approved
-hold or interrupted upload; neither package nor docs are replaced.
+its package checksum with the archive it just built, both before and inside the
+keyed step. A different package checksum, retirement, malformed metadata, or
+lookup failure refuses publication. Identical package bytes skip that upload.
+Docs planning is presence-only: a readable served gzip tarball is kept, an
+authoritative HTTP 404 permits upload, and other statuses or malformed bodies
+refuse. A second owner dispatch on the same commit finishes an approved hold or
+interrupted upload; neither package nor served docs are replaced.
 
-Read-back requires the exact package checksum, `has_docs: true`, and a served
-gzip docs archive whose SHA-256 equals the inspected docs archive. The anonymous
-docs API redirects to `https://repo.hex.pm/docs/replicant-<version>.tar.gz`.
-A different served docs digest refuses publication, including on a retry.
+Read-back requires the exact served package bytes, no retirement, and served docs.
+The docs must be a readable gzip archive with `index.html` and a valid
+`release.json` naming this package and version. A following keyless step downloads
+the served archives and uses `git merge-base --is-ancestor` against the fetched,
+complete default-branch history: the docs commit must equal the dispatched commit
+or be its ancestor, and the dispatch must be on that history. Missing history,
+missing provenance, or an unrelated commit refuses. Legacy served docs without
+`release.json` are kept during planning but cannot pass provenance read-back.
+The anonymous docs API redirects to
+`https://repo.hex.pm/docs/replicant-<version>.tar.gz`.
 
 After successful read-back, the workflow retains one `release-assets` artifact:
 `replicant-<version>.tar`, `replicant-<version>-docs.tar.gz`, and `SHA256SUMS`.
-The package uses Hex's filename; the docs suffix distinguishes the gzip docs
-archive from the package. Temporary archives are removed even after failure.
-Infra tags `v<version>` at the full source SHA, compares the artifact's package
+Both archives are the bytes Hex serves; `SHA256SUMS` is computed only over those
+retained bytes. `published_commit` is retained and exposed as a read-back step
+output. The docs suffix distinguishes the gzip docs archive from the package.
+Temporary archives are removed even after failure. Infra tags `v<version>` at the
+published commit from served `release.json`, compares the artifact's package
 archive with Hex's served bytes, and creates the GitHub release from those assets.
 No workflow creates a release or runs on a tag.
 
@@ -166,14 +175,17 @@ Consumers verify the permanent [GitHub release](https://github.com/baselabs/repl
 for `v<version>`, downloading its archives and `SHA256SUMS`:
 
 ```bash
-gh release download vX.Y.Z --repo baselabs/replicant --pattern 'replicant-*' --pattern SHA256SUMS
+gh release download vX.Y.Z --repo baselabs/replicant --pattern 'replicant-*' --pattern SHA256SUMS --pattern published_commit
 sha256sum --check SHA256SUMS
 curl --fail --silent --show-error https://repo.hex.pm/tarballs/replicant-X.Y.Z.tar -o hex.tar
 cmp replicant-X.Y.Z.tar hex.tar
-curl --fail --silent --show-error https://repo.hex.pm/docs/replicant-X.Y.Z.tar.gz -o hex-docs.tar.gz
-cmp replicant-X.Y.Z-docs.tar.gz hex-docs.tar.gz
-rm hex.tar hex-docs.tar.gz
+tar -xOf replicant-X.Y.Z-docs.tar.gz release.json
+cat published_commit
+rm hex.tar
 ```
+
+Check that `release.json` names `replicant`, this version, and the same full commit
+as `published_commit` and the release tag. No rebuilt docs digest is involved.
 
 Record the verified package digest in `scripts/release/published_packages.sha256`
 through the normal landing process. All four release identities (tag, Hex package,

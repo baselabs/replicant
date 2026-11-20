@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Docs render once and are never compared with a rebuild: a differing rendering
+  could strand immutable served docs despite matching package bytes. Planning
+  keeps readable served docs, uploads only on an authoritative 404, and refuses
+  other statuses or malformed bodies. Every built docs archive carries exact
+  `release.json` package/version/CI-commit provenance. Read-back requires it and
+  `index.html`, then proves the docs commit equals or precedes the dispatched
+  commit on fetched default-branch history; missing history or provenance refuses.
+  A keyless step retains only served archives, computes their checksums, and
+  exposes and retains `published_commit` for infra's tag. The producer lock is
+  not packaged, so package equality alone does not identify the docs commit.
+  Package byte comparisons, retirement refusals, and all archive inspections stay.
+
 - Every workflow runs its steps in bash with `pipefail` by default, so a failure
   behind a pipe fails its step. Release scripts assign a listing before checking
   it, so a failing `git`, `find` or `comm` fails the check instead of reading as
@@ -31,18 +43,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ExDoc moves to 0.40.4 for deterministic highlighting, with its required Earmark
   Parser 1.4.46. Docs use HTML and Markdown without EPUB. The Hex archive builder
   fixes entry order, ownership, timestamps, and the gzip header. Qualification
-  and publication compare docs archives from two independent renders and inspect
-  every rendered file; consumer verification compares release docs with Hex.
+  and publication inspect every rendered file without comparing docs builds.
 - Package and docs archives are built and inspected without the publish key.
   Docs build with warnings as errors before anything uploads. One isolated
   `mix run --no-mix-exs` step uploads those exact file paths through Hex's APIs,
   rechecking package existence and release identity immediately before upload.
   Untagged held releases resume only with the same package checksum and no
   retirement, uploading only missing archives. Tags and GitHub releases refuse
-  publication. Package and served docs checksums must match the inspected bytes
-  before upload and on read-back; differing docs refuse publication.
+  publication. Package checksums must match the inspected bytes before upload and
+  on read-back. Served docs are kept by presence and never compared with a rebuild.
   Temporary archives are always removed.
-- Successful read-back retains versioned package and docs archives plus
+- Successful read-back retains versioned served package and docs archives plus
   `SHA256SUMS` in one `release-assets` artifact. Infra tags, compares the package
   with Hex's bytes, and creates the GitHub release from it. Consumer verification
   downloads the GitHub release assets.

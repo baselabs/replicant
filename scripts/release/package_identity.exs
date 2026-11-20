@@ -1,3 +1,5 @@
+Code.require_file("release_docs.exs", __DIR__)
+
 defmodule Replicant.PackageIdentity do
   @moduledoc false
 
@@ -14,7 +16,7 @@ defmodule Replicant.PackageIdentity do
          :ok <- absent_local_tag(tag, runner),
          :ok <- absent_remote_tag(tag, runner),
          :ok <- absent_github(tag, runner),
-         {:ok, _state} <- check_archive(version, nil, nil, runner) do
+         {:ok, _state} <- check_archive(version, nil, runner) do
       :ok
     end
   end
@@ -75,17 +77,16 @@ defmodule Replicant.PackageIdentity do
   def verify_publish!(version, source_commit),
     do: check_publish(version, source_commit) |> unwrap!()
 
-  def verify_publish_archive!(version, source_commit, archive, docs, runner \\ &run/2) do
+  def verify_publish_archive!(version, source_commit, archive, runner \\ &run/2) do
     digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
-    docs_digest = :crypto.hash(:sha256, File.read!(docs)) |> Base.encode16(case: :lower)
     :ok = check_publish(version, source_commit, runner) |> unwrap!()
-    {:ok, _state} = check_archive(version, digest, docs_digest, runner) |> unwrap!()
+    {:ok, _state} = check_archive(version, digest, runner) |> unwrap!()
     :ok
   end
 
   # A nil digest is only the pre-build identity check. Publication always repeats
-  # this decision with both inspected SHA256s, before exposing a key.
-  def check_archive(version, digest, docs_digest, runner \\ &run/2) do
+  # this decision with the inspected package SHA256, before exposing a key.
+  def check_archive(version, digest, runner \\ &run/2) do
     args = [
       "--silent",
       "--show-error",
@@ -102,11 +103,11 @@ defmodule Replicant.PackageIdentity do
       {response, 0} ->
         case String.split(response, "\n") |> Enum.reverse() do
           ["404" | _body] ->
-            matching_docs(version, :fresh, docs_digest, runner)
+            available_docs(version, :fresh, digest, runner)
 
           ["200" | body] ->
             with {:ok, state} <- held_release(Enum.reverse(body), version, digest) do
-              matching_docs(version, state, docs_digest, runner)
+              available_docs(version, state, digest, runner)
             end
 
           _other -> {:error, "Hex release lookup failed; publication refused"}
@@ -117,9 +118,9 @@ defmodule Replicant.PackageIdentity do
     end
   end
 
-  defp matching_docs(_version, state, nil, _runner), do: {:ok, state}
+  defp available_docs(_version, state, nil, _runner), do: {:ok, state}
 
-  defp matching_docs(version, state, digest, runner) do
+  defp available_docs(version, state, _digest, runner) do
     args = [
       "--silent",
       "--show-error",
@@ -132,32 +133,33 @@ defmodule Replicant.PackageIdentity do
       @hex_docs_url <> version <> ".tar.gz"
     ]
 
-    with :ok <- docs_match(runner.("curl", args), digest, state == {:held, true}) do
+    with :ok <- docs_available(runner.("curl", args)) do
       {:ok, state}
     end
   end
 
   # Split the HTTP status by byte offset: the archive is binary, not UTF-8 text.
-  def docs_match({response, 0}, digest, required?) when byte_size(response) >= 4 do
+  def docs_available({response, 0}) when is_binary(response) and byte_size(response) >= 4 do
     size = byte_size(response) - 4
 
     <<bytes::binary-size(^size), status::binary>> = response
 
     case {status, bytes} do
-      {"\n200", <<0x1F, 0x8B, _rest::binary>>} ->
-        if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest,
-          do: :ok,
-          else: {:error, "Hex docs checksum differs from the built archive; publication refused"}
+      {"\n200", bytes} ->
+        Replicant.ReleaseDocs.files!(bytes)
+        :ok
 
-      {"\n404", _body} when not required? ->
+      {"\n404", _body} ->
         :ok
 
       _other ->
         {:error, "Hex docs archive is unavailable; publication refused"}
     end
+  rescue
+    _error -> {:error, "Hex docs archive is malformed; publication refused"}
   end
 
-  def docs_match(_response, _digest, _required?),
+  def docs_available(_response),
     do: {:error, "Hex docs archive lookup failed; publication refused"}
 
   defp held_release(body, version, digest) do
