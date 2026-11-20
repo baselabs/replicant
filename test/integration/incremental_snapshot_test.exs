@@ -429,6 +429,7 @@ defmodule Replicant.IncrementalSnapshotTest do
       failed = attach_snapshot_failed(slot)
       retried = attach_snapshot_retried(slot)
 
+      pause_snapshot_windows(slot, "public.inc_nopk_c")
       start_incremental(slot, "incnopkc_pub", chunk_rows: 500, max_pending_chunks: 4)
 
       # A CONTINUOUS writer: the keyless path has NO drop-set, so ANY concurrent write taints the
@@ -436,17 +437,24 @@ defmodule Replicant.IncrementalSnapshotTest do
       # (spec §6.4), emitting :chunk_retried on each redo (spec §9 "no silent re-read loops").
       {writer, go} = start_writer(fn w, n -> update_random_nopk(w, n, "inc_nopk_c") end)
 
-      # 90s of the test's 120s ceiling: three taint-redo cycles against a continuous
-      # writer are wall-clock, and a loaded host (or a CI 2-core runner) stretches the
-      # writer/reader interleave well past a minute — OBSERVED once under full-suite
-      # load, 2026-09-30; the assertion's CONTENT is the bounded-attempts halt, which
-      # still requires all three attempts to fire inside this window.
-      assert_receive {:snapshot_failed, :snapshot_table_contended}, 90_000
-      assert_receive {:snapshot_retried, "public.inc_nopk_c"}, 5_000
+      # Every attempt must contain a delivered write. A tight writer alone can leave a
+      # quiescent gap long enough for the whole read to succeed, so waiting longer cannot
+      # make a contention halt inevitable.
+      try do
+        contend_snapshot_attempts(ctrl, fn db, attempt ->
+          update_random_nopk(db, attempt, "inc_nopk_c")
+        end)
 
-      stop_writer(writer, go)
-      detach(failed)
-      detach(retried)
+        assert_receive {:snapshot_failed, :snapshot_table_contended}, 5_000
+        assert_receive {:snapshot_retried, "public.inc_nopk_c"}, 1_000
+        assert_receive {:snapshot_retried, "public.inc_nopk_c"}, 1_000
+        refute_received {:snapshot_retried, "public.inc_nopk_c"}
+        refute backfill_complete?()
+      after
+        stop_writer(writer, go)
+        detach(failed)
+        detach(retried)
+      end
     end
   end
 
@@ -457,6 +465,18 @@ defmodule Replicant.IncrementalSnapshotTest do
       setup_nopk_table(ctrl, "inc_nopk_q", "incnopkq_pub", 1_000)
       start_incremental(slot, "incnopkq_pub", chunk_rows: 500, max_pending_chunks: 4)
       wait_backfill_complete(30_000)
+      wait_converged(ctrl, "inc_nopk_q")
+
+      # The writer may legitimately start AFTER the whole read. This was the
+      # apparent stall: no contention halt is due, and streaming must keep advancing.
+      {:ok, before} = IncrementalSnapshotSink.checkpoint()
+      retried = attach_snapshot_retried(slot)
+      on_exit(fn -> detach(retried) end)
+      update_random_nopk(ctrl, 1, "inc_nopk_q")
+      PG16.wait_until(fn -> stream_txn_count() > 0 end, 200)
+      {:ok, after_write} = IncrementalSnapshotSink.checkpoint()
+      assert after_write > (before || 0)
+      refute_received {:snapshot_retried, "public.inc_nopk_q"}
       wait_converged(ctrl, "inc_nopk_q")
     end
   end
@@ -472,17 +492,27 @@ defmodule Replicant.IncrementalSnapshotTest do
 
       # chunk_rows: 1 makes the keyed drop-set cap 10. Each writer transaction changes 20
       # distinct primary keys while a window is open, deterministically breaching that cap.
+      pause_snapshot_windows(slot, "public.inc_keyed_c")
       start_incremental(slot, "inckeyedc_pub", chunk_rows: 1, max_pending_chunks: 2)
 
       {writer, go} =
         start_writer(fn w, n -> update_keyed_band(w, n, "inc_keyed_c", 20) end)
 
-      assert_receive {:snapshot_failed, :snapshot_table_contended}, 60_000
-      assert_receive {:snapshot_retried, "public.inc_keyed_c"}, 5_000
+      try do
+        contend_snapshot_attempts(ctrl, fn db, attempt ->
+          update_keyed_band(db, attempt, "inc_keyed_c", 20)
+        end)
 
-      stop_writer(writer, go)
-      detach(failed)
-      detach(retried)
+        assert_receive {:snapshot_failed, :snapshot_table_contended}, 5_000
+        assert_receive {:snapshot_retried, "public.inc_keyed_c"}, 1_000
+        assert_receive {:snapshot_retried, "public.inc_keyed_c"}, 1_000
+        refute_received {:snapshot_retried, "public.inc_keyed_c"}
+        refute backfill_complete?()
+      after
+        stop_writer(writer, go)
+        detach(failed)
+        detach(retried)
+      end
     end
   end
 
@@ -1160,6 +1190,59 @@ defmodule Replicant.IncrementalSnapshotTest do
 
     :telemetry.detach(active)
     :telemetry.detach(resumed)
+  end
+
+  # Control scheduling at the real GenServer call, without replacing the reader,
+  # assembler, sink, or database. The assembler pauses the caller BEFORE replying to
+  # open, so it cannot capture LW or finish its SELECT before the test's write lands.
+  # The same assembler resumes it; OTP drops its suspend counts on pipeline teardown.
+  defp pause_snapshot_windows(slot, qualified) do
+    test_pid = self()
+    handler = {__MODULE__, :pause_windows, make_ref()}
+
+    :telemetry.attach(
+      handler,
+      [:replicant, :connection, :slot_active],
+      fn _event, _measurements, _metadata, _config ->
+        :telemetry.detach(handler)
+        server = Replicant.AssemblerServer.via(slot)
+
+        :ok = :sys.install(server, {snapshot_window_debug(test_pid, qualified), nil})
+      end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler) end)
+  end
+
+  defp snapshot_window_debug(test_pid, qualified) do
+    fn
+      marker, {:in, {:"$gen_call", {reader, _tag}, {:open_snapshot_window, ^qualified}}}, _state ->
+        true = :erlang.suspend_process(reader)
+        send(test_pid, {:snapshot_window_paused, self(), reader})
+        marker
+
+      marker, {:in, {:resume_snapshot_reader, reader}}, _state ->
+        true = :erlang.resume_process(reader)
+        marker
+
+      marker, _event, _state ->
+        marker
+    end
+  end
+
+  defp contend_snapshot_attempts(ctrl, write) do
+    for attempt <- 1..3 do
+      assert_receive {:snapshot_window_paused, server, reader}, 5_000
+      :sys.get_state(server)
+      before = stream_txn_count()
+      write.(ctrl, attempt)
+      PG16.wait_until(fn -> stream_txn_count() > before end, 200)
+      # A system-message barrier ensures the delivered transaction has also been
+      # tracked before the paused reader can take its snapshot watermark.
+      :sys.get_state(server)
+      send(server, {:resume_snapshot_reader, reader})
+    end
   end
 
   defp attach_snapshot_failed(slot) do
