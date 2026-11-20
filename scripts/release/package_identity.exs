@@ -133,13 +133,13 @@ defmodule Replicant.PackageIdentity do
       @hex_docs_url <> version <> ".tar.gz"
     ]
 
-    with :ok <- docs_available(runner.("curl", args)) do
+    with :ok <- docs_available(runner.("curl", args), state == {:held, true}) do
       {:ok, state}
     end
   end
 
   # Split the HTTP status by byte offset: the archive is binary, not UTF-8 text.
-  def docs_available({response, 0}) when is_binary(response) and byte_size(response) >= 4 do
+  def docs_available({response, 0}, required?) when is_binary(response) and byte_size(response) >= 4 do
     size = byte_size(response) - 4
 
     <<bytes::binary-size(^size), status::binary>> = response
@@ -149,8 +149,11 @@ defmodule Replicant.PackageIdentity do
         Replicant.ReleaseDocs.files!(bytes)
         :ok
 
-      {"\n404", _body} ->
+      {"\n404", _body} when not required? ->
         :ok
+
+      {"\n404", _body} ->
+        {:error, "Hex docs metadata and repository disagree; inspect public state before retrying"}
 
       _other ->
         {:error, "Hex docs archive is unavailable; publication refused"}
@@ -159,7 +162,7 @@ defmodule Replicant.PackageIdentity do
     _error -> {:error, "Hex docs archive is malformed; publication refused"}
   end
 
-  def docs_available(_response),
+  def docs_available(_response, _required?),
     do: {:error, "Hex docs archive lookup failed; publication refused"}
 
   defp held_release(body, version, digest) do

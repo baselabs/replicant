@@ -35,7 +35,7 @@ defmodule Replicant.PublishHexArtifactsTest do
 
   @docs_bytes docs_bytes
   @docs_read ~s|docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), version)|
-  @docs_action ~s|docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version))|
+  @docs_action ~s|docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?)|
   @package_read ~s|package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)|
   @read ~s|release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
   @read_back ~s|read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
@@ -147,14 +147,17 @@ defmodule Replicant.PublishHexArtifactsTest do
   end
 
   test "served docs are kept by presence, while authoritative absence uploads" do
-    assert :skip == PublishHexArtifacts.docs_action!(response(200, @docs_bytes))
-    assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}))
+    for docs? <- [false, true] do
+      assert :skip == PublishHexArtifacts.docs_action!(response(200, @docs_bytes), docs?)
+    end
+
+    assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}), false)
 
     assert String.duplicate("c", 40) ==
              PublishHexArtifacts.docs_read_back!(response(200, @docs_bytes), @version)
 
     {:ok, legacy} = :mix_hex_tarball.create_docs([{~c"index.html", "legacy docs"}])
-    assert :skip == PublishHexArtifacts.docs_action!(response(200, legacy))
+    assert :skip == PublishHexArtifacts.docs_action!(response(200, legacy), true)
 
     assert_raise RuntimeError, ~r/no release.json/, fn ->
       PublishHexArtifacts.docs_read_back!(response(200, legacy), @version)
@@ -163,8 +166,10 @@ defmodule Replicant.PublishHexArtifactsTest do
     malformed = [nil, "", "not gzip", <<0x1F, 0x8B, "not a tarball">>, :zlib.gzip("not tar")]
 
     for result <- Enum.map(malformed, &response(200, &1)) ++ failures() do
-      error = assert_raise RuntimeError, fn -> PublishHexArtifacts.docs_action!(result) end
-      refute Exception.message(error) =~ "private-response-value"
+      for docs? <- [false, true] do
+        error = assert_raise RuntimeError, fn -> PublishHexArtifacts.docs_action!(result, docs?) end
+        refute Exception.message(error) =~ "private-response-value"
+      end
     end
 
     for result <- [response(404, %{}) | Enum.map(malformed, &response(200, &1))] ++ failures() do
@@ -175,6 +180,15 @@ defmodule Replicant.PublishHexArtifactsTest do
 
       refute Exception.message(error) =~ "private-response-value"
     end
+  end
+
+  test "a repository 404 cannot replace docs that release metadata says exist" do
+    error =
+      assert_raise RuntimeError, ~r/docs metadata and repository disagree/, fn ->
+        PublishHexArtifacts.docs_action!(response(404, "private-response-value"), true)
+      end
+
+    refute Exception.message(error) =~ "private-response-value"
   end
 
   test "uploads refuse failures, ambiguity and approval holds without response values" do
@@ -253,7 +267,7 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert package_case =~ ":fresh ->\n        " <> @package
     assert package_case =~ "{:held, _docs?} ->\n        :ok"
     assert package_case =~ "|> accepted!(\"Hex package\")\n        |> approved!()"
-    assert docs_case =~ "{:held, _docs?} ->"
+    assert docs_case =~ "{:held, docs?} ->"
     assert docs_case =~ "case " <> @docs_action <> " do"
     assert docs_case =~ ":upload ->\n            " <> @docs
     assert docs_case =~ ":skip ->\n            :ok"

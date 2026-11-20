@@ -178,13 +178,18 @@ defmodule Replicant.PackageIdentityTest do
       absent = docs_runner(runner, {"\n404", 0})
       result = PackageIdentity.check_archive(@version, @digest, absent)
 
-      assert result == {:ok, {:held, docs?}}
+      if docs? do
+        assert {:error, message} = result
+        assert message =~ "docs metadata and repository disagree"
+      else
+        assert result == {:ok, {:held, false}}
+      end
     end
   end
 
   test "docs response requires a readable gzip tarball or authoritative absence" do
-    assert :ok == PackageIdentity.docs_available({@docs_bytes <> "\n200", 0})
-    assert :ok == PackageIdentity.docs_available({"\n404", 0})
+    assert :ok == PackageIdentity.docs_available({@docs_bytes <> "\n200", 0}, true)
+    assert :ok == PackageIdentity.docs_available({"\n404", 0}, false)
 
     for response <- [
           {"\n404", 22},
@@ -194,9 +199,17 @@ defmodule Replicant.PackageIdentityTest do
           {"private-response-value", 7},
           {<<0x1F, 0x8B, "invalid tar">> <> "\n200", 0}
         ] do
-      assert {:error, message} = PackageIdentity.docs_available(response)
+      assert {:error, message} = PackageIdentity.docs_available(response, false)
       refute message =~ "private-response-value"
     end
+  end
+
+  test "preflight refuses a docs 404 when release metadata says docs exist" do
+    runner = hex_runner(hex_metadata(true))
+    refused = docs_runner(runner, {"private-response-value\n404", 0})
+    assert {:error, message} = PackageIdentity.check_archive(@version, @digest, refused)
+    assert message =~ "docs metadata and repository disagree"
+    refute message =~ "private-response-value"
   end
 
   test "held metadata refuses retirement, version drift and malformed identity fields" do

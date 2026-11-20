@@ -32,8 +32,8 @@ defmodule Replicant.PublishHexArtifacts do
 
     # Re-read after the package decision: docs may have appeared in the meantime.
     case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
-      {:held, _docs?} ->
-        case docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version)) do
+      {:held, docs?} ->
+        case docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?) do
           :upload ->
             Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs_bytes, auth)
             |> accepted!("Hex docs")
@@ -126,14 +126,17 @@ defmodule Replicant.PublishHexArtifacts do
   # (Hex.API.ReleaseDocs.get) decodes responses by content type and returns a nil
   # body for the served archive. Presence wins even when metadata lags. Comparing
   # a rebuild could strand immutable served docs; never replace or compare them.
-  def docs_action!({:ok, {200, _headers, bytes}}) do
+  def docs_action!({:ok, {200, _headers, bytes}}, _required?) do
     Replicant.ReleaseDocs.files!(bytes)
     :skip
   end
 
-  def docs_action!({:ok, {404, _headers, _body}}), do: :upload
+  def docs_action!({:ok, {404, _headers, _body}}, false), do: :upload
 
-  def docs_action!(_response),
+  def docs_action!({:ok, {404, _headers, _body}}, true),
+    do: raise("Hex docs metadata and repository disagree; inspect public state before retrying")
+
+  def docs_action!(_response, _required?),
     do: raise("Hex docs archive is unavailable; inspect public state before retrying")
 
   # The following keyless retention step proves this commit's default-branch ancestry.

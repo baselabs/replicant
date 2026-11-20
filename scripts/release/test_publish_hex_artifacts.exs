@@ -78,7 +78,7 @@ docs = Hex.Repo.get_docs("hexpm", "replicant", version)
 
 # Legacy served docs are kept during planning, even without provenance. Read-back
 # refuses them: package equality cannot establish which commit rendered the docs.
-:skip = PublishHexArtifacts.docs_action!(docs)
+:skip = PublishHexArtifacts.docs_action!(docs, true)
 
 PublishHexArtifactsSelfTest.reject(
   "Hex docs archive has no release.json; publication refused",
@@ -87,7 +87,12 @@ PublishHexArtifactsSelfTest.reject(
 
 # Absent docs must read as the authoritative 404 that permits the only upload.
 missing = Hex.Repo.get_docs("hexpm", "replicant", absent)
-:upload = PublishHexArtifacts.docs_action!(missing)
+:upload = PublishHexArtifacts.docs_action!(missing, false)
+
+PublishHexArtifactsSelfTest.reject(
+  "Hex docs metadata and repository disagree; inspect public state before retrying",
+  fn -> PublishHexArtifacts.docs_action!(missing, true) end
+)
 
 PublishHexArtifactsSelfTest.reject(
   "Hex docs archive is unavailable; inspect public state before retrying",
