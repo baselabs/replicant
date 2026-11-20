@@ -2,12 +2,14 @@
 # Mix prunes archive paths during compilation; restore the real installed Hex APIs.
 Mix.Local.append_archives()
 
-for api <- [Hex.API.Package, Hex.API.Release, Hex.API.ReleaseDocs, Hex.Repo] do
+for api <- [Hex.API.Package, Hex.API.Release, Hex.API.ReleaseDocs, Hex.Repo, :mix_hex_tarball] do
   Code.ensure_loaded!(api)
 end
 
 source = File.read!(Path.expand("../../scripts/release/publish_hex_artifacts.exs", __DIR__))
-{:__block__, _, [module, _entry_point]} = Code.string_to_quoted!(source)
+Code.require_file("../../scripts/release/release_docs.exs", __DIR__)
+{:__block__, _, forms} = Code.string_to_quoted!(source)
+module = Enum.find(forms, &match?({:defmodule, _, _}, &1))
 Code.compile_quoted(module)
 
 defmodule Replicant.PublishHexArtifactsTest do
@@ -18,10 +20,22 @@ defmodule Replicant.PublishHexArtifactsTest do
   @script Path.expand("../../scripts/release/publish_hex_artifacts.exs", __DIR__)
   @version "1.2.0"
   @digest String.duplicate("a", 64)
-  @docs_bytes <<0x1F, 0x8B, 0xFF, "inspected docs">>
-  @docs_digest :crypto.hash(:sha256, @docs_bytes) |> Base.encode16(case: :lower)
-  @docs_read ~s|docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest)|
-  @docs_action ~s|docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs_digest, docs?)|
+  metadata =
+    :json.encode(%{
+      "package" => "replicant",
+      "version" => @version,
+      "commit" => String.duplicate("c", 40)
+    })
+
+  {:ok, docs_bytes} =
+    :mix_hex_tarball.create_docs([
+      {~c"index.html", "served docs"},
+      {~c"release.json", IO.iodata_to_binary(metadata)}
+    ])
+
+  @docs_bytes docs_bytes
+  @docs_read ~s|docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), version)|
+  @docs_action ~s|docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?)|
   @package_read ~s|package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)|
   @read ~s|release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
   @read_back ~s|read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
@@ -132,49 +146,51 @@ defmodule Replicant.PublishHexArtifactsTest do
     end
   end
 
-  test "served docs skip only on byte identity, while authoritative absence uploads" do
-    for required? <- [false, true] do
-      assert :skip ==
-               PublishHexArtifacts.docs_action!(
-                 response(200, @docs_bytes),
-                 @docs_digest,
-                 required?
-               )
+  test "served docs are kept by presence, while authoritative absence uploads" do
+    for docs? <- [false, true] do
+      assert :skip == PublishHexArtifacts.docs_action!(response(200, @docs_bytes), docs?)
+    end
 
-      assert_raise RuntimeError, ~r/docs checksum differs/, fn ->
-        PublishHexArtifacts.docs_action!(
-          response(200, <<0x1F, 0x8B, "different">>),
-          @docs_digest,
-          required?
-        )
+    assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}), false)
+
+    assert String.duplicate("c", 40) ==
+             PublishHexArtifacts.docs_read_back!(response(200, @docs_bytes), @version)
+
+    {:ok, legacy} = :mix_hex_tarball.create_docs([{~c"index.html", "legacy docs"}])
+    assert :skip == PublishHexArtifacts.docs_action!(response(200, legacy), true)
+
+    assert_raise RuntimeError, ~r/no release.json/, fn ->
+      PublishHexArtifacts.docs_read_back!(response(200, legacy), @version)
+    end
+
+    malformed = [nil, "", "not gzip", <<0x1F, 0x8B, "not a tarball">>, :zlib.gzip("not tar")]
+
+    for result <- Enum.map(malformed, &response(200, &1)) ++ failures() do
+      for docs? <- [false, true] do
+        error =
+          assert_raise RuntimeError, fn -> PublishHexArtifacts.docs_action!(result, docs?) end
+
+        refute Exception.message(error) =~ "private-response-value"
       end
     end
 
-    assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}), @docs_digest, false)
-    assert :ok == PublishHexArtifacts.docs_read_back!(response(200, @docs_bytes), @docs_digest)
-
-    missing = [
-      response(404, %{}),
-      response(200, nil),
-      response(200, ""),
-      response(200, "not gzip") | failures()
-    ]
-
-    for result <- missing do
+    for result <- [response(404, %{}) | Enum.map(malformed, &response(200, &1))] ++ failures() do
       error =
         assert_raise RuntimeError, fn ->
-          PublishHexArtifacts.docs_read_back!(result, @docs_digest)
+          PublishHexArtifacts.docs_read_back!(result, @version)
         end
 
       refute Exception.message(error) =~ "private-response-value"
     end
+  end
 
-    assert_raise RuntimeError, ~r/docs checksum differs/, fn ->
-      PublishHexArtifacts.docs_read_back!(
-        response(200, <<0x1F, 0x8B, "different">>),
-        @docs_digest
-      )
-    end
+  test "a repository 404 cannot replace docs that release metadata says exist" do
+    error =
+      assert_raise RuntimeError, ~r/docs metadata and repository disagree/, fn ->
+        PublishHexArtifacts.docs_action!(response(404, "private-response-value"), true)
+      end
+
+    refute Exception.message(error) =~ "private-response-value"
   end
 
   test "uploads refuse failures, ambiguity and approval holds without response values" do
@@ -210,9 +226,8 @@ defmodule Replicant.PublishHexArtifactsTest do
           {"{:held, _docs?} ->", ":fresh ->"},
           {":upload ->", ":skip ->"},
           {@docs_action, ":skip"},
-          {"docs_digest = :crypto.hash(:sha256, docs_bytes)",
-           "docs_digest = :crypto.hash(:sha256, package_bytes)"},
-          {"== digest", "!= digest"},
+          {"Replicant.ReleaseDocs.files!(bytes)", ":ok"},
+          {"Replicant.ReleaseDocs.provenance!(bytes, version)", ":ok"},
           {"|> approved!()", "|> then(fn _ -> :ok end)"},
           {@read_back, ":ok"},
           {@package_read, ":ok"},
@@ -236,7 +251,12 @@ defmodule Replicant.PublishHexArtifactsTest do
 
   defp assert_isolated_upload!(source) do
     assert source =~ @guard
-    without_guard = String.replace(source, @guard, "")
+
+    without_guard =
+      source
+      |> String.replace(@guard, "")
+      |> String.replace(~s|Code.require_file("release_docs.exs", __DIR__)|, "")
+
     refute without_guard =~ ~r/System\.cmd|Code\.|Mix\.|File\.write|deps\.get|mix docs|hex\.build/
     assert source =~ "package_bytes = File.read!(archive)"
     assert source =~ "docs_bytes = File.read!(docs)"
@@ -258,9 +278,9 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert docs_case =~ @read_back
     assert docs_case =~ @package_read
     assert docs_case =~ @docs_read
-    assert source =~ "docs_digest = :crypto.hash(:sha256, docs_bytes)"
-    assert source =~ "Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == digest"
-    assert source =~ ":skip = docs_action!(response, digest, true)"
+    assert source =~ "Replicant.ReleaseDocs.files!(bytes)"
+    assert source =~ "Replicant.ReleaseDocs.provenance!(bytes, version)"
+    refute source =~ "docs_digest"
     assert source =~ "Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) != digest do"
   end
 

@@ -2,8 +2,14 @@ unless is_nil(Mix.Project.get()) do
   Mix.raise("Docs archives must be built outside a Mix project")
 end
 
-[directory, output] = System.argv()
+[directory, output, version, commit] = System.argv()
 directory = Path.expand(directory)
+
+Code.require_file("release_docs.exs", __DIR__)
+metadata = :json.encode(%{"package" => "replicant", "version" => version, "commit" => commit})
+Replicant.ReleaseDocs.fields!(IO.iodata_to_binary(metadata), version)
+# Render first, then bind this archive to the CI source before any inspection.
+File.write!(Path.join(directory, "release.json"), metadata)
 
 unless File.regular?(Path.join(directory, "index.html")) do
   Mix.raise("Documentation must contain a top-level index.html")

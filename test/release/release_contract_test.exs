@@ -162,37 +162,14 @@ defmodule Replicant.ReleaseContractTest do
     refute source =~ ~r/authorization|witness|receipt/
   end
 
-  test "qualification and publication prove independently rendered docs byte for byte" do
+  test "qualification and publication inspect one docs render and preserve package equality" do
     source = File.read!(@builder)
-    assert_docs_rebuild!(source)
-
-    for before <- [
-          ~s|consume_candidate.sh" "$rebuild_tree/package.tar" "$rebuild_tree/docs.tar.gz"|,
-          ~s|cmp -s "$output_dir/docs.tar.gz" "$rebuild_tree/docs.tar.gz"|,
-          ~s|die "docs build is not byte-reproducible"|
-        ] do
-      mutated = String.replace(source, before, ":")
-      refute mutated == source
-      assert_raise ExUnit.AssertionError, fn -> assert_docs_rebuild!(mutated) end
-    end
-
-    assert Mix.Project.config()[:docs][:formatters] == ["html", "markdown"]
-    workflow = File.read!(@workflow)
-    assert workflow =~ "bash scripts/release/build_candidate.sh --check"
-  end
-
-  defp assert_docs_rebuild!(source) do
     assert source =~ ~s|consume_candidate.sh" "$package" "$output_dir/docs.tar.gz"|
-
-    assert source =~
-             ~s|consume_candidate.sh" "$rebuild_tree/package.tar" "$rebuild_tree/docs.tar.gz"|
-
-    assert source =~
-             ~s(cmp -s "$output_dir/docs.tar.gz" "$rebuild_tree/docs.tar.gz" || die "docs build is not byte-reproducible")
-
-    [_build, after_cmp] = String.split(source, ~s|cmp -s "$output_dir/docs.tar.gz"|, parts: 2)
-    assert after_cmp =~ "Replicant.PackageIdentity.verify_publish_archive!"
-    assert after_cmp =~ "chmod a-w"
+    assert source =~ ~s|cmp -s "$package" "$rebuild_tree/package.tar"|
+    assert length(Regex.scan(~r/consume_candidate\.sh/, source)) == 1
+    refute source =~ ~r/cmp[^\n]*docs|docs build is not byte-reproducible/
+    assert Mix.Project.config()[:docs][:formatters] == ["html", "markdown"]
+    assert File.read!(@workflow) =~ "bash scripts/release/build_candidate.sh --check"
   end
 
   test "publication compares the inspected package with held Hex bytes before the keyed step" do
@@ -200,11 +177,9 @@ defmodule Replicant.ReleaseContractTest do
     assert_held_check!(source)
 
     for {before, replacement} <- [
-          {"Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive, docs)",
-           ":ok"},
-          {~s|[version, commit, archive, docs] = System.argv()|, ":ok"},
-          {~s|' -- "$version" "$commit" "$package" "$output_dir/docs.tar.gz"|,
-           ~s|' -- "$version" "$commit" other.tar|}
+          {"Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)", ":ok"},
+          {~s|[version, commit, archive] = System.argv()|, ":ok"},
+          {~s|' -- "$version" "$commit" "$package"|, ~s|' -- "$version" "$commit" other.tar|}
         ] do
       mutated = String.replace(source, before, replacement)
       refute mutated == source
@@ -216,10 +191,10 @@ defmodule Replicant.ReleaseContractTest do
     [_build, after_inspection] = String.split(source, "consume_candidate.sh\"", parts: 2)
     [checked, _retained] = String.split(after_inspection, "chmod a-w", parts: 2)
     assert checked =~ ~s|if [[ "$mode" == "publish" ]]; then|
-    call = "Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive, docs)"
+    call = "Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)"
     assert checked =~ call
-    assert checked =~ "[version, commit, archive, docs] = System.argv()"
-    assert checked =~ ~s|' -- "$version" "$commit" "$package" "$output_dir/docs.tar.gz"|
+    assert checked =~ "[version, commit, archive] = System.argv()"
+    assert checked =~ ~s|' -- "$version" "$commit" "$package"|
   end
 
   defp candidate_arguments(script, args) do

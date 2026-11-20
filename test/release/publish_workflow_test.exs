@@ -8,13 +8,7 @@ defmodule Replicant.PublishWorkflowTest do
   @checkout "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
   @beam "erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124"
   @artifact "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
-  @stage_docs Enum.join(
-                [
-                  ~s|cp "$RUNNER_TEMP/replicant-release/docs.tar.gz"|,
-                  ~s|"$assets/replicant-$version-docs.tar.gz"|
-                ],
-                " "
-              )
+  @retain ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/retain_release_assets.exs" "$PACKAGE_VERSION" "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/release-assets"|
   @example_image ~r/\Ahexpm\/elixir:(\d+\.\d+\.\d+)-erlang-(\d+\.\d+\.\d+)-\S+@sha256:[0-9a-f]{64}\z/
   @owners Enum.join(
             [
@@ -363,13 +357,13 @@ defmodule Replicant.PublishWorkflowTest do
         {"branch dispatch", ["jobs", "publish", "steps", 0, "run"], "true"},
         {"missing package refusal", ["jobs", "publish", "steps", 1, "run"], "true"},
         {"missing archives", ["jobs", "publish", "steps", 8, "run"], "true"},
-        {"unpinned release assets", ["jobs", "publish", "steps", 10, "uses"],
+        {"unpinned release assets", ["jobs", "publish", "steps", 11, "uses"],
          "actions/upload-artifact@v7.0.2"},
-        {"wrong artifact name", ["jobs", "publish", "steps", 10, "with", "name"], "other"},
-        {"wrong artifact path", ["jobs", "publish", "steps", 10, "with", "path"], "."},
-        {"missing artifact files", ["jobs", "publish", "steps", 10, "with", "if-no-files-found"],
+        {"wrong artifact name", ["jobs", "publish", "steps", 11, "with", "name"], "other"},
+        {"wrong artifact path", ["jobs", "publish", "steps", 11, "with", "path"], "."},
+        {"missing artifact files", ["jobs", "publish", "steps", 11, "with", "if-no-files-found"],
          "warn"},
-        {"assets on failed read-back", ["jobs", "publish", "steps", 10, "if"], "always()"},
+        {"assets on failed read-back", ["jobs", "publish", "steps", 11, "if"], "always()"},
         {"wrong secret", ["jobs", "publish", "steps", 9, "env", "HEX_API_KEY"],
          "${{ secrets.OTHER_KEY }}"},
         {"job credential", ["jobs", "publish", "env"],
@@ -458,7 +452,7 @@ defmodule Replicant.PublishWorkflowTest do
           "gh run download 123 -n package-authorization",
           "echo qualified"
         ] do
-      mutated = replace(original, ["jobs", "publish", "steps", 11, "run"], command)
+      mutated = replace(original, ["jobs", "publish", "steps", 12, "run"], command)
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
   end
@@ -532,23 +526,28 @@ defmodule Replicant.PublishWorkflowTest do
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
 
-    mutated = replace(original, ["jobs", "publish", "steps", 11, "if"], nil)
+    mutated = replace(original, ["jobs", "publish", "steps", 12, "if"], nil)
     assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
   end
 
-  test "release assets retain both inspected archives with versioned names and SHA256SUMS" do
+  test "release assets come only from the keyless served read-back after upload" do
     original = read_yaml!(@workflow)
     assert_publish!(original)
-    source = Enum.at(original["jobs"]["publish"]["steps"], 8)["run"]
 
-    for fragment <- [
-          ~s|cp "$RUNNER_TEMP/replicant-release/package.tar" "$assets/replicant-$version.tar"|,
-          @stage_docs,
-          "sha256sum -- *.tar *.tar.gz > SHA256SUMS"
+    for command <- [
+          "true",
+          String.replace(@retain, "retain_release_assets.exs", "build_docs_archive.exs")
         ] do
-      script = String.replace(source, fragment, "true")
-      refute script == source
-      mutated = replace(original, ["jobs", "publish", "steps", 8, "run"], script)
+      mutated = replace(original, ["jobs", "publish", "steps", 10, "run"], command)
+      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
+    end
+
+    original_build = Enum.at(original["jobs"]["publish"]["steps"], 8)["run"]
+
+    for command <- ["cp docs.tar.gz release-assets/", "sha256sum docs.tar.gz > SHA256SUMS"] do
+      mutated =
+        replace(original, ["jobs", "publish", "steps", 8, "run"], original_build <> command)
+
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
 
@@ -704,7 +703,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert job["permissions"] == %{"contents" => "read"}
     assert job["timeout-minutes"] == 90
     steps = job["steps"]
-    assert length(steps) == 12
+    assert length(steps) == 13
     assert Enum.at(steps, 0)["run"] == ~s(test "$GITHUB_REF" = refs/heads/main)
     refusal = Enum.at(steps, 1)
     assert refusal["name"] == "Refuse a first publication"
@@ -732,14 +731,7 @@ defmodule Replicant.PublishWorkflowTest do
 
     assert build["run"] =~ ~s(printf 'version=%s\\n' "$version" >> "$GITHUB_OUTPUT")
 
-    assert build["run"] =~
-             ~s|cp "$RUNNER_TEMP/replicant-release/package.tar" "$assets/replicant-$version.tar"|
-
-    assert build["run"] =~ @stage_docs
-
-    assert build["run"] =~ ~s|assets="$RUNNER_TEMP/replicant-release/release-assets"|
-    assert build["run"] =~ ~s|mkdir "$assets"|
-    assert build["run"] =~ ~s|(cd "$assets" && sha256sum -- *.tar *.tar.gz > SHA256SUMS)|
+    refute build["run"] =~ ~r/release-assets|SHA256SUMS|\bcp\b/
     upload = Enum.at(steps, 9)
     assert upload["run"] == @upload
     assert upload["working-directory"] == "${{ runner.temp }}"
@@ -750,6 +742,14 @@ defmodule Replicant.PublishWorkflowTest do
            }
 
     assert Enum.at(steps, 10) == %{
+             "name" => "Read back served archives and prove docs provenance without a key",
+             "id" => "read_back",
+             "working-directory" => "${{ runner.temp }}",
+             "env" => %{"PACKAGE_VERSION" => "${{ steps.archives.outputs.version }}"},
+             "run" => @retain
+           }
+
+    assert Enum.at(steps, 11) == %{
              "name" => "Retain verified release assets for infra",
              "uses" => @artifact,
              "with" => %{
@@ -759,8 +759,8 @@ defmodule Replicant.PublishWorkflowTest do
              }
            }
 
-    assert Enum.at(steps, 11)["if"] == "always()"
-    assert Enum.at(steps, 11)["run"] == ~s(rm -rf -- "$RUNNER_TEMP/replicant-release")
+    assert Enum.at(steps, 12)["if"] == "always()"
+    assert Enum.at(steps, 12)["run"] == ~s(rm -rf -- "$RUNNER_TEMP/replicant-release")
 
     without_secret =
       update_in(workflow, ["jobs", "publish", "steps", Access.at(9), "env"], fn env ->
