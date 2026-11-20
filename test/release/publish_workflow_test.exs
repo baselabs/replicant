@@ -547,6 +547,7 @@ defmodule Replicant.PublishWorkflowTest do
     for command <- ["cp docs.tar.gz release-assets/", "sha256sum docs.tar.gz > SHA256SUMS"] do
       mutated =
         replace(original, ["jobs", "publish", "steps", 8, "run"], original_build <> command)
+
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
 

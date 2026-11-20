@@ -177,11 +177,9 @@ defmodule Replicant.ReleaseContractTest do
     assert_held_check!(source)
 
     for {before, replacement} <- [
-          {"Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)",
-           ":ok"},
+          {"Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)", ":ok"},
           {~s|[version, commit, archive] = System.argv()|, ":ok"},
-          {~s|' -- "$version" "$commit" "$package"|,
-           ~s|' -- "$version" "$commit" other.tar|}
+          {~s|' -- "$version" "$commit" "$package"|, ~s|' -- "$version" "$commit" other.tar|}
         ] do
       mutated = String.replace(source, before, replacement)
       refute mutated == source
