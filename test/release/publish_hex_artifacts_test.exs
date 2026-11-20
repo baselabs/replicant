@@ -167,7 +167,9 @@ defmodule Replicant.PublishHexArtifactsTest do
 
     for result <- Enum.map(malformed, &response(200, &1)) ++ failures() do
       for docs? <- [false, true] do
-        error = assert_raise RuntimeError, fn -> PublishHexArtifacts.docs_action!(result, docs?) end
+        error =
+          assert_raise RuntimeError, fn -> PublishHexArtifacts.docs_action!(result, docs?) end
+
         refute Exception.message(error) =~ "private-response-value"
       end
     end
