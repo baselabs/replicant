@@ -1217,7 +1217,9 @@ defmodule Replicant.IncrementalSnapshotTest do
 
   defp snapshot_window_debug(test_pid, qualified) do
     fn
-      marker, {:in, {:"$gen_call", {reader, _tag}, {:open_snapshot_window, ^qualified}}}, _state ->
+      marker,
+      {:in, {:"$gen_call", {reader, _tag}, {:open_snapshot_window, ^qualified}}},
+      _state ->
         true = :erlang.suspend_process(reader)
         send(test_pid, {:snapshot_window_paused, self(), reader})
         marker
