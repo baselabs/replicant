@@ -10,10 +10,12 @@ run an example.)
 
 ## `replication_pipeline/` — the reference stack (docker)
 
-The deployment shape consumers actually build, as one `docker compose up`:
+The deployment shape consumers actually build, as one `docker compose up` after
+reading and pulling the engine reference from `.github/postgres.ref`:
 Postgres source (`wal_level=logical` + publication) → replicant as an OTP
 release in one container → Postgres destination, with an idempotent
-orders replica and a durable commit-LSN checkpoint. See
+orders replica and a durable commit-LSN checkpoint. Both databases use disposable
+platform-engine scratch and password host authentication. See
 [replication_pipeline/README.md](replication_pipeline/README.md).
 
 The interactive feature tour (snapshot/backfill, logical-decoding messages) lives

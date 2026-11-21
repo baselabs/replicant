@@ -1,12 +1,12 @@
 # The reference pipeline — replicant as a durable Postgres→Postgres replicator
 
-One `docker compose up` brings up the whole reference stack:
+The reference stack uses the checked BaseLabs PostgreSQL engine for both servers:
 
 ```
-Postgres 18 (source, wal_level=logical + example_pub) ──pgoutput──> [this app]
+Platform engine (source, wal_level=logical + example_pub) ──pgoutput──> [this app]
                                                                      ├─ idempotent orders replica (upsert by PK)
                                                                      └─ durable commit-LSN checkpoint
-                                                                  ──> Postgres 18 (destination)
+                                                                  ──> Platform engine (destination)
 ```
 
 This is a **go-forward change replicator**: it streams changes that commit from
@@ -22,8 +22,19 @@ All credentials are throwaway local-example values, not secrets. Ports bind to
 
 ```bash
 cd examples/replication_pipeline
+export REPLICANT_POSTGRES_IMAGE="$(cat ../../.github/postgres.ref)"
+docker pull "$REPLICANT_POSTGRES_IMAGE"
 docker compose up -d --build          # source + destination + pipeline
 ```
+
+The Compose file requires that reference and never pulls a moving tag. CI checks
+its digest anonymously against the public platform engine before pulling. Both
+databases use `baselabs-test-postgres`, uid/gid-26 tmpfs scratch at `/var/lib/pg`,
+and `/tmp` sockets. SQL under `/init` runs before TCP becomes ready. Host
+connections use scram passwords, including the example's replication account;
+the pipeline reads both passwords from environment variables. Database data is
+disposable: recreating either database container starts a new database. The
+durability demonstration below restarts only the pipeline.
 
 First boot is a full OTP-release build — a few minutes. The pipeline creates
 its replication slot a few seconds after boot; an insert committed BEFORE the
@@ -31,16 +42,16 @@ slot exists is never streamed (go-forward starts at the slot's creation
 point), so confirm the slot is active first:
 
 ```bash
-docker compose exec source-pg psql -U postgres -d example_src \
+docker compose exec source-pg psql -h /tmp -U postgres -d example_src \
   -c "SELECT slot_name, active FROM pg_replication_slots"
 # one row, active = t — ready
 
 # write a row on the source
-docker compose exec source-pg psql -U postgres -d example_src \
+docker compose exec source-pg psql -h /tmp -U postgres -d example_src \
   -c "INSERT INTO orders (id, note) VALUES (1, 'hello')"
 
 # see it on the destination, with its checkpoint
-docker compose exec dest-pg psql -U postgres -d example_dst \
+docker compose exec dest-pg psql -h /tmp -U postgres -d example_dst \
   -c "SELECT * FROM orders; SELECT commit_lsn FROM pipeline_checkpoint"
 ```
 
@@ -50,9 +61,9 @@ Teardown: `docker compose down -v`.
 
 ```bash
 docker compose restart pipeline                     # kill/restart mid-life
-docker compose exec source-pg psql -U postgres -d example_src \
+docker compose exec source-pg psql -h /tmp -U postgres -d example_src \
   -c "INSERT INTO orders (id, note) VALUES (3, 'after restart')"
-docker compose exec dest-pg psql -U postgres -d example_dst \
+docker compose exec dest-pg psql -h /tmp -U postgres -d example_dst \
   -c "SELECT id, note FROM orders ORDER BY id" \
   -c "SELECT count(*) FROM cdc_receipts"            # no re-delivery of prior rows
 ```
@@ -76,7 +87,7 @@ extend the sink per table — the seam is the point, not the schema.
 
 ## Swapping the decoder (pre-15 sources through pglogical / wal2json)
 
-The stack above targets `pgoutput` on Postgres 18. A pre-15 source that already carries
+The stack above targets `pgoutput` on the platform engine. A pre-15 source that already carries
 the `pglogical` or `wal2json` output plugin streams through the SAME sink and checkpoint
 contract — the same container image, one env change (`application.ex` builds the
 per-decoder table-set key from `REPLICANT_DECODER`):

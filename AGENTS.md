@@ -225,11 +225,17 @@ and reread them whenever you touch a workflow, a Dockerfile, a release script or
   `REPLICANT_PG96_URL` to a real 9.6 carrying both plugins. The snapshot leg
   (`test/integration/plugin_snapshot_pg96_test.exs`) proves exactly-once arrival across a 9.6
   two-part exported-snapshot handoff wherever a pre-10 server is wired.
-- **Supported PostgreSQL versions: 9.6, 12, 15, 16, 17, 18.** The 9.6, 12 and 15-plugin rows
-  serve the plugin decoders (ADR-0009); their images come from `test/support/pg_old.dockerfile`
-  (digest-pinned bases, pglogical 2.4.8, wal2json pinned per major). PG15+ plugin lanes start
-  with `output_plugin_libraries=wal2json,pglogical_output,pgoutput`; the `:pg_old_decoders`
-  exclusion follows a plugin probe, not the version. Rows carry `EXPECTED_PG_MAJOR`. Behavior
+- **PostgreSQL substrate:** `.github/postgres.ref` is the checked platform engine reference.
+  `.github/postgres-lanes.json` declares each other supported major once (9.6, 12, 15, 16, 17),
+  its digest-pinned upstream image, decoder/pgoutput roles, and decoder settings. The engine
+  supplies the current-major lane and both example servers; it is never a compatibility row.
+  `scripts/ci/postgres-lanes.sh` validates the declaration and emits the matrix and expected
+  engine major. `.github/actions/postgres` owns every start and unconditional teardown, checks
+  the public engine digest anonymously before pulling, and uses password host authentication.
+  Decoder images build from declared bases through `test/support/pg_old.dockerfile`, with
+  full source commits and exact server headers. The legacy-source role backs the parity
+  sidecar. The `:pg_old_decoders` exclusion follows a plugin probe, not the version. Rows
+  carry reader-derived `EXPECTED_PG_MAJOR`. Behavior
   gates on `server_version_num`: the slot-invalidation query selects only columns the major has
   (PG15 `wal_status`; PG16 `+ conflicting`; PG17/18 `+ invalidation_reason, synced`); failover
   slots exist on PG17/18 and halt `{:config, :failover_unsupported}` on PG15/16. `:pg14`
@@ -237,18 +243,20 @@ and reread them whenever you touch a workflow, a Dockerfile, a release script or
   CI runs the full suite on all six majors.
 - **Integration + crash-injection tests** (`test/integration/**`): gate on
   `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
-  unset. Contributors without a server can spin a major (never on `localhost:5432`) with
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p <PORT>:5432 postgres:<MAJOR> -c
-  wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
-  and `export REPLICANT_TEST_URL="postgres://postgres@localhost:<PORT>/postgres"`. A shared
-  server needs a `LOGIN REPLICATION CREATEDB` role, its own test database, and
+  unset. Qualification provisions isolated containers on loopback with a new database,
+  `wal_level=logical`, and throwaway password fixtures supplied through environment variables.
+  Compatibility entrypoints require stable readiness across their init restart; the engine
+  requires TCP readiness after initialization. Its disposable scratch is uid/gid 26 at
+  `/var/lib/pg` plus `/tmp`; in-container psql names `-h /tmp`. Checks run only through the
+  CI route above. A shared server needs a password-bearing `LOGIN REPLICATION CREATEDB`
+  role, its own test database, and
   `GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal()`; tests set
   `logical_decoding_work_mem` on `CURRENT_USER` only.
 - **Version-behavior tests** (`version_behavior_test.exs`) branch on the live major and emit an
   `R05-SUBSTRATE-RECEIPT pg=<major>` line CI greps against `EXPECTED_PG_MAJOR`. **PG17+
   failover tests** (`pg17_failover_test.exs`, `:pg17`) are auto-excluded below 17.
 - **Reference example** (`examples/replication_pipeline`, CI job `reference-example`): a
-  docker-compose stack (source PG18 → replicant release container → dest PG18), the public sink
+  docker-compose stack (platform engine → replicant release container → platform engine), the public sink
   API's canary, proving delivery, TOAST-sentinel survival and restart-resume with zero
   duplicate effects. The repo-root `.dockerignore` is a WHITELIST: anything not explicitly
   allowed (`.env`, crash dumps, lifecycle artifacts) never rides the build context; extend it

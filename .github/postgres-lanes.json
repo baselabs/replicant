@@ -1,0 +1,43 @@
+[
+  {
+    "major": "9.6",
+    "image": "postgres:9.6@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698",
+    "roles": [
+      "decoders",
+      "legacy-source"
+    ]
+  },
+  {
+    "major": "12",
+    "image": "postgres:12@sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c",
+    "roles": [
+      "decoders",
+      "parity-primary"
+    ]
+  },
+  {
+    "major": "15",
+    "image": "postgres:15@sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111",
+    "roles": [
+      "pgoutput",
+      "decoders"
+    ],
+    "settings": [
+      "output_plugin_libraries=wal2json,pglogical_output,pgoutput"
+    ]
+  },
+  {
+    "major": "16",
+    "image": "postgres:16@sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5",
+    "roles": [
+      "pgoutput"
+    ]
+  },
+  {
+    "major": "17",
+    "image": "postgres:17@sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449",
+    "roles": [
+      "pgoutput"
+    ]
+  }
+]

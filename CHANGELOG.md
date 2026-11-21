@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI uses the checked BaseLabs PostgreSQL engine for its current-major lane and
+  reference example, with declared compatibility roles for older servers. One
+  action owns password-authenticated startup and unconditional cleanup; decoder
+  images use declared bases and full source pins. No library API changes.
 - Docs render once. Under infra's release rule, this path never replaces or
   compares served docs: it keeps them and reads them back by presence and
   `release.json` provenance. Hex itself allows docs republishing, but replacing

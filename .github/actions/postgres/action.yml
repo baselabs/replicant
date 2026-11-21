@@ -1,0 +1,56 @@
+name: PostgreSQL substrate
+description: Own the job's disposable engine, compatibility servers, or example stack
+inputs:
+  mode:
+    description: start or stop
+    default: start
+  lane:
+    description: Validated matrix cell from scripts/ci/postgres-lanes.sh
+    default: '{}'
+  example:
+    description: Manage the reference example stack instead of a matrix server
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Check the public platform engine and pull its digest
+      if: inputs.mode == 'start'
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        engine="$(cat .github/postgres.ref)"
+        [[ "$engine" =~ ^ghcr\.io/baselabs/postgres:[0-9]+\.[0-9]+-inputs-[0-9a-f]{64}@sha256:[0-9a-f]{64}$ ]]
+        current_digest="$(python3 - <<'PY'
+        import json, re, urllib.request
+        host, path = 'ghcr.io', 'baselabs/postgres'
+        with urllib.request.urlopen(f'https://{host}/token?scope=repository:{path}:pull', timeout=30) as response:
+            token = json.load(response)['token']
+        request = urllib.request.Request(f'https://{host}/v2/{path}/manifests/current', method='HEAD', headers={
+            'Authorization': 'Bearer ' + token,
+            'Accept': ', '.join(('application/vnd.oci.image.index.v1+json', 'application/vnd.oci.image.manifest.v1+json',
+                                 'application/vnd.docker.distribution.manifest.list.v2+json',
+                                 'application/vnd.docker.distribution.manifest.v2+json'))})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            digest = response.headers.get('Docker-Content-Digest', '')
+        if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+            raise SystemExit('ghcr.io/baselabs/postgres:current: registry named no digest')
+        print(digest)
+        PY
+        )"
+        if [ "${engine##*@}" != "$current_digest" ]; then
+          echo 'checked PostgreSQL digest differs from ghcr.io/baselabs/postgres:current' >&2; exit 1
+        fi
+        docker pull "$engine"
+    - name: Manage PostgreSQL
+      if: always() && (inputs.mode == 'stop' || success())
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        PG_MODE: ${{ inputs.mode }}
+        PG_LANE: ${{ inputs.lane }}
+        PG_EXAMPLE: ${{ inputs.example }}
+        # Throwaway fixtures for isolated containers, never external credentials.
+        TEST_PG_USER: postgres
+        TEST_PG_PASSWORD: postgres
+        TEST_PG_DATABASE: replicant_test
+      run: scripts/ci/postgres.sh

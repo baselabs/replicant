@@ -5,12 +5,9 @@
 # for the :decoder_option_unsupported halt (a build that predates
 # numeric-data-types-as-string rejects the option wal2json ≥ 2.6 requires).
 #
-# Build (the substrate majors from the SAME Dockerfile; a 15+ base additionally
-# needs output_plugin_libraries=wal2json,pglogical_output,pgoutput at server
-# start — PG15+ gates EVERY output plugin, pgoutput included):
-#   docker build -f test/support/pg_old.dockerfile --build-arg BASE=postgres:9.6@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698 -t replicant-pg96-plugins:test .
-#   docker build -f test/support/pg_old.dockerfile --build-arg BASE=postgres:12@sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c -t replicant-pg12-plugins:test .
-#   docker build -f test/support/pg_old.dockerfile --build-arg BASE=postgres:15@sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111 -t replicant-pg15-plugins:test .
+# Base images and decoder roles are declared once in .github/postgres-lanes.json.
+# scripts/ci/postgres-lanes.sh validates them; the postgres action passes BASE.
+# No default base: a missing build argument refuses before any build stage.
 #
 # The build context is the repo root. Plugin sources are pinned by commit (not a
 # moving branch) so a rebuild reproduces the same bytes.
@@ -26,7 +23,7 @@
 # minor-release server libraries (15.20) under the base's 15.19 server, and the
 # server never started (CI, November 2026).
 
-ARG BASE=postgres:12@sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c
+ARG BASE
 FROM ${BASE} AS build
 
 # The 9.6 image rides Debian stretch (archived upstream; PGDG's stretch archive has
@@ -34,7 +31,7 @@ FROM ${BASE} AS build
 # postgresql-server-dev-9.6 for arm64; installing it needs the base image's PGDG
 # libpq5 downgraded to Debian's matching build (--allow-downgrades pins the trio).
 RUN set -eux; \
-    case "$PG_MAJOR" in 9.*) \
+    case "$PG_MAJOR" in 9.6) \
       printf 'deb http://archive.debian.org/debian stretch main\ndeb http://archive.debian.org/debian-security stretch/updates main\n' > /etc/apt/sources.list; \
       rm -f /etc/apt/sources.list.d/*.list; \
       apt-get update -o Acquire::Check-Valid-Until=false; \
@@ -44,7 +41,7 @@ RUN set -eux; \
         build-essential git ca-certificates libkrb5-dev libselinux1-dev \
         libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev; \
       ;; \
-    *) \
+    12|15) \
       apt-get update; \
       apt-get install -y --no-install-recommends ca-certificates; \
       sed -E 's#https?://apt\.postgresql\.org#https://apt-archive.postgresql.org#; s#-pgdg main.*$#-pgdg-archive main#' \
@@ -56,6 +53,7 @@ RUN set -eux; \
         libzstd-dev liblz4-dev \
         "postgresql-server-dev-$PG_MAJOR=$PG_VERSION"; \
       ;; \
+    *) echo "unsupported plugin substrate major" >&2; exit 1 ;; \
     esac
 
 # pglogical 2.4.8 (output plugin `pglogical_output`) — OBSERVED protocol facts in
@@ -76,26 +74,30 @@ RUN set -eux; \
 #     tests", 21 commits past 2.6) — the first committed-lineage pin carrying the
 #     PG15/16 compile shims (txn->xact_time.commit_time under
 #     PG_VERSION_NUM >= 150000).
+# wal2json_2_4 resolves to 36fbee6cbb7e4bc1bf9ee4f55842ab51393e3ac0.
 # The wal2json2_4 lever (the option-rejection halt's live substrate) builds only on
 # the pre-15 majors — wal2json_2_4 predates PG15 and no 15+ lane needs it.
 RUN set -eux; \
     git clone --quiet https://github.com/eulerto/wal2json.git /tmp/wal2json; \
     cd /tmp/wal2json; \
     case "$PG_MAJOR" in \
-      9.*|10|11|12|13|14) git checkout --quiet 75629c2e1e81a12350cc9d63782fc53252185d8d ;; \
-      *) git checkout --quiet 75a4b494 ;; \
+      9.6|12) git checkout --quiet 75629c2e1e81a12350cc9d63782fc53252185d8d ;; \
+      15) git checkout --quiet 75a4b494a3fe0c4626e699de5bf2732079badb7b ;; \
+      *) echo "unsupported plugin substrate major" >&2; exit 1 ;; \
     esac; \
     make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
     make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
     case "$PG_MAJOR" in \
-      9.*|10|11|12|13|14) \
+      9.6|12) \
         mv /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json_head.so; \
-        git checkout --quiet wal2json_2_4; \
+        git checkout --quiet 36fbee6cbb7e4bc1bf9ee4f55842ab51393e3ac0; \
         make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
         make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
         mv /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json2_4.so; \
         mv /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json_head.so /plugins/usr/lib/postgresql/$PG_MAJOR/lib/wal2json.so \
         ;; \
+      15) ;; \
+      *) echo "unsupported plugin substrate major" >&2; exit 1 ;; \
     esac
 
 FROM ${BASE}

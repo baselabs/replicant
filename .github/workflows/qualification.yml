@@ -57,147 +57,42 @@ jobs:
       - run: mix credo --strict
       - run: mix dialyzer
 
-  test:
-    name: test (PG${{ matrix.pg.major }})
+  postgres-lanes:
     runs-on: ubuntu-24.04
-    timeout-minutes: 9 # Green run 44222373059: test PG12 (slowest matrix row) 4m23s
+    timeout-minutes: 90 # no green run yet
+    outputs:
+      matrix: ${{ steps.lanes.outputs.matrix }}
+      engine-major: ${{ steps.lanes.outputs.engine-major }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: lanes
+        run: scripts/ci/postgres-lanes.sh
+
+  test:
+    name: test (${{ matrix.pg.kind }} PG${{ matrix.pg.major }} ${{ matrix.pg.role }})
+    needs: postgres-lanes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9 # Green run 44222373059: slowest test matrix row 4m23s
     strategy:
       fail-fast: false
-      # R05 supported-version matrix: PostgreSQL 9.6, 12, 15, 16, 17, 18. The 15-18
-      # rows use the operator-approved local port mapping (5615/5599/5617/5618) and pin
-      # the image by manifest-list digest (supply-chain: a moved tag cannot silently
-      # change the tested image). The 9.6/12 rows (ADR-0009) BUILD their images from the
-      # committed test/support/pg_old.dockerfile (digest-pinned bases + pglogical 2.4.8 +
-      # wal2json 2.6) and export the plugin-decoder substrate vars. `localhost:5432` is
-      # never the substrate; `major` is exported as EXPECTED_PG_MAJOR so the integration
-      # suite fails a row wired to the wrong container.
-      matrix:
-        pg:
-          - { major: "9", port: "5609", digest: "sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698", plugins: true }
-          - { major: "12", port: "5612", digest: "sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c", plugins: true }
-          # The 15 PLUGIN lane: same digest-pinned 15 base, built from the committed
-          # pg_old.dockerfile (wal2json master @ 75a4b494 there — 2.6 does not compile
-          # on 15). PG15+ gates EVERY output plugin, so the run passes
-          # output_plugin_libraries for wal2json, pglogical_output AND pgoutput.
-          - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111", plugins: true, plugin_gucs: "-c output_plugin_libraries=wal2json,pglogical_output,pgoutput" }
-          # The stock 15 row (pgoutput only) keeps its own lane below.
-          - { major: "15", port: "5615", digest: "sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111", stock: true }
-          - { major: "16", port: "5599", digest: "sha256:e17e86066e5ef83e0952a9347f5c792b7ece00972e2aa787a6986f471b3dd3d5" }
-          - { major: "17", port: "5617", digest: "sha256:e38411452a464af89e5adadb8d223bf53b898d47d6ef918b2d58c08707350449" }
-          - { major: "18", port: "5618", digest: "sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941" }
+      matrix: ${{ fromJSON(needs.postgres-lanes.outputs.matrix) }}
     env:
       MIX_ENV: test
-      REPLICANT_TEST_URL: postgres://postgres@localhost:${{ matrix.pg.port }}/postgres
-      EXPECTED_PG_MAJOR: ${{ matrix.pg.major }}
-      # The 12 row ALSO runs a real 9.6 beside it (the parity marquee's cross-vintage
-      # legs are part of ADR-0009's acceptance and FAIL LOUD when the URL is unset on
-      # a pre-15 plugin row). The 9 row's own server backs the value there.
-      REPLICANT_PG96_URL: ${{ (matrix.pg.major == '9' && format('postgres://postgres@localhost:{0}/postgres', matrix.pg.port)) || (matrix.pg.major == '12' && 'postgres://postgres@localhost:5609/postgres') || '' }}
+      # Throwaway container fixtures; no external service credentials.
+      REPLICANT_TEST_URL: postgres://postgres:postgres@127.0.0.1:15432/replicant_test
+      EXPECTED_PG_MAJOR: ${{ matrix.pg.expected_major }}
+      REPLICANT_PG96_URL: ${{ (matrix.pg.legacy_self && 'postgres://postgres:postgres@127.0.0.1:15432/replicant_test') || (matrix.pg.sidecar && 'postgres://postgres:postgres@127.0.0.1:15433/replicant_test') || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Start PostgreSQL ${{ matrix.pg.major }} with logical replication
-        env:
-          PG_DIGEST: ${{ matrix.pg.digest }}
-          PG_PLUGINS: ${{ matrix.pg.plugins }}
-          PG_PLUGIN_GUCS: ${{ matrix.pg.plugin_gucs }}
-          PG_PORT: ${{ matrix.pg.port }}
-        # A `services:` block cannot pass `-c wal_level=logical` to the container, so run
-        # Postgres directly with the flags (mirrors AGENTS.md). Without wal_level=logical the
-        # integration suite would silently skip and CI would be green-but-vacuous. The
-        # 9.6/12 rows build the plugin image from the committed Dockerfile instead of the
-        # stock base (ADR-0009), and bootstrap the pglogical extension + node. The 12 row
-        # additionally starts the 9.6 secondary that backs REPLICANT_PG96_URL (the parity
-        # marquee's 9.6 legs run against it; without it the marquee flunks, not narrows).
-        run: |
-          if [ "$PG_PLUGINS" = "true" ]; then
-            docker build -f test/support/pg_old.dockerfile \
-              --build-arg "BASE=postgres:$EXPECTED_PG_MAJOR@$PG_DIGEST" \
-              -t "replicant-pg$EXPECTED_PG_MAJOR-plugins:ci" .
-            IMAGE="replicant-pg$EXPECTED_PG_MAJOR-plugins:ci"
-          else
-            IMAGE="postgres:$EXPECTED_PG_MAJOR@$PG_DIGEST"
-          fi
-          server_args=(-c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10)
-          if [ "$PG_PLUGINS" = "true" ]; then
-            server_args+=(-c shared_preload_libraries=pglogical)
-          fi
-          if [ -n "$PG_PLUGIN_GUCS" ]; then
-            read -r -a plugin_gucs <<< "$PG_PLUGIN_GUCS"
-            server_args+=("${plugin_gucs[@]}")
-          fi
-          docker run -d --name pg \
-            -e POSTGRES_HOST_AUTH_METHOD=trust \
-            -p "$PG_PORT:5432" \
-            "$IMAGE" \
-            "${server_args[@]}"
-          # STABLE readiness: a fresh postgres container runs a TEMP server first and
-          # restarts into final mode — a single pg_isready can pass on the temp server
-          # and the next probe lands mid-restart ("rejecting connections", OBSERVED:
-          # run 37018576121's stock-15 row failed its gate 60ms after passing it).
-          # Require three consecutive accepts spanning at least two seconds.
-          pg_ready=0
-          for _ in $(seq 1 40); do
-            if docker exec pg pg_isready -U postgres >/dev/null 2>&1 \
-               && sleep 1 \
-               && docker exec pg pg_isready -U postgres >/dev/null 2>&1 \
-               && sleep 1 \
-               && docker exec pg pg_isready -U postgres >/dev/null 2>&1; then
-              pg_ready=1
-              break
-            fi
-            sleep 1
-          done
-          [ "$pg_ready" = "1" ] || { echo "Postgres never became ready"; docker logs pg; exit 1; }
-          if [ "$PG_PLUGINS" = "true" ]; then
-            # the dsn is registration metadata (replicant's read path never dials it);
-            # in-container the server listens on 5432, not the host-mapped port
-            docker exec pg psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pglogical" \
-              -c "SELECT * FROM pglogical.create_node(node_name := 'ci_src', dsn := 'postgres://postgres@localhost:5432/postgres')"
-            # replication connections from the CI network must pass pg_hba (9.6 rejects
-            # them by default; OBSERVED on the substrate)
-            docker exec pg sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
-          fi
-          if [ "$EXPECTED_PG_MAJOR" = "12" ]; then
-            docker build -f test/support/pg_old.dockerfile \
-              --build-arg BASE=postgres:9.6@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698 \
-              -t replicant-pg9-plugins:ci .
-            docker run -d --name pg96 \
-              -e POSTGRES_HOST_AUTH_METHOD=trust \
-              -p 5609:5432 \
-              replicant-pg9-plugins:ci \
-              -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10 \
-              -c shared_preload_libraries=pglogical
-            pg96_ready=0
-            for _ in $(seq 1 40); do
-              if docker exec pg96 pg_isready -U postgres >/dev/null 2>&1 \
-                 && sleep 1 \
-                 && docker exec pg96 pg_isready -U postgres >/dev/null 2>&1 \
-                 && sleep 1 \
-                 && docker exec pg96 pg_isready -U postgres >/dev/null 2>&1; then
-                pg96_ready=1
-                break
-              fi
-              sleep 1
-            done
-            [ "$pg96_ready" = "1" ] || { echo "PostgreSQL 9.6 never became ready"; docker logs pg96; exit 1; }
-            docker exec pg96 psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pglogical" \
-              -c "SELECT * FROM pglogical.create_node(node_name := 'ci_src96', dsn := 'postgres://postgres@localhost:5432/postgres')"
-            docker exec pg96 sh -c "echo 'host replication all all trust' >> \$PGDATA/pg_hba.conf && psql -U postgres -c 'SELECT pg_reload_conf()'"
-          fi
-
-      - name: Assert the live server is the expected major (substrate wiring)
-        # Fail closed if the started container's version does not match the matrix row — a
-        # mis-pinned digest or wrong tag is caught BEFORE the suite runs, never a silent
-        # green against the wrong version.
-        run: |
-          got=$(docker exec pg psql -U postgres -tAc "SELECT current_setting('server_version_num')")
-          echo "server_version_num=$got"
-          major=$(( got / 10000 ))
-          test "$major" = "$EXPECTED_PG_MAJOR" \
-            || { echo "::error::started PG$major but the matrix row expects PG$EXPECTED_PG_MAJOR"; exit 1; }
+      - name: Start the declared PostgreSQL lane
+        uses: ./.github/actions/postgres
+        with:
+          lane: ${{ toJSON(matrix.pg) }}
 
       - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
@@ -209,20 +104,19 @@ jobs:
         run: elixir scripts/ci/assert_runtime.exs
 
       - run: mix deps.get --check-locked
-      - name: Run tests and prove this matrix row ran integration against PG${{ matrix.pg.major }}
-        # R05 CI discovery: the integration suite emits `R05-SUBSTRATE-RECEIPT pg=<major>` from a
-        # live-server test. Grepping for THIS row's major proves the row actually exercised the
-        # integration suite against the version it claims — a skipped or mis-wired row (which
-        # would print nothing, or a different major) reds here rather than passing vacuously.
-        # The workflow's bash default runs this with pipefail, so tee cannot hide a failing
-        # `mix test` before the receipt grep.
+      - name: Run tests and prove this matrix row exercised its declared substrate
+        # pipefail preserves mix test's status through tee. The live receipt
+        # refuses skipped or incorrectly wired integration coverage.
         run: |
           mix test --warnings-as-errors 2>&1 | tee test-output.log
-          # No `^` anchor: ExUnit prints inline progress dots with no trailing newline, so the
-          # receipt from IO.puts lands mid-line (`....R05-SUBSTRATE-RECEIPT ...`). The pattern is
-          # specific enough that a substring match anywhere is unambiguous.
           grep -qE "R05-SUBSTRATE-RECEIPT pg=$EXPECTED_PG_MAJOR version_num=" test-output.log \
             || { echo "::error::integration did not run against PG$EXPECTED_PG_MAJOR (no R05-SUBSTRATE-RECEIPT)"; exit 1; }
+
+      - name: Remove PostgreSQL and its disposable data
+        if: always()
+        uses: ./.github/actions/postgres
+        with:
+          mode: stop
 
   release-artifact:
     name: docs and package
@@ -274,9 +168,12 @@ jobs:
   # (source PG → replicant release container → destination PG) that is the
   # public sink API's canary — if replicant breaks its consumer surface, the
   # release build, or the substrate wiring, this end-to-end run goes red.
-  # Images are the same digest-pinned postgres:18 the matrix pins; the repo-root
+  # Source and destination use the checked platform engine; the repo-root
   # .dockerignore whitelist is the containment barrier for the build context.
   reference-example:
+    needs: postgres-lanes
+    env:
+      EXPECTED_PG_MAJOR: ${{ needs.postgres-lanes.outputs.engine-major }}
     name: Reference example (docker)
     runs-on: ubuntu-24.04
     timeout-minutes: 8 # Green run 44265557928: reference-example 3m33s
@@ -313,7 +210,9 @@ jobs:
           mix dialyzer
 
       - name: Build and start the stack
-        run: docker compose up -d --build
+        uses: ./.github/actions/postgres
+        with:
+          example: 'true'
 
       # The pipeline creates its slot a few seconds after boot; an insert
       # committed BEFORE the slot exists is go-forward-correct but never
@@ -324,7 +223,7 @@ jobs:
         run: |
           ready=""
           for _ in $(seq 1 30); do
-            active=$(docker compose exec -T source-pg psql -U postgres -d example_src \
+            active=$(docker compose exec -T source-pg psql -h /tmp -U postgres -d example_src \
               -tAc "SELECT count(*) FROM pg_replication_slots WHERE slot_name = 'replicant_example' AND active" 2>/dev/null)
             [ "$active" = "1" ] && ready=1 && break
             sleep 2
@@ -332,21 +231,21 @@ jobs:
           [ "${ready:-0}" = "1" ] \
             || { echo "::error::pipeline never created/activated its slot"; docker compose logs pipeline; exit 1; }
 
-      - name: Assert the substrate is the expected major (PG18)
+      - name: Assert the substrate is the engine major
         run: |
-          got=$(docker compose exec -T source-pg psql -U postgres -d example_src \
+          got=$(docker compose exec -T source-pg psql -h /tmp -U postgres -d example_src \
             -tAc "SELECT current_setting('server_version_num')")
           echo "server_version_num=$got"
-          test "$(( got / 10000 ))" = "18" \
-            || { echo "::error::expected PG18"; exit 1; }
+          test "$(( got / 10000 ))" = "$EXPECTED_PG_MAJOR" \
+            || { echo "::error::expected PG$EXPECTED_PG_MAJOR"; exit 1; }
 
       - name: Deliver one transaction — replica + checkpoint
         run: |
-          docker compose exec -T source-pg psql -U postgres -d example_src \
+          docker compose exec -T source-pg psql -h /tmp -U postgres -d example_src \
             -c "INSERT INTO orders (id, note) VALUES (1, 'hello')"
           n=""
           for _ in $(seq 1 30); do
-            n=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            n=$(docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
               -tAc "SELECT count(*) FROM orders" 2>/dev/null)
             [ "$n" = "1" ] && break
             sleep 2
@@ -356,10 +255,10 @@ jobs:
           # The checkpoint row advanced to the transaction's commit LSN, and
           # the value-free receipts ledger recorded the delivery — exactly one
           # receipt per delivered change, none for a skipped re-delivery.
-          docker compose exec -T dest-pg psql -U postgres -d example_dst \
+          docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
             -tAc "SELECT commit_lsn FROM pipeline_checkpoint WHERE id = 1" | grep -q . \
             || { echo "::error::checkpoint never persisted"; docker compose logs pipeline; exit 1; }
-          docker compose exec -T dest-pg psql -U postgres -d example_dst \
+          docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
             -tAc "SELECT count(*) FROM cdc_receipts WHERE table_name = 'orders' AND op = 'insert'" \
             | grep -qx "1" \
             || { echo "::error::expected exactly 1 insert receipt"; docker compose logs pipeline; exit 1; }
@@ -370,22 +269,22 @@ jobs:
         # wrote the sentinel — or crashed on the omitted column — fails here:
         # the note must be updated AND the destination payload byte-identical.
         run: |
-          docker compose exec -T source-pg psql -U postgres -d example_src \
+          docker compose exec -T source-pg psql -h /tmp -U postgres -d example_src \
             -c "INSERT INTO orders (id, note, payload) VALUES (2, 'toast-row', repeat('t', 4096))"
           ok=""
           for _ in $(seq 1 30); do
-            ok=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            ok=$(docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
               -tAc "SELECT count(*) FROM orders WHERE id = 2 AND length(payload) = 4096" 2>/dev/null)
             [ "$ok" = "1" ] && break
             sleep 2
           done
           [ "$ok" = "1" ] \
             || { echo "::error::TOASTed row never materialized"; docker compose logs pipeline; exit 1; }
-          docker compose exec -T source-pg psql -U postgres -d example_src \
+          docker compose exec -T source-pg psql -h /tmp -U postgres -d example_src \
             -c "UPDATE orders SET note = 'touched' WHERE id = 2"
           touched=""
           for _ in $(seq 1 30); do
-            touched=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            touched=$(docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
               -tAc "SELECT count(*) FROM orders WHERE id = 2 AND note = 'touched' AND length(payload) = 4096" 2>/dev/null)
             [ "$touched" = "1" ] && break
             sleep 2
@@ -399,21 +298,21 @@ jobs:
         # are unchanged — the durable checkpoint made the resume effect-once
         # (a re-delivery would double the receipt count).
         run: |
-          before=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+          before=$(docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
             -tAc "SELECT count(*) FROM cdc_receipts")
           docker compose restart pipeline
-          docker compose exec -T source-pg psql -U postgres -d example_src \
+          docker compose exec -T source-pg psql -h /tmp -U postgres -d example_src \
             -c "INSERT INTO orders (id, note) VALUES (3, 'after restart')"
           resumed=""
           for _ in $(seq 1 30); do
-            resumed=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+            resumed=$(docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
               -tAc "SELECT count(*) FROM orders WHERE id = 3 AND note = 'after restart'" 2>/dev/null)
             [ "$resumed" = "1" ] && break
             sleep 2
           done
           [ "$resumed" = "1" ] \
             || { echo "::error::post-restart row never arrived"; docker compose logs pipeline; exit 1; }
-          after=$(docker compose exec -T dest-pg psql -U postgres -d example_dst \
+          after=$(docker compose exec -T dest-pg psql -h /tmp -U postgres -d example_dst \
             -tAc "SELECT count(*) FROM cdc_receipts")
           expected=$((before + 1))
           [ "$after" = "$expected" ] \
@@ -421,4 +320,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose down -v --remove-orphans
+        uses: ./.github/actions/postgres
+        with:
+          mode: stop
+          example: 'true'

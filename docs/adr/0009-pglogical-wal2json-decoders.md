@@ -4,6 +4,14 @@
 **Date:** 2026-09-29
 **Deciders:** replicant maintainer (roadmap row A7)
 
+**Substrate update (2026-11-21):** The CI wiring described below is superseded by
+`.github/postgres.ref`, `.github/postgres-lanes.json`, their validated reader, and
+the shared PostgreSQL action. The platform engine supplies the current-major
+lane and example databases; declared compatibility roles retain the plugin and
+legacy-source coverage. Every host connection uses password authentication;
+plugin builds take their base from the declaration and pin full source commits.
+The decoder design and acceptance guarantees in this ADR remain in force.
+
 ## Context
 
 Replicant reads exactly one logical-decoding output plugin. The slot grammar emits

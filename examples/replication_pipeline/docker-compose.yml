@@ -2,29 +2,34 @@
 # one container) → Postgres destination, with a durable commit-LSN checkpoint.
 # Throwaway local-example values throughout; ports bind to 127.0.0.1 ONLY.
 #
+#   export REPLICANT_POSTGRES_IMAGE="$(cat ../../.github/postgres.ref)"
+#   docker pull "$REPLICANT_POSTGRES_IMAGE"
 #   docker compose up -d --build     # source + destination + pipeline
 #   docker compose logs -f pipeline  # watch it stream
 #   docker compose down -v           # teardown + wipe volumes
 #
-# Images are digest-pinned (the same digests the library's CI matrix pins) — a
-# moved tag cannot silently change the tested substrate.
+# Both servers use the checked engine reference; scratch is disposable tmpfs.
 
 name: replicant-example
 
 services:
   source-pg:
-    image: postgres:18@sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941
+    image: ${REPLICANT_POSTGRES_IMAGE:?read .github/postgres.ref into REPLICANT_POSTGRES_IMAGE}
+    pull_policy: never
+    entrypoint: baselabs-test-postgres
+    tmpfs:
+      - /var/lib/pg:uid=26,gid=26,mode=0750
+      - /tmp
     # wal_level=logical is the load-bearing flag (a `services:` block in CI
     # cannot pass it); max_wal_senders/max_replication_slots mirror AGENTS.md.
     command:
       ["-c", "wal_level=logical", "-c", "max_wal_senders=10", "-c", "max_replication_slots=10"]
     environment:
-      POSTGRES_HOST_AUTH_METHOD: trust
-      POSTGRES_DB: example_src
-    # TCP-forced pg_isready: the socket form answers "accepting connections"
-    # during the entrypoint's init-SQL phase (its temp server is socket-only),
-    # so only -h 127.0.0.1 proves the init scripts finished and the real
-    # server is listening — probe-verified 2026-08-24 against postgres:18.
+      # Throwaway fixture values, never external service credentials.
+      TEST_PG_USER: postgres
+      TEST_PG_PASSWORD: postgres
+      TEST_PG_DATABASE: example_src
+    # Only TCP answers after the engine finishes /init/*.sql.
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
       interval: 3s
@@ -33,17 +38,22 @@ services:
     ports:
       - "127.0.0.1:15432:5432"
     volumes:
-      - source-data:/var/lib/postgresql
-      - ./docker/source-init:/docker-entrypoint-initdb.d:ro
+      - ./docker/source-init:/init:ro
 
   dest-pg:
-    image: postgres:18@sha256:06cad38a5d9f5d24b4d83d86def30795d5e4b757fedbf5281172b576dedcd941
+    image: ${REPLICANT_POSTGRES_IMAGE:?read .github/postgres.ref into REPLICANT_POSTGRES_IMAGE}
+    pull_policy: never
+    entrypoint: baselabs-test-postgres
+    tmpfs:
+      - /var/lib/pg:uid=26,gid=26,mode=0750
+      - /tmp
     environment:
-      POSTGRES_HOST_AUTH_METHOD: trust
-      POSTGRES_DB: example_dst
+      # Throwaway fixture values, never external service credentials.
+      TEST_PG_USER: postgres
+      TEST_PG_PASSWORD: postgres
+      TEST_PG_DATABASE: example_dst
     volumes:
-      - dest-data:/var/lib/postgresql
-      - ./priv/schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro
+      - ./priv/schema.sql:/init/00-schema.sql:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
       interval: 3s
@@ -61,10 +71,12 @@ services:
       SOURCE_HOST: source-pg
       SOURCE_PORT: "5432"
       SOURCE_USER: replicant_reader
+      SOURCE_PASSWORD: postgres
       SOURCE_DB: example_src
       DEST_HOST: dest-pg
       DEST_PORT: "5432"
       DEST_USER: postgres
+      DEST_PASSWORD: postgres
       DEST_DB: example_dst
       REPLICANT_SLOT_NAME: replicant_example
       REPLICANT_PUBLICATION: example_pub
@@ -87,7 +99,3 @@ services:
       retries: 6
       start_period: 20s
     restart: unless-stopped
-
-volumes:
-  source-data:
-  dest-data:

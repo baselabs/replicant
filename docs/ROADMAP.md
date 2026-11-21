@@ -12,6 +12,14 @@
 
 ## Current package snapshot
 
+Qualification uses the platform PostgreSQL engine in `.github/postgres.ref` for
+its current-major lane and the reference example's source and destination.
+`.github/postgres-lanes.json` declares the other supported majors and their
+pgoutput/decoder/source roles; one reader derives the matrix and one action owns
+password-authenticated startup, stable readiness, and unconditional cleanup.
+The plugin image uses declared bases and full source commits. This CI substrate
+change leaves the library API and decoder guarantees unchanged.
+
 Publication builds and inspects package and docs without a registry key. A second
 owner dispatch can finish a held, untagged release when its package checksum
 matches the newly built package and the release is not retired. Docs render once

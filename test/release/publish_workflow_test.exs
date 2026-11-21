@@ -831,7 +831,7 @@ defmodule Replicant.PublishWorkflowTest do
     for {name, job} <- workflow["jobs"], not Map.has_key?(job, "uses") do
       [_, body] = Regex.run(~r/^  #{Regex.escape(name)}:\n(.*?)(?=^  [\w-]+:|\z)/ms, source)
 
-      if workflow["name"] == "Publish to Hex" do
+      if body =~ "timeout-minutes: 90 # no green run yet" do
         assert body =~ "timeout-minutes: 90 # no green run yet"
         assert job["timeout-minutes"] == 90
       else

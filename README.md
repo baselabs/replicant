@@ -246,8 +246,13 @@ across the range. `decoder:` selects the output plugin
 
 The [CI matrix](https://github.com/baselabs/replicant/blob/main/.github/workflows/qualification.yml)
 runs the full suite on each maintainer-submitted landing candidate against
-PostgreSQL 9.6, 12, 15, 15 with plugins, 16, 17 and 18, each a real digest-pinned
-server with `wal_level=logical`. The 9.6, 12 and
+the platform PostgreSQL engine from `.github/postgres.ref` and the compatibility
+lanes declared in `.github/postgres-lanes.json` (9.6, 12, 15, 15 with plugins,
+16 and 17), each a real digest-pinned server with password host authentication
+and `wal_level=logical`. One validated reader generates the matrix; one composite
+action checks the engine's public digest, starts every server, and removes its
+disposable data. The reference example uses the same engine for both databases.
+The 9.6, 12 and
 15-plugin rows build `pglogical` 2.4.8 and `wal2json` into the image and run a
 parity test that delivers one fixture transaction byte-identically across pgoutput,
 pglogical and wal2json. PostgreSQL 10, 11, 13 and 14 are inside the pgoutput range but not in the matrix, and the

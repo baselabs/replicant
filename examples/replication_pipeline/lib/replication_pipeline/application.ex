@@ -31,6 +31,7 @@ defmodule ReplicationPipeline.Application do
       hostname: env!("DEST_HOST"),
       port: env_int!("DEST_PORT"),
       username: env!("DEST_USER"),
+      password: env!("DEST_PASSWORD"),
       database: env!("DEST_DB"),
       sync_connect: true
     ]
@@ -42,6 +43,7 @@ defmodule ReplicationPipeline.Application do
         hostname: env!("SOURCE_HOST"),
         port: env_int!("SOURCE_PORT"),
         username: env!("SOURCE_USER"),
+        password: env!("SOURCE_PASSWORD"),
         database: env!("SOURCE_DB")
       ],
       slot_name: env!("REPLICANT_SLOT_NAME"),
