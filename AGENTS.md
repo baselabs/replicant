@@ -78,6 +78,9 @@ Covering tests for changed files and their direct dependents run in
 `.github/workflows/qualification.yml`, through the same `kci/` route as all other checks.
 Land changes with `kimosabe-land`, which submits a `kci/<commit>` candidate and moves `main`
 only after its `qualified` check succeeds. Do not push directly to `main`.
+It settles after promotion itself: it deletes local and origin branches that contain the landed
+commits, retires clean delegate worktrees and sweeps `kci/` refs. Exit 0 means landed and settled;
+exit 4 means landed with leftovers named, so fix the cause and run `kimosabe-land --repo . --sweep`.
 
 The commands below describe the CI gates. See [Testing](#testing) for the test coverage and
 [Workflow](#workflow) for contribution and release responsibilities.
