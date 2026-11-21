@@ -6,10 +6,11 @@ Thank you for your interest in contributing to Replicant!
 
 - **Elixir** and **Erlang/OTP** at the exact versions in
   [`.tool-versions`](https://github.com/baselabs/replicant/blob/main/.tool-versions).
-- **PostgreSQL 15, 16, 17, or 18** with `wal_level=logical` (for integration tests).
-  Use the approved host ports PG15 `5615`, PG16 `5599`, PG17 `5617`, or PG18 `5618` — e.g.
-  `docker run -e POSTGRES_HOST_AUTH_METHOD=trust -p 5599:5432 postgres:16 \
-    -c wal_level=logical -c max_wal_senders=10 -c max_replication_slots=10`
+- **PostgreSQL** with `wal_level=logical` for integration tests, on any supported major:
+  the platform engine named in [`.github/postgres.ref`](.github/postgres.ref) or a
+  compatibility major listed in [`.github/postgres-lanes.json`](.github/postgres-lanes.json).
+  Point `REPLICANT_TEST_URL` at it; `.github/actions/postgres` and `scripts/ci/postgres.sh`
+  show exactly how CI starts each server, with password authentication.
 
 ## Getting Started
 
