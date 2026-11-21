@@ -59,7 +59,7 @@ jobs:
 
   postgres-lanes:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5 # Green run 44901298909: postgres-lanes 0m02s
+    timeout-minutes: 5 # Green run 44902270787: postgres-lanes 0m09s
     outputs:
       matrix: ${{ steps.lanes.outputs.matrix }}
       engine-major: ${{ steps.lanes.outputs.engine-major }}
@@ -74,7 +74,7 @@ jobs:
     name: test (${{ matrix.pg.kind }} PG${{ matrix.pg.major }} ${{ matrix.pg.role }})
     needs: postgres-lanes
     runs-on: ubuntu-24.04
-    timeout-minutes: 9 # Green run 44222373059: slowest test matrix row 4m23s
+    timeout-minutes: 9 # Green run 44902270787: slowest test matrix row 4m30s
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.postgres-lanes.outputs.matrix) }}
