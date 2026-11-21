@@ -12,7 +12,12 @@ if [ "$PG_EXAMPLE" = true ]; then
     docker compose -f examples/replication_pipeline/docker-compose.yml up -d --build --wait
   else
     log_status=0
-    if ! docker compose -f examples/replication_pipeline/docker-compose.yml logs; then log_status=1; fi
+    containers=$(docker compose -f examples/replication_pipeline/docker-compose.yml ps --all --quiet)
+    while IFS= read -r container; do
+      if [ -z "$container" ]; then continue; fi
+      if ! docker logs "$container"; then log_status=1; fi
+      if ! docker rm -f -v "$container"; then log_status=1; fi
+    done <<< "$containers"
     docker compose -f examples/replication_pipeline/docker-compose.yml down -v --remove-orphans --rmi local
     exit "$log_status"
   fi

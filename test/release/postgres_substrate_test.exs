@@ -24,12 +24,14 @@ defmodule Replicant.PostgresSubstrateTest do
       parity = Enum.filter(compatibility, &Map.has_key?(&1, "sidecar"))
       assert parity != []
       assert Enum.all?(parity, &(&1["sidecar"]["image"] == source["image"]))
+
       count =
         Enum.sum(
           Enum.map(lanes, fn lane ->
             Enum.count(lane["roles"], &(&1 in ["pgoutput", "decoders"]))
           end)
         )
+
       assert length(compatibility) == count
     end)
   end
@@ -104,8 +106,8 @@ defmodule Replicant.PostgresSubstrateTest do
     action = yaml(".github/actions/postgres/action.yml")
     [check, manage] = action["runs"]["steps"]
     assert check["name"] == "Check the public platform engine and pull its digest"
-    assert check["run"] =~ ~s(engine="$(cat .github/postgres.ref)")
-    assert check["run"] =~ ~s(if [ "${engine##*@}" != "$current_digest" ])
+    assert check["run"] =~ ~S|engine="$(cat .github/postgres.ref)"|
+    assert check["run"] =~ ~S|if [ "${engine##*@}" != "$current_digest" ]|
     assert check["run"] =~ ~s(docker pull "$engine")
     refute check["run"] =~ "docker pull ghcr"
     assert manage["if"] == "always() && (inputs.mode == 'stop' || success())"
@@ -114,6 +116,7 @@ defmodule Replicant.PostgresSubstrateTest do
     assert script =~ "--entrypoint baselabs-test-postgres"
     assert script =~ "--tmpfs /var/lib/pg:uid=26,gid=26,mode=0750 --tmpfs /tmp"
     assert script =~ "pg_isready -h 127.0.0.1"
+    assert script =~ "POSTGRES_INITDB_ARGS=\"--auth-host=$auth\""
     assert script =~ "docker rm -f -v"
     refute script =~ ~r/host replication.*trust/
   end
@@ -127,13 +130,14 @@ defmodule Replicant.PostgresSubstrateTest do
       assert server["entrypoint"] == "baselabs-test-postgres"
       assert "/var/lib/pg:uid=26,gid=26,mode=0750" in server["tmpfs"]
       assert "/tmp" in server["tmpfs"]
-      assert server["environment"]["TEST_PG_DATABASE"] != "postgres"
+      database = server["environment"]["TEST_PG_DATABASE"]
+      assert is_binary(database) and database not in ["", "postgres"]
       refute Map.has_key?(server["environment"], "POSTGRES_HOST_AUTH_METHOD")
     end
 
     pipeline = compose["services"]["pipeline"]["environment"]
-    assert pipeline["SOURCE_PASSWORD"] != ""
-    assert pipeline["DEST_PASSWORD"] != ""
+    assert is_binary(pipeline["SOURCE_PASSWORD"]) and pipeline["SOURCE_PASSWORD"] != ""
+    assert is_binary(pipeline["DEST_PASSWORD"]) and pipeline["DEST_PASSWORD"] != ""
   end
 
   defp yaml(path) do

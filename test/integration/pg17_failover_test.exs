@@ -2,7 +2,8 @@ defmodule Replicant.Integration.PG17FailoverTest do
   @moduledoc """
   PG17-only integration coverage (spec §12 Definition of Done). Tagged `:integration` +
   `:pg17`; `test_helper.exs` excludes `:pg17` when the connected server is < 17, so these
-  RUN on PG17 (:5617) and are cleanly SKIPPED (never vacuously passed) on PG16 (:5599).
+  RUN on servers with failover slots and are cleanly SKIPPED (never vacuously
+  passed) on older servers, using the live version behind REPLICANT_TEST_URL.
   Observes the REAL code path: a full `Replicant` pipeline (Config → Connection → QueryBuilder
   → PG), not a hand-rolled driver.
   """

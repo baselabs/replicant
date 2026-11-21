@@ -73,10 +73,9 @@ defmodule Replicant.Integration.VersionBehaviorTest do
     # tests against the version it claims (non-vacuity — a skipped/mis-wired row emits nothing).
     IO.puts("R05-SUBSTRATE-RECEIPT pg=#{major} version_num=#{version}")
 
-    # ADR-0009: the matrix gained the 9.6 and 12 rows (the plugin decoders' servers);
-    # pgoutput-oriented branches below still gate themselves on major >= 10.
-    assert major in [9, 12, 15, 16, 17, 18],
-           "R05 supports PostgreSQL 9.6 and 12-18; live server_version_num=#{version} is out of range"
+    # The reader owns the supported-lane list and engine major. Keep only the
+    # protocol's minimum here; the expected major below proves the actual wiring.
+    assert version >= 90_600, "logical replication requires a supported server version"
 
     case System.get_env("EXPECTED_PG_MAJOR") do
       nil ->

@@ -59,7 +59,7 @@ jobs:
 
   postgres-lanes:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90 # no green run yet
+    timeout-minutes: 5 # Green run 44901298909: postgres-lanes 0m02s
     outputs:
       matrix: ${{ steps.lanes.outputs.matrix }}
       engine-major: ${{ steps.lanes.outputs.engine-major }}
