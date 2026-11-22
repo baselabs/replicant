@@ -35,13 +35,12 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   A module-function sink has no state of its own, so the ETS tables must be owned by
   a process that outlives the PIPELINE under test — Task 11/12 kill and restart the
   supervised pipeline mid-backfill and assert the mirror/ledger/progress persisted
-  across that restart. `start_link/1` boots a small `Agent` (mirroring
-  `Replicant.Test.RecordingSink`'s exact ownership pattern) that creates the tables
-  as `:public, :named_table` in its own `init` — the calling test process links to
-  this Agent, never a pipeline-internal process, so a `:one_for_all` supervisor
-  restart or a killed `Connection`/`AssemblerServer` cannot take the tables down with
-  it. Call `start_link/1` once from test `setup` (idempotent: a second call from a
-  later test returns the already-running Agent), then call `reset/0` per test.
+  across that restart. `start_link/1` boots a small `Agent` that creates the tables
+  as `:public, :named_table` in its own `init`. Start it once per test with
+  `start_supervised!(IncrementalSnapshotSink)` in `setup`, then call `reset/0`.
+  ExUnit owns the Agent independently of the pipeline, so a `:one_for_all`
+  supervisor restart or a killed `Connection`/`AssemblerServer` cannot take the
+  tables down with it. ExUnit stops the Agent synchronously before the next test.
 
   ## Ledger vs mirror (`feedback_pre_dedup_count_defeated_by_query_dedup`)
 
@@ -89,17 +88,12 @@ defmodule Replicant.Test.IncrementalSnapshotSink do
   # -- lifecycle ---------------------------------------------------------------
 
   @doc """
-  Boots the Agent that owns the three ETS tables. Call once from test `setup`
-  (mirrors `Replicant.Test.RecordingSink.start_link/0`): idempotent across
-  repeated calls (including from later tests in the same run) via the
-  `{:already_started, pid}` fallback.
+  Boots the Agent that owns the three ETS tables. Start it once per test through
+  `start_supervised!/1`; an already-registered instance is an error.
   """
   @spec start_link(keyword()) :: Agent.on_start()
   def start_link(_opts \\ []) do
-    case Agent.start_link(&boot_tables/0, name: __MODULE__) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
+    Agent.start_link(&boot_tables/0, name: __MODULE__)
   end
 
   defp boot_tables do

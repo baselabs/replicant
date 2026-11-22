@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Test sink Agents belong to each test's ExUnit supervisor, preventing a later
+  test from reusing an Agent still linked to the previous test's exiting process.
+
 ## [1.6.0] - 2026-11-22
 
 ### Added

@@ -12,11 +12,11 @@ defmodule Replicant.Test.ParitySink do
 
   use Agent
 
+  # Started per test with `start_supervised!/1`, so ExUnit stops it before the next
+  # test's setup. Never reuse an already-registered instance: one left by a finished
+  # test is still linked to that test's exiting process and dies mid-test.
   def start_link(_opts \\ []) do
-    case Agent.start_link(fn -> %{txns: [], messages: []} end, name: __MODULE__) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
+    Agent.start_link(fn -> %{txns: [], messages: []} end, name: __MODULE__)
   end
 
   @impl true

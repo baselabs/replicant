@@ -17,7 +17,7 @@ defmodule Replicant.Integration.PG17FailoverTest do
 
   setup do
     {:ok, ctrl} = Postgrex.start_link(PG16.pg_opts())
-    {:ok, _} = RecordingSink.start_link()
+    start_supervised!(RecordingSink)
     RecordingSink.reset()
 
     slot = "repl_pg17_fo_#{System.unique_integer([:positive])}"

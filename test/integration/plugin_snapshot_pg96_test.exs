@@ -41,6 +41,11 @@ defmodule Replicant.PluginSnapshotPg96Test do
 
   if is_nil(@target), do: @moduletag(skip: "no pre-10 server on this row")
 
+  setup do
+    start_supervised!(SnapshotRecordingSink)
+    :ok
+  end
+
   @tag target: @target
   test "a wal2json snapshot on 9.6 back-fills under its two-part name, then streams after it",
        %{target: url} do
@@ -48,7 +53,6 @@ defmodule Replicant.PluginSnapshotPg96Test do
   end
 
   defp snapshot_then_stream(url) do
-    {:ok, _} = SnapshotRecordingSink.start_link()
     SnapshotRecordingSink.reset()
 
     {:ok, ctrl} = Postgrex.start_link(conn_opts(url) ++ [pool_size: 2, backoff_type: :stop])

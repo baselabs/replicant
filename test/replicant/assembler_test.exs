@@ -4,10 +4,7 @@ defmodule Replicant.AssemblerTest.AcceptingSink do
   use Agent
 
   def start_link(_opts \\ []) do
-    case Agent.start_link(fn -> [] end, name: __MODULE__) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
+    Agent.start_link(fn -> [] end, name: __MODULE__)
   end
 
   @impl Replicant.Sink
@@ -122,18 +119,7 @@ defmodule Replicant.AssemblerTest do
     }
 
   setup do
-    {:ok, pid} = RecordingSink.start_link()
-
-    on_exit(fn ->
-      # Deterministic teardown: stopping the linked named Agent can race its own
-      # link-driven death (TOCTOU on Process.alive?/1), so tolerate a dead pid.
-      try do
-        Agent.stop(pid)
-      catch
-        :exit, _ -> :ok
-      end
-    end)
-
+    start_supervised!(RecordingSink)
     RecordingSink.reset()
     :ok
   end
@@ -490,18 +476,7 @@ defmodule Replicant.AssemblerTest do
     end
 
     test "a destructive change is APPLIED (not halted) when the sink accepts it via handle_schema_change/2" do
-      {:ok, pid} = AcceptingSink.start_link()
-
-      on_exit(fn ->
-        # Deterministic teardown: stopping the linked named Agent can race its own
-        # link-driven death (TOCTOU on Process.alive?/1), so tolerate a dead pid.
-        try do
-          Agent.stop(pid)
-        catch
-          :exit, _ -> :ok
-        end
-      end)
-
+      start_supervised!(AcceptingSink)
       asm = Assembler.new(AcceptingSink)
 
       {:ok, asm} =

@@ -9,10 +9,7 @@ defmodule Replicant.Test.RecordingSink do
   use Agent
 
   def start_link(_opts \\ []) do
-    case Agent.start_link(fn -> %{txns: [], messages: []} end, name: __MODULE__) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
+    Agent.start_link(fn -> %{txns: [], messages: []} end, name: __MODULE__)
   end
 
   @impl Replicant.Sink

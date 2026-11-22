@@ -12,10 +12,7 @@ defmodule Replicant.Test.SnapshotRecordingSink do
   use Agent
 
   def start_link(_opts \\ []) do
-    case Agent.start_link(fn -> initial() end, name: __MODULE__) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-    end
+    Agent.start_link(fn -> initial() end, name: __MODULE__)
   end
 
   def reset, do: Agent.update(__MODULE__, fn _ -> initial() end)

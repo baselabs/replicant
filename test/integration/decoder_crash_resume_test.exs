@@ -28,7 +28,7 @@ defmodule Replicant.DecoderCrashResumeTest do
       :ok
     end
 
-    {:ok, _} = ParitySink.start_link()
+    start_supervised!(ParitySink)
     :ok
   end
 

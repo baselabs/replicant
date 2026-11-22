@@ -207,7 +207,7 @@ defmodule Replicant.DecoderParityTest do
 
   setup do
     if PG16.enabled?() do
-      {:ok, _} = ParitySink.start_link()
+      start_supervised!(ParitySink)
 
       # Plugin availability on BOTH wired servers: the marquee FAILS LOUD when an
       # expected plugin is absent (a missing leg narrows the comparison silently —
