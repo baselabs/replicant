@@ -1,13 +1,13 @@
 name: Qualification
 
 # Every qualification job, defined once. ci.yml calls it on a kci/<commit>
-# candidate; its `qualified` job is the landing verdict (kimosabe ADR 0043).
+# candidate; its `qualified` job is the landing verdict.
 # The caller passes no secrets, and no job here reads one.
 # The package-check step uses its job token only for read-only GitHub release
 # identity lookups through gh api; it receives no repository or environment secret.
 # Jobs fetch dependencies, build, and generate Dialyzer PLTs without Actions caches.
 # Timeout rule for all workflows: 2x the measured green duration, rounded up to
-# whole minutes; jobs measured under 2.5 minutes get 5. See infra baselabs/docs/ci.md.
+# whole minutes; jobs measured under 2.5 minutes get 5. See the infrastructure CI requirements.
 on:
   workflow_call:
 
@@ -18,7 +18,7 @@ env:
   HEX_VERSION: "2.7.0"
 
 # Every run step uses bash -eo pipefail, so a failure behind a pipe fails its step
-# (infra baselabs/docs/ci.md). Scripts the jobs call set -euo pipefail themselves.
+# (the infrastructure CI requirements). Scripts the jobs call set -euo pipefail themselves.
 defaults:
   run:
     shell: bash

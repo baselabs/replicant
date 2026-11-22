@@ -2,8 +2,8 @@ defmodule Replicant.Decoder.Pglogical do
   @moduledoc """
   The `pglogical_output` binary-protocol decoder (pglogical 2.x, ADR-0009 §3).
 
-  Wire grammar (OBSERVED from the pglogical 2.4.8 sources; anchors in
-  `.kimosabe/intents/pglogical-wal2json-decoders.md`): a startup message `S` (version
+  Wire grammar (OBSERVED from the pglogical 2.4.8 sources; see
+  ADR-0009 "Plugin-fact verification"): a startup message `S` (version
   byte 1 + NUL-terminated key/value pairs) precedes the first transaction; `B`/`C`
   bracket transactions (flags u8, LSNs u64, commit time µs-since-2000-epoch, xid u32);
   `R` relation metadata carries names and identity-key flags but NO types and NO

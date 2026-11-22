@@ -140,8 +140,7 @@ fixture.
 ## Plugin-fact verification (2026-09-29, sources read before the build)
 
 Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own source) or
-**CORRECTED** (the ADR's claim was adjusted; anchor record in
-`.kimosabe/intents/pglogical-wal2json-decoders.md`):
+**CORRECTED** (the ADR's claim was adjusted):
 
 - **pglogical startup message** (protocol version + parameter pairs), **begin/commit/origin**,
   and the **tuple markers `n`/`u`/`t`** — OBSERVED. The row messages carry `K`/`N` tuple
@@ -274,8 +273,8 @@ Each fact this ADR rests on, marked **OBSERVED** (verified in the project's own 
   defined from that var; CI always sets it); 9.6 row — 806/86;
   15 — 878/14; 16 — 878/14; 17 — 880/12 (one transient spill-marquee wait timeout on a
   first run under shared-substrate load, green alone and on immediate full rerun);
-  18 — 880/12; unit-only — 799/93. The development tree's outcome record
-  (`.kimosabe/work/`, untracked by design) carries the raw logs behind these numbers.
+  18 — 880/12; unit-only — 799/93. The raw logs behind these numbers were kept
+  outside the repository.
 - Real captured bytes from the 9.6 and 12 servers (one frame per message kind per plugin)
   join the conformance suite with the same byte-flip tamper test the pgoutput fixtures
   carry, so each new fixture is proven to go red on mutation.

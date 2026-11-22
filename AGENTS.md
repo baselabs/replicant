@@ -76,11 +76,11 @@ All checks run only in GitHub CI on GitHub-hosted runners. This public repositor
 builds on the build box. Nothing that compiles or tests runs on the owner's Mac.
 Covering tests for changed files and their direct dependents run in
 `.github/workflows/qualification.yml`, through the same `kci/` route as all other checks.
-Land changes with `kimosabe-land`, which submits a `kci/<commit>` candidate and moves `main`
+Land changes with the landing tool, which submits a `kci/<commit>` candidate and moves `main`
 only after its `qualified` check succeeds. Do not push directly to `main`.
 It settles after promotion itself: it deletes local and origin branches that contain the landed
 commits, retires clean delegate worktrees and sweeps `kci/` refs. Exit 0 means landed and settled;
-exit 4 means landed with leftovers named, so fix the cause and run `kimosabe-land --repo . --sweep`.
+exit 4 means landed with leftovers named, so fix the cause and run its sweep.
 
 The commands below describe the CI gates. See [Testing](#testing) for the test coverage and
 [Workflow](#workflow) for contribution and release responsibilities.
@@ -115,7 +115,7 @@ inside a test, so its failure fails the step.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate has
 a new cache scope, and a cache written on `main` would be restorable by candidates.
 
-Timeouts follow infra's CI requirements linked below. Comments name each job's slowest
+Timeouts follow the infrastructure CI requirements. Comments name each job's slowest
 measured green run and duration; publishing uses the unmeasured limit until its own first run.
 All runtime installers use `.tool-versions` with strict selection and immediately refuse any
 Elixir, full OTP patch, or Elixir OTP build-suffix mismatch. The example Dockerfile documents
@@ -191,27 +191,24 @@ If CI goes red, fix forward in the next commit.
 
 ## CI/CD and releases
 
-infra-1, the DevOps session, owns CI/CD, the build box, releases and their keys for every
-BaseLabs product, and its requirements bind this repository. They are written once in the infra
-repository under "What infra requires of every product" in the
-[infra CI requirements](https://github.com/baselabs/infra/blob/main/baselabs/docs/ci.md).
-Read them from infra's default branch (`git -C ~/Developer/infra fetch -q origin`, then
-`git -C ~/Developer/infra show origin/main:baselabs/docs/ci.md`), not from a local checkout,
-and reread them whenever you touch a workflow, a Dockerfile, a release script or a secret.
+The infrastructure maintainers own CI/CD, the build box, releases and their keys for every
+BaseLabs product, and their CI requirements bind this repository. Maintainers read the current
+requirements from their default branch, not from a local checkout, and reread them whenever
+they touch a workflow, a Dockerfile, a release script or a secret.
 
-- An agent's work ends at `main`, and it lands through `kimosabe-land` and nothing else. It never
+- An agent's work ends at `main`, and it lands through the landing tool and nothing else. It never
   releases, deploys, publishes, tags a version, dispatches a workflow, pushes an image by hand,
-  or handles a release, publish or CI key. When something should go out, it sends infra-1 one
-  message: the repository, the full commit, what goes out, and anything infra-1 needs.
+  or handles a release, publish or CI key. When something should go out, it sends the infrastructure
+  maintainers one message: the repository, the full commit, what goes out, and anything they need.
 - An agent writes its own workflow changes. Before landing a change to `.github/`, a Dockerfile,
-  a release script or anything that touches a secret, it sends infra-1 the branch and head and
-  waits for infra-1's review. Any CI/CD, runner, box or key problem goes to infra-1, not around
-  it.
+  a release script or anything that touches a secret, it sends the infrastructure maintainers
+  the branch and head and waits for their review. Any CI/CD, runner, box or key problem goes to
+  them, not around it.
 - This public repository never builds on the build box. Never list process arguments:
   no `ps` with `args` or `-f`, no `/proc/*/cmdline`; use `ps -eo pid,etimes,pcpu,comm`.
 - A secret never appears on a command line, in a log or in a message. If you see one exposed,
-  tell infra-1 where it sits without copying the value.
-- Messages to infra-1 carry one result each and are complete enough to act on without a reply.
+  tell the infrastructure maintainers where it sits without copying the value.
+- Messages to the infrastructure maintainers carry one result each and are complete enough to act on without a reply.
   No acknowledgements and no status notes.
 - Every brief given to a child agent carries these same rules.
 

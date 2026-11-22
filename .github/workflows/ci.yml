@@ -1,6 +1,6 @@
 name: CI
 
-# One qualification run per landing candidate (kimosabe ADR 0043). kimosabe-land pushes
+# One qualification run per landing candidate. The landing tool pushes
 # kci/<commit>; this run is the only verdict, and main moves to that commit only on its
 # `qualified` check. A push to main, a tag or a release starts nothing here.
 # Fork changes are qualified only when a maintainer submits a landing candidate.
@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 # Every run step uses bash -eo pipefail, so a failure behind a pipe fails its step
-# (infra baselabs/docs/ci.md). Scripts the jobs call set -euo pipefail themselves.
+# (the infrastructure CI requirements). Scripts the jobs call set -euo pipefail themselves.
 defaults:
   run:
     shell: bash

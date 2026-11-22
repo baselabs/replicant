@@ -36,7 +36,6 @@ priv/plts/
 /.zcode/
 /.agent/
 /.aider/
-/.kimosabe/
 
 # Superpowers lifecycle artifacts (specs, plans, handoffs, reviews) — local only, never tracked
 /docs/superpowers/

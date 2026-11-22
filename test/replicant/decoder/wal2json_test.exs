@@ -1,7 +1,7 @@
 defmodule Replicant.Decoder.Wal2jsonTest do
   @moduledoc """
   Hand-built wal2json format-version-2 documents from the OBSERVED shapes (wal2json
-  sources; anchors in `.kimosabe/intents/pglogical-wal2json-decoders.md`): `B`/`C`
+  sources; see ADR-0009 "Plugin-fact verification"): `B`/`C`
   carry `lsn`/`nextlsn`/`xid`/`timestamp`; `I`/`U`/`D` carry `columns`/`identity`/`pk`
   arrays of `{name, type, typeoid, value}` objects; a column ABSENT from `columns` is
   the unchanged-TOAST sentinel; `M`/`T` mirror their actions. Values arrive under

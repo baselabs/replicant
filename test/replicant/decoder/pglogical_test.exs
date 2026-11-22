@@ -1,7 +1,7 @@
 defmodule Replicant.Decoder.PglogicalTest do
   @moduledoc """
   Hand-built pglogical_output frames from the OBSERVED native wire grammar (pglogical
-  2.4.8 sources; anchors in `.kimosabe/intents/pglogical-wal2json-decoders.md`): `'S'`
+  2.4.8 sources; see ADR-0009 "Plugin-fact verification"): `'S'`
   startup, `'B`/`'C'` txn brackets (flags u8, LSN u64, commit-time µs, xid u32), `'R'`
   relation metadata (NUL-inclusive name lengths, NO types / NO replica identity on the
   wire), `'I'`/`'U'`/`'D'` rows with `'K'`/`'N'` tuple markers, and the `'T'`-tuple

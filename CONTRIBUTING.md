@@ -71,9 +71,8 @@ specific `!path`.
 
 ## CI
 
-Infra's binding requirements live in
-[`baselabs/docs/ci.md`, "What infra requires of every product"](https://github.com/baselabs/infra/blob/main/baselabs/docs/ci.md#what-infra-requires-of-every-product).
-Read that section from infra's default branch before changing workflows or release scripts.
+The infrastructure maintainers' CI requirements bind every workflow and release script here;
+maintainers read them before changing either.
 
 Every check above, `mix test` on all six PostgreSQL majors, and the docs and
 package build are jobs in
@@ -86,7 +85,7 @@ and `main` moves only on its `qualified` check.
 Qualification jobs do not cache dependencies, builds, or Dialyzer PLTs. Each candidate
 has a new cache scope, and a cache written on `main` would be restorable by candidates.
 
-Workflow timeouts follow infra's rule in the linked CI requirements. Each comment
+Workflow timeouts follow the infrastructure CI requirements. Each comment
 names its slowest measured green run and duration; an unmeasured publish job uses
 the unmeasured limit until its own first green run.
 Every runtime installer reads `.tool-versions` with strict selection and immediately

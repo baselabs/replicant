@@ -2,8 +2,8 @@ defmodule Replicant.Decoder.Wal2json do
   @moduledoc """
   The `wal2json` decoder — JSON format version 2 (ADR-0009 §4).
 
-  One JSON document per action (`B`, `C`, `I`, `U`, `D`, `T`, `M`; anchors in
-  `.kimosabe/intents/pglogical-wal2json-decoders.md`). The decoder requests
+  One JSON document per action (`B`, `C`, `I`, `U`, `D`, `T`, `M`; see
+  ADR-0009 "Plugin-fact verification"). The decoder requests
   `include-transaction`, `include-lsn`, `include-xids`, `include-timestamp`,
   `include-types`, `include-type-oids`, `include-pk` and
   `numeric-data-types-as-string` (wal2json ≥ 2.6): numerics arrive as JSON strings so
