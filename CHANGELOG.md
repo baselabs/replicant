@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-11-22
+
 ### Added
 
 - Owner-dispatched **Publish to Hex** workflow, restricted to `main` and the
@@ -23,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Raise the Postgrex requirement to `~> 0.23` in the library and reference example,
+  with both locks at 0.23.0. The new floor clears password and SSL options after
+  connect and fixes async messages during replication startup. Replicant retains
+  its halt-at-bound backpressure policy; it does not use the new pause/resume API.
 - CI uses the checked BaseLabs PostgreSQL engine for its current-major lane and
   reference example, with declared compatibility roles for older servers. One
   action owns password-authenticated startup and unconditional cleanup; decoder
@@ -1102,7 +1108,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/baselabs/replicant/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/baselabs/replicant/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/baselabs/replicant/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/baselabs/replicant/compare/v1.4.1...v1.4.2

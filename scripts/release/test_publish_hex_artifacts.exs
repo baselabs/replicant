@@ -21,7 +21,8 @@ defmodule PublishHexArtifactsSelfTest do
   end
 end
 
-# A published version whose immutable digest this repository records.
+# The most recent published release, independent of the candidate version.
+# Its immutable digest and legacy served docs are already recorded and verified.
 version = "1.5.1"
 artifact = "replicant-#{version}.tar"
 

@@ -1,7 +1,7 @@
 defmodule Replicant.MixProject do
   use Mix.Project
 
-  @version "1.5.1"
+  @version "1.6.0"
   @source_url "https://github.com/baselabs/replicant"
 
   def project do
@@ -51,15 +51,10 @@ defmodule Replicant.MixProject do
       {:decimal, "~> 3.1"},
       {:jason, "~> 1.4"},
       {:telemetry, "~> 1.0"},
-      # Live streaming (Plan 2): the ReplicationConnection substrate. Floor 0.22.4
-      # (NOT ~> 0.20 — 0.20 requires decimal ~> 1.5/2.0 and conflicts with decimal
-      # ~> 3.1; the 0.22.x line requires decimal ~> 1.5 or ~> 2.0 or ~> 3.0 and accepts 3.1).
-      # 0.22.4 (not 0.22) so a lock regeneration can never resolve an earlier 0.22.x:
-      #   - 0.22.2 floors CVE-2026-32687 (SQLi in Postgrex.Notifications.listen/3)
-      #   - 0.22.3 fixes  CVE-2026-58225 (dollar-quote in Notifications reconnect replay)
-      #   - 0.22.4 fixes  CVE-2026-66838 (SQLi via the :comment option in Postgrex.stream/4)
-      # No ReplicationConnection API change across 0.22.2 → 0.22.4 (security patches only).
-      {:postgrex, "~> 0.22.4"},
+      # ReplicationConnection substrate. Postgrex 0.23 is the floor for clearing
+      # password/SSL options after connect and handling async messages during
+      # replication startup. Its decimal requirement accepts our 3.x dependency.
+      {:postgrex, "~> 0.23"},
       # Dev/Test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},

@@ -36,16 +36,14 @@ defmodule Replicant.Connection do
   `:invalidation_check` →
   (`:create_slot` if absent) → `:streaming`.
 
-  ## Why a fail-closed halt and not soft pacing (Postgrex flow-control)
+  ## Backpressure policy
 
-  `Postgrex.ReplicationConnection` re-arms the replication socket (`active: :once`)
-  **automatically** after each `handle_data/2` batch — the handler's return value has
-  no way to defer socket re-activation, so there is no lever to pause TCP reading
-  from the handler. `:max_messages` bounds only Postgrex's per-batch socket buffer,
-  not the downstream `AssemblerServer` mailbox. So true socket-level pacing is not
-  available; the bounded in-flight window is enforced by the fail-closed halt at the
-  ceiling — which bounds memory (the pipeline tears down before the mailbox grows
-  unbounded) and surfaces the overload rather than silently livelocking.
+  Postgrex 0.23 offers pause/resume for replication streams. Replicant 1.6.0 keeps
+  its halt-at-bound policy unchanged: it consumes continuously, answers keepalives,
+  and halts fail-closed when the in-flight window exceeds its ceiling. It does not
+  use pause/resume. Postgrex's `:max_messages` bounds the number of decoded messages
+  per receive batch, not its byte size or the downstream `AssemblerServer` mailbox.
+  The in-flight ceiling remains the pipeline's overload guard.
   """
   use Postgrex.ReplicationConnection
 

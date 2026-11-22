@@ -15,9 +15,10 @@ defmodule Replicant.DependencyTest do
     assert {:handle_result, 2} in behaviours
   end
 
-  test "decimal 3.x still resolves alongside postgrex (the dep-floor guard)" do
+  test "the postgrex 0.23 floor resolves alongside decimal 3.x" do
     assert Code.ensure_loaded?(Decimal)
-    # postgrex ~> 0.20 would force decimal ~> 1.5/2.0 and break this; ~> 0.22 accepts 3.x.
+    # Postgrex 0.23 supplies the replication-startup fixes and accepts decimal 3.x.
+    assert Version.match?(to_string(Application.spec(:postgrex, :vsn)), "~> 0.23")
     assert Version.match?(Version.parse!(to_string(Application.spec(:decimal, :vsn))), "~> 3.0")
   end
 end

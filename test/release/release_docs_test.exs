@@ -11,7 +11,7 @@ defmodule Replicant.ReleaseDocsTest do
 
   alias Replicant.{ReleaseAssets, ReleaseDocs}
 
-  @version "1.5.1"
+  @version "1.6.0"
   @commit String.duplicate("c", 40)
 
   setup do
