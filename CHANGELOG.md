@@ -790,7 +790,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (the declared-but-unenforced `deps.unlock --check-unused` + `hex.audit` + `deps.audit` alias) is
   now a CI gate before build, and the cache key binds the pinned toolchain + `mix.lock` + `.tool-versions`.
 - **Hex package boundary.** Package files now enumerate the published docs and
-  ADR directories instead of including all of `docs/`, so ignored local Forge
+  ADR directories instead of including all of `docs/`, so ignored local
   specs, plans, reviews, and handoffs cannot leak into release bytes.
 - **`Replicant.Config.t` no longer advertises a `:batch` key.** It is derived from
   `checkpoint_store[:batch]`; a top-level `batch:` option is rejected with `:config_invalid`, so the
