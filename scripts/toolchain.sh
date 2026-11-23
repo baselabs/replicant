@@ -3,9 +3,11 @@
 # Run --self-test for the portable validation cases. This single file is shared
 # across repositories and runs before any listed toolchain is installed.
 # After installation, --installed TOOL=VERSION... refuses unless each installed
-# tool (elixir, erlang, nodejs, golang) reports exactly that version.
+# tool (elixir, erlang, nodejs, golang, python, bun, deno, uv, rust, ruby, ocaml, java)
+# reports exactly that version.
 # The one source is the harness's scripts/toolchain.sh; each repository carries a byte-identical
-# copy at scripts/toolchain.sh, mode 755, called by path, and the harness preflight refuses any other.
+# copy at scripts/toolchain.sh, mode 755, called by path; the harness preflight refuses any copy but
+# these bytes and the one earlier reader its config/toolchain-readers.toml admits.
 set -euo pipefail
 
 self_test() (
@@ -70,7 +72,17 @@ python_lanes=["path:a\\b\"c"]'
     check 'missing file' bad 'toolchain: cannot read file' "$scratch/missing"
     check 'installed without arguments' bad 'toolchain: --installed needs TOOL=VERSION arguments' --installed
     check 'installed malformed argument' bad 'toolchain: malformed argument nodejs' --installed nodejs
-    check 'installed unknown tool' bad 'toolchain: cannot check an installed python' --installed python=3.15.0
+    check 'installed unknown tool' bad 'toolchain: cannot check an installed zig' --installed zig=0.15.1
+    # A declared tool that is not installed is refused by name, whatever the shell said first.
+    status=0
+    actual=$(PATH="$scratch" "$BASH" "$0" --installed rust=1.95.0 2>&1) || status=$?
+    if [ "$status" -ne 0 ] && [ "${actual##*$'\n'}" = 'toolchain: rust version probe failed' ]; then
+        printf 'ok: %s\n' 'installed tool absent'
+        passed=$((passed + 1))
+    else
+        printf 'FAIL: %s (status %s)\n' 'installed tool absent' "$status"
+        failed=$((failed + 1))
+    fi
     check 'unreadable file' bad 'toolchain: cannot read file' "$scratch"
     bad 'missing version' 'python # missing' 'no version for python'
     bad 'duplicate tool' 'python 3.15.0
@@ -120,6 +132,27 @@ installed() (
             golang)
                 have=$(go env GOVERSION) || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; }
                 have=${have#go} ;;
+            python)
+                have=$(python3 -c 'import platform; print(platform.python_version())') || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; } ;;
+            bun)
+                have=$(bun --version) || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; } ;;
+            deno)
+                have=$(deno eval 'console.log(Deno.version.deno)') || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; } ;;
+            uv)
+                have=$(uv --version) || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; }
+                have=${have#uv }
+                have=${have%% *} ;;
+            rust)
+                have=$(rustc --version) || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; }
+                have=${have#rustc }
+                have=${have%% *} ;;
+            ruby)
+                have=$(ruby -e 'print RUBY_VERSION') || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; } ;;
+            ocaml)
+                have=$(ocaml -vnum) || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; } ;;
+            java)
+                # asdf names a JDK by distribution, as the JDK's own vendor version does (temurin-21.0.9+10).
+                have=$(java -XshowSettings:properties -version 2>&1 | sed -n 's/^ *java\.vendor\.version = //p' | tr '[:upper:]' '[:lower:]') || { printf 'toolchain: %s version probe failed\n' "$tool" >&2; refused=1; continue; } ;;
             *)
                 printf 'toolchain: cannot check an installed %s\n' "$tool" >&2
                 refused=1

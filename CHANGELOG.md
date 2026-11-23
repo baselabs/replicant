@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changelog in `release-assets`, naming the published commit and both archive digests.
 - CI and publication take runtime versions only from the shared toolchain reader,
   with strict installation and its installed-runtime refusal replacing the local parser.
+- The shared toolchain reader is kimosabe 2443e475's copy, which adds installed-version
+  probes for more tools; its version outputs are unchanged.
 - Lib-mode incremental snapshot tests wait for the store's durable completion
   token, which is written after delivery, instead of reading it as soon as the
   sink records the completion chunk.

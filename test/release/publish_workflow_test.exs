@@ -8,7 +8,7 @@ defmodule Replicant.PublishWorkflowTest do
   @beam_action Path.join(@repo_root, ".github/actions/beam/action.yml")
   @toolchain "./.github/actions/toolchain"
   @beam_action_ref "./.github/actions/beam"
-  @reader_sha256 "b29bfeb6ec4ec8f5b7e3ac3c963f04b6d3c73483172e5bd59ea40f20b102f1eb"
+  @reader_sha256 "25bbfa023b7f031256428b498fe300fcc460988fea81277072355e4c0d933764"
   @installed ~S|"$GITHUB_WORKSPACE/scripts/toolchain.sh" --installed "elixir=$WANT_ELIXIR" "erlang=$WANT_OTP"|
   @qualification Path.join(@repo_root, ".github/workflows/qualification.yml")
   @checkout "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
