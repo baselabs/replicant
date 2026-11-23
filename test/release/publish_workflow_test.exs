@@ -259,7 +259,10 @@ defmodule Replicant.PublishWorkflowTest do
           )
         ] do
       refute mutated == dockerfile
-      assert_raise ExUnit.AssertionError, fn -> assert_example_image_runtime!(mutated, versions) end
+
+      assert_raise ExUnit.AssertionError, fn ->
+        assert_example_image_runtime!(mutated, versions)
+      end
     end
 
     mutated = Map.put(versions, "erlang", "0.0.0")
@@ -536,7 +539,8 @@ defmodule Replicant.PublishWorkflowTest do
     assert_raise ExUnit.AssertionError, fn -> assert_publish!(removed) end
 
     for directory <- [".", "${{ github.workspace }}", "scripts/release"] do
-      mutated = replace(original, ["jobs", "publish", "steps", 10, "working-directory"], directory)
+      mutated =
+        replace(original, ["jobs", "publish", "steps", 10, "working-directory"], directory)
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
 
@@ -1180,7 +1184,9 @@ defmodule Replicant.PublishWorkflowTest do
           {String.replace(elixir, "-otp-" <> major, "-otp-0"), otp, false}
         ] do
       {_output, status} =
-        System.cmd(@reader, ["--installed", "elixir=#{expected_elixir}", "erlang=#{expected_otp}"],
+        System.cmd(
+          @reader,
+          ["--installed", "elixir=#{expected_elixir}", "erlang=#{expected_otp}"],
           stderr_to_stdout: true
         )
 
