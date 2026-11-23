@@ -14,8 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changelog in `release-assets`, naming the published commit and both archive digests.
 - CI and publication take runtime versions only from the shared toolchain reader,
   with strict installation and its installed-runtime refusal replacing the local parser.
-- Test sink Agents belong to each test's ExUnit supervisor, preventing a later
-  test from reusing an Agent still linked to the previous test's exiting process.
+- Lib-mode incremental snapshot tests wait for the store's durable completion
+  token, which is written after delivery, instead of reading it as soon as the
+  sink records the completion chunk.
 
 ## [1.6.0] - 2026-11-22
 
@@ -96,6 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Test sink Agents belong to each test's ExUnit supervisor, preventing a later
+  test from reusing an Agent still linked to the previous test's exiting process.
 - In-flight-lag integration tests assert halts from telemetry and size their
   shared bound from the measured WAL span.
 - Incremental snapshot contention tests synchronize a delivered write inside every

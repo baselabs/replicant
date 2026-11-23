@@ -133,11 +133,7 @@ defmodule Replicant.IncrementalSnapshotTest do
       refute Process.alive?(crashed_connection)
 
       wait_backfill_complete(8_000)
-
-      assert [[token]] =
-               Postgrex.query!(ctrl, "SELECT token FROM #{prog} WHERE slot_name = $1", [slot]).rows
-
-      assert {:ok, %{complete?: true}} = Replicant.SnapshotProgress.decode(token)
+      assert {:ok, %{complete?: true}} = wait_store_progress_complete(ctrl, prog, slot)
       wait_converged(ctrl, "inc_lib_pending")
     end
   end
@@ -672,11 +668,7 @@ defmodule Replicant.IncrementalSnapshotTest do
       wait_backfill_complete(2_400)
 
       # Progress is durable IN THE STORE and decodes to :complete (lib mode carries no sink progress).
-      assert [[token]] =
-               Postgrex.query!(ctrl, "SELECT token FROM #{prog} WHERE slot_name = $1", [slot]).rows
-
-      assert {:ok, sp} = Replicant.SnapshotProgress.decode(token)
-      assert sp.complete?
+      assert {:ok, %{complete?: true}} = wait_store_progress_complete(ctrl, prog, slot)
 
       # Dup ≤ 1 chunk (lib guarantee); an uninterrupted backfill delivers each chunk-PK once.
       assert length(chunk_pk_duplicates()) <= 200
@@ -1337,6 +1329,23 @@ defmodule Replicant.IncrementalSnapshotTest do
   # ===========================================================================
 
   defp wait_backfill_complete(tries), do: PG16.wait_until(&backfill_complete?/0, tries)
+
+  # Lib mode writes the store token only AFTER handle_snapshot returns (checkpoint-after-persist,
+  # assembler_server.ex persist_progress), and the sink ledger records the completion chunk inside
+  # handle_snapshot, so a store read right after wait_backfill_complete can see the prior token.
+  # Wait for the durable token itself; the bound fails closed through PG16.wait_until's flunk.
+  defp wait_store_progress_complete(ctrl, prog, slot) do
+    complete? = fn -> match?({:ok, %{complete?: true}}, store_progress(ctrl, prog, slot)) end
+    PG16.wait_until(complete?, 400)
+    store_progress(ctrl, prog, slot)
+  end
+
+  defp store_progress(ctrl, prog, slot) do
+    case Postgrex.query!(ctrl, "SELECT token FROM #{prog} WHERE slot_name = $1", [slot]).rows do
+      [[token]] -> Replicant.SnapshotProgress.decode(token)
+      rows -> {:rows, length(rows)}
+    end
+  end
 
   defp backfill_complete? do
     Enum.any?(IncrementalSnapshotSink.ledger(), fn
