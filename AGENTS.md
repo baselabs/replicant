@@ -180,7 +180,8 @@ If CI goes red, fix forward in the next commit.
   alone do not identify the docs commit. Served docs are never replaced.
   The script loads no project code and builds nothing.
   After successful read-back, one `release-assets` artifact retains the versioned package,
-  served docs archive, `SHA256SUMS` over the retained served bytes, and `published_commit`.
+  served docs archive, `SHA256SUMS` over the retained served bytes, `published_commit`,
+  and `RELEASE-NOTES.md` from the packaged changelog with that commit and both digests.
   The keyless read-back exposes `published_commit` as a step output. Temporary archives
   are removed even on failure. Infra creates the `v<version>` tag at the served docs'
   published commit, compares the artifact's package with Hex's bytes, and creates the

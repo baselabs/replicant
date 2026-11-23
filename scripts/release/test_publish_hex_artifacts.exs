@@ -4,12 +4,13 @@ if Mix.Project.get(), do: raise("upload preconditions must run without a Mix pro
 
 path = Path.join(__DIR__, "publish_hex_artifacts.exs")
 Code.require_file("release_docs.exs", __DIR__)
+Code.require_file("release_notes.exs", __DIR__)
 {:ok, {:__block__, _, forms}} = Code.string_to_quoted(File.read!(path))
 module = Enum.find(forms, &match?({:defmodule, _, _}, &1))
 Code.compile_quoted(module, path)
 Hex.start()
 
-alias Replicant.PublishHexArtifacts
+alias Replicant.{PublishHexArtifacts, ReleaseNotes}
 
 defmodule PublishHexArtifactsSelfTest do
   def reject(expected, function) do
@@ -22,8 +23,8 @@ defmodule PublishHexArtifactsSelfTest do
 end
 
 # The most recent published release, independent of the candidate version.
-# Its immutable digest and legacy served docs are already recorded and verified.
-version = "1.5.1"
+# Its immutable digest and served docs provenance are recorded after infra read-back.
+version = "1.6.0"
 artifact = "replicant-#{version}.tar"
 
 recorded =
@@ -76,14 +77,33 @@ PublishHexArtifactsSelfTest.reject(
 )
 
 docs = Hex.Repo.get_docs("hexpm", "replicant", version)
+:skip = PublishHexArtifacts.docs_action!(docs, true)
+"8d313d6b06503098e1e5c58186f19e6e5501efed" =
+  PublishHexArtifacts.docs_read_back!(docs, version)
+
+{:ok, {200, _headers, package}} = tarball
+section = ReleaseNotes.package_section!(package, version)
+
+for changelog <- [
+      "## [0.0.0]\n\n- Other release.\n",
+      section <> "\n\n" <> section,
+      "## [#{version}]\n\n### Fixed\n\n"
+    ] do
+  PublishHexArtifactsSelfTest.reject(
+    "the changelog section for #{version} is missing, duplicated or empty; publication refused",
+    fn -> ReleaseNotes.section!(changelog, version) end
+  )
+end
 
 # Legacy served docs are kept during planning, even without provenance. Read-back
 # refuses them: package equality cannot establish which commit rendered the docs.
-:skip = PublishHexArtifacts.docs_action!(docs, true)
+legacy_version = "1.5.1"
+legacy_docs = Hex.Repo.get_docs("hexpm", "replicant", legacy_version)
+:skip = PublishHexArtifacts.docs_action!(legacy_docs, true)
 
 PublishHexArtifactsSelfTest.reject(
   "Hex docs archive has no release.json; publication refused",
-  fn -> PublishHexArtifacts.docs_read_back!(docs, version) end
+  fn -> PublishHexArtifacts.docs_read_back!(legacy_docs, legacy_version) end
 )
 
 # Absent docs must read as the authoritative 404 that permits the only upload.

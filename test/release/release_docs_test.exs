@@ -1,6 +1,7 @@
 Mix.Local.append_archives()
 for api <- [:mix_hex_tarball, Hex.Repo, Hex.API.Release], do: Code.ensure_loaded!(api)
 Code.require_file("../../scripts/release/release_docs.exs", __DIR__)
+Code.require_file("../../scripts/release/release_notes.exs", __DIR__)
 
 source = File.read!(Path.expand("../../scripts/release/retain_release_assets.exs", __DIR__))
 {:__block__, _, forms} = Code.string_to_quoted!(source)
@@ -9,10 +10,11 @@ Code.compile_quoted(Enum.find(forms, &match?({:defmodule, _, _}, &1)))
 defmodule Replicant.ReleaseDocsTest do
   use ExUnit.Case, async: true
 
-  alias Replicant.{ReleaseAssets, ReleaseDocs}
+  alias Replicant.{ReleaseAssets, ReleaseDocs, ReleaseNotes}
 
   @version "1.6.0"
   @commit String.duplicate("c", 40)
+  @section "## [#{@version}] - 2026-11-22\n\n### Fixed\n\n- Notes from the served package."
 
   setup do
     directory =
@@ -110,7 +112,8 @@ defmodule Replicant.ReleaseDocsTest do
     {ancestor, dispatched} = history!(dir)
     docs = archive(Map.put(metadata(), "commit", ancestor))
     output = Path.join(dir, "release-assets")
-    package = "served package bytes already verified by read-back"
+    package = package!(dir, @section <> "\n\n## [1.5.1]\n\n- Older notes.\n")
+    File.write!(Path.join(dir, "CHANGELOG.md"), "## [#{@version}]\n\n- Workspace-only notes.\n")
 
     assert ancestor == ReleaseAssets.retain!(package, docs, @version, output, dispatched, dir)
     assert File.read!(Path.join(output, "replicant-#{@version}.tar")) == package
@@ -127,6 +130,18 @@ defmodule Replicant.ReleaseDocsTest do
       assert checksums =~ "#{digest}  #{name}\n"
     end
 
+    notes = File.read!(Path.join(output, "RELEASE-NOTES.md"))
+    package_digest = Base.encode16(:crypto.hash(:sha256, package), case: :lower)
+    docs_digest = Base.encode16(:crypto.hash(:sha256, docs), case: :lower)
+
+    assert notes ==
+             "#{@section}\n\nCommit: #{ancestor}\n\n" <>
+               "Package SHA-256: #{package_digest}\n\nDocs SHA-256: #{docs_digest}\n"
+
+    refute notes =~ dispatched
+    refute notes =~ "Older notes"
+    refute notes =~ "Workspace-only notes"
+
     refused = Path.join(dir, "refused-assets")
     invalid = archive(Map.put(metadata(), "commit", String.duplicate("0", 40)))
 
@@ -135,6 +150,104 @@ defmodule Replicant.ReleaseDocsTest do
     end
 
     refute File.exists?(refused)
+  end
+
+  test "pre-build and read-back reject invalid version sections", %{directory: dir} do
+    {ancestor, dispatched} = history!(dir)
+    docs = archive(Map.put(metadata(), "commit", ancestor))
+    mixfile = Path.join(dir, "mix.exs")
+    changelog = Path.join(dir, "CHANGELOG.md")
+    File.write!(mixfile, "  @version \"#{@version}\"\n")
+    File.write!(changelog, @section)
+    assert ReleaseNotes.verify_changelog!(mixfile, changelog) == @section
+
+    for invalid <- [
+          "## [1.5.1]\n\n- Other release.\n",
+          @section <> "\n\n" <> @section,
+          @section <> "\n\n## [#{@version}]",
+          "## [#{@version}]",
+          "## [#{@version}]\n\n",
+          "## [#{@version}]\n\n### Fixed\n\n### Changed\n\n",
+          "## [#{@version}]\n\n### Fixed\n\n## [1.5.1]\n\n- Older notes.\n"
+        ] do
+      File.write!(changelog, invalid)
+
+      assert_raise RuntimeError, ~r/missing, duplicated or empty/, fn ->
+        ReleaseNotes.verify_changelog!(mixfile, changelog)
+      end
+
+      package = package!(dir, invalid)
+      output = Path.join(dir, "refused-assets")
+      File.write!(changelog, @section)
+
+      assert_raise RuntimeError, ~r/missing, duplicated or empty/, fn ->
+        ReleaseAssets.retain!(package, docs, @version, output, dispatched, dir)
+      end
+
+      refute File.exists?(output)
+    end
+  end
+
+  test "pre-build refuses an absent or ambiguous Mix project version", %{directory: dir} do
+    mixfile = Path.join(dir, "mix.exs")
+    changelog = Path.join(dir, "CHANGELOG.md")
+    File.write!(changelog, @section)
+
+    for contents <- ["", "  @version \"#{@version}\"\n  @version \"1.5.1\"\n"] do
+      File.write!(mixfile, contents)
+
+      assert_raise RuntimeError, ~r/exactly one Mix project version/, fn ->
+        ReleaseNotes.verify_changelog!(mixfile, changelog)
+      end
+    end
+  end
+
+  test "release notes reject malformed or incomplete packages", %{directory: dir} do
+    missing_contents = tar!(dir, "package.tar", [])
+    missing_changelog = package!(dir, nil)
+
+    duplicate_contents =
+      tar!(dir, "package.tar", [
+        {~c"contents.tar.gz", "invalid"},
+        {~c"contents.tar.gz", "invalid"}
+      ])
+
+    contents =
+      tar!(
+        dir,
+        "contents.tar.gz",
+        [{~c"CHANGELOG.md", @section}, {~c"CHANGELOG.md", @section}],
+        [:compressed]
+      )
+
+    duplicate_changelog = tar!(dir, "package.tar", [{~c"contents.tar.gz", contents}])
+
+    for bytes <- [
+          "private-response-value",
+          missing_contents,
+          missing_changelog,
+          duplicate_contents,
+          duplicate_changelog
+        ] do
+      error =
+        assert_raise RuntimeError, ~r/Hex package changelog is missing or malformed/, fn ->
+          ReleaseNotes.package_section!(bytes, @version)
+        end
+
+      refute Exception.message(error) =~ "private-response-value"
+    end
+  end
+
+  defp package!(directory, changelog) do
+    files = if is_nil(changelog), do: [], else: [{~c"CHANGELOG.md", changelog}]
+    contents = tar!(directory, "contents.tar.gz", files, [:compressed])
+    tar!(directory, "package.tar", [{~c"contents.tar.gz", contents}])
+  end
+
+  defp tar!(directory, name, files, options \\ []) do
+    path = Path.join(directory, name)
+    :ok = :erl_tar.create(String.to_charlist(path), files, options)
+    File.read!(path)
   end
 
   defp metadata, do: %{"package" => "replicant", "version" => @version, "commit" => @commit}

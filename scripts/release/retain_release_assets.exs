@@ -1,5 +1,6 @@
 # Keyless read-back after upload: retain only served archives and their provenance.
 Code.require_file("release_docs.exs", __DIR__)
+Code.require_file("release_notes.exs", __DIR__)
 
 defmodule Replicant.ReleaseAssets do
   @moduledoc false
@@ -32,8 +33,11 @@ defmodule Replicant.ReleaseAssets do
   def retain!(package, docs, version, output, dispatched, repository) do
     published = Replicant.ReleaseDocs.provenance!(docs, version)
     verify_history!(published, dispatched, repository)
+    notes = Replicant.ReleaseNotes.package_section!(package, version)
+    package_digest = sha256(package)
+    docs_digest = sha256(docs)
 
-    # Nothing is retained until the package, docs, and history all pass read-back.
+    # Nothing is retained until the package, docs, history, and changelog all pass.
     File.mkdir!(output)
     package_name = "replicant-#{version}.tar"
     docs_name = "replicant-#{version}-docs.tar.gz"
@@ -42,7 +46,13 @@ defmodule Replicant.ReleaseAssets do
 
     File.write!(
       Path.join(output, "SHA256SUMS"),
-      "#{sha256(package)}  #{package_name}\n#{sha256(docs)}  #{docs_name}\n"
+      "#{package_digest}  #{package_name}\n#{docs_digest}  #{docs_name}\n"
+    )
+
+    File.write!(
+      Path.join(output, "RELEASE-NOTES.md"),
+      "#{notes}\n\nCommit: #{published}\n\n" <>
+        "Package SHA-256: #{package_digest}\n\nDocs SHA-256: #{docs_digest}\n"
     )
 
     File.write!(Path.join(output, "published_commit"), published <> "\n")

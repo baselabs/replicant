@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-10-10 · **Current release:** `1.5.1` (2026-10-10)
+**Updated:** 2026-11-23 · **Current release:** `1.6.0` (2026-11-23 UTC)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -42,7 +42,10 @@ the dispatched commit on fetched, complete default-branch history. Missing
 history or provenance refuses. Equal package bytes alone do not identify the
 docs commit because the producer lock is not packaged. A keyless step retains
 Hex's served archives and computes their `SHA256SUMS`, records `published_commit`,
-and exposes it as a step output. Infra tags that published commit and creates the
+and exposes it as a step output. It writes `RELEASE-NOTES.md` from the changelog
+section inside the served package, with the published commit and both archive
+digests. Missing, duplicated or empty sections refuse before the build and again
+at read-back. Infra tags that published commit and creates the
 GitHub release from the retained assets. Consumers use the
 [GitHub release](https://github.com/baselabs/replicant/releases) for verification;
 the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only)
@@ -58,8 +61,13 @@ through later releases:
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
   in ADR-0002.
-- **`replicant` 1.5.1 is the current release** (2026-10-10; every published digest is in
-  `scripts/release/published_packages.sha256`): it restores
+- **`replicant` 1.6.0 is the current release** (2026-11-23 UTC): Hex package and docs,
+  tag `v1.6.0`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/v1.6.0)
+  are published at `8d313d6b06503098e1e5c58186f19e6e5501efed`. The verified package
+  digest is recorded in `scripts/release/published_packages.sha256`. It raises the
+  Postgrex floor to `~> 0.23` and ships the guarded publication and PostgreSQL CI
+  changes in CHANGELOG `[1.6.0]`.
+- **`replicant` 1.5.1** (2026-10-10): it restores
   `Replicant.QueryBuilder.table_columns/0` and the 1.4.x row shape of
   `table_columns_for/1` (both now documented as deprecated census queries) for
   existing callers such as `AshReplicant.Coverage` 1.6.2; see CHANGELOG `[1.5.1]`.

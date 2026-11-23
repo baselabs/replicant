@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Publication refuses a missing, duplicated or empty version section before
+  building. Keyless read-back retains `RELEASE-NOTES.md` from the served package's
+  changelog in `release-assets`, naming the published commit and both archive digests.
 - CI and publication take runtime versions only from the shared toolchain reader,
   with strict installation and its installed-runtime refusal replacing the local parser.
 - Test sink Agents belong to each test's ExUnit supervisor, preventing a later

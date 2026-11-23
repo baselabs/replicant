@@ -65,6 +65,11 @@ jobs:
           elixir: ${{ steps.toolchain.outputs.elixir }}
           otp: ${{ steps.toolchain.outputs.otp }}
 
+      - name: Refuse a missing, duplicated or empty release changelog section
+        run: >-
+          elixir -r scripts/release/release_notes.exs
+          -e 'Replicant.ReleaseNotes.verify_changelog!("mix.exs", "CHANGELOG.md")'
+
       - run: mix local.hex "$HEX_VERSION" --force
       - run: mix local.rebar --force
       - run: mix deps.get --check-locked

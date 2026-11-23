@@ -168,10 +168,15 @@ The anonymous docs API redirects to
 `https://repo.hex.pm/docs/replicant-<version>.tar.gz`.
 
 After successful read-back, the workflow retains one `release-assets` artifact:
-`replicant-<version>.tar`, `replicant-<version>-docs.tar.gz`, and `SHA256SUMS`.
+`replicant-<version>.tar`, `replicant-<version>-docs.tar.gz`, `SHA256SUMS`,
+`published_commit`, and `RELEASE-NOTES.md`.
 Both archives are the bytes Hex serves; `SHA256SUMS` is computed only over those
 retained bytes. `published_commit` is retained and exposed as a read-back step
 output. The docs suffix distinguishes the gzip docs archive from the package.
+Release notes contain the version section from the changelog inside the served
+package, followed by the published commit and both archive digests. The section
+must occur exactly once and contain more than headings or whitespace; the workflow
+checks this before building, and read-back repeats it against the served package.
 Temporary archives are removed even after failure. Infra tags `v<version>` at the
 published commit from served `release.json`, compares the artifact's package
 archive with Hex's served bytes, and creates the GitHub release from those assets.
