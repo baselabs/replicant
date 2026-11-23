@@ -541,6 +541,7 @@ defmodule Replicant.PublishWorkflowTest do
     for directory <- [".", "${{ github.workspace }}", "scripts/release"] do
       mutated =
         replace(original, ["jobs", "publish", "steps", 10, "working-directory"], directory)
+
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
 
@@ -955,6 +956,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert checkout["with"]["fetch-depth"] == 0
     assert Enum.at(steps, 3)["uses"] == @toolchain
     assert Enum.at(steps, 4)["uses"] == @beam_action_ref
+
     assert Enum.at(steps, 5) == %{
              "name" => "Refuse a missing, duplicated or empty release changelog section",
              "run" => @notes
