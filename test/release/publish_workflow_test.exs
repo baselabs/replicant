@@ -804,22 +804,26 @@ defmodule Replicant.PublishWorkflowTest do
       install = Enum.find_index(steps, &(&1["uses"] == @beam_action_ref))
 
       for {step, index} <- Enum.with_index(steps) do
-        refute String.starts_with?(step["uses"] || "", "erlef/setup-beam@")
-        refute (step["run"] || "") =~ ".tool-versions"
-
-        if (step["run"] || "") =~ ~r/\b(?:mix|elixir|erl)\s/ do
-          assert is_integer(install) and install < index
-        end
-
-        if step["uses"] == @beam_action_ref do
-          source = runtime_output_source!(workflow, job, steps, index)
-
-          assert step["with"] == %{
-                   "elixir" => "${{ #{source}.elixir }}",
-                   "otp" => "${{ #{source}.otp }}"
-                 }
-        end
+        assert_runtime_step!(workflow, job, steps, install, step, index)
       end
+    end
+  end
+
+  defp assert_runtime_step!(workflow, job, steps, install, step, index) do
+    refute String.starts_with?(step["uses"] || "", "erlef/setup-beam@")
+    refute (step["run"] || "") =~ ".tool-versions"
+
+    if (step["run"] || "") =~ ~r/\b(?:mix|elixir|erl)\s/ do
+      assert is_integer(install) and install < index
+    end
+
+    if step["uses"] == @beam_action_ref do
+      source = runtime_output_source!(workflow, job, steps, index)
+
+      assert step["with"] == %{
+               "elixir" => "${{ #{source}.elixir }}",
+               "otp" => "${{ #{source}.otp }}"
+             }
     end
   end
 
