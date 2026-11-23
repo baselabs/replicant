@@ -3,7 +3,13 @@ defmodule Replicant.PublishWorkflowTest do
 
   @repo_root Path.expand("../..", __DIR__)
   @workflow Path.join(@repo_root, ".github/workflows/publish.yml")
-  @tools Path.join(@repo_root, ".tool-versions")
+  @reader Path.join(@repo_root, "scripts/toolchain.sh")
+  @toolchain_action Path.join(@repo_root, ".github/actions/toolchain/action.yml")
+  @beam_action Path.join(@repo_root, ".github/actions/beam/action.yml")
+  @toolchain "./.github/actions/toolchain"
+  @beam_action_ref "./.github/actions/beam"
+  @reader_sha256 "b29bfeb6ec4ec8f5b7e3ac3c963f04b6d3c73483172e5bd59ea40f20b102f1eb"
+  @installed ~S|"$GITHUB_WORKSPACE/scripts/toolchain.sh" --installed "elixir=$WANT_ELIXIR" "erlang=$WANT_OTP"|
   @qualification Path.join(@repo_root, ".github/workflows/qualification.yml")
   @checkout "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
   @beam "erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124"
@@ -24,14 +30,13 @@ defmodule Replicant.PublishWorkflowTest do
     assert paths != []
 
     for path <- paths do
-      assert_workflow!(read_yaml!(path), File.read!(@tools))
+      assert_workflow!(read_yaml!(path))
     end
   end
 
   test "test output pipelines cannot turn failed tests into a successful integration job" do
     original = read_yaml!(@qualification)
-    tools = File.read!(@tools)
-    assert_workflow!(original, tools)
+    assert_workflow!(original)
 
     pipelines =
       for {name, job} <- original["jobs"],
@@ -44,7 +49,7 @@ defmodule Replicant.PublishWorkflowTest do
     for {name, index} <- pipelines,
         shell <- ["sh", "bash {0}"] do
       mutated = replace(original, ["jobs", name, "steps", index, "shell"], shell)
-      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
     end
   end
 
@@ -239,8 +244,8 @@ defmodule Replicant.PublishWorkflowTest do
 
   test "the example image runs the exact .tool-versions runtime" do
     dockerfile = File.read!(Path.join(@repo_root, "examples/replication_pipeline/Dockerfile"))
-    tools = File.read!(@tools)
-    assert_example_image_runtime!(dockerfile, tools)
+    versions = toolchain_versions!()
+    assert_example_image_runtime!(dockerfile, versions)
 
     for mutated <- [
           Regex.replace(~r/(hexpm\/elixir:)\d+\.\d+\.\d+/, dockerfile, "\\g{1}0.0.0"),
@@ -253,11 +258,11 @@ defmodule Replicant.PublishWorkflowTest do
           )
         ] do
       refute mutated == dockerfile
-      assert_raise ExUnit.AssertionError, fn -> assert_example_image_runtime!(mutated, tools) end
+      assert_raise ExUnit.AssertionError, fn -> assert_example_image_runtime!(mutated, versions) end
     end
 
-    mutated = Regex.replace(~r/^erlang \S+$/m, tools, "erlang 0.0.0")
-    refute mutated == tools
+    mutated = Map.put(versions, "erlang", "0.0.0")
+    refute mutated == versions
 
     assert_raise ExUnit.AssertionError, fn ->
       assert_example_image_runtime!(dockerfile, mutated)
@@ -286,53 +291,160 @@ defmodule Replicant.PublishWorkflowTest do
     assert_raise ExUnit.AssertionError, fn -> assert_example_audits!(mutated) end
   end
 
-  test "every runtime installation refuses duplicated versions and missing guards" do
-    tools = File.read!(@tools)
-
+  test "every runtime installation consumes only shared reader outputs" do
     for path <- [@workflow, @qualification] do
       original = read_yaml!(path)
-      assert_workflow!(original, tools)
+      assert_workflow!(original)
 
-      for {name, job} <- original["jobs"],
-          {step, index} <- Enum.with_index(job["steps"]),
-          step["uses"] == @beam do
-        for {keys, value} <- [
-              {["with", "elixir-version"], "1.20.3"},
-              {["with", "otp-version"], "29.0.3"},
-              {["with", "version-file"], nil},
-              {["with", "version-file"], "other/.tool-versions"},
-              {["with", "version-type"], nil},
-              {["with", "version-type"], "loose"}
+      installs =
+        for {name, job} <- original["jobs"],
+            {step, index} <- Enum.with_index(job["steps"] || []),
+            step["uses"] == @beam_action_ref,
+            do: {name, index}
+
+      assert installs != []
+
+      for {name, index} <- installs do
+        for {key, value} <- [
+              {"elixir", "1.20.3-otp-29"},
+              {"otp", "29.0.5"},
+              {"elixir", nil},
+              {"otp", "${{ inputs.otp }}"},
+              {"version-file", ".tool-versions"},
+              {"version-type", "loose"}
             ] do
-          mutated = replace(original, ["jobs", name, "steps", index] ++ keys, value)
-          assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+          mutated = replace(original, ["jobs", name, "steps", index, "with", key], value)
+          assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
         end
 
-        mutated = update_in(original, ["jobs", name, "steps"], &List.delete_at(&1, index + 1))
+        mutated = update_in(original, ["jobs", name, "steps"], &List.delete_at(&1, index))
+        assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
 
-        assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+        mutated = replace(original, ["jobs", name, "steps", index, "uses"], @beam)
+        assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
+      end
 
-        for {key, value} <- [{"run", "true"}, {"working-directory", "examples"}] do
-          mutated = replace(original, ["jobs", name, "steps", index + 1, key], value)
-          assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+      for {name, job} <- original["jobs"],
+          {step, index} <- Enum.with_index(job["steps"] || []),
+          step["uses"] == @toolchain do
+        for mutated <- [
+              replace(original, ["jobs", name, "steps", index, "id"], "other"),
+              update_in(original, ["jobs", name, "steps"], &List.delete_at(&1, index))
+            ] do
+          assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
         end
       end
     end
+
+    original = read_yaml!(@qualification)
+
+    for key <- ["elixir", "otp"] do
+      mutated = replace(original, ["jobs", "toolchain", "outputs", key], "0.0.0")
+      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
+    end
+
+    for name <- ["static", "test", "release-artifact", "reference-example"] do
+      mutated = replace(original, ["jobs", name, "needs"], nil)
+      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
+    end
+
+    for {path, value} <- [
+          {["env", "WANT_ELIXIR"], "1.20.3-otp-29"},
+          {["env", "WANT_OTP"], "29.0.5"},
+          {["env", "elixir-version"], "1.20.3"},
+          {["env", "otp-version"], "29.0.5"},
+          {["env", "version-file"], ".tool-versions"}
+        ] do
+      mutated = replace(original, path, value)
+      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
+    end
+
+    mutated =
+      update_in(original, ["jobs", "toolchain", "steps"], fn steps ->
+        steps ++ [%{"run" => "awk '{print $2}' .tool-versions"}]
+      end)
+
+    assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
   end
 
-  test "the runtime refusal rejects either version or OTP suffix changing in the tools file" do
-    script = File.read!(Path.join(@repo_root, "scripts/ci/assert_runtime.exs"))
-    assert_runtime_check!(script)
+  test "the shared reader action tests its parser before exposing versions by path" do
+    original = read_yaml!(@toolchain_action)
+    assert_toolchain_action!(original)
 
-    for guard <- [
-          "System.version() == elixir_version",
-          ~S|otp_version == Map.fetch!(tools, "erlang")|,
-          "to_string(:erlang.system_info(:otp_release)) == otp_major"
+    for {path, value} <- [
+          {["outputs", "elixir", "value"], "1.20.3-otp-29"},
+          {["outputs", "otp", "value"], "29.0.5"},
+          {["runs", "steps", 0, "run"], "true"},
+          {["runs", "steps", 1, "id"], "other"},
+          {["runs", "steps", 1, "run"], ~s(bash scripts/toolchain.sh >> "$GITHUB_OUTPUT")},
+          {["runs", "steps", 1, "run"], ~s(awk '{print $2}' .tool-versions)},
+          {["runs", "steps", 1, "shell"], "sh"}
         ] do
-      mutated = String.replace(script, guard, "true")
-      refute mutated == script
-      assert_raise ExUnit.AssertionError, fn -> assert_runtime_check!(mutated) end
+      mutated = replace(original, path, value)
+      assert_raise ExUnit.AssertionError, fn -> assert_toolchain_action!(mutated) end
     end
+
+    mutated = update_in(original, ["runs", "steps"], &Enum.reverse/1)
+    assert_raise ExUnit.AssertionError, fn -> assert_toolchain_action!(mutated) end
+  end
+
+  test "the BEAM action installs strictly and immediately checks the installed runtime" do
+    original = read_yaml!(@beam_action)
+    assert_beam_action!(original)
+
+    for {path, value} <- [
+          {["inputs", "elixir", "default"], "1.20.3-otp-29"},
+          {["inputs", "otp", "required"], false},
+          {["runs", "steps", 0, "uses"], "erlef/setup-beam@main"},
+          {["runs", "steps", 0, "with", "version-file"], ".tool-versions"},
+          {["runs", "steps", 0, "with", "elixir-version"], "1.20.3"},
+          {["runs", "steps", 0, "with", "otp-version"], "29.0.5"},
+          {["runs", "steps", 0, "with", "version-type"], nil},
+          {["runs", "steps", 0, "with", "version-type"], "loose"},
+          {["runs", "steps", 1, "env", "WANT_ELIXIR"], "1.20.3-otp-29"},
+          {["runs", "steps", 1, "env", "WANT_OTP"], "29"},
+          {["runs", "steps", 1, "run"], "true"},
+          {["runs", "steps", 1, "run"], String.replace(@installed, "--installed", "--self-test")},
+          {["runs", "steps", 1, "run"], String.replace(@installed, "$GITHUB_WORKSPACE/", "")},
+          {["runs", "steps", 1, "shell"], "sh"}
+        ] do
+      mutated = replace(original, path, value)
+      assert_raise ExUnit.AssertionError, fn -> assert_beam_action!(mutated) end
+    end
+
+    for steps <- [
+          Enum.take(original["runs"]["steps"], 1),
+          Enum.reverse(original["runs"]["steps"])
+        ] do
+      mutated = put_in(original, ["runs", "steps"], steps)
+      assert_raise ExUnit.AssertionError, fn -> assert_beam_action!(mutated) end
+    end
+  end
+
+  test "the shared reader has the pinned bytes and executable mode" do
+    source = File.read!(@reader)
+    stat = File.stat!(@reader)
+    assert stat.type == :regular
+    assert_shared_reader!(source, stat.mode)
+
+    for {contents, mode} <- [
+          {source <> "\n", stat.mode},
+          {source, 0o100644},
+          {source, 0o104755},
+          {source, 0o100777}
+        ] do
+      assert_raise ExUnit.AssertionError, fn -> assert_shared_reader!(contents, mode) end
+    end
+  end
+
+  test "the shared refusal rejects Elixir, full OTP patch, and OTP build suffix drift" do
+    assert_installed_runtime!()
+  end
+
+  test "the shared reader's parser self-test passes" do
+    {output, status} = System.cmd(@reader, ["--self-test"], stderr_to_stdout: true)
+    assert status == 0, output
+    assert output =~ "toolchain self-test:"
   end
 
   test "publish is owner-dispatched with one environment secret and guarded exact-byte upload" do
@@ -483,10 +595,8 @@ defmodule Replicant.PublishWorkflowTest do
         {"job runtime override", ["jobs", "publish", "env"], %{"OTP_VERSION" => "28.0.0"}},
         {"step runtime override", ["jobs", "publish", "steps", 3, "env"],
          %{"ELIXIR_VERSION" => "1.20.2"}},
-        {"missing strict version", ["jobs", "publish", "steps", 3, "with", "version-type"], nil},
-        {"loose version", ["jobs", "publish", "steps", 3, "with", "version-type"], "loose"},
-        {"Elixir override", ["jobs", "publish", "steps", 3, "with", "elixir-version"], "1.20.2"},
-        {"literal OTP override", ["jobs", "publish", "steps", 3, "with", "otp-version"], "29"},
+        {"Elixir override", ["jobs", "publish", "steps", 4, "with", "elixir"], "1.20.2"},
+        {"literal OTP override", ["jobs", "publish", "steps", 4, "with", "otp"], "29"},
         {"moving runner", ["jobs", "publish", "runs-on"], "ubuntu-" <> "latest"},
         {"self-hosted runner", ["jobs", "publish", "runs-on"], ["self-hosted", "linux"]},
         {"build-box runner", ["jobs", "publish", "runs-on"], "devbox-ovh"},
@@ -496,20 +606,10 @@ defmodule Replicant.PublishWorkflowTest do
       ] do
     test "every workflow contract refuses #{name}" do
       original = read_yaml!(@workflow)
-      tools = File.read!(@tools)
-      assert_workflow!(original, tools)
+      assert_workflow!(original)
       mutated = replace(original, unquote(path), unquote(Macro.escape(value)))
-      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated, tools) end
+      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
     end
-  end
-
-  test "the Elixir OTP suffix must match the Erlang major" do
-    workflow = read_yaml!(@workflow)
-    tools = File.read!(@tools)
-    assert_workflow!(workflow, tools)
-    mutated = String.replace(tools, ~r/-otp-\d+/, "-otp-28")
-    refute mutated == tools
-    assert_raise ExUnit.AssertionError, fn -> assert_workflow!(workflow, mutated) end
   end
 
   test "both archives are inspected before upload and cleaned even on failure" do
@@ -597,18 +697,25 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
-  defp assert_workflow!(workflow, tools) do
-    [_, suffix] = Regex.run(~r/^elixir \d+\.\d+\.\d+-otp-(\d+)$/m, tools)
-    [_, major] = Regex.run(~r/^erlang (\d+)\.\d+\.\d+$/m, tools)
-    assert suffix == major
+  defp assert_workflow!(workflow) do
     maps = maps(workflow)
     refute_pull_request_trigger!(workflow)
     assert_github_auth!(workflow)
 
-    for map <- maps, key <- ["ELIXIR_VERSION", "OTP_VERSION"], do: refute(Map.has_key?(map, key))
+    for map <- maps do
+      for key <- ["ELIXIR_VERSION", "OTP_VERSION", "version-file"] do
+        refute Map.has_key?(map, key)
+      end
+
+      for key <- ["elixir", "otp", "elixir-version", "otp-version", "WANT_ELIXIR", "WANT_OTP"],
+          Map.has_key?(map, key) do
+        assert is_binary(map[key])
+        assert map[key] =~ ~r/\A\$\{\{ (?:steps|needs|inputs)\.[\w.]+ \}\}\z/
+      end
+    end
 
     for {_name, job} <- workflow["jobs"], do: assert_job_host!(job)
-    for {_name, job} <- workflow["jobs"], do: assert_runtime_steps!(job)
+    assert_runtime_steps!(workflow)
 
     assert_bash_shell!(workflow)
 
@@ -660,15 +767,107 @@ defmodule Replicant.PublishWorkflowTest do
              job["timeout-minutes"] <= 90
   end
 
-  defp assert_runtime_steps!(job) do
-    steps = job["steps"] || []
+  defp assert_runtime_steps!(workflow) do
+    for {_name, job} <- workflow["jobs"] do
+      steps = job["steps"] || []
+      install = Enum.find_index(steps, &(&1["uses"] == @beam_action_ref))
 
-    for {step, index} <- Enum.with_index(steps), step["uses"] == @beam do
-      refusal = Enum.at(steps, index + 1)
-      assert refusal["name"] == "Assert release runtime"
-      assert refusal["working-directory"] == "."
-      assert refusal["run"] == "elixir scripts/ci/assert_runtime.exs"
+      for {step, index} <- Enum.with_index(steps) do
+        refute String.starts_with?(step["uses"] || "", "erlef/setup-beam@")
+        refute (step["run"] || "") =~ ".tool-versions"
+
+        if (step["run"] || "") =~ ~r/\b(?:mix|elixir|erl)\s/ do
+          assert is_integer(install) and install < index
+        end
+
+        if step["uses"] == @beam_action_ref do
+          source = runtime_output_source!(workflow, job, steps, index)
+
+          assert step["with"] == %{
+                   "elixir" => "${{ #{source}.elixir }}",
+                   "otp" => "${{ #{source}.otp }}"
+                 }
+        end
+      end
     end
+  end
+
+  defp runtime_output_source!(workflow, job, steps, index) do
+    reader = Enum.find_index(steps, &(&1["uses"] == @toolchain))
+
+    if is_integer(reader) do
+      assert reader < index
+      assert_reader_step!(steps)
+      "steps.toolchain.outputs"
+    else
+      assert "toolchain" in List.wrap(job["needs"])
+      toolchain = workflow["jobs"]["toolchain"]
+      assert is_map(toolchain)
+      assert_reader_step!(toolchain["steps"])
+
+      for key <- ["elixir", "otp"] do
+        assert toolchain["outputs"][key] == "${{ steps.toolchain.outputs.#{key} }}"
+      end
+
+      "needs.toolchain.outputs"
+    end
+  end
+
+  defp assert_reader_step!(steps) do
+    reader = Enum.find_index(steps, &(&1["uses"] == @toolchain))
+    checkout = Enum.find_index(steps, &(&1["uses"] == @checkout))
+    assert is_integer(reader) and is_integer(checkout) and checkout < reader
+    assert Enum.at(steps, reader) == %{"uses" => @toolchain, "id" => "toolchain"}
+  end
+
+  defp assert_toolchain_action!(action) do
+    assert Enum.sort(Map.keys(action["outputs"])) == ["elixir", "otp"]
+
+    for key <- ["elixir", "otp"] do
+      assert action["outputs"][key]["value"] == "${{ steps.versions.outputs.#{key} }}"
+    end
+
+    assert action["runs"] == %{
+             "using" => "composite",
+             "steps" => [
+               %{
+                 "name" => "Test the shared toolchain reader",
+                 "shell" => "bash",
+                 "run" => "scripts/toolchain.sh --self-test"
+               },
+               %{
+                 "name" => "Read the runtime versions",
+                 "id" => "versions",
+                 "shell" => "bash",
+                 "run" => ~s(scripts/toolchain.sh >> "$GITHUB_OUTPUT")
+               }
+             ]
+           }
+  end
+
+  defp assert_beam_action!(action) do
+    assert Enum.sort(Map.keys(action["inputs"])) == ["elixir", "otp"]
+
+    for key <- ["elixir", "otp"] do
+      assert action["inputs"][key]["required"] == true
+      refute Map.has_key?(action["inputs"][key], "default")
+    end
+
+    assert action["runs"]["using"] == "composite"
+    assert [setup, refusal] = action["runs"]["steps"]
+    assert_action_pins!(setup)
+    assert setup["uses"] == @beam
+    assert map_size(setup) == 2
+
+    assert refusal == %{
+             "name" => "Refuse a differing runtime",
+             "shell" => "bash",
+             "env" => %{
+               "WANT_ELIXIR" => "${{ inputs.elixir }}",
+               "WANT_OTP" => "${{ inputs.otp }}"
+             },
+             "run" => @installed <> "\n"
+           }
   end
 
   defp assert_action_pins!(map) do
@@ -684,12 +883,17 @@ defmodule Replicant.PublishWorkflowTest do
 
     if String.starts_with?(uses, "erlef/setup-beam@") do
       assert uses == @beam
-      assert map["with"] == %{"version-file" => ".tool-versions", "version-type" => "strict"}
+
+      assert map["with"] == %{
+               "elixir-version" => "${{ inputs.elixir }}",
+               "otp-version" => "${{ inputs.otp }}",
+               "version-type" => "strict"
+             }
     end
   end
 
   defp assert_publish!(workflow) do
-    assert_workflow!(workflow, File.read!(@tools))
+    assert_workflow!(workflow)
     assert workflow["on"] == %{"workflow_dispatch" => nil}
     refute Enum.any?(maps(workflow), &Map.has_key?(&1, "inputs"))
     serialized = Jason.encode!(workflow)
@@ -719,7 +923,8 @@ defmodule Replicant.PublishWorkflowTest do
     assert checkout["with"]["persist-credentials"] == false
     assert checkout["with"]["ref"] == "${{ github.sha }}"
     assert checkout["with"]["fetch-depth"] == 0
-    assert Enum.at(steps, 3)["uses"] == @beam
+    assert Enum.at(steps, 3)["uses"] == @toolchain
+    assert Enum.at(steps, 4)["uses"] == @beam_action_ref
     assert Enum.at(steps, 6)["run"] == "mix local.rebar --force"
     assert Enum.at(steps, 7)["run"] == "mix deps.get --check-locked"
     build = Enum.at(steps, 8)
@@ -854,8 +1059,7 @@ defmodule Replicant.PublishWorkflowTest do
 
   # Every external base image is the official Elixir image whose Elixir and OTP
   # versions equal .tool-versions; every other stage derives from it.
-  defp assert_example_image_runtime!(dockerfile, tools) do
-    versions = tools |> String.split() |> Enum.chunk_every(2) |> Map.new(&List.to_tuple/1)
+  defp assert_example_image_runtime!(dockerfile, versions) do
     [elixir, _otp_major] = String.split(Map.fetch!(versions, "elixir"), "-otp-")
     otp = Map.fetch!(versions, "erlang")
     stages = Regex.scan(~r/^FROM\s+\S+\s+AS\s+(\S+)$/m, dockerfile, capture: :all_but_first)
@@ -915,17 +1119,27 @@ defmodule Replicant.PublishWorkflowTest do
            end)
   end
 
-  defp assert_runtime_check!(script) do
-    tools = File.read!(@tools)
-    [_, elixir] = Regex.run(~r/^elixir (\S+)$/m, tools)
-    [_, otp] = Regex.run(~r/^erlang (\S+)$/m, tools)
+  defp assert_shared_reader!(source, mode) do
+    assert Base.encode16(:crypto.hash(:sha256, source), case: :lower) == @reader_sha256
+    assert rem(mode, 0o10000) == 0o755
+  end
+
+  defp toolchain_versions! do
+    {output, status} = System.cmd(@reader, [], cd: @repo_root, stderr_to_stdout: true)
+    assert status == 0, output
+
+    Map.new(String.split(output, "\n", trim: true), fn line ->
+      [name, value] = String.split(line, "=", parts: 2)
+      {name, value}
+    end)
+  end
+
+  defp assert_installed_runtime! do
+    versions = toolchain_versions!()
+    elixir = Map.fetch!(versions, "elixir")
+    otp = Map.fetch!(versions, "otp")
     [major, minor, patch] = String.split(otp, ".")
     wrong_patch = Enum.join([major, minor, String.to_integer(patch) + 1], ".")
-    root = Path.join(System.tmp_dir!(), "replicant-runtime-#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf!(root) end)
-    runtime = Path.join(root, "scripts/ci/assert_runtime.exs")
-    File.mkdir_p!(Path.dirname(runtime))
-    File.write!(runtime, script)
 
     for {expected_elixir, expected_otp, success?} <- [
           {elixir, otp, true},
@@ -934,11 +1148,10 @@ defmodule Replicant.PublishWorkflowTest do
           {elixir, major, false},
           {String.replace(elixir, "-otp-" <> major, "-otp-0"), otp, false}
         ] do
-      expected = "elixir #{expected_elixir}\nerlang #{expected_otp}\n"
-      File.write!(Path.join(root, ".tool-versions"), expected)
-
       {_output, status} =
-        System.cmd("elixir", [runtime], cd: root, stderr_to_stdout: true)
+        System.cmd(@reader, ["--installed", "elixir=#{expected_elixir}", "erlang=#{expected_otp}"],
+          stderr_to_stdout: true
+        )
 
       assert status == 0 == success?
     end

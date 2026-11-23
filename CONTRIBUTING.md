@@ -88,8 +88,9 @@ has a new cache scope, and a cache written on `main` would be restorable by cand
 Workflow timeouts follow the infrastructure CI requirements. Each comment
 names its slowest measured green run and duration; an unmeasured publish job uses
 the unmeasured limit until its own first green run.
-Every runtime installer reads `.tool-versions` with strict selection and immediately
-refuses a differing Elixir version, full OTP patch version, or Elixir OTP build suffix.
+Every runtime installer takes versions only from the shared `scripts/toolchain.sh`
+reader's outputs, selects them strictly, and uses its `--installed` check to refuse a
+differing Elixir version, full OTP patch version, or Elixir OTP build suffix.
 The example Dockerfile explains its separately pinned container toolchain.
 
 Release scripts read GitHub through `gh api`. The package-check step receives only

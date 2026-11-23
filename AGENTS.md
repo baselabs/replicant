@@ -117,9 +117,10 @@ a new cache scope, and a cache written on `main` would be restorable by candidat
 
 Timeouts follow the infrastructure CI requirements. Comments name each job's slowest
 measured green run and duration; publishing uses the unmeasured limit until its own first run.
-All runtime installers use `.tool-versions` with strict selection and immediately refuse any
-Elixir, full OTP patch, or Elixir OTP build-suffix mismatch. The example Dockerfile documents
-why its immutable container toolchain is pinned separately.
+All runtime installers take versions only from the shared `scripts/toolchain.sh` reader's
+outputs, select them strictly, and use its `--installed` check to refuse any Elixir, full OTP
+patch, or Elixir OTP build-suffix mismatch. The example Dockerfile documents why its immutable
+container toolchain is pinned separately.
 
 GitHub REST lookups in release scripts use `gh api`, with the calling step's
 `GH_TOKEN: ${{ github.token }}` and job-level `contents: read`. Only steps that

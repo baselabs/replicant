@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- CI and publication take runtime versions only from the shared toolchain reader,
+  with strict installation and its installed-runtime refusal replacing the local parser.
 - Test sink Agents belong to each test's ExUnit supervisor, preventing a later
   test from reusing an Agent still linked to the previous test's exiting process.
 

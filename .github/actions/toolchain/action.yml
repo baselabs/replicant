@@ -1,0 +1,19 @@
+name: Runtime toolchain
+description: Read the exact runtime versions through the shared toolchain reader before installation.
+outputs:
+  elixir:
+    description: The default Elixir version.
+    value: ${{ steps.versions.outputs.elixir }}
+  otp:
+    description: The default OTP version.
+    value: ${{ steps.versions.outputs.otp }}
+runs:
+  using: composite
+  steps:
+    - name: Test the shared toolchain reader
+      shell: bash
+      run: scripts/toolchain.sh --self-test
+    - name: Read the runtime versions
+      id: versions
+      shell: bash
+      run: scripts/toolchain.sh >> "$GITHUB_OUTPUT"

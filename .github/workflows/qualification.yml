@@ -27,6 +27,7 @@ jobs:
   # Format, lint, compile warnings, the dependency audit and dialyzer read no database,
   # so they run once here instead of in every matrix row.
   static:
+    needs: toolchain
     name: static (format, credo, compile, audit, dialyzer)
     runs-on: ubuntu-24.04
     timeout-minutes: 7 # Green run 44220063612: static 3m15s
@@ -37,14 +38,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      - uses: ./.github/actions/beam
         with:
-          version-file: .tool-versions
-          version-type: strict
-
-      - name: Assert release runtime
-        working-directory: .
-        run: elixir scripts/ci/assert_runtime.exs
+          elixir: ${{ needs.toolchain.outputs.elixir }}
+          otp: ${{ needs.toolchain.outputs.otp }}
 
       - run: mix deps.get --check-locked
       # Supply-chain gate (declared in mix.exs `audit` alias: unused-dep + hex advisory +
@@ -57,27 +54,31 @@ jobs:
       - run: mix credo --strict
       - run: mix dialyzer
 
-  postgres-lanes:
+  toolchain:
     runs-on: ubuntu-24.04
     timeout-minutes: 5 # Green run 44902270787: postgres-lanes 0m09s
     outputs:
+      elixir: ${{ steps.toolchain.outputs.elixir }}
+      otp: ${{ steps.toolchain.outputs.otp }}
       matrix: ${{ steps.lanes.outputs.matrix }}
       engine-major: ${{ steps.lanes.outputs.engine-major }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: ./.github/actions/toolchain
+        id: toolchain
       - id: lanes
         run: scripts/ci/postgres-lanes.sh
 
   test:
     name: test (${{ matrix.pg.kind }} PG${{ matrix.pg.major }} ${{ matrix.pg.role }})
-    needs: postgres-lanes
+    needs: toolchain
     runs-on: ubuntu-24.04
     timeout-minutes: 9 # Green run 44902270787: slowest test matrix row 4m30s
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.postgres-lanes.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.toolchain.outputs.matrix) }}
     env:
       MIX_ENV: test
       # Throwaway container fixtures; no external service credentials.
@@ -94,14 +95,10 @@ jobs:
         with:
           lane: ${{ toJSON(matrix.pg) }}
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      - uses: ./.github/actions/beam
         with:
-          version-file: .tool-versions
-          version-type: strict
-
-      - name: Assert release runtime
-        working-directory: .
-        run: elixir scripts/ci/assert_runtime.exs
+          elixir: ${{ needs.toolchain.outputs.elixir }}
+          otp: ${{ needs.toolchain.outputs.otp }}
 
       - run: mix deps.get --check-locked
       - name: Run tests and prove this matrix row exercised its declared substrate
@@ -119,6 +116,7 @@ jobs:
           mode: stop
 
   release-artifact:
+    needs: toolchain
     name: docs and package
     runs-on: ubuntu-24.04
     timeout-minutes: 5 # Green run 44222373059: release-artifact 1m57s
@@ -133,14 +131,10 @@ jobs:
           persist-credentials: false
           # Published check mode verifies the local tag and its ancestry against main.
           fetch-depth: 0
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      - uses: ./.github/actions/beam
         with:
-          version-file: .tool-versions
-          version-type: strict
-
-      - name: Assert release runtime
-        working-directory: .
-        run: elixir scripts/ci/assert_runtime.exs
+          elixir: ${{ needs.toolchain.outputs.elixir }}
+          otp: ${{ needs.toolchain.outputs.otp }}
 
       # Match the publisher: Hex records its own version in the package bytes.
       - run: mix local.hex "$HEX_VERSION" --force
@@ -171,9 +165,9 @@ jobs:
   # Source and destination use the checked platform engine; the repo-root
   # .dockerignore whitelist is the containment barrier for the build context.
   reference-example:
-    needs: postgres-lanes
+    needs: toolchain
     env:
-      EXPECTED_PG_MAJOR: ${{ needs.postgres-lanes.outputs.engine-major }}
+      EXPECTED_PG_MAJOR: ${{ needs.toolchain.outputs.engine-major }}
     name: Reference example (docker)
     runs-on: ubuntu-24.04
     timeout-minutes: 8 # Green run 44265557928: reference-example 3m33s
@@ -187,14 +181,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      - uses: ./.github/actions/beam
         with:
-          version-file: .tool-versions
-          version-type: strict
-
-      - name: Assert release runtime
-        working-directory: .
-        run: elixir scripts/ci/assert_runtime.exs
+          elixir: ${{ needs.toolchain.outputs.elixir }}
+          otp: ${{ needs.toolchain.outputs.otp }}
 
       # Static gates for the example project: the "sink API canary" catches
       # static contract drift too — a wrong callback shape or type is red here

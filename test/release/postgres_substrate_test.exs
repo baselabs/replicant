@@ -80,8 +80,8 @@ defmodule Replicant.PostgresSubstrateTest do
   test "workflows use one substrate action, declared matrices, and unconditional cleanup" do
     qualification = yaml(".github/workflows/qualification.yml")
     test_job = qualification["jobs"]["test"]
-    assert test_job["needs"] == "postgres-lanes"
-    assert test_job["strategy"]["matrix"] =~ "fromJSON(needs.postgres-lanes.outputs.matrix)"
+    assert test_job["needs"] == "toolchain"
+    assert test_job["strategy"]["matrix"] =~ "fromJSON(needs.toolchain.outputs.matrix)"
     assert test_job["env"]["EXPECTED_PG_MAJOR"] == "${{ matrix.pg.expected_major }}"
 
     for name <- ["test", "reference-example"] do

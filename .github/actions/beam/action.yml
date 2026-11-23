@@ -1,0 +1,24 @@
+name: Exact BEAM runtime
+description: Install the reader's exact Elixir and OTP versions and refuse a differing runtime.
+inputs:
+  elixir:
+    description: Elixir version from the shared toolchain reader.
+    required: true
+  otp:
+    description: OTP version from the shared toolchain reader.
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      with:
+        elixir-version: ${{ inputs.elixir }}
+        otp-version: ${{ inputs.otp }}
+        version-type: strict
+    - name: Refuse a differing runtime
+      shell: bash
+      env:
+        WANT_ELIXIR: ${{ inputs.elixir }}
+        WANT_OTP: ${{ inputs.otp }}
+      run: |
+        "$GITHUB_WORKSPACE/scripts/toolchain.sh" --installed "elixir=$WANT_ELIXIR" "erlang=$WANT_OTP"
