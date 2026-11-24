@@ -21,4 +21,11 @@ defmodule Replicant.DependencyTest do
     assert Version.match?(to_string(Application.spec(:postgrex, :vsn)), "~> 0.23")
     assert Version.match?(Version.parse!(to_string(Application.spec(:decimal, :vsn))), "~> 3.0")
   end
+
+  test "the db_connection security floor excludes EEF-CVE-2026-133555" do
+    assert Version.match?(
+             to_string(Application.spec(:db_connection, :vsn)),
+             ">= 2.10.3 and < 3.0.0-0"
+           )
+  end
 end

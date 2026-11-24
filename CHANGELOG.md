@@ -9,12 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Lock db_connection 2.10.2 → 2.10.3, in both the library and the reference
-  example, for EEF-CVE-2026-133555
+- Require db_connection `>= 2.10.3 and < 3.0.0-0` for EEF-CVE-2026-133555
   (GHSA-gmmq-fw75-wq46: code execution via the `:log` option of forged
-  `DBConnection.Stream` structs, affecting 1.1.0 up to 2.10.3). db_connection
-  is a transitive dependency through Postgrex, so the public requirements are
-  unchanged; consumers locked below 2.10.3 should run `mix deps.update db_connection`.
+  `DBConnection.Stream` structs, affecting 1.1.0 up to 2.10.3). Postgrex's own
+  requirement admits 2.10.2, so a consumer whose lock already held it would keep
+  it; the declared floor refuses to resolve a vulnerable release. The library and
+  reference-example locks move from 2.10.2 to 2.10.3.
 
 ### Fixed
 

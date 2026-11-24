@@ -55,6 +55,11 @@ defmodule Replicant.MixProject do
       # password/SSL options after connect and handling async messages during
       # replication startup. Its decimal requirement accepts our 3.x dependency.
       {:postgrex, "~> 0.23"},
+      # Security floor: EEF-CVE-2026-133555 (GHSA-gmmq-fw75-wq46) affects every
+      # db_connection below 2.10.3. Postgrex alone admits 2.10.2, and the checkpoint
+      # store matches DBConnection errors directly, so a consumer must not be able
+      # to keep a vulnerable release.
+      {:db_connection, ">= 2.10.3 and < 3.0.0-0"},
       # Dev/Test
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
