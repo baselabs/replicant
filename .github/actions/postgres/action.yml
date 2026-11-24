@@ -21,17 +21,27 @@ runs:
         engine="$(cat .github/postgres.ref)"
         [[ "$engine" =~ ^ghcr\.io/baselabs/postgres:[0-9]+\.[0-9]+-inputs-[0-9a-f]{64}@sha256:[0-9a-f]{64}$ ]]
         current_digest="$(python3 - <<'PY'
-        import json, re, urllib.request
+        import json, re, time, urllib.error, urllib.request
         host, path = 'ghcr.io', 'baselabs/postgres'
-        with urllib.request.urlopen(f'https://{host}/token?scope=repository:{path}:pull', timeout=30) as response:
-            token = json.load(response)['token']
+        def read(request, answer):
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(request, timeout=30) as response:
+                        return answer(response)
+                except urllib.error.HTTPError as error:
+                    if (error.code != 429 and error.code < 500) or attempt == 2:
+                        raise
+                except OSError:
+                    if attempt == 2:
+                        raise
+                time.sleep(10 * (attempt + 1))
+        token = read(f'https://{host}/token?scope=repository:{path}:pull', lambda response: json.load(response)['token'])
         request = urllib.request.Request(f'https://{host}/v2/{path}/manifests/current', method='HEAD', headers={
             'Authorization': 'Bearer ' + token,
             'Accept': ', '.join(('application/vnd.oci.image.index.v1+json', 'application/vnd.oci.image.manifest.v1+json',
                                  'application/vnd.docker.distribution.manifest.list.v2+json',
                                  'application/vnd.docker.distribution.manifest.v2+json'))})
-        with urllib.request.urlopen(request, timeout=30) as response:
-            digest = response.headers.get('Docker-Content-Digest', '')
+        digest = read(request, lambda response: response.headers.get('Docker-Content-Digest', ''))
         if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
             raise SystemExit('ghcr.io/baselabs/postgres:current: registry named no digest')
         print(digest)

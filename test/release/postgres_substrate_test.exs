@@ -109,6 +109,8 @@ defmodule Replicant.PostgresSubstrateTest do
     assert check["run"] =~ ~S|engine="$(cat .github/postgres.ref)"|
     assert check["run"] =~ ~S|if [ "${engine##*@}" != "$current_digest" ]|
     assert check["run"] =~ ~s(docker pull "$engine")
+    assert check["run"] =~ "for attempt in range(3):"
+    assert check["run"] =~ "error.code != 429 and error.code < 500"
     refute check["run"] =~ "docker pull ghcr"
     assert manage["if"] == "always() && (inputs.mode == 'stop' || success())"
 
