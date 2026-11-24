@@ -22,8 +22,8 @@ defmodule Replicant.PackageIdentity do
   end
 
   def check_publish(version, source_commit, runner \\ &run/2) do
-    # Tags and the GitHub release follow successful Hex read-back. Re-prove the
-    # source before building. An untagged Hex version may be held; its checksum
+    # Tags and the GitHub release follow successful Hex read-back. Verify the
+    # source against live main. An untagged Hex version may be held; its checksum
     # must match the built archive before the credentialed step can run.
     with :ok <- matching_main(source_commit, runner),
          :ok <- check_candidate(version, runner) do
@@ -74,9 +74,6 @@ defmodule Replicant.PackageIdentity do
 
   def verify_candidate!(version), do: check_candidate(version) |> unwrap!()
 
-  def verify_publish!(version, source_commit),
-    do: check_publish(version, source_commit) |> unwrap!()
-
   def verify_publish_archive!(version, source_commit, archive, runner \\ &run/2) do
     digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
     :ok = check_publish(version, source_commit, runner) |> unwrap!()
@@ -84,8 +81,8 @@ defmodule Replicant.PackageIdentity do
     :ok
   end
 
-  # A nil digest is only the pre-build identity check. Publication always repeats
-  # this decision with the inspected package SHA256, before exposing a key.
+  # A nil digest checks release identity alone. Publication also verifies
+  # the inspected package SHA256 and served docs before exposing a key.
   def check_archive(version, digest, runner \\ &run/2) do
     args = [
       "--silent",

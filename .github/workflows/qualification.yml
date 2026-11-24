@@ -150,13 +150,31 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/test_publish_hex_artifacts.exs"
 
-      # Build both archives twice from independent trees at the exact commit and
-      # compare their bytes. Audit and consume the package; inspect both archives.
-      # GitHub identity reads receive only this step's read-only job token.
+      # Build the package twice from independent trees at the exact commit and
+      # compare its bytes. Audit and consume it, render docs, and inspect both archives.
       - name: Prove both release archives without retaining them
-        env:
-          GH_TOKEN: ${{ github.token }}
+        id: archives
         run: bash scripts/release/build_candidate.sh --check
+
+      # GitHub identity reads receive only this step's read-only job token.
+      - name: Verify release identity
+        env:
+          VERSION: ${{ steps.archives.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.archives.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          manifest=scripts/release/published_packages.sha256
+          test -r "$manifest"
+          digest="$(awk -v artifact="replicant-$VERSION.tar" '$2 == artifact {print $1}' "$manifest")"
+          if [[ -n "$digest" && ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Published package digest manifest has an invalid or duplicate entry for $VERSION"
+            exit 1
+          fi
+          elixir -r scripts/release/package_identity.exs \
+            -e '
+              [version, commit, digest] = System.argv()
+              Replicant.PackageIdentity.verify_build!(version, commit, digest)
+            ' -- "$VERSION" "$SOURCE_COMMIT" "$digest"
 
   # The REFERENCE EXAMPLE (examples/replication_pipeline): a docker stack
   # (source PG → replicant release container → destination PG) that is the

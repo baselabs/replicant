@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and inspect both release archives without a registry credential.
+# Build and inspect both release archives; workflows check release identity separately.
 # Check mode removes all artifacts; publication retains only the inspected paths.
 set -euo pipefail
 
@@ -12,13 +12,8 @@ usage() {
 }
 
 [[ $# -eq 1 && -n "$1" ]] || usage
-mode="publish"
+[[ "$1" == "--check" || "$1" != -* ]] || usage
 output_dir="$1"
-if [[ "$1" == "--check" ]]; then
-  mode="check"
-elif [[ "$1" == -* ]]; then
-  usage
-fi
 
 log() { echo "build_candidate: $*" >&2; }
 die() { echo "::error::build_candidate: $*" >&2; exit 1; }
@@ -28,22 +23,6 @@ tree_status="$(git status --porcelain)"
 commit="$(git rev-parse HEAD)"
 version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
 [[ -n "$version" ]] || die "could not read package version"
-published_manifest="$repo_root/scripts/release/published_packages.sha256"
-[[ -r "$published_manifest" ]] || die "published package digest manifest is unavailable"
-published_digest="$(awk -v artifact="replicant-$version.tar" '$2 == artifact {print $1}' "$published_manifest")"
-if [[ -n "$published_digest" && ! "$published_digest" =~ ^[0-9a-f]{64}$ ]]; then
-  die "published package digest manifest has an invalid or duplicate entry for $version"
-fi
-
-if [[ "$mode" == "publish" ]]; then
-  elixir -r "$repo_root/scripts/release/package_identity.exs" \
-    -e 'Replicant.PackageIdentity.verify_publish!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1))' -- \
-    "$version" "$commit"
-else
-  elixir -r "$repo_root/scripts/release/package_identity.exs" \
-    -e 'Replicant.PackageIdentity.verify_build!(Enum.at(System.argv(), 0), Enum.at(System.argv(), 1), Enum.at(System.argv(), 2))' -- \
-    "$version" "$commit" "$published_digest"
-fi
 
 build_tree="$(mktemp -d "${TMPDIR:-/tmp}/replicant-package.XXXXXX")"
 output_owned=0
@@ -59,7 +38,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ "$mode" == "check" ]]; then
+if [[ "$output_dir" == "--check" ]]; then
   output_dir="$build_tree/artifacts"
 fi
 mkdir "$output_dir"
@@ -81,17 +60,10 @@ cmp -s "$package" "$rebuild_tree/package.tar" || die "package build is not byte-
 
 EXPECTED_VERSION="$version" bash "$repo_root/scripts/release/verify_package.sh" "$package" >&2
 bash "$repo_root/scripts/release/consume_candidate.sh" "$package" "$output_dir/docs.tar.gz" >&2
-if [[ "$mode" == "publish" ]]; then
-  # A held package must match exactly. Infra's rule keeps served docs without
-  # comparison or replacement: comparison could refuse matching package bytes,
-  # and replacement could rebind their published commit. Repeat tag/release refusals.
-  elixir -r "$repo_root/scripts/release/package_identity.exs" \
-    -e '
-      [version, commit, archive] = System.argv()
-      Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)
-    ' -- "$version" "$commit" "$package"
-fi
 # The upload step receives these same inspected file paths, with no intervening rebuild.
 chmod a-w "$package" "$output_dir/docs.tar.gz"
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'version=%s\ncommit=%s\n' "$version" "$commit" >> "$GITHUB_OUTPUT"
+fi
 complete=1
 log "PASS - package built twice identically, inspected, audited, consumed; docs built once and inspected"

@@ -146,23 +146,24 @@ If CI goes red, fix forward in the next commit.
   qualification guarantee; publication performs no qualification lookup or artifact download.
   An early anonymous Hex read refuses a missing `replicant` package name: a first publication
   is the owner's decision. Lookup errors fail closed. Keyless steps build the package twice
-  from the exact live `origin/main` commit, compare and inspect its bytes, audit and consume
+  from the exact checked-out commit, compare and inspect its bytes, audit and consume
   it, render docs once with warnings as errors, write `release.json` with exactly
   `package`, `version`, and the full `GITHUB_SHA` as `commit`, and inspect every
   rendered file and those provenance fields. The fresh generated
   consumer starts without a lock and runs both audits on its new resolution; projects with
   committed locks fetch with `--check-locked`.
-  Before upload, the shared changelog check reads the inspected Hex package archive.
+  After the build, the shared changelog check reads the inspected Hex package archive.
   It requires exactly one root changelog with entries under the release version and
-  no entries in sections above it.
+  no entries in sections above it. The release identity step then verifies the built
+  commit against live `origin/main` and checks the package and docs state in Hex.
   Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
   it: `mix run --no-mix-exs`, run from the runner's temporary directory where no `mix.exs`
   exists, runs `scripts/release/publish_hex_artifacts.exs`. The script refuses to run inside a
   Mix project, reads the two inspected archive paths, and rechecks package existence. Local
   or remote version tags and GitHub releases refuse publication. An untagged Hex version can
-  finish only when its checksum matches the built package and it is not retired; the keyless
-  build and the keyed script both check this. Only missing package or docs uploads run. Both
-  are read back from Hex's repository. The package SHA-256 must match the inspected
+  finish only when its checksum matches the built package and it is not retired; the release
+  identity step and the keyed script both check this. Only missing package or docs uploads run.
+  Both are read back from Hex's repository. The package SHA-256 must match the inspected
   archive; docs planning keeps a readable served gzip tarball and uploads only
   when metadata says `has_docs: false` and the repository returns HTTP 404.
   `has_docs: true` with a repository 404 refuses as a metadata/repository disagreement;

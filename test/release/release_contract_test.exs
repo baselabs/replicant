@@ -118,14 +118,12 @@ defmodule Replicant.ReleaseContractTest do
     end
   end
 
-  test "post-release package checks keep the published identity and clean main guards" do
+  test "post-release package checks fetch the published identity and ancestry" do
     workflow = File.read!(@workflow)
-    builder = File.read!(@builder)
     [_, release_job] = String.split(workflow, "  release-artifact:", parts: 2)
 
     assert release_job =~ "fetch-depth: 0"
-    assert builder =~ "Replicant.PackageIdentity.verify_publish!"
-    assert builder =~ "Replicant.PackageIdentity.verify_build!"
+    assert release_job =~ "scripts/release/published_packages.sha256"
   end
 
   test "published package digest manifest binds the preceding release bytes" do
@@ -137,11 +135,11 @@ defmodule Replicant.ReleaseContractTest do
 
   test "candidate accepts only check mode or one output directory" do
     [_, parser] = Regex.run(~r/(usage\(\).*?)\nlog\(\)/s, File.read!(@builder))
-    script = parser <> ~S(printf '%s\n%s\n' "$mode" "$output_dir")
+    script = parser <> ~S(printf '%s\n' "$output_dir")
 
     for {args, expected} <- [
-          {["--check"], "check\n--check\n"},
-          {["output path"], "publish\noutput path\n"}
+          {["--check"], "--check\n"},
+          {["output path"], "output path\n"}
         ] do
       assert {expected, 0} == candidate_arguments(script, args)
     end
@@ -155,6 +153,9 @@ defmodule Replicant.ReleaseContractTest do
 
   test "candidate builds and inspects the same two paths the workflow uploads" do
     source = File.read!(@builder)
+    assert source =~ ~S|commit="$(git rev-parse HEAD)"|
+    assert source =~ ~S|git archive --format=tar --output="$source_archive" "$commit"|
+    assert source =~ ~S|printf 'version=%s\ncommit=%s\n' "$version" "$commit" >> "$GITHUB_OUTPUT"|
     assert source =~ ~s(package="$output_dir/package.tar")
     assert source =~ ~s(cmp -s "$package" "$rebuild_tree/package.tar")
     assert source =~ ~s(verify_package.sh" "$package")
@@ -173,29 +174,23 @@ defmodule Replicant.ReleaseContractTest do
     assert File.read!(@workflow) =~ "bash scripts/release/build_candidate.sh --check"
   end
 
-  test "publication compares the inspected package with held Hex bytes before the keyed step" do
+  test "the archive builder leaves release registry lookups to the workflows" do
     source = File.read!(@builder)
-    assert_held_check!(source)
+    assert_no_release_lookup!(source)
 
-    for {before, replacement} <- [
-          {"Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)", ":ok"},
-          {~s|[version, commit, archive] = System.argv()|, ":ok"},
-          {~s|' -- "$version" "$commit" "$package"|, ~s|' -- "$version" "$commit" other.tar|}
+    for command <- [
+          "elixir -r scripts/release/package_identity.exs",
+          "curl https://hex.pm/api/packages/replicant",
+          "gh api repos/baselabs/replicant/releases",
+          "git ls-remote origin refs/heads/main"
         ] do
-      mutated = String.replace(source, before, replacement)
-      refute mutated == source
-      assert_raise ExUnit.AssertionError, fn -> assert_held_check!(mutated) end
+      assert_raise ExUnit.AssertionError, fn -> assert_no_release_lookup!(source <> command) end
     end
   end
 
-  defp assert_held_check!(source) do
-    [_build, after_inspection] = String.split(source, "consume_candidate.sh\"", parts: 2)
-    [checked, _retained] = String.split(after_inspection, "chmod a-w", parts: 2)
-    assert checked =~ ~s|if [[ "$mode" == "publish" ]]; then|
-    call = "Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)"
-    assert checked =~ call
-    assert checked =~ "[version, commit, archive] = System.argv()"
-    assert checked =~ ~s|' -- "$version" "$commit" "$package"|
+  defp assert_no_release_lookup!(source) do
+    refute source =~
+             ~r/PackageIdentity|package_identity\.exs|\bcurl\b|\bgh\s+api\b|\bgit\s+ls-remote\b/
   end
 
   defp candidate_arguments(script, args) do

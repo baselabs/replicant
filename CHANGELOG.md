@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Publication checks the built Hex package for changelog entries above its version
-  and refuses an unstamped archive before upload.
+  and refuses an unstamped archive before checking release state or uploading.
 
 ## [1.6.1] - 2026-11-24
 

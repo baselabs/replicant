@@ -76,12 +76,7 @@ jobs:
 
       - name: Compare two package builds and inspect one docs build
         id: archives
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"
-          version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+        run: bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"
 
       - name: Refuse a package whose changelog is not stamped for its version
         shell: bash
@@ -128,6 +123,21 @@ jobs:
                   refuse(f'the packaged CHANGELOG has entries above {version}, under "{title}"')
           print(f'{archive}: the packaged CHANGELOG is stamped for {version}')
           PY
+
+      # A held package must match exactly. Infra's rule keeps served docs without
+      # comparison or replacement: comparison could refuse matching package bytes,
+      # and replacement could rebind their published commit.
+      - name: Verify release identity and served docs
+        env:
+          VERSION: ${{ steps.archives.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.archives.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          elixir -r scripts/release/package_identity.exs \
+            -e '
+              [version, commit, archive] = System.argv()
+              Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)
+            ' -- "$VERSION" "$SOURCE_COMMIT" "$RUNNER_TEMP/replicant-release/package.tar"
 
       # Run from a directory without mix.exs: from the checkout, Mix would load and
       # compile the project under the key, and Hex's modules would leave the code path.

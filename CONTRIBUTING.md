@@ -118,9 +118,8 @@ Only the archive upload step receives that secret.
 An early anonymous Hex lookup refuses a package name that does not already exist:
 a first publication of `replicant` is the owner's decision. All lookup errors fail
 closed. The workflow checks out the dispatched SHA without persisted credentials.
-Building requires a clean checkout of live `origin/main` and refuses a local or
-remote version tag or GitHub release. Only the keyless build step receives the job
-token through `GH_TOKEN` for GitHub reads; tokens never enter arguments or files.
+Building requires a clean checkout and records the source commit used to build
+the archives.
 
 Both qualification and publication build the package twice from `git archive`
 and compare its bytes, inspect the exact package manifest and Hex checksum, then
@@ -140,9 +139,12 @@ from the commit infra tags. Comparing a rebuild would refuse a held release whos
 package bytes match. The producer lock is not packaged, so equal package
 bytes alone do not establish which commit rendered served docs.
 
-Before upload, the shared changelog check reads the inspected Hex package archive.
+After the build, the shared changelog check reads the inspected Hex package archive.
 The package must contain exactly one root changelog with entries under the release
-version and no entries in sections above it.
+version and no entries in sections above it. The release identity step then
+confirms the built commit is live `origin/main`, refuses a local or remote version
+tag or GitHub release, and checks the served package checksum and docs. Only that
+publication step receives the read-only GitHub job token through `GH_TOKEN`.
 
 The single credentialed step runs `mix run --no-mix-exs` from the runner's temporary
 directory, which holds no `mix.exs`, with those two inspected file paths. Its
@@ -150,9 +152,9 @@ standalone script uses only Hex's APIs and file reads: it refuses to run inside 
 Mix project, loads no project code, fetches no dependencies, and rebuilds nothing.
 Immediately before uploading, it rechecks that the package name exists. A version
 already served by Hex without a tag is a held or partial release: the job compares
-its package checksum with the archive it just built, both before and inside the
-keyed step. A different package checksum, retirement, malformed metadata, or
-lookup failure refuses publication. Identical package bytes skip that upload.
+its package checksum with the archive it just built in both the release identity
+and keyed upload steps. A different package checksum, retirement, malformed
+metadata, or lookup failure refuses publication. Identical package bytes skip that upload.
 Docs planning keeps a readable served gzip tarball even when metadata says docs
 are absent. Upload requires both `has_docs: false` and an HTTP 404 from the
 repository. If metadata says `has_docs: true` but the repository returns 404,
