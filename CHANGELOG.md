@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Set the replication lag baseline from the first XLogData frame with a valid WAL
+  position. A pglogical startup frame with position `0/0` could trigger a
+  false `:sink_too_slow` halt before an incremental snapshot completed.
 - Publication refuses a missing, duplicated or empty version section before
   building. Keyless read-back retains `RELEASE-NOTES.md` from the served package's
   changelog in `release-assets`, naming the published commit and both archive digests.
