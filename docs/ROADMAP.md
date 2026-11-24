@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-11-23 · **Current release:** `1.6.0` (2026-11-23 UTC)
+**Updated:** 2026-11-24 · **Current release:** `1.6.1` (2026-11-24 UTC)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -61,7 +61,13 @@ through later releases:
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
   in ADR-0002.
-- **`replicant` 1.6.0 is the current release** (2026-11-23 UTC): Hex package and docs,
+- **`replicant` 1.6.1 is the current release** (2026-11-24 UTC): Hex package and docs,
+  tag `v1.6.1`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/v1.6.1)
+  are published at `4e476cb1fd07fcbd78706765d8b4d044698c56d5` (publish run 45469479926).
+  The verified package digest is recorded in `scripts/release/published_packages.sha256`.
+  It requires db_connection `>= 2.10.3 and < 3.0.0-0` for EEF-CVE-2026-133555 and
+  fixes the false `:sink_too_slow` halt from a `0/0` startup frame; see CHANGELOG `[1.6.1]`.
+- **`replicant` 1.6.0** (2026-11-23 UTC): Hex package and docs,
   tag `v1.6.0`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/v1.6.0)
   are published at `8d313d6b06503098e1e5c58186f19e6e5501efed`. The verified package
   digest is recorded in `scripts/release/published_packages.sha256`. It raises the
