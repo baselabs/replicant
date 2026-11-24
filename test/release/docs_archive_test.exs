@@ -3,7 +3,7 @@ defmodule Replicant.DocsArchiveTest do
 
   @builder Path.expand("../../scripts/release/build_docs_archive.exs", __DIR__)
   @checker Path.expand("../../scripts/release/check_docs_archive.py", __DIR__)
-  @version "1.6.0"
+  @version "1.6.1"
   @commit String.duplicate("c", 40)
 
   setup do

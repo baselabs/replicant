@@ -12,17 +12,16 @@ defmodule Replicant.ReleaseContractTest do
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.5.1"
+  @previous_release "1.6.0"
   # Immutable registry digest for the preceding release, recorded after read-back.
   # Held versions are compared with freshly built bytes before upload; they do not
   # rewrite this ledger.
-  @published_digest "a09c0a7b6d47dc9ca63f84267a2b668ecde72309b161fdcd239585a4ad6bc869"
-  @current_digest "0b5f2e188d8ed7713c0832ff06a4a22131d63cdcd69f49ed37b0a7487efcdef6"
+  @published_digest "0b5f2e188d8ed7713c0832ff06a4a22131d63cdcd69f49ed37b0a7487efcdef6"
 
   defp version, do: Mix.Project.config()[:version]
 
-  test "the dependency floor requires the coordinated minor release" do
-    assert version() == "1.6.0"
+  test "the db_connection security floor and startup lag fix require the patch release" do
+    assert version() == "1.6.1"
   end
 
   test "snapshot release documents the halt, token contents, and conservative plugin policy" do
@@ -129,13 +128,11 @@ defmodule Replicant.ReleaseContractTest do
     assert builder =~ "Replicant.PackageIdentity.verify_build!"
   end
 
-  test "published package digest manifest binds the preceding and current release bytes" do
+  test "published package digest manifest binds the preceding release bytes" do
     manifest = File.read!(@published_digests)
-    releases = [{@previous_release, @published_digest}, {version(), @current_digest}]
 
-    for {release, digest} <- releases do
-      assert manifest =~ "#{digest}  replicant-#{release}.tar"
-    end
+    assert manifest =~
+             "#{@published_digest}  replicant-#{@previous_release}.tar"
   end
 
   test "candidate accepts only check mode or one output directory" do

@@ -12,7 +12,7 @@ defmodule Replicant.ReleaseDocsTest do
 
   alias Replicant.{ReleaseAssets, ReleaseDocs, ReleaseNotes}
 
-  @version "1.6.0"
+  @version "1.6.1"
   @commit String.duplicate("c", 40)
   @section "## [#{@version}] - 2026-11-22\n\n### Fixed\n\n- Notes from the served package."
 
