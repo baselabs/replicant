@@ -391,7 +391,7 @@ defmodule Replicant.Connection do
     store_retry_count = reset_retry_count(state.store_retry_count, checkpoint_state)
 
     # Reset the in-flight window on (re)connect. `stream_floor_lsn` is re-derived from
-    # the FIRST XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
+    # the first positioned XLogData frame of the new stream (see `inflight_lag/1`) — PG clamps
     # `START_REPLICATION` to the slot's server-side `confirmed_flush_lsn`, which for a
     # fresh/empty checkpoint is the slot-creation LSN (a large absolute value), NOT 0.
     # Measuring lag against that per-stream floor (never against absolute 0) is what
@@ -1171,15 +1171,16 @@ defmodule Replicant.Connection do
   # unbounded — a single non-blocking integer comparison, so keepalives are never
   # starved.
   def handle_data(<<?w, _wal_start::64, wal_end::64, _clock::64, payload::binary>>, state) do
-    # Capture the per-stream floor from the FIRST frame — the position PG actually
-    # began streaming at (its clamped `confirmed_flush_lsn`), so lag is measured
-    # relative to the stream, never absolute 0.
-    stream_floor_lsn = state.stream_floor_lsn || wal_end
+    # PostgreSQL writes an invalid 0/0 position on non-final plugin writes, including
+    # pglogical's startup frame. Use the first real position so the lag guard measures
+    # from the stream's starting range even when the checkpoint is still 0.
+    stream_floor_lsn =
+      if wal_end > 0, do: state.stream_floor_lsn || wal_end, else: state.stream_floor_lsn
 
-    # On the FIRST frame of a (re)connected stream, report the floor to the AssemblerServer — it is
+    # Once the (re)connected stream has a floor, report it to the AssemblerServer — it is
     # the cold-start component of the batch span-cap base `max(lib_checkpoint, stream_floor)` (§7),
     # so a large-absolute first-txn LSN on a fresh slot (lib_checkpoint 0) does not spuriously flush.
-    if is_nil(state.stream_floor_lsn) and batches?(state) do
+    if is_nil(state.stream_floor_lsn) and not is_nil(stream_floor_lsn) and batches?(state) do
       GenServer.cast(AssemblerServer.via(state.slot_name), {:stream_floor, stream_floor_lsn})
     end
 
