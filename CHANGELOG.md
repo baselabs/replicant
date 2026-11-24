@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Lock db_connection 2.10.2 → 2.10.3 for EEF-CVE-2026-133555
+- Lock db_connection 2.10.2 → 2.10.3, in both the library and the reference
+  example, for EEF-CVE-2026-133555
   (GHSA-gmmq-fw75-wq46: code execution via the `:log` option of forged
   `DBConnection.Stream` structs, affecting 1.1.0 up to 2.10.3). db_connection
   is a transitive dependency through Postgrex, so the public requirements are
