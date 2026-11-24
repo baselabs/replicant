@@ -479,6 +479,8 @@ defmodule Replicant.PublishWorkflowTest do
         {"wrong artifact path", ["jobs", "publish", "steps", 12, "with", "path"], "."},
         {"missing artifact files", ["jobs", "publish", "steps", 12, "with", "if-no-files-found"],
          "warn"},
+        {"long artifact retention", ["jobs", "publish", "steps", 12, "with", "retention-days"],
+         90},
         {"assets on failed read-back", ["jobs", "publish", "steps", 12, "if"], "always()"},
         {"wrong secret", ["jobs", "publish", "steps", 10, "env", "HEX_API_KEY"],
          "${{ secrets.OTHER_KEY }}"},
@@ -1001,7 +1003,8 @@ defmodule Replicant.PublishWorkflowTest do
              "with" => %{
                "name" => "release-assets",
                "path" => "${{ runner.temp }}/replicant-release/release-assets/",
-               "if-no-files-found" => "error"
+               "if-no-files-found" => "error",
+               "retention-days" => 7
              }
            }
 

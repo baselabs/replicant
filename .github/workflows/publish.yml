@@ -109,6 +109,7 @@ jobs:
           name: release-assets
           path: ${{ runner.temp }}/replicant-release/release-assets/
           if-no-files-found: error
+          retention-days: 7
 
       - name: Remove built release archives
         if: always()
