@@ -140,6 +140,10 @@ from the commit infra tags. Comparing a rebuild would refuse a held release whos
 package bytes match. The producer lock is not packaged, so equal package
 bytes alone do not establish which commit rendered served docs.
 
+Before upload, the shared changelog check reads the inspected Hex package archive.
+The package must contain exactly one root changelog with entries under the release
+version and no entries in sections above it.
+
 The single credentialed step runs `mix run --no-mix-exs` from the runner's temporary
 directory, which holds no `mix.exs`, with those two inspected file paths. Its
 standalone script uses only Hex's APIs and file reads: it refuses to run inside a

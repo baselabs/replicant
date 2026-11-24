@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Publication checks the built Hex package for changelog entries above its version
+  and refuses an unstamped archive before upload.
+
 ## [1.6.1] - 2026-11-24
 
 ### Security

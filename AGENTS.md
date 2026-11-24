@@ -152,6 +152,9 @@ If CI goes red, fix forward in the next commit.
   rendered file and those provenance fields. The fresh generated
   consumer starts without a lock and runs both audits on its new resolution; projects with
   committed locks fetch with `--check-locked`.
+  Before upload, the shared changelog check reads the inspected Hex package archive.
+  It requires exactly one root changelog with entries under the release version and
+  no entries in sections above it.
   Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
   it: `mix run --no-mix-exs`, run from the runner's temporary directory where no `mix.exs`
   exists, runs `scripts/release/publish_hex_artifacts.exs`. The script refuses to run inside a
