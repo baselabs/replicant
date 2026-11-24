@@ -12,6 +12,7 @@ defmodule Replicant.ConnectionTest do
   alias Replicant.Connection
   alias Replicant.Decoder.Messages.Begin
   alias Replicant.Decoder.Messages.{Commit, StreamAbort, StreamCommit, StreamStart}
+  alias Replicant.Decoder.Pglogical
 
   defmodule StubSink do
     @behaviour Replicant.Sink
@@ -488,7 +489,7 @@ defmodule Replicant.ConnectionTest do
           batch_delivery: [max_transactions: 10, max_delay_ms: 100, max_span: 1_000_000]
         )
 
-      cache = Replicant.Decoder.Pglogical.init_cache([])
+      cache = Pglogical.init_cache([])
       st = %{st | decoder: %{st.decoder | kind: :pglogical, cache: cache}}
 
       # PostgreSQL writes 0/0 on pglogical's startup frame. The following Begin

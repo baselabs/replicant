@@ -1171,18 +1171,7 @@ defmodule Replicant.Connection do
   # unbounded — a single non-blocking integer comparison, so keepalives are never
   # starved.
   def handle_data(<<?w, _wal_start::64, wal_end::64, _clock::64, payload::binary>>, state) do
-    # PostgreSQL writes an invalid 0/0 position on non-final plugin writes, including
-    # pglogical's startup frame. Use the first real position so the lag guard measures
-    # from the stream's starting range even when the checkpoint is still 0.
-    stream_floor_lsn =
-      if wal_end > 0, do: state.stream_floor_lsn || wal_end, else: state.stream_floor_lsn
-
-    # Once the (re)connected stream has a floor, report it to the AssemblerServer — it is
-    # the cold-start component of the batch span-cap base `max(lib_checkpoint, stream_floor)` (§7),
-    # so a large-absolute first-txn LSN on a fresh slot (lib_checkpoint 0) does not spuriously flush.
-    if is_nil(state.stream_floor_lsn) and not is_nil(stream_floor_lsn) and batches?(state) do
-      GenServer.cast(AssemblerServer.via(state.slot_name), {:stream_floor, stream_floor_lsn})
-    end
+    stream_floor_lsn = seed_stream_floor(state, wal_end)
 
     received_lsn = max(state.received_lsn, wal_end)
 
@@ -1828,6 +1817,23 @@ defmodule Replicant.Connection do
   # and the per-stream `stream_floor_lsn` (the position PG began streaming at, used
   # before the first commit while checkpoint is still 0). A cheap integer subtraction —
   # safe to call on the keepalive-free hot path.
+  # PostgreSQL writes an invalid 0/0 position on non-final plugin writes, including
+  # pglogical's startup frame. Use the first real position so the lag guard measures
+  # from the stream's starting range even when the checkpoint is still 0.
+  #
+  # Once the (re)connected stream has a floor, report it to the AssemblerServer — it is
+  # the cold-start component of the batch span-cap base `max(lib_checkpoint, stream_floor)` (§7),
+  # so a large-absolute first-txn LSN on a fresh slot (lib_checkpoint 0) does not spuriously flush.
+  defp seed_stream_floor(%{stream_floor_lsn: nil} = state, wal_end) when wal_end > 0 do
+    if batches?(state) do
+      GenServer.cast(AssemblerServer.via(state.slot_name), {:stream_floor, wal_end})
+    end
+
+    wal_end
+  end
+
+  defp seed_stream_floor(%{stream_floor_lsn: floor}, _wal_end), do: floor
+
   defp inflight_lag(%{
          received_lsn: received,
          checkpoint_lsn: cp,
