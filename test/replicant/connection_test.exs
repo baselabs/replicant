@@ -474,6 +474,37 @@ defmodule Replicant.ConnectionTest do
       assert_receive {:"$gen_cast", {:message, %Begin{xid: 7}, _bytes, _from}}
     end
 
+    test "a pglogical startup frame with no WAL position cannot seed the stream floor" do
+      slot = "conn_pglogical_startup"
+      {:ok, _} = Registry.register(Replicant.Registry, {slot, :assembler}, nil)
+
+      [startup, begin_payload | _] =
+        "test/fixtures/pglogical_pg12.bin" |> File.read!() |> :erlang.binary_to_term()
+
+      st =
+        state(
+          slot_name: slot,
+          snapshot: [mode: :incremental],
+          batch_delivery: [max_transactions: 10, max_delay_ms: 100, max_span: 1_000_000]
+        )
+
+      cache = Replicant.Decoder.Pglogical.init_cache([])
+      st = %{st | decoder: %{st.decoder | kind: :pglogical, cache: cache}}
+
+      # PostgreSQL writes 0/0 on pglogical's startup frame. The following Begin
+      # carries a real WAL position which can already be past the lag ceiling.
+      absent = <<?w, 0::64, 0::64, 0::64, startup::binary>>
+      lsn = st.max_inflight_lag + 1
+      positioned = <<?w, lsn::64, lsn::64, 0::64, begin_payload::binary>>
+
+      assert {:noreply, st} = Connection.handle_data(absent, st)
+      assert {:noreply, st} = Connection.handle_data(positioned, st)
+      assert st.stream_floor_lsn == lsn
+      assert_received {:"$gen_cast", {:stream_floor, ^lsn}}
+      assert_received {:"$gen_cast", {:message, %Begin{}, _bytes, _from}}
+      refute_received {:"$gen_cast", {:stream_floor, 0}}
+    end
+
     test "an XLogData whose lag over the stream floor is at/under the bound still forwards" do
       {:ok, _} = Registry.register(Replicant.Registry, {"conn_underbound", :assembler}, nil)
       begin_payload = <<"B", 0::64, 0::64, 7::32>>
