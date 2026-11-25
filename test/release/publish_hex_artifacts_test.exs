@@ -208,6 +208,7 @@ defmodule Replicant.PublishHexArtifactsTest do
   test "the grant's token is kept before metadata validation and removed after revocation" do
     source = File.read!(@script)
     assert source =~ ~s|%{"access_token" => token} = grant|
+
     assert {stored, _} =
              :binary.match(source, "File.write(token_path(), token, [:binary, :exclusive])")
 

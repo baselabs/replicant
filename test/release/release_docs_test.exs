@@ -130,6 +130,7 @@ defmodule Replicant.ReleaseDocsTest do
 
     assert ancestor ==
              ReleaseAssets.retain!(package, docs, @version, output, dispatched, dir, "main")
+
     assert File.read!(Path.join(output, "replicant-#{@version}.tar")) == package
     assert File.read!(Path.join(output, "replicant-#{@version}-docs.tar.gz")) == docs
     assert File.read!(Path.join(output, "published_commit")) == ancestor <> "\n"

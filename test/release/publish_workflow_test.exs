@@ -654,7 +654,10 @@ defmodule Replicant.PublishWorkflowTest do
     qualification = read_yaml!(@qualification)
     assert_hex!(publish, qualification)
 
-    mutated = put_in(publish, ["env", "HEX_VERSION"], "0.0.0")
+    mutated = Map.put(publish, "env", Map.put(publish["env"] || %{}, "HEX_VERSION", "0.0.0"))
+    assert_raise ExUnit.AssertionError, fn -> assert_hex!(mutated, qualification) end
+
+    mutated = replace(publish, ["jobs", "build", "steps", 5, "env"], %{"HEX_VERSION" => "0.0.0"})
     assert_raise ExUnit.AssertionError, fn -> assert_hex!(mutated, qualification) end
 
     mutated = replace(publish, ["jobs", "build", "steps", 5, "run"], "mix local.hex --force")
@@ -902,6 +905,7 @@ defmodule Replicant.PublishWorkflowTest do
 
   defp assert_publish!(workflow) do
     assert_workflow!(workflow)
+
     assert %{"workflow_dispatch" => %{"inputs" => %{"release_commit" => input} = inputs}} =
              workflow["on"]
 
@@ -910,7 +914,10 @@ defmodule Replicant.PublishWorkflowTest do
     assert input["required"] == true
     assert input["type"] == "string"
     refute Map.has_key?(input, "default")
-    refute Jason.encode!(workflow) =~ ~r/github\.sha|GITHUB_SHA|secrets\.|gh\s+release|create-release/
+
+    refute Jason.encode!(workflow) =~
+             ~r/github\.sha|GITHUB_SHA|secrets\.|gh\s+release|create-release/
+
     assert workflow["permissions"] == %{"contents" => "read"}
 
     assert %{"verify" => verify, "build" => build, "upload" => upload, "read_back" => read_back} =
@@ -935,6 +942,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert input["run"] =~ ~S|^[0-9a-f]{40}$|
     assert source["with"]["ref"] == "${{ steps.release.outputs.commit }}"
     assert source["with"]["fetch-depth"] == 0
+
     assert ancestry["run"] =~
              ~S|git merge-base --is-ancestor "$RELEASE_COMMIT" "refs/remotes/origin/$DEFAULT_BRANCH"|
 
@@ -978,16 +986,22 @@ defmodule Replicant.PublishWorkflowTest do
 
     assert Enum.at(build["steps"], 4)["run"] =~
              ~s|Replicant.ReleaseNotes.section!(File.read!("source/CHANGELOG.md"), hd(System.argv()))|
+
     assert Enum.at(build["steps"], 7)["run"] == "mix deps.get --check-locked"
     assert Enum.at(build["steps"], 7)["working-directory"] == "source"
+
     assert Enum.at(build["steps"], 8)["run"] ==
              ~S|bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"|
+
     stamp = Enum.at(build["steps"], 9)
     assert stamp["shell"] == "bash"
     refute stamp["if"]
     refute stamp["env"]
     assert Base.encode16(:crypto.hash(:sha256, stamp["run"]), case: :lower) == @stamp_sha256
-    assert Enum.at(build["steps"], 10)["run"] =~ "Replicant.PackageIdentity.verify_publish_archive!"
+
+    assert Enum.at(build["steps"], 10)["run"] =~
+             "Replicant.PackageIdentity.verify_publish_archive!"
+
     assert Enum.at(build["steps"], 10)["run"] =~ ~S|"$VERSION" "$RELEASE_COMMIT"|
     assert Enum.at(build["steps"], 11)["run"] =~ "sha256sum package.tar docs.tar.gz upload-plan"
     assert_artifact!(build, 12, "inspected-archives", "replicant-release", 1)
@@ -999,6 +1013,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert Enum.at(upload["steps"], 4)["run"] =~ ~S|"$PLAN_SHA256" upload-plan|
     assert Enum.at(upload["steps"], 4)["run"] =~ "sha256sum --check --strict -"
     assert Enum.at(upload["steps"], 5)["run"] == @upload
+
     assert Enum.at(upload["steps"], 5)["working-directory"] ==
              "${{ runner.temp }}/inspected-archives"
 
@@ -1011,9 +1026,13 @@ defmodule Replicant.PublishWorkflowTest do
     registry = Enum.at(read_back["steps"], 4)
     refute registry["if"]
     assert registry["run"] =~ "https://repo.hex.pm/packages/replicant"
-    assert registry["run"] =~ ~S|python3 -I scripts/release/check_hex_registry.py "$VERSION" "$PACKAGE_SHA256"|
+
+    assert registry["run"] =~
+             ~S|python3 -I scripts/release/check_hex_registry.py "$VERSION" "$PACKAGE_SHA256"|
+
     assert Enum.at(read_back["steps"], 5)["run"] == @retain
     assert Enum.at(read_back["steps"], 5)["working-directory"] == "${{ runner.temp }}"
+
     assert read_back["outputs"]["published_commit"] ==
              "${{ steps.read_back.outputs.published_commit }}"
 
@@ -1125,8 +1144,10 @@ defmodule Replicant.PublishWorkflowTest do
           {qualification["jobs"]["release-artifact"], "${{ needs.toolchain.outputs.hex }}"}
         ] do
       refute job["env"]["HEX_VERSION"]
+
       assert [install] =
                Enum.filter(job["steps"], &((&1["run"] || "") =~ ~r/\bmix local\.hex\b/))
+
       assert install["run"] == ~s(mix local.hex "$HEX_VERSION" --force)
       assert install["env"] == %{"HEX_VERSION" => source}
     end
