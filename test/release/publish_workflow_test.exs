@@ -781,25 +781,30 @@ defmodule Replicant.PublishWorkflowTest do
   defp runtime_output_source!(workflow, job, steps, index) do
     reader = Enum.find_index(steps, &(&1["uses"] == @toolchain))
 
-    if is_integer(reader) do
-      assert reader < index
-      assert_reader_step!(steps)
-      "steps.toolchain.outputs"
-    else
-      if workflow["name"] == "Publish to Hex" do
-        assert "build" in List.wrap(job["needs"])
-        build = workflow["jobs"]["build"]
-        assert_reader_step!(build["steps"])
+    cond do
+      is_integer(reader) ->
+        assert reader < index
+        assert_reader_step!(steps)
+        "steps.toolchain.outputs"
 
-        for key <- ["elixir", "otp"] do
-          assert build["outputs"][key] == "${{ steps.toolchain.outputs.#{key} }}"
-        end
+      workflow["name"] == "Publish to Hex" ->
+        publish_runtime_outputs!(workflow, job)
 
-        "needs.build.outputs"
-      else
+      true ->
         qualification_runtime_outputs!(workflow, job)
-      end
     end
+  end
+
+  defp publish_runtime_outputs!(workflow, job) do
+    assert "build" in List.wrap(job["needs"])
+    build = workflow["jobs"]["build"]
+    assert_reader_step!(build["steps"])
+
+    for key <- ["elixir", "otp"] do
+      assert build["outputs"][key] == "${{ steps.toolchain.outputs.#{key} }}"
+    end
+
+    "needs.build.outputs"
   end
 
   defp qualification_runtime_outputs!(workflow, job) do
