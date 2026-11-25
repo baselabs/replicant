@@ -16,7 +16,7 @@ repo_root="${RELEASE_SOURCE:-$tooling_root}"
 log() { echo "consume_candidate: $*" >&2; }
 die() { echo "::error::consume_candidate: $*" >&2; exit 1; }
 
-version="$(grep -oE '@version "[^"]+"' "$repo_root/mix.exs" | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
+version="$(grep -oE '^[[:blank:]]*@version[[:blank:]]+"[^"]+"' "$repo_root/mix.exs" | head -1 | sed -E 's/^[[:blank:]]*@version[[:blank:]]+"([^"]+)"/\1/')"
 [[ $# -ge 1 && $# -le 3 ]] || die "usage: consume_candidate.sh TARBALL [DOCS_ARCHIVE] [EXPECTED_SHA256]"
 tarball="$1"
 docs_archive="${2:-}"

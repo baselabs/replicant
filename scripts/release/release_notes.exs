@@ -2,13 +2,6 @@
 defmodule Replicant.ReleaseNotes do
   @moduledoc false
 
-  def verify_changelog!(mixfile, changelog) do
-    case Regex.scan(~r/^  @version "([^"]+)"$/m, File.read!(mixfile)) do
-      [[_, version]] -> section!(File.read!(changelog), version)
-      _other -> raise "expected exactly one Mix project version; publication refused"
-    end
-  end
-
   def section!(changelog, version) do
     pattern = ~r/^## \[#{Regex.escape(version)}\][^\n]*(?:\n|\z).*?(?=^## |\z)/ms
 

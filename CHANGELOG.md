@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Publish from an explicitly selected qualified commit, with checksum-verified
   archives and upload decisions handed to a separate Hex workload identity job.
-  Keyless read-back retains the served archives and their published commit.
+  The selected source pins Hex in `.tool-versions`. Keyless read-back verifies the
+  signed registry record before retaining the served archives and published commit.
 
 ## [1.6.1] - 2026-11-24
 

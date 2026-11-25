@@ -105,13 +105,14 @@ Hex metadata still uses public unauthenticated reads.
 
 Publishing runs in [`.github/workflows/publish.yml`](.github/workflows/publish.yml),
 on GitHub-hosted Ubuntu 24.04 with the exact `.tool-versions` runtime. Qualification
-and publishing pin the same Hex version because Hex records its version in package
-metadata. No workstation publish command or credential-file loader remains.
+and publishing read Hex from the selected source's `.tool-versions` because Hex
+records its version in package metadata.
 
 After qualification, give infra the repository, full `release_commit`, version,
-release contents, and successful `qualified` run. Infra asks an owner (`corepay`
-or `palermo-git`) to dispatch **Publish to Hex** from the default branch with that
-40-character lowercase SHA. The same owner allowlist applies to reruns. The first
+release contents, and successful `qualified` run. Infra obtains the owner's
+approval and dispatches **Publish to Hex** from the default branch with that
+40-character lowercase SHA. Both the original and triggering actors must be
+`corepay` or `palermo-git`. The first
 job verifies default-branch ancestry, a successful GitHub Actions `qualified`
 check on that exact SHA, the version in its `mix.exs`, and the absence of its
 version tag. An anonymous Hex lookup requires the existing `replicant` package
@@ -142,14 +143,19 @@ Only the upload job enters the `publish` environment. It verifies the downloaded
 checksums and runs the standalone uploader with `mix run --no-mix-exs` in a
 temporary directory without a Mix project. When an upload is planned, the script
 exchanges GitHub workload identity for a short-lived `package:hexpm/replicant`
-token and revokes it when done. Package uploads disable replacement. The script
-rechecks the release and docs state immediately before a planned write.
+token and revokes it on exit. Runner cleanup retries revocation after failure
+or cancellation. Package uploads disable replacement. Hex's docs POST can
+replace an existing archive. The uploader checks served package bytes, release
+metadata, and docs absence in succession before sending it. The workflow
+serializes dispatches. Another Hex writer can still race the final absence
+check and the POST.
 If Hex holds either archive for approval, dispatch again with the same
 `release_commit` after approval. A held package can finish its docs upload once
 the package is publicly visible.
 
-Keyless read-back checks the served package against the inspected digest and
-requires an active release and readable served docs with `index.html` and valid
+Keyless read-back verifies the signed Hex registry entry for the version and
+outer checksum, checks the served package against that digest, and requires
+readable served docs with `index.html` and valid
 `release.json`. The docs commit must be `release_commit` or its ancestor in the
 fetched default-branch history. A docs build can vary in search data ordering,
 so the workflow preserves the served docs bytes and uses their provenance to

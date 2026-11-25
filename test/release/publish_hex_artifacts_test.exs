@@ -34,15 +34,7 @@ defmodule Replicant.PublishHexArtifactsTest do
     ])
 
   @docs_bytes docs_bytes
-  @docs_read ~s|docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), version)|
-  @docs_action ~s|docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?)|
-  @package_read ~s|package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)|
-  @read ~s|release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
-  @read_back ~s|read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)|
-  @exists ~s|existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))|
-  @package ~s|Hex.API.Release.publish(nil, package_bytes, auth)|
-  @docs ~s|Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs_bytes, auth)|
-  @guard ~s|if Mix.Project.get(), do: raise("publication must run without a Mix project")|
+  @commit String.duplicate("a", 40)
 
   test "only an existing package name permits publication" do
     assert :ok == PublishHexArtifacts.existing_package!(response(200, %{}))
@@ -106,40 +98,29 @@ defmodule Replicant.PublishHexArtifactsTest do
     assert Mix.Project.get()
 
     assert_raise RuntimeError, ~r/without a Mix project/, fn ->
-      PublishHexArtifacts.main(["0.0.0", "missing-package.tar", "missing-docs.tar.gz"])
+      PublishHexArtifacts.main([
+        @version,
+        @commit,
+        "missing-package.tar",
+        "missing-docs.tar.gz",
+        "missing-plan"
+      ])
     end
   end
 
-  test "read-back requires the exact live package, no retirement and served docs" do
-    assert :ok == PublishHexArtifacts.read_back!(response(200, metadata(true)), @version, @digest)
-
-    incomplete = [
-      response(404, %{}),
-      response(200, metadata(false)),
-      response(200, Map.put(metadata(true), "checksum", String.duplicate("b", 64))),
-      response(200, Map.put(metadata(true), "retirement", %{"reason" => "other"}))
-    ]
-
-    for result <- incomplete ++ failures() do
-      assert_raise RuntimeError, fn ->
-        PublishHexArtifacts.read_back!(result, @version, @digest)
-      end
-    end
-  end
-
-  test "package read-back requires the served archive's exact bytes" do
+  test "docs upload requires the served package archive's exact bytes" do
     package = "served package archive"
     digest = :crypto.hash(:sha256, package) |> Base.encode16(case: :lower)
-    assert :ok == PublishHexArtifacts.package_read_back!(response(200, package), digest)
+    assert :ok == PublishHexArtifacts.verify_package_bytes!(response(200, package), digest)
 
     assert_raise RuntimeError, ~r/package archive checksum differs/, fn ->
-      PublishHexArtifacts.package_read_back!(response(200, "different archive"), digest)
+      PublishHexArtifacts.verify_package_bytes!(response(200, "different archive"), digest)
     end
 
     for result <- [response(404, "private-response-value"), response(200, nil) | failures()] do
       error =
         assert_raise RuntimeError, fn ->
-          PublishHexArtifacts.package_read_back!(result, digest)
+          PublishHexArtifacts.verify_package_bytes!(result, digest)
         end
 
       refute Exception.message(error) =~ "private-response-value"
@@ -153,15 +134,8 @@ defmodule Replicant.PublishHexArtifactsTest do
 
     assert :upload == PublishHexArtifacts.docs_action!(response(404, %{}), false)
 
-    assert String.duplicate("c", 40) ==
-             PublishHexArtifacts.docs_read_back!(response(200, @docs_bytes), @version)
-
     {:ok, legacy} = :mix_hex_tarball.create_docs([{~c"index.html", "legacy docs"}])
     assert :skip == PublishHexArtifacts.docs_action!(response(200, legacy), true)
-
-    assert_raise RuntimeError, ~r/no release.json/, fn ->
-      PublishHexArtifacts.docs_read_back!(response(200, legacy), @version)
-    end
 
     malformed = [nil, "", "not gzip", <<0x1F, 0x8B, "not a tarball">>, :zlib.gzip("not tar")]
 
@@ -172,15 +146,6 @@ defmodule Replicant.PublishHexArtifactsTest do
 
         refute Exception.message(error) =~ "private-response-value"
       end
-    end
-
-    for result <- [response(404, %{}) | Enum.map(malformed, &response(200, &1))] ++ failures() do
-      error =
-        assert_raise RuntimeError, fn ->
-          PublishHexArtifacts.docs_read_back!(result, @version)
-        end
-
-      refute Exception.message(error) =~ "private-response-value"
     end
   end
 
@@ -214,74 +179,42 @@ defmodule Replicant.PublishHexArtifactsTest do
     end
   end
 
-  test "the isolated uploader gates both writes and reads both served artifacts back" do
+  test "the isolated uploader orders package and absence checks before its docs write" do
     source = File.read!(@script)
-    assert_isolated_upload!(source)
 
-    for {before, after_change} <- [
-          {@exists, ":ok"},
-          {@read, ":fresh"},
-          {@package, "mix hex.publish"},
-          {@docs, "mix docs"},
-          {"{:held, _docs?} ->", ":fresh ->"},
-          {":upload ->", ":skip ->"},
-          {@docs_action, ":skip"},
-          {"Replicant.ReleaseDocs.files!(bytes)", ":ok"},
-          {"Replicant.ReleaseDocs.provenance!(bytes, version)", ":ok"},
-          {"|> approved!()", "|> then(fn _ -> :ok end)"},
-          {@read_back, ":ok"},
-          {@package_read, ":ok"},
-          {@docs_read, ":ok"},
-          {"!= digest do", "== digest do"},
-          {~s|"checksum" => ^digest|, ~s|"checksum" => _checksum|},
-          {~s|"retirement" => nil|, ~s|"retirement" => _retirement|}
-        ] do
-      mutated = String.replace(source, before, after_change)
-      refute mutated == source
-      assert_raise ExUnit.AssertionError, fn -> assert_isolated_upload!(mutated) end
-    end
+    required = [
+      ~s|case String.split(File.read!(plan))|,
+      ~s|existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))|,
+      ~s|token = exchange!(config)|,
+      ~s|Hex.API.Release.publish(nil, package, auth, fn _ -> :ok end, replace: false)|,
+      ~s|if docs_plan == "upload" do|,
+      ~S|verify_package_bytes!(repo_archive("tarballs/replicant-#{version}.tar"), digest)|,
+      ~s|case served_release!(config, version, digest) do|,
+      ~S|docs_action!(repo_archive("docs/replicant-#{version}.tar.gz"), docs?) == :upload|,
+      ~s|Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs, auth)|,
+      "after\n      revoke!(config)"
+    ]
 
-    commands = ["System.cmd", "Code.require_file", "Mix.Task.run", "Mix.Project", "File.write!"]
+    offsets =
+      for checkpoint <- required do
+        assert {offset, _size} = :binary.match(source, checkpoint)
+        offset
+      end
 
-    for command <- commands do
-      mutated = source <> "\n" <> command
-      assert_raise ExUnit.AssertionError, fn -> assert_isolated_upload!(mutated) end
-    end
+    assert offsets == Enum.sort(offsets)
+    refute source =~ ~r/Mix\.Task|System\.cmd|deps\.get|mix docs|hex\.build/
   end
 
-  defp assert_isolated_upload!(source) do
-    assert source =~ @guard
+  test "the grant's token is kept before metadata validation and removed after revocation" do
+    source = File.read!(@script)
+    assert source =~ ~s|%{"access_token" => token} = grant|
+    assert {stored, _} =
+             :binary.match(source, "File.write(token_path(), token, [:binary, :exclusive])")
 
-    without_guard =
-      source
-      |> String.replace(@guard, "")
-      |> String.replace(~s|Code.require_file("release_docs.exs", __DIR__)|, "")
-
-    refute without_guard =~ ~r/System\.cmd|Code\.|Mix\.|File\.write|deps\.get|mix docs|hex\.build/
-    assert source =~ "package_bytes = File.read!(archive)"
-    assert source =~ "docs_bytes = File.read!(docs)"
-    assert source =~ ~s|"checksum" => ^digest|
-    assert source =~ ~s|"retirement" => nil|
-    parts = String.split(source, "case " <> @read <> " do")
-    assert length(parts) == 3
-    [before_package, package_case, docs_case] = parts
-    assert before_package =~ @exists
-    assert package_case =~ ":fresh ->\n        " <> @package
-    assert package_case =~ "{:held, _docs?} ->\n        :ok"
-    assert package_case =~ "|> accepted!(\"Hex package\")\n        |> approved!()"
-    assert docs_case =~ "{:held, docs?} ->"
-    assert docs_case =~ "case " <> @docs_action <> " do"
-    assert docs_case =~ ":upload ->\n            " <> @docs
-    assert docs_case =~ ":skip ->\n            :ok"
-    assert docs_case =~ "|> accepted!(\"Hex docs\")\n            |> approved!()"
-
-    assert docs_case =~ @read_back
-    assert docs_case =~ @package_read
-    assert docs_case =~ @docs_read
-    assert source =~ "Replicant.ReleaseDocs.files!(bytes)"
-    assert source =~ "Replicant.ReleaseDocs.provenance!(bytes, version)"
-    refute source =~ "docs_digest"
-    assert source =~ "Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) != digest do"
+    assert {validated, _} = :binary.match(source, "case {status, grant} do")
+    assert stored < validated
+    assert source =~ "revoke_token!(config, token)\n        File.rm!(token_path())"
+    assert source =~ ~s|:mix_hex_api.post(config, "oauth/revoke", %{"token" => token})|
   end
 
   defp metadata(docs?) do

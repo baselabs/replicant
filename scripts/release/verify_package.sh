@@ -31,7 +31,7 @@ fi
 expected_name="replicant"
 expected_version="${EXPECTED_VERSION:-}"
 if [[ -z "$expected_version" ]]; then
-  expected_version="$(grep -oE '@version "[^"]+"' "$repo_root/mix.exs" | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
+  expected_version="$(grep -oE '^[[:blank:]]*@version[[:blank:]]+"[^"]+"' "$repo_root/mix.exs" | head -1 | sed -E 's/^[[:blank:]]*@version[[:blank:]]+"([^"]+)"/\1/')"
 fi
 if [[ -z "$expected_version" ]]; then
   echo "::error::could not determine expected version" >&2

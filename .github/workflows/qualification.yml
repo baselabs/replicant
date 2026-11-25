@@ -14,9 +14,6 @@ on:
 permissions:
   contents: read
 
-env:
-  HEX_VERSION: "2.7.0"
-
 # Every run step uses bash -eo pipefail, so a failure behind a pipe fails its step
 # (the infrastructure CI requirements). Scripts the jobs call set -euo pipefail themselves.
 defaults:
@@ -60,6 +57,7 @@ jobs:
     outputs:
       elixir: ${{ steps.toolchain.outputs.elixir }}
       otp: ${{ steps.toolchain.outputs.otp }}
+      hex: ${{ steps.toolchain.outputs.hex }}
       matrix: ${{ steps.lanes.outputs.matrix }}
       engine-major: ${{ steps.lanes.outputs.engine-major }}
     steps:
@@ -138,6 +136,8 @@ jobs:
 
       # Match the publisher: Hex records its own version in the package bytes.
       - run: mix local.hex "$HEX_VERSION" --force
+        env:
+          HEX_VERSION: ${{ needs.toolchain.outputs.hex }}
       - run: mix local.rebar --force
       - run: mix deps.get --check-locked
       - run: mix audit

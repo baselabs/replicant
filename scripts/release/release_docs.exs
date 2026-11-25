@@ -30,10 +30,23 @@ defmodule Replicant.ReleaseDocs do
   end
 
   def fields!(json, version) do
-    case :json.decode(json) do
-      %{"package" => "replicant", "version" => ^version, "commit" => commit} = fields
+    decoders = %{
+      object_start: fn _acc -> %{} end,
+      object_push: fn key, value, fields ->
+        if Map.has_key?(fields, key), do: raise("duplicate release.json field")
+        Map.put(fields, key, value)
+      end,
+      object_finish: fn fields, acc -> {fields, acc} end
+    }
+
+    case :json.decode(json, nil, decoders) do
+      {%{"package" => "replicant", "version" => ^version, "commit" => commit} = fields, nil, rest}
       when map_size(fields) == 3 and is_binary(commit) ->
-        if Regex.match?(~r/\A[0-9a-f]{40}\z/, commit), do: commit, else: invalid_fields!()
+        if Regex.match?(~r/\A[0-9a-f]{40}\z/, commit) and Regex.match?(~r/\A[ \t\r\n]*\z/, rest) do
+          commit
+        else
+          invalid_fields!()
+        end
 
       _other ->
         invalid_fields!()

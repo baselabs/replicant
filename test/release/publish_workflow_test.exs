@@ -27,7 +27,11 @@ defmodule Replicant.PublishWorkflowTest do
   @selected "${{ needs.verify.outputs.release_commit }}"
   @version "${{ needs.verify.outputs.version }}"
   @workflow_revision "${{ github.workflow_sha }}"
-  @upload ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" "$VERSION" "$RELEASE_COMMIT" package.tar docs.tar.gz upload-plan|
+  @upload ~S"""
+  umask 077
+  mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" \
+    "$VERSION" "$RELEASE_COMMIT" package.tar docs.tar.gz upload-plan
+  """
   @retain ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/retain_release_assets.exs" "$VERSION" "$RELEASE_COMMIT" "$PACKAGE_SHA256" "$GITHUB_WORKSPACE/source" "$DEFAULT_BRANCH" "$RUNNER_TEMP/release-assets"|
 
   test "all workflows enforce the exact toolchain, hosted runners, and no caches" do
@@ -178,7 +182,7 @@ defmodule Replicant.PublishWorkflowTest do
     end
   end
 
-  test "every executable job has a measured timeout and rejects missing or invalid limits" do
+  test "every executable job documents its timeout and refuses invalid limits" do
     for path <- Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}")) do
       source = File.read!(path)
       assert_timeouts!(source)
@@ -203,13 +207,21 @@ defmodule Replicant.PublishWorkflowTest do
             line |> String.split(" #") |> hd(),
             Regex.replace(~r/Green run \d+|no green run yet/, line, "unknown"),
             String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 1"),
-            String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 30")
+            String.replace(line, ~r/timeout-minutes: \d+/, "timeout-minutes: 91")
           ] do
         mutated = String.replace(source, line, replacement)
         refute mutated == source
         assert_raise ExUnit.AssertionError, fn -> assert_timeouts!(mutated) end
       end
     end
+  end
+
+  test "a publish job can switch from its initial limit to a measured green limit" do
+    source = File.read!(@workflow)
+    initial = "timeout-minutes: 90 # no green run yet"
+    measured = "timeout-minutes: 7 # Green run 12345: build 3m15s"
+    assert_timeouts!(source)
+    assert_timeouts!(String.replace(source, initial, measured))
   end
 
   test "committed projects fetch locked and the generated consumer resolves without a borrowed lock" do
@@ -507,6 +519,31 @@ defmodule Replicant.PublishWorkflowTest do
     assert output =~ "Tag v1.2.3 already exists"
   end
 
+  @tag :tmp_dir
+  test "version gate counts assignments at every indentation before accepting a literal",
+       %{tmp_dir: directory} do
+    step = Enum.at(read_yaml!(@workflow)["jobs"]["verify"]["steps"], 5)
+    mixfile = Path.join(directory, "mix.exs")
+    output = Path.join(directory, "version-output")
+    variables = [{"GITHUB_OUTPUT", output}]
+
+    File.write!(mixfile, "\t   @version\t\"1.2.3-rc.1\"  # release\n")
+    assert {_, 0} = run_step(step, variables, directory)
+    assert File.read!(output) == "version=1.2.3-rc.1\n"
+
+    for contents <- [
+          "  @version \"1.2.3\"\n    @version current_version()\n",
+          "  @version \"1.2.3\"\n\t@version \"1.2.4\"\n",
+          "  @version \"1.2.3\"\n@version(\"1.2.4\")\n",
+          "@version current_version()\n",
+          "# @version \"1.2.3\"\n"
+        ] do
+      File.write!(mixfile, contents)
+      assert {message, 1} = run_step(step, variables, directory)
+      assert message =~ "expected exactly one literal Mix project version"
+    end
+  end
+
   test "qualification gate requires a successful GitHub Actions check on the exact SHA" do
     steps = read_yaml!(@workflow)["jobs"]["verify"]["steps"]
     qualify = Enum.at(steps, 4)
@@ -538,7 +575,9 @@ defmodule Replicant.PublishWorkflowTest do
         {["jobs", "upload", "steps", 4, "run"], "true"},
         {["jobs", "upload", "steps", 5, "working-directory"], "."},
         {["jobs", "read_back", "steps", 1, "with", "fetch-depth"], 1},
-        {["jobs", "read_back", "steps", 5, "if"], "always()"},
+        {["jobs", "upload", "steps", 6, "if"], "success()"},
+        {["jobs", "read_back", "steps", 4, "run"], "true"},
+        {["jobs", "read_back", "steps", 6, "if"], "always()"},
         {["jobs", "read_back", "environment"], "publish"},
         {["jobs", "build", "permissions", "id-token"], "write"},
         {["jobs", "upload", "env", "HEX_API_KEY"], "${{ secrets.HEX_API_KEY }}"}
@@ -789,9 +828,9 @@ defmodule Replicant.PublishWorkflowTest do
 
   defp assert_toolchain_action!(action) do
     assert action["inputs"]["path"]["default"] == ".tool-versions"
-    assert Enum.sort(Map.keys(action["outputs"])) == ["elixir", "otp"]
+    assert Enum.sort(Map.keys(action["outputs"])) == ["elixir", "hex", "otp"]
 
-    for key <- ["elixir", "otp"] do
+    for key <- ["elixir", "hex", "otp"] do
       assert action["outputs"][key]["value"] == "${{ steps.versions.outputs.#{key} }}"
     end
 
@@ -938,7 +977,7 @@ defmodule Replicant.PublishWorkflowTest do
     end
 
     assert Enum.at(build["steps"], 4)["run"] =~
-             ~s|verify_changelog!("source/mix.exs", "source/CHANGELOG.md")|
+             ~s|Replicant.ReleaseNotes.section!(File.read!("source/CHANGELOG.md"), hd(System.argv()))|
     assert Enum.at(build["steps"], 7)["run"] == "mix deps.get --check-locked"
     assert Enum.at(build["steps"], 7)["working-directory"] == "source"
     assert Enum.at(build["steps"], 8)["run"] ==
@@ -963,11 +1002,22 @@ defmodule Replicant.PublishWorkflowTest do
     assert Enum.at(upload["steps"], 5)["working-directory"] ==
              "${{ runner.temp }}/inspected-archives"
 
-    assert Enum.at(read_back["steps"], 4)["run"] == @retain
-    assert Enum.at(read_back["steps"], 4)["working-directory"] == "${{ runner.temp }}"
+    revoke = Enum.at(upload["steps"], 6)
+    assert revoke["if"] == "always()"
+    assert revoke["working-directory"] == "${{ runner.temp }}"
+    assert revoke["run"] =~ ~S|[ -f "$RUNNER_TEMP/replicant-hex-token" ]|
+    assert revoke["run"] =~ ~S|/publish_hex_artifacts.exs" revoke|
+
+    registry = Enum.at(read_back["steps"], 4)
+    refute registry["if"]
+    assert registry["run"] =~ "https://repo.hex.pm/packages/replicant"
+    assert registry["run"] =~ ~S|python3 -I scripts/release/check_hex_registry.py "$VERSION" "$PACKAGE_SHA256"|
+    assert Enum.at(read_back["steps"], 5)["run"] == @retain
+    assert Enum.at(read_back["steps"], 5)["working-directory"] == "${{ runner.temp }}"
     assert read_back["outputs"]["published_commit"] ==
              "${{ steps.read_back.outputs.published_commit }}"
-    assert_artifact!(read_back, 5, "release-assets", "release-assets", 7)
+
+    assert_artifact!(read_back, 6, "release-assets", "release-assets", 7)
   end
 
   defp assert_artifact!(job, index, name, directory, retention) do
@@ -1056,17 +1106,29 @@ defmodule Replicant.PublishWorkflowTest do
   end
 
   defp assert_hex!(publish, qualification) do
-    version = qualification["env"]["HEX_VERSION"]
-    assert version =~ ~r/^\d+\.\d+\.\d+$/
-    assert publish["env"]["HEX_VERSION"] == version
+    workflow_hex = "${{ steps.toolchain.outputs.hex }}"
 
-    for job <- [
-          publish["jobs"]["build"],
-          publish["jobs"]["upload"],
-          publish["jobs"]["read_back"],
-          qualification["jobs"]["release-artifact"]
+    for workflow <- [publish, qualification] do
+      refute workflow["env"]["HEX_VERSION"]
+    end
+
+    assert publish["jobs"]["build"]["outputs"]["hex"] == workflow_hex
+    assert qualification["jobs"]["toolchain"]["outputs"]["hex"] == workflow_hex
+    assert_reader_step!(publish["jobs"]["build"]["steps"])
+    assert_reader_step!(qualification["jobs"]["toolchain"]["steps"])
+    assert toolchain_versions!()["hex"] =~ ~r/^\d+\.\d+\.\d+$/
+
+    for {job, source} <- [
+          {publish["jobs"]["build"], workflow_hex},
+          {publish["jobs"]["upload"], "${{ needs.build.outputs.hex }}"},
+          {publish["jobs"]["read_back"], "${{ needs.build.outputs.hex }}"},
+          {qualification["jobs"]["release-artifact"], "${{ needs.toolchain.outputs.hex }}"}
         ] do
-      assert Enum.any?(job["steps"], &(&1["run"] == ~s(mix local.hex "$HEX_VERSION" --force)))
+      refute job["env"]["HEX_VERSION"]
+      assert [install] =
+               Enum.filter(job["steps"], &((&1["run"] || "") =~ ~r/\bmix local\.hex\b/))
+      assert install["run"] == ~s(mix local.hex "$HEX_VERSION" --force)
+      assert install["env"] == %{"HEX_VERSION" => source}
     end
   end
 
@@ -1081,8 +1143,8 @@ defmodule Replicant.PublishWorkflowTest do
     for {name, job} <- workflow["jobs"], not Map.has_key?(job, "uses") do
       [_, body] = Regex.run(~r/^  #{Regex.escape(name)}:\n(.*?)(?=^  [\w-]+:|\z)/ms, source)
 
-      if workflow["name"] == "Publish to Hex" do
-        assert body =~ "timeout-minutes: 90 # no green run yet"
+      if workflow["name"] == "Publish to Hex" and
+           body =~ ~r/^    timeout-minutes: 90 # no green run yet$/m do
         assert job["timeout-minutes"] == 90
       else
         measurement =

@@ -141,9 +141,9 @@ If CI goes red, fix forward in the next commit.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
 - For the release operator: give infra the repository, full qualified `release_commit`,
-  version, release contents, and green `qualified` run. Infra asks a permitted owner
-  (`corepay` or `palermo-git`, including the triggering actor on reruns) to dispatch
-  `.github/workflows/publish.yml` from the default branch with that exact lowercase SHA.
+  version, release contents, and green `qualified` run. Infra obtains the owner's approval and
+  dispatches `.github/workflows/publish.yml` from the default branch with that exact lowercase SHA.
+  Both the original and triggering actors must be `corepay` or `palermo-git`.
   The verify job requires default-branch ancestry, a successful `qualified` check on the SHA,
   the source version, an absent version tag, and an existing Hex package name.
   The keyless build fetches the selected commit and its history, checks its exact runtime,
@@ -156,10 +156,11 @@ If CI goes red, fix forward in the next commit.
   Only upload enters `publish`. It checks the downloaded bytes and runs
   `scripts/release/publish_hex_artifacts.exs` with `mix run --no-mix-exs` from a temporary
   directory without a Mix project. It exchanges and revokes a package-scoped workload
-  identity token, rechecks served state before writes, and preserves served archives.
+  identity token and retries revocation during runner cleanup. It checks served package bytes
+  and docs absence before the docs POST, which can replace docs if another writer races it.
   After approval of a held upload, dispatch again with the same `release_commit`.
-  Keyless read-back proves byte equality for the package and validates served docs and their
-  provenance. The docs commit must equal `release_commit` or be an ancestor of it on the
+  Keyless read-back checks the signed Hex registry entry for the version and outer checksum,
+  proves byte equality for the package, and validates served docs and their provenance. The docs commit must equal `release_commit` or be an ancestor of it on the
   default branch. The single `release-assets` artifact retains the served archives, their
   checksums and `published_commit`, which is also a job output. Infra compares the package
   with Hex, tags the published commit, and creates the GitHub release with notes from the
@@ -178,7 +179,8 @@ they touch a workflow, a Dockerfile, a release script or a secret.
 - An agent's work ends at `main`, and it lands through the landing tool and nothing else. It never
   releases, deploys, publishes, tags a version, dispatches a workflow, pushes an image by hand,
   or handles a release, publish or CI key. When something should go out, it sends the infrastructure
-  maintainers one message: the repository, the full commit, what goes out, and anything they need.
+  maintainers one message with the repository, full `release_commit`, version, what goes out,
+  and the green `qualified` run.
 - An agent writes its own workflow changes. Before landing a change to `.github/`, a Dockerfile,
   a release script or anything that touches a secret, it sends the infrastructure maintainers
   the branch and head and waits for their review. Any CI/CD, runner, box or key problem goes to

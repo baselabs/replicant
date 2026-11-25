@@ -1,9 +1,13 @@
 # Runs with --no-mix-exs: only Hex and the already inspected archives are loaded.
-# No dependency fetch, build, project code, credential persistence, or response logging.
+# No dependency fetch, build, or project code. A private runner file allows revocation
+# after cancellation. Its contents never enter an argument or log.
 Code.require_file("release_docs.exs", __DIR__)
 
 defmodule Replicant.PublishHexArtifacts do
   @moduledoc false
+
+  @scope "package:hexpm/replicant"
+  @audience "hexpm"
 
   def main([version, commit, archive, docs, plan]) do
     if Mix.Project.get(), do: raise("publication must run without a Mix project")
@@ -20,6 +24,12 @@ defmodule Replicant.PublishHexArtifacts do
     end
   end
 
+  def main(["revoke"]) do
+    if Mix.Project.get(), do: raise("revocation must run without a Mix project")
+    Hex.start()
+    revoke!(Hex.API.Client.config())
+  end
+
   def main(_argv),
     do: raise("usage: publish_hex_artifacts.exs VERSION COMMIT PACKAGE_ARCHIVE DOCS_ARCHIVE PLAN")
 
@@ -29,17 +39,10 @@ defmodule Replicant.PublishHexArtifacts do
     digest = :crypto.hash(:sha256, package) |> Base.encode16(case: :lower)
     config = Hex.API.Client.config()
 
-    token =
-      case request(fn ->
-             :mix_hex_cli_auth.workload_identity_auth(config, "package:hexpm/replicant")
-           end) do
-        {:ok, "Bearer " <> token} when token != "" -> token
-        _other -> raise "Hex workload identity did not grant a Replicant publish token"
-      end
-
-    auth = [key: token, oauth: true]
-
     try do
+      token = exchange!(config)
+      auth = [key: token, oauth: true]
+
       case {package_plan, served_release!(config, version, digest)} do
         {"upload", :fresh} ->
           request(fn ->
@@ -56,9 +59,13 @@ defmodule Replicant.PublishHexArtifacts do
       end
 
       if docs_plan == "upload" do
+        verify_package_bytes!(repo_archive("tarballs/replicant-#{version}.tar"), digest)
+
         case served_release!(config, version, digest) do
           {:held, docs?} ->
-            if docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?) == :upload do
+            # Hex's POST is an upsert. Revalidate the CDN absence after the
+            # package checks and make the POST the very next request.
+            if docs_action!(repo_archive("docs/replicant-#{version}.tar.gz"), docs?) == :upload do
               request(fn -> Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs, auth) end)
               |> accepted!("Hex docs")
               |> approved!()
@@ -69,11 +76,91 @@ defmodule Replicant.PublishHexArtifacts do
         end
       end
     after
-      case request(fn -> :mix_hex_api.post(config, "oauth/revoke", %{"token" => token}) end) do
-        {:ok, {200, _headers, _body}} -> :ok
-        _other -> raise "Hex workload identity token revocation failed"
-      end
+      revoke!(config)
     end
+  end
+
+  defp exchange!(config) do
+    result =
+      request(fn ->
+        with {:ok, {200, _, %{"audience" => @audience}}} <-
+               :mix_hex_api_oauth.oidc_audience(config),
+             {:ok, provider} <- :mix_hex_oidc.detect_provider(),
+             {:ok, assertion} <- :mix_hex_oidc.fetch_token(config, provider, @audience) do
+          :mix_hex_api_oauth.jwt_bearer_token(config, assertion, @scope)
+        end
+      end)
+
+    case result do
+      {:ok, {status, _, %{"access_token" => token} = grant}}
+      when is_binary(token) and byte_size(token) > 0 ->
+        # Keep even a malformed grant's token for revocation before inspecting
+        # the status, scope, type or lifetime.
+        case File.write(token_path(), token, [:binary, :exclusive]) do
+          :ok -> :ok
+          {:error, _reason} ->
+            revoke_token!(config, token)
+            raise "could not keep the Hex token for cancellation cleanup"
+        end
+
+        case {status, grant} do
+          {200, %{"scope" => @scope, "token_type" => "bearer", "expires_in" => ttl}}
+          when is_integer(ttl) and ttl in 1..900 ->
+            token
+
+          _other ->
+            raise "Hex workload identity grant metadata is invalid"
+        end
+
+      _other ->
+        raise "Hex workload identity did not return a Replicant publish token"
+    end
+  end
+
+  defp revoke!(config) do
+    case File.read(token_path()) do
+      {:ok, token} ->
+        revoke_token!(config, token)
+        File.rm!(token_path())
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, _reason} ->
+        raise "could not read the runner's Hex token for revocation"
+    end
+  end
+
+  defp revoke_token!(config, token) do
+    case request(fn -> :mix_hex_api.post(config, "oauth/revoke", %{"token" => token}) end) do
+      {:ok, {200, _headers, _body}} -> :ok
+      _other -> raise "Hex workload identity token revocation failed"
+    end
+  end
+
+  defp token_path, do: Path.join(System.fetch_env!("RUNNER_TEMP"), "replicant-hex-token")
+
+  def verify_package_bytes!({:ok, {200, _headers, bytes}}, digest) when is_binary(bytes) do
+    if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) != digest do
+      raise "Hex package archive checksum differs from the built package; publication refused"
+    end
+
+    :ok
+  end
+
+  def verify_package_bytes!(_response, _digest),
+    do: raise("Hex package archive is unavailable; dispatch again with the same release_commit")
+
+  defp repo_archive(path) do
+    request(fn ->
+      Hex.HTTP.request(
+        :get,
+        "https://repo.hex.pm/" <> path,
+        %{"cache-control" => "no-cache"},
+        :undefined,
+        %{max_body_size: 16 * 1024 * 1024}
+      )
+    end)
   end
 
   # HTTP adapters can raise with the original request embedded in the error.

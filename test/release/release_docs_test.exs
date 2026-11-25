@@ -57,6 +57,20 @@ defmodule Replicant.ReleaseDocsTest do
     assert_raise RuntimeError, ~r/archive is malformed/, fn -> ReleaseDocs.files!(no_index) end
   end
 
+  test "provenance refuses duplicate JSON keys after decoding escapes" do
+    for key <- ["package", "version", "commit", ~S(pack\u0061ge)] do
+      json =
+        ~s({"#{key}":"duplicate","package":"replicant","version":"#{@version}","commit":"#{@commit}"})
+
+      {:ok, docs} =
+        :mix_hex_tarball.create_docs([{~c"index.html", "index"}, {~c"release.json", json}])
+
+      assert_raise RuntimeError, ~r/release.json is invalid/, fn ->
+        ReleaseDocs.provenance!(docs, @version)
+      end
+    end
+  end
+
   test "missing provenance is accepted in planning and refused at read-back" do
     {:ok, legacy} = :mix_hex_tarball.create_docs([{~c"index.html", "legacy"}])
     assert [{~c"index.html", "legacy"}] == ReleaseDocs.files!(legacy)
@@ -147,12 +161,8 @@ defmodule Replicant.ReleaseDocsTest do
     refute File.exists?(refused)
   end
 
-  test "pre-build rejects invalid version sections", %{directory: dir} do
-    mixfile = Path.join(dir, "mix.exs")
-    changelog = Path.join(dir, "CHANGELOG.md")
-    File.write!(mixfile, "  @version \"#{@version}\"\n")
-    File.write!(changelog, @section)
-    assert ReleaseNotes.verify_changelog!(mixfile, changelog) == @section
+  test "pre-build rejects invalid version sections" do
+    assert ReleaseNotes.section!(@section, @version) == @section
 
     for invalid <- [
           "## [1.5.1]\n\n- Other release.\n",
@@ -163,24 +173,8 @@ defmodule Replicant.ReleaseDocsTest do
           "## [#{@version}]\n\n### Fixed\n\n### Changed\n\n",
           "## [#{@version}]\n\n### Fixed\n\n## [1.5.1]\n\n- Older notes.\n"
         ] do
-      File.write!(changelog, invalid)
-
       assert_raise RuntimeError, ~r/missing, duplicated or empty/, fn ->
-        ReleaseNotes.verify_changelog!(mixfile, changelog)
-      end
-    end
-  end
-
-  test "pre-build refuses an absent or ambiguous Mix project version", %{directory: dir} do
-    mixfile = Path.join(dir, "mix.exs")
-    changelog = Path.join(dir, "CHANGELOG.md")
-    File.write!(changelog, @section)
-
-    for contents <- ["", "  @version \"#{@version}\"\n  @version \"1.5.1\"\n"] do
-      File.write!(mixfile, contents)
-
-      assert_raise RuntimeError, ~r/exactly one Mix project version/, fn ->
-        ReleaseNotes.verify_changelog!(mixfile, changelog)
+        ReleaseNotes.section!(invalid, @version)
       end
     end
   end

@@ -11,16 +11,6 @@ defmodule Replicant.ReleaseAssets do
     package = served!(Hex.Repo.get_tarball("hexpm", "replicant", version))
     if sha256(package) != digest, do: raise("served package differs from inspected package")
 
-    case Hex.API.Release.get(nil, "replicant", version) do
-      {:ok,
-       {200, _headers,
-        %{"version" => ^version, "checksum" => ^digest, "retirement" => nil, "has_docs" => true}}} ->
-        :ok
-
-      _other ->
-        raise "served release identity is unavailable, retired, or different; read-back refused"
-    end
-
     docs = served!(Hex.Repo.get_docs("hexpm", "replicant", version))
     published = retain!(package, docs, version, output, commit, repository, branch)
     File.write!(System.fetch_env!("GITHUB_OUTPUT"), "published_commit=#{published}\n", [:append])

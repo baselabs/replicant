@@ -13,9 +13,6 @@ on:
 permissions:
   contents: read
 
-env:
-  HEX_VERSION: "2.7.0"
-
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -96,10 +93,14 @@ jobs:
           python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
           from pathlib import Path
           import re
-          matches = re.findall(r'^  @version "([^"\n]+)"$', Path('mix.exs').read_text(), re.M)
-          if len(matches) != 1 or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", matches[0]):
+          declarations = re.findall(r'^[ \t]*@version(?=[ \t(]|$)(.*)$', Path('mix.exs').read_text(), re.M)
+          version = re.fullmatch(
+              r'[ \t]+"([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"[ \t]*(?:#.*)?',
+              declarations[0],
+          ) if len(declarations) == 1 else None
+          if version is None:
               raise SystemExit("expected exactly one literal Mix project version")
-          print(f'version={matches[0]}')
+          print(f'version={version[1]}')
           PY
       - name: Refuse an existing release tag
         env:
@@ -146,6 +147,7 @@ jobs:
     outputs:
       elixir: ${{ steps.toolchain.outputs.elixir }}
       otp: ${{ steps.toolchain.outputs.otp }}
+      hex: ${{ steps.toolchain.outputs.hex }}
       package_sha256: ${{ steps.handoff.outputs.package_sha256 }}
       docs_sha256: ${{ steps.handoff.outputs.docs_sha256 }}
       plan_sha256: ${{ steps.handoff.outputs.plan_sha256 }}
@@ -176,9 +178,11 @@ jobs:
       - name: Refuse a missing, duplicated or empty release changelog section
         run: >-
           elixir -r scripts/release/release_notes.exs
-          -e 'Replicant.ReleaseNotes.verify_changelog!("source/mix.exs", "source/CHANGELOG.md")'
+          -e 'Replicant.ReleaseNotes.section!(File.read!("source/CHANGELOG.md"), hd(System.argv()))' -- "$VERSION"
 
       - run: mix local.hex "$HEX_VERSION" --force
+        env:
+          HEX_VERSION: ${{ steps.toolchain.outputs.hex }}
       - run: mix local.rebar --force
       - run: mix deps.get --check-locked
         working-directory: source
@@ -297,6 +301,8 @@ jobs:
           otp: ${{ needs.build.outputs.otp }}
 
       - run: mix local.hex "$HEX_VERSION" --force
+        env:
+          HEX_VERSION: ${{ needs.build.outputs.hex }}
         working-directory: ${{ runner.temp }}
 
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -321,9 +327,20 @@ jobs:
         env:
           HEX_API_URL: https://hex.pm/api
           HEX_WORKLOAD_IDENTITY_AUDIENCE: hexpm
-        run: >-
-          mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs"
-          "$VERSION" "$RELEASE_COMMIT" package.tar docs.tar.gz upload-plan
+        run: |
+          umask 077
+          mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" \
+            "$VERSION" "$RELEASE_COMMIT" package.tar docs.tar.gz upload-plan
+
+      - name: Revoke any outstanding Hex token
+        if: always()
+        working-directory: ${{ runner.temp }}
+        env:
+          HEX_API_URL: https://hex.pm/api
+        run: |
+          if [ -f "$RUNNER_TEMP/replicant-hex-token" ]; then
+            mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" revoke
+          fi
 
       - name: Remove inspected archives
         if: always()
@@ -361,7 +378,15 @@ jobs:
           otp: ${{ needs.build.outputs.otp }}
 
       - run: mix local.hex "$HEX_VERSION" --force
+        env:
+          HEX_VERSION: ${{ needs.build.outputs.hex }}
         working-directory: ${{ runner.temp }}
+
+      - name: Verify the signed Hex registry release
+        run: |
+          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 \
+            --max-filesize 16777216 https://repo.hex.pm/packages/replicant |
+            python3 -I scripts/release/check_hex_registry.py "$VERSION" "$PACKAGE_SHA256"
 
       - name: Read back served archives and prove docs provenance
         id: read_back

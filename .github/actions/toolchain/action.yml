@@ -11,6 +11,9 @@ outputs:
   otp:
     description: The default OTP version.
     value: ${{ steps.versions.outputs.otp }}
+  hex:
+    description: The Hex version used to build the package.
+    value: ${{ steps.versions.outputs.hex }}
 runs:
   using: composite
   steps:
