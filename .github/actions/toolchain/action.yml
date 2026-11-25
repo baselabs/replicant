@@ -1,5 +1,9 @@
 name: Runtime toolchain
 description: Read the exact runtime versions through the shared toolchain reader before installation.
+inputs:
+  path:
+    description: Tool versions file in the source checkout.
+    default: .tool-versions
 outputs:
   elixir:
     description: The default Elixir version.
@@ -16,4 +20,6 @@ runs:
     - name: Read the runtime versions
       id: versions
       shell: bash
-      run: scripts/toolchain.sh >> "$GITHUB_OUTPUT"
+      env:
+        TOOLCHAIN_PATH: ${{ inputs.path }}
+      run: scripts/toolchain.sh "$TOOLCHAIN_PATH" >> "$GITHUB_OUTPUT"

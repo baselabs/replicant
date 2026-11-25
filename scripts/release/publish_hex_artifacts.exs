@@ -5,55 +5,91 @@ Code.require_file("release_docs.exs", __DIR__)
 defmodule Replicant.PublishHexArtifacts do
   @moduledoc false
 
-  def main([version, archive, docs]) do
+  def main([version, commit, archive, docs, plan]) do
     if Mix.Project.get(), do: raise("publication must run without a Mix project")
 
-    # Read both files before uploading anything. The keyless build inspected these paths.
-    package_bytes = File.read!(archive)
-    docs_bytes = File.read!(docs)
-    key = System.fetch_env!("HEX_API_KEY")
-    if key == "", do: raise("HEX_API_KEY is empty; publication stopped")
-    Hex.start()
-    auth = [key: key]
-
-    # A missing release alone cannot prove the package name already exists.
-    existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))
-    digest = :crypto.hash(:sha256, package_bytes) |> Base.encode16(case: :lower)
-
-    case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
-      :fresh ->
-        Hex.API.Release.publish(nil, package_bytes, auth)
-        |> accepted!("Hex package")
-        |> approved!()
-
-      {:held, _docs?} ->
-        :ok
-    end
-
-    # Re-read after the package decision: docs may have appeared in the meantime.
-    case release_state!(Hex.API.Release.get(nil, "replicant", version), version, digest) do
-      {:held, docs?} ->
-        case docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?) do
-          :upload ->
-            Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs_bytes, auth)
-            |> accepted!("Hex docs")
-            |> approved!()
-
-          :skip ->
-            :ok
+    case String.split(File.read!(plan)) do
+      [^commit, ^version, package_plan, docs_plan]
+      when package_plan in ["upload", "skip"] and docs_plan in ["upload", "skip"] ->
+        if package_plan == "upload" or docs_plan == "upload" do
+          publish!(version, File.read!(archive), File.read!(docs), package_plan, docs_plan)
         end
 
-      :fresh ->
-        raise "Hex package is not served yet; inspect public state before retrying"
+      _other ->
+        raise "upload plan does not match this release"
     end
-
-    read_back!(Hex.API.Release.get(nil, "replicant", version), version, digest)
-    package_read_back!(Hex.Repo.get_tarball("hexpm", "replicant", version), digest)
-    docs_read_back!(Hex.Repo.get_docs("hexpm", "replicant", version), version)
   end
 
   def main(_argv),
-    do: raise("usage: publish_hex_artifacts.exs VERSION PACKAGE_ARCHIVE DOCS_ARCHIVE")
+    do: raise("usage: publish_hex_artifacts.exs VERSION COMMIT PACKAGE_ARCHIVE DOCS_ARCHIVE PLAN")
+
+  defp publish!(version, package, docs, package_plan, docs_plan) do
+    Hex.start()
+    existing_package!(Hex.API.Package.get_anonymous(nil, "replicant"))
+    digest = :crypto.hash(:sha256, package) |> Base.encode16(case: :lower)
+    config = Hex.API.Client.config()
+
+    token =
+      case request(fn ->
+             :mix_hex_cli_auth.workload_identity_auth(config, "package:hexpm/replicant")
+           end) do
+        {:ok, "Bearer " <> token} when token != "" -> token
+        _other -> raise "Hex workload identity did not grant a Replicant publish token"
+      end
+
+    auth = [key: token, oauth: true]
+
+    try do
+      case {package_plan, served_release!(config, version, digest)} do
+        {"upload", :fresh} ->
+          request(fn ->
+            Hex.API.Release.publish(nil, package, auth, fn _ -> :ok end, replace: false)
+          end)
+          |> accepted!("Hex package")
+          |> approved!()
+
+        {"skip", :fresh} ->
+          raise "Hex no longer serves the planned package; publication refused"
+
+        {_plan, {:held, _docs?}} ->
+          :ok
+      end
+
+      if docs_plan == "upload" do
+        case served_release!(config, version, digest) do
+          {:held, docs?} ->
+            if docs_action!(Hex.Repo.get_docs("hexpm", "replicant", version), docs?) == :upload do
+              request(fn -> Hex.API.ReleaseDocs.publish(nil, "replicant", version, docs, auth) end)
+              |> accepted!("Hex docs")
+              |> approved!()
+            end
+
+          :fresh ->
+            raise "Hex package is not served yet; dispatch again with the same release_commit"
+        end
+      end
+    after
+      case request(fn -> :mix_hex_api.post(config, "oauth/revoke", %{"token" => token}) end) do
+        {:ok, {200, _headers, _body}} -> :ok
+        _other -> raise "Hex workload identity token revocation failed"
+      end
+    end
+  end
+
+  # HTTP adapters can raise with the original request embedded in the error.
+  defp request(function) do
+    function.()
+  rescue
+    _error -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  defp served_release!(config, version, digest) do
+    # Recheck before each write, bypassing the public release metadata's cache.
+    config = Map.update!(config, :http_headers, &Map.put(&1, "cache-control", "no-cache"))
+    :mix_hex_api_release.get(config, "replicant", version) |> release_state!(version, digest)
+  end
 
   def existing_package!({:ok, {200, _headers, _body}}), do: :ok
 
@@ -102,25 +138,7 @@ defmodule Replicant.PublishHexArtifacts do
   def approved!(:published), do: :ok
 
   def approved!(:staged),
-    do: raise("Hex approval pending; inspect public state before retrying the same commit")
-
-  def read_back!(response, version, digest) do
-    case release_state!(response, version, digest) do
-      {:held, true} -> :ok
-      _other -> raise "Hex package or docs are not served; inspect public state before retrying"
-    end
-  end
-
-  def package_read_back!({:ok, {200, _headers, bytes}}, digest) when is_binary(bytes) do
-    if Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) != digest do
-      raise "Hex package archive checksum differs from the built package; publication refused"
-    end
-
-    :ok
-  end
-
-  def package_read_back!(_response, _digest),
-    do: raise("Hex package archive is unavailable; inspect public state before retrying")
+    do: raise("Hex approval pending; inspect public state then dispatch again with the same release_commit")
 
   # Read the served archive's raw bytes from the repository. The docs API
   # (Hex.API.ReleaseDocs.get) decodes responses by content type and returns a nil
@@ -139,14 +157,6 @@ defmodule Replicant.PublishHexArtifacts do
     do: raise("Hex docs metadata and repository disagree; inspect public state before retrying")
 
   def docs_action!(_response, _required?),
-    do: raise("Hex docs archive is unavailable; inspect public state before retrying")
-
-  # The following keyless retention step proves this commit's default-branch ancestry.
-  def docs_read_back!({:ok, {200, _headers, bytes}}, version) do
-    Replicant.ReleaseDocs.provenance!(bytes, version)
-  end
-
-  def docs_read_back!(_response, _version),
     do: raise("Hex docs archive is unavailable; inspect public state before retrying")
 end
 

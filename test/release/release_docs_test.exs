@@ -68,8 +68,8 @@ defmodule Replicant.ReleaseDocsTest do
 
   test "real git ancestry accepts the dispatched commit and its ancestors", %{directory: dir} do
     {ancestor, dispatched} = history!(dir)
-    assert :ok == ReleaseAssets.verify_history!(dispatched, dispatched, dir)
-    assert :ok == ReleaseAssets.verify_history!(ancestor, dispatched, dir)
+    assert :ok == ReleaseDocs.verify_history!(dispatched, dispatched, dir, "main")
+    assert :ok == ReleaseDocs.verify_history!(ancestor, dispatched, dir, "main")
 
     # An unrelated real commit is valid Git data but is not on the default history.
     tree = git!(dir, ["rev-parse", "HEAD^{tree}"])
@@ -83,14 +83,14 @@ defmodule Replicant.ReleaseDocsTest do
           {"HEAD", dispatched}
         ] do
       assert_raise RuntimeError, ~r/default-branch history/, fn ->
-        ReleaseAssets.verify_history!(published, source, dir)
+        ReleaseDocs.verify_history!(published, source, dir, "main")
       end
     end
 
     git!(dir, ["update-ref", "-d", "refs/remotes/origin/main"])
 
     assert_raise RuntimeError, ~r/default-branch history/, fn ->
-      ReleaseAssets.verify_history!(ancestor, dispatched, dir)
+      ReleaseDocs.verify_history!(ancestor, dispatched, dir, "main")
     end
   end
 
@@ -103,7 +103,7 @@ defmodule Replicant.ReleaseDocsTest do
 
     for path <- [clone, Path.join(dir, "missing")] do
       assert_raise RuntimeError, ~r/default-branch history/, fn ->
-        ReleaseAssets.verify_history!(dispatched, dispatched, path)
+        ReleaseDocs.verify_history!(dispatched, dispatched, path, "main")
       end
     end
   end
@@ -113,9 +113,9 @@ defmodule Replicant.ReleaseDocsTest do
     docs = archive(Map.put(metadata(), "commit", ancestor))
     output = Path.join(dir, "release-assets")
     package = package!(dir, @section <> "\n\n## [1.5.1]\n\n- Older notes.\n")
-    File.write!(Path.join(dir, "CHANGELOG.md"), "## [#{@version}]\n\n- Workspace-only notes.\n")
 
-    assert ancestor == ReleaseAssets.retain!(package, docs, @version, output, dispatched, dir)
+    assert ancestor ==
+             ReleaseAssets.retain!(package, docs, @version, output, dispatched, dir, "main")
     assert File.read!(Path.join(output, "replicant-#{@version}.tar")) == package
     assert File.read!(Path.join(output, "replicant-#{@version}-docs.tar.gz")) == docs
     assert File.read!(Path.join(output, "published_commit")) == ancestor <> "\n"
@@ -130,31 +130,24 @@ defmodule Replicant.ReleaseDocsTest do
       assert checksums =~ "#{digest}  #{name}\n"
     end
 
-    notes = File.read!(Path.join(output, "RELEASE-NOTES.md"))
-    package_digest = Base.encode16(:crypto.hash(:sha256, package), case: :lower)
-    docs_digest = Base.encode16(:crypto.hash(:sha256, docs), case: :lower)
-
-    assert notes ==
-             "#{@section}\n\nCommit: #{ancestor}\n\n" <>
-               "Package SHA-256: #{package_digest}\n\nDocs SHA-256: #{docs_digest}\n"
-
-    refute notes =~ dispatched
-    refute notes =~ "Older notes"
-    refute notes =~ "Workspace-only notes"
+    assert Enum.sort(File.ls!(output)) == [
+             "SHA256SUMS",
+             "published_commit",
+             "replicant-#{@version}-docs.tar.gz",
+             "replicant-#{@version}.tar"
+           ]
 
     refused = Path.join(dir, "refused-assets")
     invalid = archive(Map.put(metadata(), "commit", String.duplicate("0", 40)))
 
     assert_raise RuntimeError, fn ->
-      ReleaseAssets.retain!(package, invalid, @version, refused, dispatched, dir)
+      ReleaseAssets.retain!(package, invalid, @version, refused, dispatched, dir, "main")
     end
 
     refute File.exists?(refused)
   end
 
-  test "pre-build and read-back reject invalid version sections", %{directory: dir} do
-    {ancestor, dispatched} = history!(dir)
-    docs = archive(Map.put(metadata(), "commit", ancestor))
+  test "pre-build rejects invalid version sections", %{directory: dir} do
     mixfile = Path.join(dir, "mix.exs")
     changelog = Path.join(dir, "CHANGELOG.md")
     File.write!(mixfile, "  @version \"#{@version}\"\n")
@@ -175,16 +168,6 @@ defmodule Replicant.ReleaseDocsTest do
       assert_raise RuntimeError, ~r/missing, duplicated or empty/, fn ->
         ReleaseNotes.verify_changelog!(mixfile, changelog)
       end
-
-      package = package!(dir, invalid)
-      output = Path.join(dir, "refused-assets")
-      File.write!(changelog, @section)
-
-      assert_raise RuntimeError, ~r/missing, duplicated or empty/, fn ->
-        ReleaseAssets.retain!(package, docs, @version, output, dispatched, dir)
-      end
-
-      refute File.exists?(output)
     end
   end
 
@@ -202,45 +185,8 @@ defmodule Replicant.ReleaseDocsTest do
     end
   end
 
-  test "release notes reject malformed or incomplete packages", %{directory: dir} do
-    missing_contents = tar!(dir, "package.tar", [])
-    missing_changelog = package!(dir, nil)
-
-    duplicate_contents =
-      tar!(dir, "package.tar", [
-        {~c"contents.tar.gz", "invalid"},
-        {~c"contents.tar.gz", "invalid"}
-      ])
-
-    contents =
-      tar!(
-        dir,
-        "contents.tar.gz",
-        [{~c"CHANGELOG.md", @section}, {~c"CHANGELOG.md", @section}],
-        [:compressed]
-      )
-
-    duplicate_changelog = tar!(dir, "package.tar", [{~c"contents.tar.gz", contents}])
-
-    for bytes <- [
-          "private-response-value",
-          missing_contents,
-          missing_changelog,
-          duplicate_contents,
-          duplicate_changelog
-        ] do
-      error =
-        assert_raise RuntimeError, ~r/Hex package changelog is missing or malformed/, fn ->
-          ReleaseNotes.package_section!(bytes, @version)
-        end
-
-      refute Exception.message(error) =~ "private-response-value"
-    end
-  end
-
   defp package!(directory, changelog) do
-    files = if is_nil(changelog), do: [], else: [{~c"CHANGELOG.md", changelog}]
-    contents = tar!(directory, "contents.tar.gz", files, [:compressed])
+    contents = tar!(directory, "contents.tar.gz", [{~c"CHANGELOG.md", changelog}], [:compressed])
     tar!(directory, "package.tar", [{~c"contents.tar.gz", contents}])
   end
 

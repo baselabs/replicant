@@ -11,7 +11,8 @@
 # Usage: consume_candidate.sh TARBALL [DOCS_ARCHIVE] [EXPECTED_SHA256]
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="${RELEASE_SOURCE:-$tooling_root}"
 log() { echo "consume_candidate: $*" >&2; }
 die() { echo "::error::consume_candidate: $*" >&2; exit 1; }
 
@@ -60,13 +61,15 @@ cp "$repo_root/mix.lock" "$src/mix.lock"
 
 # Archive and inspect the rendered docs before the credentialed step can run.
 if [[ -n "$docs_archive" ]]; then
+  commit="$(git -C "$repo_root" rev-parse HEAD)"
+  [[ "$commit" == "${RELEASE_COMMIT:-$commit}" ]] || die "docs source differs from release_commit"
   [[ -f "$src/doc/index.html" ]] || die "docs have no index.html"
   special_entry="$(find "$src/doc" ! -type f ! -type d -print -quit)"
   [[ -z "$special_entry" ]] || die "docs contain a link or special entry"
-  ( cd "$scratch" && mix run --no-mix-exs "$repo_root/scripts/release/build_docs_archive.exs" \
-      "$src/doc" "$docs_archive" "$version" "$GITHUB_SHA" ) >&2
-  python3 -I "$repo_root/scripts/release/check_docs_archive.py" \
-    "$docs_archive" "$src/doc" "$version" "$GITHUB_SHA" >&2
+  ( cd "$scratch" && mix run --no-mix-exs "$tooling_root/scripts/release/build_docs_archive.exs" \
+      "$src/doc" "$docs_archive" "$version" "$commit" ) >&2
+  python3 -I "$tooling_root/scripts/release/check_docs_archive.py" \
+    "$docs_archive" "$src/doc" "$version" "$commit" >&2
 fi
 
 # --- 3. A brand-new consumer that depends ONLY on the extracted source. ----------------------

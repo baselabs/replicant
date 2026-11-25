@@ -3,7 +3,8 @@
 # Check mode removes all artifacts; publication retains only the inspected paths.
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+repo_root="${RELEASE_SOURCE:-$tooling_root}"
 cd "$repo_root"
 
 usage() {
@@ -21,8 +22,10 @@ die() { echo "::error::build_candidate: $*" >&2; exit 1; }
 tree_status="$(git status --porcelain)"
 [[ -z "$tree_status" ]] || die "working tree is dirty"
 commit="$(git rev-parse HEAD)"
+[[ "$commit" == "${RELEASE_COMMIT:-$commit}" ]] || die "checkout differs from release_commit"
 version="$(grep -oE '@version "[^"]+"' mix.exs | head -1 | sed -E 's/@version "([^"]+)"/\1/')"
 [[ -n "$version" ]] || die "could not read package version"
+[[ "$version" == "${VERSION:-$version}" ]] || die "checkout version differs from verified version"
 
 build_tree="$(mktemp -d "${TMPDIR:-/tmp}/replicant-package.XXXXXX")"
 output_owned=0
@@ -59,7 +62,8 @@ tar -xf "$source_archive" -C "$rebuild_tree"
 cmp -s "$package" "$rebuild_tree/package.tar" || die "package build is not byte-reproducible"
 
 EXPECTED_VERSION="$version" bash "$repo_root/scripts/release/verify_package.sh" "$package" >&2
-bash "$repo_root/scripts/release/consume_candidate.sh" "$package" "$output_dir/docs.tar.gz" >&2
+RELEASE_SOURCE="$repo_root" RELEASE_COMMIT="$commit" \
+  bash "$tooling_root/scripts/release/consume_candidate.sh" "$package" "$output_dir/docs.tar.gz" >&2
 # The upload step receives these same inspected file paths, with no intervening rebuild.
 chmod a-w "$package" "$output_dir/docs.tar.gz"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then

@@ -42,6 +42,22 @@ defmodule Replicant.ReleaseDocs do
     _error -> invalid_fields!()
   end
 
+  def verify_history!(published, release_commit, repository, branch) do
+    valid? = Enum.all?([published, release_commit], &Regex.match?(~r/\A[0-9a-f]{40}\z/, &1))
+
+    with true <- valid?,
+         {"false\n", 0} <- git(repository, ["rev-parse", "--is-shallow-repository"]),
+         {_output, 0} <-
+           git(repository, ["merge-base", "--is-ancestor", release_commit, "refs/remotes/origin/#{branch}"]),
+         {_output, 0} <- git(repository, ["merge-base", "--is-ancestor", published, release_commit]) do
+      :ok
+    else
+      _other -> raise "docs commit is outside the selected default-branch history; publication refused"
+    end
+  end
+
+  defp git(repository, args), do: System.cmd("git", ["-C", repository | args], stderr_to_stdout: true)
+
   defp invalid_fields!, do: raise("Hex docs release.json is invalid; publication refused")
 
   defp safe_name?(name) do

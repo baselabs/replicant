@@ -174,6 +174,20 @@ defmodule Replicant.ReleaseContractTest do
     assert File.read!(@workflow) =~ "bash scripts/release/build_candidate.sh --check"
   end
 
+  test "the selected source commit binds both archive builds and docs provenance" do
+    builder = File.read!(@builder)
+    consumer = File.read!(Path.expand("../../scripts/release/consume_candidate.sh", __DIR__))
+
+    assert builder =~ ~S|${RELEASE_SOURCE:-$tooling_root}|
+    assert builder =~ ~S|"$commit" == "${RELEASE_COMMIT:-$commit}"|
+    assert builder =~ ~S|RELEASE_SOURCE="$repo_root" RELEASE_COMMIT="$commit"|
+    assert consumer =~ ~S|commit="$(git -C "$repo_root" rev-parse HEAD)"|
+    assert consumer =~ ~S|"$commit" == "${RELEASE_COMMIT:-$commit}"|
+    assert consumer =~ ~S|"$src/doc" "$docs_archive" "$version" "$commit"|
+    assert consumer =~ ~S|"$docs_archive" "$src/doc" "$version" "$commit"|
+    refute consumer =~ "GITHUB_SHA"
+  end
+
   test "the archive builder leaves release registry lookups to the workflows" do
     source = File.read!(@builder)
     assert_no_release_lookup!(source)

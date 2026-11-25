@@ -20,38 +20,21 @@ password-authenticated startup, stable readiness, and unconditional cleanup.
 The plugin image uses declared bases and full source commits. This CI substrate
 change leaves the library API and decoder guarantees unchanged.
 
-Publication builds and inspects package and docs without a registry key. A second
-owner dispatch can finish a held, untagged release when its package checksum
-matches the newly built package and the release is not retired. Docs render once
-with warnings as errors. The builder adds a top-level `release.json` with exactly
-`package`, `version`, and the full CI `GITHUB_SHA` as `commit`, then inspects every
-file and the provenance fields. ExDoc 0.40.4 fixes highlighting IDs; HTML and
-Markdown ship without EPUB in a sorted Hex archive with fixed archive metadata.
-Under infra's release rule, this path never replaces or compares served docs;
-it keeps them and reads them back by presence and `release.json` provenance.
-Hex itself allows docs republishing, but replacing docs on resume could rebind
-their provenance away from the commit infra tags. Comparing a rebuild would
-refuse a held release whose package bytes match. A readable served docs tarball
-is kept. Upload requires both `has_docs: false` and a repository 404; a 404 with
-`has_docs: true` refuses the disagreement. Other statuses and malformed responses
-also refuse.
+Publication selects a qualified `release_commit` on the default branch.
+The keyless build inspects the package and docs, checks the packaged changelog,
+and plans missing Hex uploads. The uploader verifies the inspected archives and
+uses a short-lived package-scoped workload identity token in the `publish`
+environment. A dispatch with the same `release_commit` can finish a held release
+when the active release's served package matches the inspected bytes.
 
-Read-back compares the package bytes, requires served docs with `index.html` and
-valid package/version provenance, and proves the docs commit equals or precedes
-the dispatched commit on fetched, complete default-branch history. Missing
-history or provenance refuses. Equal package bytes alone do not identify the
-docs commit because the producer lock is not packaged. A keyless step retains
-Hex's served archives and computes their `SHA256SUMS`, records `published_commit`,
-and exposes it as a step output. It writes `RELEASE-NOTES.md` from the changelog
-section inside the served package, with the published commit and both archive
-digests. Missing, duplicated or empty sections refuse before the build and again
-at read-back. Infra tags that published commit and creates the
-GitHub release from the retained assets. Consumers use the
-[GitHub release](https://github.com/baselabs/replicant/releases) for verification;
-the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only)
-describes the checksum and provenance checks. After infra reports read-back and
-the tag, this repository records the verified package digest through normal
-landing; held versions do not rewrite `scripts/release/published_packages.sha256`.
+Read-back retains the served archives and their `SHA256SUMS` and checks
+`release.json` against the selected release history. Infra tags the published
+commit from served docs and derives release notes from the changelog in the
+compared package. Consumers verify against the
+[GitHub release](https://github.com/baselabs/replicant/releases), as described in
+the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only).
+Once infra reports the tag and read-back, the repository records the verified
+digest in `scripts/release/published_packages.sha256` through normal landing.
 
 The initial sequencing plan below is complete, and both packages have continued
 through later releases:

@@ -14,17 +14,8 @@ defmodule Replicant.PublishWorkflowTest do
   @checkout "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
   @beam "erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124"
   @artifact "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
-  @retain ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/retain_release_assets.exs" "$PACKAGE_VERSION" "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/release-assets"|
-  @notes ~S|elixir -r scripts/release/release_notes.exs -e 'Replicant.ReleaseNotes.verify_changelog!("mix.exs", "CHANGELOG.md")'|
   # Infra baselabs/docs/ci.md, with the package path substituted.
   @stamp_sha256 "3f610675f09f526548a79003f5ab6b129e07b0f49bd5bdd9d25cf2da3ebbe6f4"
-  @release_identity ~S"""
-  elixir -r scripts/release/package_identity.exs \
-    -e '
-      [version, commit, archive] = System.argv()
-      Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive)
-    ' -- "$VERSION" "$SOURCE_COMMIT" "$RUNNER_TEMP/replicant-release/package.tar"
-  """
   @example_image ~r/\Ahexpm\/elixir:(\d+\.\d+\.\d+)-erlang-(\d+\.\d+\.\d+)-\S+@sha256:[0-9a-f]{64}\z/
   @owners Enum.join(
             [
@@ -33,7 +24,11 @@ defmodule Replicant.PublishWorkflowTest do
             ],
             " && "
           )
-  @upload ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" "$PACKAGE_VERSION" "$RUNNER_TEMP/replicant-release/package.tar" "$RUNNER_TEMP/replicant-release/docs.tar.gz"|
+  @selected "${{ needs.verify.outputs.release_commit }}"
+  @version "${{ needs.verify.outputs.version }}"
+  @workflow_revision "${{ github.workflow_sha }}"
+  @upload ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" "$VERSION" "$RELEASE_COMMIT" package.tar docs.tar.gz upload-plan|
+  @retain ~S|mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/retain_release_assets.exs" "$VERSION" "$RELEASE_COMMIT" "$PACKAGE_SHA256" "$GITHUB_WORKSPACE/source" "$DEFAULT_BRANCH" "$RUNNER_TEMP/release-assets"|
 
   test "all workflows enforce the exact toolchain, hosted runners, and no caches" do
     paths = Path.wildcard(Path.join(@repo_root, ".github/workflows/*.{yml,yaml}"))
@@ -460,227 +455,98 @@ defmodule Replicant.PublishWorkflowTest do
     assert output =~ "toolchain self-test:"
   end
 
-  test "publish is owner-dispatched with one environment secret and guarded exact-byte upload" do
+  test "publication verifies the selected source before building, uploading or retaining bytes" do
     assert_publish!(read_yaml!(@workflow))
   end
 
-  # Each mutation starts from the passing real workflow.
-  for {name, path, value} <- [
-        {"automatic trigger", ["on", "push"], %{}},
-        {"missing dispatch", ["on"], %{}},
-        {"dispatch input", ["on", "workflow_dispatch"], %{"inputs" => %{}}},
-        {"wrong environment", ["jobs", "publish", "environment"], "production"},
-        {"missing owner guard", ["jobs", "publish", "if"], nil},
-        {"unguarded triggering actor", ["jobs", "publish", "if"], "github.actor == 'corepay'"},
-        {"write permission", ["permissions", "contents"], "write"},
-        {"job write permission", ["jobs", "publish", "permissions", "contents"], "write"},
-        {"Actions permission", ["jobs", "publish", "permissions", "actions"], "read"},
-        {"extra workflow permission", ["permissions", "actions"], "read"},
-        {"persisted key", ["jobs", "publish", "steps", 2, "with", "persist-credentials"], true},
-        {"unpinned checkout", ["jobs", "publish", "steps", 2, "uses"], "actions/checkout@main"},
-        {"unpinned source", ["jobs", "publish", "steps", 2, "with", "ref"], "main"},
-        {"branch dispatch", ["jobs", "publish", "steps", 0, "run"], "true"},
-        {"missing package refusal", ["jobs", "publish", "steps", 1, "run"], "true"},
-        {"missing archives", ["jobs", "publish", "steps", 9, "run"], "true"},
-        {"bypassed changelog stamp", ["jobs", "publish", "steps", 10, "run"], "true"},
-        {"skipped changelog stamp", ["jobs", "publish", "steps", 10, "if"], "false"},
-        {"wrong changelog stamp version", ["jobs", "publish", "steps", 10, "env", "VERSION"],
-         "9.9.9"},
-        {"bypassed release identity", ["jobs", "publish", "steps", 11, "run"], "true"},
-        {"skipped release identity", ["jobs", "publish", "steps", 11, "if"], "false"},
-        {"wrong source commit", ["jobs", "publish", "steps", 11, "env", "SOURCE_COMMIT"],
-         "${{ github.sha }}"},
-        {"unpinned release assets", ["jobs", "publish", "steps", 14, "uses"],
-         "actions/upload-artifact@v7.0.2"},
-        {"wrong artifact name", ["jobs", "publish", "steps", 14, "with", "name"], "other"},
-        {"wrong artifact path", ["jobs", "publish", "steps", 14, "with", "path"], "."},
-        {"missing artifact files", ["jobs", "publish", "steps", 14, "with", "if-no-files-found"],
-         "warn"},
-        {"long artifact retention", ["jobs", "publish", "steps", 14, "with", "retention-days"],
-         90},
-        {"assets on failed read-back", ["jobs", "publish", "steps", 14, "if"], "always()"},
-        {"wrong secret", ["jobs", "publish", "steps", 12, "env", "HEX_API_KEY"],
-         "${{ secrets.OTHER_KEY }}"},
-        {"job credential", ["jobs", "publish", "env"],
-         %{"HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}"}}
+  test "publication refuses short, uppercase and nonliteral release commit input" do
+    [_, validate | _] = read_yaml!(@workflow)["jobs"]["verify"]["steps"]
+    valid = String.duplicate("a", 40)
+
+    for input <- ["", "main", "324c6e3", String.upcase(valid), valid <> "\n", " " <> valid] do
+      {output, status} =
+        run_step(validate, [{"RELEASE_COMMIT", input}, {"LC_ALL", "C"}])
+
+      assert status == 1
+      assert output =~ "must be a full 40-hex lowercase SHA"
+    end
+
+    assert {_, 0} =
+             run_step(validate, [
+               {"RELEASE_COMMIT", valid},
+               {"LC_ALL", "C"},
+               {"GITHUB_OUTPUT", "/dev/null"}
+             ])
+  end
+
+  @tag :tmp_dir
+  test "source gates allow a candidate behind main and refuse other history and existing tags",
+       %{tmp_dir: directory} do
+    verify = read_yaml!(@workflow)["jobs"]["verify"]["steps"]
+    ancestry = Enum.at(verify, 3)
+    tags = Enum.at(verify, 6)
+    git!(directory, ["init", "--initial-branch=main"])
+    git!(directory, ["commit", "--allow-empty", "-m", "candidate"])
+    candidate = git!(directory, ["rev-parse", "HEAD"])
+    tree = git!(directory, ["rev-parse", "HEAD^{tree}"])
+    unrelated = git!(directory, ["commit-tree", tree, "-m", "unrelated"])
+    git!(directory, ["commit", "--allow-empty", "-m", "later main"])
+    main = git!(directory, ["rev-parse", "HEAD"])
+    git!(directory, ["update-ref", "refs/remotes/origin/main", main])
+    git!(directory, ["remote", "add", "origin", directory])
+    git!(directory, ["checkout", "--detach", candidate])
+    assert {_, 0} = run_step(ancestry, release_env(candidate), directory)
+
+    git!(directory, ["checkout", "--detach", unrelated])
+    assert {output, 1} = run_step(ancestry, release_env(unrelated), directory)
+    assert output =~ "not reachable from main"
+
+    assert {_, 0} = run_step(tags, [{"VERSION", "1.2.3"}], directory)
+    git!(directory, ["tag", "v1.2.3", candidate])
+    assert {output, 1} = run_step(tags, [{"VERSION", "1.2.3"}], directory)
+    assert output =~ "Tag v1.2.3 already exists"
+  end
+
+  test "qualification gate requires a successful GitHub Actions check on the exact SHA" do
+    steps = read_yaml!(@workflow)["jobs"]["verify"]["steps"]
+    qualify = Enum.at(steps, 4)
+
+    for {original, weakened} <- [
+          {"/commits/$RELEASE_COMMIT/check-runs", "/commits/main/check-runs"},
+          {~s(.name == "qualified"), "true"},
+          {~s(.conclusion == "success"), "true"},
+          {~s(.app.slug == "github-actions"), "true"},
+          {~S(grep -Fxq -- "$RELEASE_COMMIT"), ~S(grep -q .)}
+        ] do
+      rewritten = String.replace(qualify["run"], original, weakened)
+      refute rewritten == qualify["run"]
+
+      workflow = read_yaml!(@workflow)
+      mutated = replace(workflow, ["jobs", "verify", "steps", 4, "run"], rewritten)
+      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
+    end
+  end
+
+  for {path, weakened} <- [
+        {["on", "push"], %{}},
+        {["on", "workflow_dispatch", "inputs", "release_commit", "required"], false},
+        {["jobs", "verify", "steps", 0, "run"], "true"},
+        {["jobs", "verify", "steps", 6, "run"], "true"},
+        {["jobs", "build", "steps", 1, "with", "ref"], "${{ github.sha }}"},
+        {["jobs", "build", "steps", 9, "if"], "false"},
+        {["jobs", "build", "steps", 10, "run"], "true"},
+        {["jobs", "upload", "steps", 4, "run"], "true"},
+        {["jobs", "upload", "steps", 5, "working-directory"], "."},
+        {["jobs", "read_back", "steps", 1, "with", "fetch-depth"], 1},
+        {["jobs", "read_back", "steps", 5, "if"], "always()"},
+        {["jobs", "read_back", "environment"], "publish"},
+        {["jobs", "build", "permissions", "id-token"], "write"},
+        {["jobs", "upload", "env", "HEX_API_KEY"], "${{ secrets.HEX_API_KEY }}"}
       ] do
-    test "publish contract refuses #{name}" do
-      original = read_yaml!(@workflow)
-      assert_publish!(original)
-      mutated = replace(original, unquote(path), unquote(Macro.escape(value)))
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-  end
-
-  test "the key cannot reach any step except the isolated uploader" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    for {_step, index} <- Enum.with_index(original["jobs"]["publish"]["steps"]), index != 12 do
-      mutated =
-        replace(original, ["jobs", "publish", "steps", index, "env", "HEX_API_KEY"], "leak")
-
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-
-    mutated = put_in(original, ["env", "HEX_API_KEY"], "leak")
-    assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-  end
-
-  test "the upload step accepts only the no-project Mix invocation and both inspected paths" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    for command <- [
-          "mix hex.publish --yes",
-          String.replace(@upload, "--no-mix-exs", "--no-start"),
-          @upload <> "\nmix docs",
-          "mix deps.get --check-locked\n" <> @upload,
-          String.replace(@upload, "package.tar", "other.tar"),
-          String.replace(@upload, "docs.tar.gz", "other.tar.gz")
-        ] do
-      mutated = replace(original, ["jobs", "publish", "steps", 12, "run"], command)
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-  end
-
-  test "the upload step runs outside the checkout, where no mix.exs exists" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    removed =
-      update_in(
-        original,
-        ["jobs", "publish", "steps", Access.at(12)],
-        &Map.delete(&1, "working-directory")
-      )
-
-    assert_raise ExUnit.AssertionError, fn -> assert_publish!(removed) end
-
-    for directory <- [".", "${{ github.workspace }}", "scripts/release"] do
-      mutated =
-        replace(original, ["jobs", "publish", "steps", 12, "working-directory"], directory)
-
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-
-    relative =
-      replace(
-        original,
-        ["jobs", "publish", "steps", 12, "run"],
-        String.replace(
-          @upload,
-          ~s("$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs"),
-          "scripts/release/publish_hex_artifacts.exs"
-        )
-      )
-
-    assert_raise ExUnit.AssertionError, fn -> assert_publish!(relative) end
-  end
-
-  test "publication refuses qualification lookups anywhere in the workflow" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    for command <- [
-          "gh run view 123",
-          "gh run list",
-          "gh api repos/baselabs/replicant/actions/runs",
-          "gh run download 123 -n package-authorization",
-          "echo qualified"
-        ] do
-      mutated = replace(original, ["jobs", "publish", "steps", 15, "run"], command)
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-  end
-
-  test "package refusal requires an anonymous 200 and fails closed on every other result" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-    source = Enum.at(original["jobs"]["publish"]["steps"], 1)["run"]
-
-    for {before, replacement} <- [
-          {"https://hex.pm/api/packages/replicant", "https://hex.pm/api/packages/other"},
-          {"200) ;;", "200|404) ;;"},
-          {"404)", "400)"},
-          {"*)", "503)"},
-          {"exit 1", "true"},
-          {"a first publication is the owner's decision", "absent"}
-        ] do
-      script = String.replace(source, before, replacement)
-      refute script == source
-      mutated = replace(original, ["jobs", "publish", "steps", 1, "run"], script)
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-  end
-
-  for {name, path, value} <- [
-        {"Elixir drift", ["env", "ELIXIR_VERSION"], "1.20.2"},
-        {"OTP drift", ["env", "OTP_VERSION"], "29"},
-        {"job runtime override", ["jobs", "publish", "env"], %{"OTP_VERSION" => "28.0.0"}},
-        {"step runtime override", ["jobs", "publish", "steps", 3, "env"],
-         %{"ELIXIR_VERSION" => "1.20.2"}},
-        {"Elixir override", ["jobs", "publish", "steps", 4, "with", "elixir"], "1.20.2"},
-        {"literal OTP override", ["jobs", "publish", "steps", 4, "with", "otp"], "29"},
-        {"moving runner", ["jobs", "publish", "runs-on"], "ubuntu-" <> "latest"},
-        {"self-hosted runner", ["jobs", "publish", "runs-on"], ["self-hosted", "linux"]},
-        {"build-box runner", ["jobs", "publish", "runs-on"], "devbox-ovh"},
-        {"cache action", ["jobs", "publish", "steps", 6, "uses"], "actions/cache@v4"},
-        {"pull request trigger", ["on", "pull_request"], nil},
-        {"privileged pull request trigger", ["on", "pull_request_target"], nil}
-      ] do
-    test "every workflow contract refuses #{name}" do
-      original = read_yaml!(@workflow)
-      assert_workflow!(original)
-      mutated = replace(original, unquote(path), unquote(Macro.escape(value)))
-      assert_raise ExUnit.AssertionError, fn -> assert_workflow!(mutated) end
-    end
-  end
-
-  test "both archives are inspected before upload and cleaned even on failure" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    for index <- [10, 11] do
-      removed = update_in(original, ["jobs", "publish", "steps"], &List.delete_at(&1, index))
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(removed) end
-    end
-
-    for {first, second} <- [{1, 9}, {9, 10}, {10, 11}, {11, 12}, {12, 13}, {13, 14}] do
-      mutated =
-        update_in(original, ["jobs", "publish", "steps"], fn steps ->
-          List.replace_at(steps, first, Enum.at(steps, second))
-          |> List.replace_at(second, Enum.at(steps, first))
-        end)
-
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-
-    mutated = replace(original, ["jobs", "publish", "steps", 15, "if"], nil)
-    assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-  end
-
-  test "changelog refusal runs before dependencies, builds or uploads" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    for command <- [
-          "true",
-          String.replace(@notes, "CHANGELOG.md", "README.md"),
-          String.replace(@notes, "mix.exs", "other.exs"),
-          String.replace(@notes, "verify_changelog!", "section!")
-        ] do
-      mutated = replace(original, ["jobs", "publish", "steps", 5, "run"], command)
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-
-    for later <- [6, 8, 9, 12] do
-      mutated =
-        update_in(original, ["jobs", "publish", "steps"], fn steps ->
-          List.replace_at(steps, 5, Enum.at(steps, later))
-          |> List.replace_at(later, Enum.at(steps, 5))
-        end)
-
+    test "publication refuses drift at #{Enum.join(path, "/")}" do
+      workflow = read_yaml!(@workflow)
+      assert_publish!(workflow)
+      mutated = replace(workflow, unquote(path), unquote(Macro.escape(weakened)))
       assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
     end
   end
@@ -690,7 +556,7 @@ defmodule Replicant.PublishWorkflowTest do
     on_exit(fn -> File.rm_rf!(directory) end)
     workflow = read_yaml!(@workflow)
     assert_publish!(workflow)
-    stamp = Enum.at(workflow["jobs"]["publish"]["steps"], 10)
+    stamp = Enum.at(workflow["jobs"]["build"]["steps"], 9)
     archive_dir = Path.join(directory, "replicant-release")
     File.mkdir!(archive_dir)
     archive = String.to_charlist(Path.join(archive_dir, "package.tar"))
@@ -715,29 +581,6 @@ defmodule Replicant.PublishWorkflowTest do
       assert status == expected_status, output
       assert output =~ message
     end
-  end
-
-  test "release assets come only from the keyless served read-back after upload" do
-    original = read_yaml!(@workflow)
-    assert_publish!(original)
-
-    for command <- [
-          "true",
-          String.replace(@retain, "retain_release_assets.exs", "build_docs_archive.exs")
-        ] do
-      mutated = replace(original, ["jobs", "publish", "steps", 13, "run"], command)
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-
-    original_build = Enum.at(original["jobs"]["publish"]["steps"], 9)["run"]
-
-    for command <- ["cp docs.tar.gz release-assets/", "sha256sum docs.tar.gz > SHA256SUMS"] do
-      script = original_build <> "\n" <> command
-      mutated = replace(original, ["jobs", "publish", "steps", 9, "run"], script)
-      assert_raise ExUnit.AssertionError, fn -> assert_publish!(mutated) end
-    end
-
-    assert File.read!(@workflow) =~ @artifact <> " # v7.0.2"
   end
 
   test "qualification checks both archives without a publication authorization artifact" do
@@ -775,7 +618,7 @@ defmodule Replicant.PublishWorkflowTest do
     mutated = put_in(publish, ["env", "HEX_VERSION"], "0.0.0")
     assert_raise ExUnit.AssertionError, fn -> assert_hex!(mutated, qualification) end
 
-    mutated = replace(publish, ["jobs", "publish", "steps", 6, "run"], "mix local.hex --force")
+    mutated = replace(publish, ["jobs", "build", "steps", 5, "run"], "mix local.hex --force")
     assert_raise ExUnit.AssertionError, fn -> assert_hex!(mutated, qualification) end
   end
 
@@ -901,27 +744,51 @@ defmodule Replicant.PublishWorkflowTest do
       assert_reader_step!(steps)
       "steps.toolchain.outputs"
     else
-      assert "toolchain" in List.wrap(job["needs"])
-      toolchain = workflow["jobs"]["toolchain"]
-      assert is_map(toolchain)
-      assert_reader_step!(toolchain["steps"])
+      if workflow["name"] == "Publish to Hex" do
+        assert "build" in List.wrap(job["needs"])
+        build = workflow["jobs"]["build"]
+        assert_reader_step!(build["steps"])
 
-      for key <- ["elixir", "otp"] do
-        assert toolchain["outputs"][key] == "${{ steps.toolchain.outputs.#{key} }}"
+        for key <- ["elixir", "otp"] do
+          assert build["outputs"][key] == "${{ steps.toolchain.outputs.#{key} }}"
+        end
+
+        "needs.build.outputs"
+      else
+        qualification_runtime_outputs!(workflow, job)
       end
-
-      "needs.toolchain.outputs"
     end
+  end
+
+  defp qualification_runtime_outputs!(workflow, job) do
+    assert "toolchain" in List.wrap(job["needs"])
+    toolchain = workflow["jobs"]["toolchain"]
+    assert is_map(toolchain)
+    assert_reader_step!(toolchain["steps"])
+
+    for key <- ["elixir", "otp"] do
+      assert toolchain["outputs"][key] == "${{ steps.toolchain.outputs.#{key} }}"
+    end
+
+    "needs.toolchain.outputs"
   end
 
   defp assert_reader_step!(steps) do
     reader = Enum.find_index(steps, &(&1["uses"] == @toolchain))
     checkout = Enum.find_index(steps, &(&1["uses"] == @checkout))
     assert is_integer(reader) and is_integer(checkout) and checkout < reader
-    assert Enum.at(steps, reader) == %{"uses" => @toolchain, "id" => "toolchain"}
+    step = Enum.at(steps, reader)
+    assert Map.drop(step, ["with"]) == %{"uses" => @toolchain, "id" => "toolchain"}
+
+    if Enum.any?(steps, &(&1["with"]["path"] == "source")) do
+      assert step["with"] == %{"path" => "source/.tool-versions"}
+    else
+      refute step["with"]
+    end
   end
 
   defp assert_toolchain_action!(action) do
+    assert action["inputs"]["path"]["default"] == ".tool-versions"
     assert Enum.sort(Map.keys(action["outputs"])) == ["elixir", "otp"]
 
     for key <- ["elixir", "otp"] do
@@ -940,7 +807,8 @@ defmodule Replicant.PublishWorkflowTest do
                  "name" => "Read the runtime versions",
                  "id" => "versions",
                  "shell" => "bash",
-                 "run" => ~s(scripts/toolchain.sh >> "$GITHUB_OUTPUT")
+                 "env" => %{"TOOLCHAIN_PATH" => "${{ inputs.path }}"},
+                 "run" => ~s(scripts/toolchain.sh "$TOOLCHAIN_PATH" >> "$GITHUB_OUTPUT")
                }
              ]
            }
@@ -995,102 +863,150 @@ defmodule Replicant.PublishWorkflowTest do
 
   defp assert_publish!(workflow) do
     assert_workflow!(workflow)
-    assert workflow["on"] == %{"workflow_dispatch" => nil}
-    refute Enum.any?(maps(workflow), &Map.has_key?(&1, "inputs"))
-    serialized = Jason.encode!(workflow)
-    refute serialized =~ ~r/qualified|authorization|actions\/runs|actions\/workflows|gh\s+run/
-    refute serialized =~ ~r/gh\s+release|action-gh-release|create-release/
+    assert %{"workflow_dispatch" => %{"inputs" => %{"release_commit" => input} = inputs}} =
+             workflow["on"]
+
+    assert Map.keys(workflow["on"]) == ["workflow_dispatch"]
+    assert Map.keys(inputs) == ["release_commit"]
+    assert input["required"] == true
+    assert input["type"] == "string"
+    refute Map.has_key?(input, "default")
+    refute Jason.encode!(workflow) =~ ~r/github\.sha|GITHUB_SHA|secrets\.|gh\s+release|create-release/
     assert workflow["permissions"] == %{"contents" => "read"}
-    assert Map.keys(workflow["jobs"]) == ["publish"]
-    job = workflow["jobs"]["publish"]
-    assert job["if"] == @owners
-    assert job["environment"] == "publish"
-    assert job["permissions"] == %{"contents" => "read"}
-    assert job["timeout-minutes"] == 90
-    steps = job["steps"]
-    assert length(steps) == 16
-    assert Enum.at(steps, 0)["run"] == ~s(test "$GITHUB_REF" = refs/heads/main)
-    refusal = Enum.at(steps, 1)
-    assert refusal["name"] == "Refuse a first publication"
-    assert refusal["run"] =~ "https://hex.pm/api/packages/replicant"
-    assert refusal["run"] =~ "200) ;;"
-    assert refusal["run"] =~ "404)"
-    assert refusal["run"] =~ "*)"
-    assert refusal["run"] =~ "the owner's decision"
-    assert refusal["run"] =~ "a first publication is the owner's decision"
-    assert length(Regex.scan(~r/exit 1/, refusal["run"])) == 3
-    checkout = Enum.at(steps, 2)
-    assert checkout["uses"] == @checkout
-    assert checkout["with"]["persist-credentials"] == false
-    assert checkout["with"]["ref"] == "${{ github.sha }}"
-    assert checkout["with"]["fetch-depth"] == 0
-    assert Enum.at(steps, 3)["uses"] == @toolchain
-    assert Enum.at(steps, 4)["uses"] == @beam_action_ref
 
-    assert Enum.at(steps, 5) == %{
-             "name" => "Refuse a missing, duplicated or empty release changelog section",
-             "run" => @notes
-           }
+    assert %{"verify" => verify, "build" => build, "upload" => upload, "read_back" => read_back} =
+             workflow["jobs"]
 
-    assert Enum.at(steps, 7)["run"] == "mix local.rebar --force"
-    assert Enum.at(steps, 8)["run"] == "mix deps.get --check-locked"
+    assert map_size(workflow["jobs"]) == 4
 
-    assert Enum.at(steps, 9) == %{
-             "name" => "Compare two package builds and inspect one docs build",
-             "id" => "archives",
-             "run" => ~s(bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release")
-           }
+    for {name, job} <- workflow["jobs"] do
+      assert job["if"] == @owners
+      assert job["environment"] == if(name == "upload", do: "publish")
+      assert job["permissions"] == publication_permissions(name)
+    end
 
-    stamp = Enum.at(steps, 10)
-    assert stamp["name"] == "Refuse a package whose changelog is not stamped for its version"
-    assert stamp["shell"] == "bash"
-    assert stamp["env"] == %{"VERSION" => "${{ steps.archives.outputs.version }}"}
-    assert Enum.sort(Map.keys(stamp)) == ["env", "name", "run", "shell"]
-    assert Base.encode16(:crypto.hash(:sha256, stamp["run"]), case: :lower) == @stamp_sha256
+    refute verify["needs"]
+    assert build["needs"] == "verify"
+    assert upload["needs"] == ["verify", "build"]
+    assert read_back["needs"] == ["verify", "build", "upload"]
 
-    assert Enum.at(steps, 11) == %{
-             "name" => "Verify release identity and served docs",
-             "env" => release_identity_env(),
-             "run" => @release_identity
-           }
+    assert [refusal, input, source, ancestry, qualify, version, tag, package] = verify["steps"]
+    assert refusal["run"] =~ ~S|"$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH"|
+    assert input["env"]["RELEASE_COMMIT"] == "${{ inputs.release_commit }}"
+    assert input["run"] =~ ~S|^[0-9a-f]{40}$|
+    assert source["with"]["ref"] == "${{ steps.release.outputs.commit }}"
+    assert source["with"]["fetch-depth"] == 0
+    assert ancestry["run"] =~
+             ~S|git merge-base --is-ancestor "$RELEASE_COMMIT" "refs/remotes/origin/$DEFAULT_BRANCH"|
 
-    upload = Enum.at(steps, 12)
-    assert upload["run"] == @upload
-    assert upload["working-directory"] == "${{ runner.temp }}"
+    for required <- [
+          "gh api --method GET --paginate",
+          "/commits/$RELEASE_COMMIT/check-runs?check_name=qualified",
+          ~s(.name == "qualified"),
+          ~s(.conclusion == "success"),
+          ~s(.app.slug == "github-actions"),
+          ~S(grep -Fxq -- "$RELEASE_COMMIT")
+        ] do
+      assert qualify["run"] =~ required
+    end
 
-    assert upload["env"] == %{
-             "PACKAGE_VERSION" => "${{ steps.archives.outputs.version }}",
-             "HEX_API_KEY" => "${{ secrets.HEX_API_KEY }}"
-           }
+    assert qualify["env"]["RELEASE_COMMIT"] == "${{ steps.release.outputs.commit }}"
+    assert version["run"] =~ "@version"
+    assert version["run"] =~ "mix.exs"
+    assert tag["env"]["VERSION"] == "${{ steps.version.outputs.version }}"
+    assert tag["run"] =~ ~S|git ls-remote --exit-code --tags origin "refs/tags/v$VERSION"|
+    assert tag["run"] =~ "2) ;;"
+    assert tag["run"] =~ "Tag v$VERSION already exists."
+    assert package["run"] =~ "https://hex.pm/api/packages/replicant"
+    assert package["run"] =~ "200) ;;"
+    assert package["run"] =~ "a first publication is the owner's decision"
+    assert length(Regex.scan(~r/exit 1/, package["run"])) == 3
 
-    assert Enum.at(steps, 13) == %{
-             "name" => "Read back served archives and prove docs provenance without a key",
-             "id" => "read_back",
-             "working-directory" => "${{ runner.temp }}",
-             "env" => %{"PACKAGE_VERSION" => "${{ steps.archives.outputs.version }}"},
-             "run" => @retain
-           }
+    for job <- [build, upload, read_back] do
+      assert job["env"]["RELEASE_COMMIT"] == @selected
+      assert job["env"]["VERSION"] == @version
+      assert hd(job["steps"])["with"]["ref"] == @workflow_revision
+    end
 
-    assert Enum.at(steps, 14) == %{
-             "name" => "Retain verified release assets for infra",
-             "uses" => @artifact,
-             "with" => %{
-               "name" => "release-assets",
-               "path" => "${{ runner.temp }}/replicant-release/release-assets/",
-               "if-no-files-found" => "error",
-               "retention-days" => 7
+    for job <- [build, read_back] do
+      assert Enum.at(job["steps"], 1)["with"] == %{
+               "ref" => @selected,
+               "path" => "source",
+               "fetch-depth" => 0,
+               "persist-credentials" => false
              }
+    end
+
+    assert Enum.at(build["steps"], 4)["run"] =~
+             ~s|verify_changelog!("source/mix.exs", "source/CHANGELOG.md")|
+    assert Enum.at(build["steps"], 7)["run"] == "mix deps.get --check-locked"
+    assert Enum.at(build["steps"], 7)["working-directory"] == "source"
+    assert Enum.at(build["steps"], 8)["run"] ==
+             ~S|bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"|
+    stamp = Enum.at(build["steps"], 9)
+    assert stamp["shell"] == "bash"
+    refute stamp["if"]
+    refute stamp["env"]
+    assert Base.encode16(:crypto.hash(:sha256, stamp["run"]), case: :lower) == @stamp_sha256
+    assert Enum.at(build["steps"], 10)["run"] =~ "Replicant.PackageIdentity.verify_publish_archive!"
+    assert Enum.at(build["steps"], 10)["run"] =~ ~S|"$VERSION" "$RELEASE_COMMIT"|
+    assert Enum.at(build["steps"], 11)["run"] =~ "sha256sum package.tar docs.tar.gz upload-plan"
+    assert_artifact!(build, 12, "inspected-archives", "replicant-release", 1)
+
+    assert hd(upload["steps"])["with"]["sparse-checkout"] ==
+             "/.github/actions/beam/\n/scripts/toolchain.sh\n/scripts/release/publish_hex_artifacts.exs\n/scripts/release/release_docs.exs\n"
+
+    assert Enum.at(upload["steps"], 3)["with"]["name"] == "inspected-archives"
+    assert Enum.at(upload["steps"], 4)["run"] =~ ~S|"$PLAN_SHA256" upload-plan|
+    assert Enum.at(upload["steps"], 4)["run"] =~ "sha256sum --check --strict -"
+    assert Enum.at(upload["steps"], 5)["run"] == @upload
+    assert Enum.at(upload["steps"], 5)["working-directory"] ==
+             "${{ runner.temp }}/inspected-archives"
+
+    assert Enum.at(read_back["steps"], 4)["run"] == @retain
+    assert Enum.at(read_back["steps"], 4)["working-directory"] == "${{ runner.temp }}"
+    assert read_back["outputs"]["published_commit"] ==
+             "${{ steps.read_back.outputs.published_commit }}"
+    assert_artifact!(read_back, 5, "release-assets", "release-assets", 7)
+  end
+
+  defp assert_artifact!(job, index, name, directory, retention) do
+    artifact = Enum.at(job["steps"], index)
+    refute artifact["if"]
+    assert artifact["uses"] == @artifact
+
+    assert artifact["with"] == %{
+             "name" => name,
+             "path" => "${{ runner.temp }}/#{directory}/",
+             "if-no-files-found" => "error",
+             "retention-days" => retention,
+             "overwrite" => true
            }
 
-    assert Enum.at(steps, 15)["if"] == "always()"
-    assert Enum.at(steps, 15)["run"] == ~s(rm -rf -- "$RUNNER_TEMP/replicant-release")
+    cleanup = Enum.at(job["steps"], index + 1)
+    assert cleanup["if"] == "always()"
+    assert cleanup["run"] == ~s(rm -rf -- "$RUNNER_TEMP/#{directory}")
+  end
 
-    without_secret =
-      update_in(workflow, ["jobs", "publish", "steps", Access.at(12), "env"], fn env ->
-        Map.delete(env, "HEX_API_KEY")
-      end)
+  defp publication_permissions("verify"), do: %{"contents" => "read", "checks" => "read"}
+  defp publication_permissions("build"), do: %{"contents" => "read"}
+  defp publication_permissions("upload"), do: %{"contents" => "read", "id-token" => "write"}
+  defp publication_permissions("read_back"), do: nil
 
-    refute Jason.encode!(without_secret) =~ "HEX_API_KEY"
+  defp release_env(commit), do: [{"RELEASE_COMMIT", commit}, {"DEFAULT_BRANCH", "main"}]
+
+  defp run_step(step, variables, directory \\ @repo_root) do
+    System.cmd("bash", ["-eo", "pipefail", "-c", step["run"]],
+      env: variables,
+      cd: directory,
+      stderr_to_stdout: true
+    )
+  end
+
+  defp git!(directory, args) do
+    identity = ["-c", "user.name=Release Test", "-c", "user.email=release-test@example.invalid"]
+    {output, 0} = System.cmd("git", identity ++ args, cd: directory, stderr_to_stdout: true)
+    String.trim(output)
   end
 
   defp assert_github_auth!(workflow) do
@@ -1144,7 +1060,12 @@ defmodule Replicant.PublishWorkflowTest do
     assert version =~ ~r/^\d+\.\d+\.\d+$/
     assert publish["env"]["HEX_VERSION"] == version
 
-    for job <- [publish["jobs"]["publish"], qualification["jobs"]["release-artifact"]] do
+    for job <- [
+          publish["jobs"]["build"],
+          publish["jobs"]["upload"],
+          publish["jobs"]["read_back"],
+          qualification["jobs"]["release-artifact"]
+        ] do
       assert Enum.any?(job["steps"], &(&1["run"] == ~s(mix local.hex "$HEX_VERSION" --force)))
     end
   end

@@ -133,17 +133,12 @@ defmodule Replicant.PackageIdentityTest do
     end
   end
 
-  test "publish requires clean exact main and an untagged identity before infra tags" do
-    assert :ok == PackageIdentity.check_publish(@version, @commit, &publish_runner/2)
-  end
-
   test "fresh and held package decisions bind built bytes while docs may be missing or served" do
     assert {:ok, :fresh} ==
              PackageIdentity.check_archive(@version, @digest, &publish_runner/2)
 
     for docs? <- [false, true] do
       runner = hex_runner(hex_metadata(docs?))
-      assert :ok == PackageIdentity.check_publish(@version, @commit, runner)
 
       assert {:ok, {:held, docs?}} ==
                PackageIdentity.check_archive(@version, @digest, runner)
@@ -156,60 +151,30 @@ defmodule Replicant.PackageIdentityTest do
   end
 
   test "held docs are kept by presence and only authoritative absence permits upload" do
-    for docs? <- [false, true] do
-      runner = hex_runner(hex_metadata(docs?))
-
-      assert {:ok, {:held, docs?}} ==
-               PackageIdentity.check_archive(@version, @digest, runner)
+    for state <- [:fresh, {:held, false}, {:held, true}] do
+      assert {:ok, {:keep, @docs_bytes}} =
+               PackageIdentity.docs_plan(@version, state, &publish_runner/2)
 
       for response <- [
             {<<0x1F, 0x8B, "different">> <> "\n200", 0},
             {"private-response-value\n503", 0},
-            {@docs_bytes <> "\n200", 22}
+            {@docs_bytes <> "\n200", 22},
+            {"not gzip\n200", 0},
+            {"\n200", 0},
+            {"", 0},
+            {"private-response-value", 7}
           ] do
-        refused = docs_runner(runner, response)
-
-        assert {:error, message} =
-                 PackageIdentity.check_archive(@version, @digest, refused)
-
+        refused = docs_runner(&publish_runner/2, response)
+        assert {:error, message} = PackageIdentity.docs_plan(@version, state, refused)
         refute message =~ "private-response-value"
       end
-
-      absent = docs_runner(runner, {"\n404", 0})
-      result = PackageIdentity.check_archive(@version, @digest, absent)
-
-      if docs? do
-        assert {:error, message} = result
-        assert message =~ "docs metadata and repository disagree"
-      else
-        assert result == {:ok, {:held, false}}
-      end
     end
-  end
 
-  test "docs response requires a readable gzip tarball or authoritative absence" do
-    assert :ok == PackageIdentity.docs_available({@docs_bytes <> "\n200", 0}, true)
-    assert :ok == PackageIdentity.docs_available({"\n404", 0}, false)
-
-    for response <- [
-          {"\n404", 22},
-          {"not gzip\n200", 0},
-          {"\n200", 0},
-          {"", 0},
-          {"private-response-value", 7},
-          {<<0x1F, 0x8B, "invalid tar">> <> "\n200", 0}
-        ] do
-      assert {:error, message} = PackageIdentity.docs_available(response, false)
-      refute message =~ "private-response-value"
-    end
-  end
-
-  test "preflight refuses a docs 404 when release metadata says docs exist" do
-    runner = hex_runner(hex_metadata(true))
-    refused = docs_runner(runner, {"private-response-value\n404", 0})
-    assert {:error, message} = PackageIdentity.check_archive(@version, @digest, refused)
+    absent = docs_runner(&publish_runner/2, {"\n404", 0})
+    assert {:ok, :upload} = PackageIdentity.docs_plan(@version, :fresh, absent)
+    assert {:ok, :upload} = PackageIdentity.docs_plan(@version, {:held, false}, absent)
+    assert {:error, message} = PackageIdentity.docs_plan(@version, {:held, true}, absent)
     assert message =~ "docs metadata and repository disagree"
-    refute message =~ "private-response-value"
   end
 
   test "held metadata refuses retirement, version drift and malformed identity fields" do
@@ -226,9 +191,8 @@ defmodule Replicant.PackageIdentityTest do
           Map.delete(metadata, "has_docs")
         ] do
       runner = hex_runner(mutated)
-      assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
+      assert {:error, message} = PackageIdentity.check_archive(@version, @digest, runner)
       refute message =~ "private-response-value"
-      assert {:error, _message} = PackageIdentity.check_archive(@version, @digest, runner)
     end
 
     assert {:error, message} =
@@ -239,82 +203,6 @@ defmodule Replicant.PackageIdentityTest do
              )
 
     assert message =~ "retired"
-  end
-
-  test "post-build publication hashes the actual archive and repeats source and tag refusals" do
-    archive =
-      Path.join(System.tmp_dir!(), "replicant-publish-#{System.unique_integer([:positive])}.tar")
-
-    on_exit(fn ->
-      File.rm!(archive)
-    end)
-
-    File.write!(archive, "inspected-package-bytes")
-    digest = :crypto.hash(:sha256, File.read!(archive)) |> Base.encode16(case: :lower)
-    runner = hex_runner(Map.put(hex_metadata(false), "checksum", digest))
-
-    assert :ok ==
-             PackageIdentity.verify_publish_archive!(@version, @commit, archive, runner)
-
-    File.write!(archive, "changed-package-bytes")
-
-    assert_raise RuntimeError, ~r/checksum differs from the built package/, fn ->
-      PackageIdentity.verify_publish_archive!(@version, @commit, archive, runner)
-    end
-
-    for {command, args, response} <- [
-          {"git", ["status", "--porcelain"], {" M mix.exs", 0}},
-          {"git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"], {@commit, 0}},
-          {"gh", ["api", "-i", @github_path], {"HTTP/2.0 200 OK\r\n\r\n{}", 0}}
-        ] do
-      refused = fn
-        ^command, ^args -> response
-        cmd, argv -> runner.(cmd, argv)
-      end
-
-      assert_raise RuntimeError, fn ->
-        PackageIdentity.verify_publish_archive!(@version, @commit, archive, refused)
-      end
-    end
-  end
-
-  test "publish refuses moved main, a different HEAD, a dirty tree, and an unavailable origin" do
-    for {command, args, response} <- [
-          {"git", ["rev-parse", "HEAD"], {String.duplicate("b", 40), 0}},
-          {"git", ["status", "--porcelain"], {" M README.md\n", 0}},
-          {"git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"],
-           {String.duplicate("b", 40) <> "\trefs/heads/main\n", 0}},
-          {"git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"], {"", 128}}
-        ] do
-      runner = fn
-        ^command, ^args -> response
-        cmd, argv -> publish_runner(cmd, argv)
-      end
-
-      assert {:error, message} = PackageIdentity.check_publish(@version, @commit, runner)
-      assert message =~ "clean checkout of the source commit at live origin/main"
-    end
-  end
-
-  test "publish refuses every occupied release identity and ambiguous release reads" do
-    for {command, args, response} <- [
-          {"git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"], {@commit, 0}},
-          {"git", ["ls-remote", "--exit-code", "--tags", "origin", "refs/tags/v1.2.0"],
-           {@commit <> "\trefs/tags/v1.2.0\n", 0}},
-          {"gh", ["api", "-i", @github_path], {"HTTP/2.0 200 OK\r\n\r\n{}", 0}},
-          {"curl", @hex_url, {"200", 0}},
-          {"curl", @hex_url, {"503", 0}}
-        ] do
-      runner = fn cmd, argv ->
-        target = if cmd == "curl", do: List.last(argv), else: argv
-
-        if cmd == command and target == args,
-          do: response,
-          else: publish_runner(cmd, argv)
-      end
-
-      assert {:error, _message} = PackageIdentity.check_publish(@version, @commit, runner)
-    end
   end
 
   test "package check accepts a coherent published release behind the current main commit" do
@@ -493,12 +381,6 @@ defmodule Replicant.PackageIdentityTest do
 
     assert System.monotonic_time(:millisecond) - started < 500
   end
-
-  defp publish_runner("git", ["rev-parse", "HEAD"]), do: {@commit <> "\n", 0}
-  defp publish_runner("git", ["status", "--porcelain"]), do: {"", 0}
-
-  defp publish_runner("git", ["ls-remote", "--exit-code", "origin", "refs/heads/main"]),
-    do: {@commit <> "\trefs/heads/main\n", 0}
 
   defp publish_runner("git", ["rev-parse", "-q", "--verify", "refs/tags/v1.2.0"]),
     do: {"", 1}

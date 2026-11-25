@@ -140,60 +140,33 @@ If CI goes red, fix forward in the next commit.
   change that finds it.
 - Update the CHANGELOG when behavior, a dependency or a contract changes; other docs only when
   a contract changes.
-- For the release operator: after the version commit lands on `main`, infra asks an owner
+- For the release operator: give infra the repository, full qualified `release_commit`,
+  version, release contents, and green `qualified` run. Infra asks a permitted owner
   (`corepay` or `palermo-git`, including the triggering actor on reruns) to dispatch
-  `.github/workflows/publish.yml` on `main` with no inputs. The default-branch ruleset is the
-  qualification guarantee; publication performs no qualification lookup or artifact download.
-  An early anonymous Hex read refuses a missing `replicant` package name: a first publication
-  is the owner's decision. Lookup errors fail closed. Keyless steps build the package twice
-  from the exact checked-out commit, compare and inspect its bytes, audit and consume
-  it, render docs once with warnings as errors, write `release.json` with exactly
-  `package`, `version`, and the full `GITHUB_SHA` as `commit`, and inspect every
-  rendered file and those provenance fields. The fresh generated
-  consumer starts without a lock and runs both audits on its new resolution; projects with
-  committed locks fetch with `--check-locked`.
-  After the build, the shared changelog check reads the inspected Hex package archive.
-  It requires exactly one root changelog with entries under the release version and
-  no entries in sections above it. The release identity step then verifies the built
-  commit against live `origin/main` and checks the package and docs state in Hex.
-  Infra declares the `publish` environment and its `HEX_API_KEY` secret. Only one step receives
-  it: `mix run --no-mix-exs`, run from the runner's temporary directory where no `mix.exs`
-  exists, runs `scripts/release/publish_hex_artifacts.exs`. The script refuses to run inside a
-  Mix project, reads the two inspected archive paths, and rechecks package existence. Local
-  or remote version tags and GitHub releases refuse publication. An untagged Hex version can
-  finish only when its checksum matches the built package and it is not retired; the release
-  identity step and the keyed script both check this. Only missing package or docs uploads run.
-  Both are read back from Hex's repository. The package SHA-256 must match the inspected
-  archive; docs planning keeps a readable served gzip tarball and uploads only
-  when metadata says `has_docs: false` and the repository returns HTTP 404.
-  `has_docs: true` with a repository 404 refuses as a metadata/repository disagreement;
-  other statuses or malformed bodies also refuse.
-  Qualification runs the same reads against live Hex for a published version, without a key.
-  ExDoc 0.40.4 fixes the highlighting group prefix; only HTML and Markdown ship, with no
-  timestamped EPUB. Hex
-  constructs sorted archives with fixed metadata and a gzip header without a name or mtime.
-  Under infra's release rule, this path never replaces or compares served docs;
-  it keeps them and reads them back by presence and `release.json` provenance.
-  Hex itself allows docs republishing, but replacing docs on resume could rebind
-  their provenance away from the commit infra tags. Comparing a rebuild would
-  refuse a held release whose package bytes match. Read-back requires `index.html`
-  and valid `release.json` package/version
-  fields. A following keyless step proves the docs commit is the dispatched commit
-  or its ancestor on fetched, complete default-branch history; missing history or
-  provenance refuses. The producer lock is not packaged, so matching package bytes
-  alone do not identify the docs commit. Served docs are never replaced.
-  The script loads no project code and builds nothing.
-  After successful read-back, one `release-assets` artifact retains the versioned package,
-  served docs archive, `SHA256SUMS` over the retained served bytes, `published_commit`,
-  and `RELEASE-NOTES.md` from the packaged changelog with that commit and both digests.
-  The keyless read-back exposes `published_commit` as a step output. Temporary archives
-  are removed even on failure. Infra creates the `v<version>` tag at the served docs'
-  published commit, compares the artifact's package with Hex's bytes, and creates the
-  GitHub release from those assets. Consumer verification uses that
-  GitHub release. Once infra reports the read-back and tag, this repository's session records
-  the verified package digest in `scripts/release/published_packages.sha256` through normal
-  landing; held versions do not change the ledger.
-  A release is finished only when its tag, Hex package and docs, and GitHub release all exist.
+  `.github/workflows/publish.yml` from the default branch with that exact lowercase SHA.
+  The verify job requires default-branch ancestry, a successful `qualified` check on the SHA,
+  the source version, an absent version tag, and an existing Hex package name.
+  The keyless build fetches the selected commit and its history, checks its exact runtime,
+  builds and compares two package archives, audits and consumes the archive, and renders docs
+  once. It inspects the docs with `release.json` containing exactly `package`, `version`, and
+  the selected commit. The packaged changelog check runs before upload planning. An untagged
+  Hex version can resume when the active release's served package matches the inspected package.
+  The plan validates provenance for existing docs and permits a docs upload only on authoritative
+  absence. Upload receives both inspected archives, their checksums and the plan.
+  Only upload enters `publish`. It checks the downloaded bytes and runs
+  `scripts/release/publish_hex_artifacts.exs` with `mix run --no-mix-exs` from a temporary
+  directory without a Mix project. It exchanges and revokes a package-scoped workload
+  identity token, rechecks served state before writes, and preserves served archives.
+  After approval of a held upload, dispatch again with the same `release_commit`.
+  Keyless read-back proves byte equality for the package and validates served docs and their
+  provenance. The docs commit must equal `release_commit` or be an ancestor of it on the
+  default branch. The single `release-assets` artifact retains the served archives, their
+  checksums and `published_commit`, which is also a job output. Infra compares the package
+  with Hex, tags the published commit, and creates the GitHub release with notes from the
+  packaged changelog. Consumers verify against that release. After infra reports the
+  tag and read-back, this session records the verified package digest in
+  `scripts/release/published_packages.sha256` through normal landing. The release is
+  finished when the annotated tag, Hex package and docs, and GitHub release all exist.
 
 ## CI/CD and releases
 

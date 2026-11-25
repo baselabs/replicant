@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Publication checks the built Hex package for changelog entries above its version
   and refuses an unstamped archive before checking release state or uploading.
 
+- Publish from an explicitly selected qualified commit, with checksum-verified
+  archives and upload decisions handed to a separate Hex workload identity job.
+  Keyless read-back retains the served archives and their published commit.
+
 ## [1.6.1] - 2026-11-24
 
 ### Security
