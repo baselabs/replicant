@@ -73,7 +73,7 @@ jobs:
     name: test (${{ matrix.pg.kind }} PG${{ matrix.pg.major }})
     needs: toolchain
     runs-on: ubuntu-24.04
-    timeout-minutes: 90 # no green run yet
+    timeout-minutes: 11 # Green run 45860375989: slowest test matrix row 5m28s
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.toolchain.outputs.matrix) }}
