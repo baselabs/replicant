@@ -43,6 +43,10 @@ through later releases:
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
   in ADR-0002.
+- **`replicant` 1.7.0 is cut and awaiting publication** (2026-11-26): the PGDG support
+  policy (PostgreSQL 15-19, pglogical on 15-19, wal2json and pre-15 servers deprecated;
+  ADR-0010) and the shared Hex publication route. Its tag will be the package-scoped
+  `baselabs_replicant-v1.7.0`. The digest is recorded here after infra's read-back.
 - **`replicant` 1.6.1 is the current release** (2026-11-24 UTC): Hex package and docs,
   tag `v1.6.1`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/v1.6.1)
   are published at `4e476cb1fd07fcbd78706765d8b4d044698c56d5` (publish run 45469479926).
