@@ -73,7 +73,7 @@ jobs:
     name: test (${{ matrix.pg.kind }} PG${{ matrix.pg.major }})
     needs: toolchain
     runs-on: ubuntu-24.04
-    timeout-minutes: 90 # Expanded plugin matrix has no green run yet
+    timeout-minutes: 90 # no green run yet
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.toolchain.outputs.matrix) }}

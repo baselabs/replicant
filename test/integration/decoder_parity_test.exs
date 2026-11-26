@@ -242,7 +242,8 @@ defmodule Replicant.DecoderParityTest do
     expect_pg96? = version < 150_000
 
     expect_wal2json? =
-      pg96_enabled?() or expect_pg96? or "wal2json" in String.split(System.get_env("EXPECTED_PG_PLUGINS", ""), ",")
+      pg96_enabled?() or expect_pg96? or
+        "wal2json" in String.split(System.get_env("EXPECTED_PG_PLUGINS", ""), ",")
 
     if expect_wal2json?, do: assert(avail.wal2json, "primary carries no wal2json")
 

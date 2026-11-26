@@ -21,6 +21,7 @@ defmodule Replicant.PostgresSubstrateTest do
 
       for {lane, cell} <- Enum.zip(lanes, compatibility) do
         assert cell["kind"] == "compatibility"
+
         assert Map.take(cell, ["major", "image", "plugins"]) ==
                  Map.take(lane, ["major", "image", "plugins"])
 

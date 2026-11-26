@@ -61,8 +61,10 @@ RUN set -eux; \
     git clone --quiet https://github.com/2ndQuadrant/pglogical.git /tmp/pglogical; \
     cd /tmp/pglogical; \
     git checkout --quiet 9a0e182745885ad0152ea387988c95a483396a81; \
-    make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config; \
-    make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config
+    make -j"$(nproc)" PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config \
+      LDFLAGS_EX="-L/usr/lib/postgresql/$PG_MAJOR/lib"; \
+    make install DESTDIR=/plugins PG_CONFIG=/usr/lib/postgresql/$PG_MAJOR/bin/pg_config \
+      LDFLAGS_EX="-L/usr/lib/postgresql/$PG_MAJOR/lib"
 
 # wal2json is pinned PER MAJOR, both pins commit-exact and carrying
 # numeric-data-types-as-string (coverage verified live on the built images):
