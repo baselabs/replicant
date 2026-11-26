@@ -183,8 +183,8 @@ they touch a workflow, a Dockerfile, a release script or a secret.
   and the green `qualified` run.
 - An agent writes its own workflow changes. Before landing a change to `.github/`, a Dockerfile,
   a release script or anything that touches a secret, it sends the infrastructure maintainers
-  the branch and head and waits for their review. Any CI/CD, runner, box or key problem goes to
-  them, not around it.
+  the branch and head for their advice; the repository's owner decides and lands the change.
+  Any CI/CD, runner, box or key problem goes to them, not around it.
 - This public repository never builds on the build box. Never list process arguments:
   no `ps` with `args` or `-f`, no `/proc/*/cmdline`; use `ps -eo pid,etimes,pcpu,comm`.
 - A secret never appears on a command line, in a log or in a message. If you see one exposed,
