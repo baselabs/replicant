@@ -49,7 +49,7 @@ RUN set -eux; \
       apt-get update; \
       apt-get install -y --no-install-recommends build-essential git \
         libkrb5-dev libselinux1-dev libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev \
-        libzstd-dev liblz4-dev \
+        libzstd-dev liblz4-dev libnuma-dev \
         "postgresql-server-dev-$PG_MAJOR=$PG_VERSION"; \
       ;; \
     *) echo "unsupported plugin substrate major" >&2; exit 1 ;; \
