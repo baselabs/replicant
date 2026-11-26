@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-11-26
+
 ### Added
 
 - Adopt the PGDG support calendar with one real CI lane per supported major.
@@ -1158,7 +1160,8 @@ against a real-PG16 crash-injection suite (loss = 0, effect-dup = 0).
   **permanent** fail-closed halt (operator restart required), not auto-retry
   (spec §6 / §14.18).
 
-[Unreleased]: https://github.com/baselabs/replicant/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/baselabs/replicant/compare/baselabs_replicant-v1.7.0...HEAD
+[1.7.0]: https://github.com/baselabs/replicant/compare/v1.6.1...baselabs_replicant-v1.7.0
 [1.6.1]: https://github.com/baselabs/replicant/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/baselabs/replicant/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/baselabs/replicant/compare/v1.5.0...v1.5.1

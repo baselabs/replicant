@@ -11,16 +11,16 @@ defmodule Replicant.ReleaseContractTest do
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.6.0"
+  @previous_release "1.6.1"
   # Immutable registry digest for the preceding release, recorded after read-back.
   # Held versions are compared with freshly built bytes before upload; they do not
   # rewrite this ledger.
-  @published_digest "0b5f2e188d8ed7713c0832ff06a4a22131d63cdcd69f49ed37b0a7487efcdef6"
+  @published_digest "e315ef3d2e3bb7e99b09cb56594e737876172ba567aedecf187b4e57dfa293f2"
 
   defp version, do: Mix.Project.config()[:version]
 
-  test "the db_connection security floor and startup lag fix require the patch release" do
-    assert version() == "1.6.1"
+  test "the PostgreSQL 15-19 support policy requires the minor release" do
+    assert version() == "1.7.0"
   end
 
   test "snapshot release documents the halt, token contents, and conservative plugin policy" do
@@ -95,12 +95,12 @@ defmodule Replicant.ReleaseContractTest do
     v = version()
 
     assert body =~
-             ~r{^\[#{Regex.escape(v)}\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(@previous_release)}\.\.\.v#{Regex.escape(v)}$}m,
-           "missing/incorrect `[#{v}]:` comparison link to v#{@previous_release}...v#{v}"
+             ~r{^\[#{Regex.escape(v)}\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(@previous_release)}\.\.\.baselabs_replicant-v#{Regex.escape(v)}$}m,
+           "missing/incorrect `[#{v}]:` comparison link to v#{@previous_release}...baselabs_replicant-v#{v}"
 
     assert body =~
-             ~r{^\[Unreleased\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(v)}\.\.\.HEAD$}m,
-           "the [Unreleased] link must compare from the freshly cut v#{v} tag"
+             ~r{^\[Unreleased\]: https://github.com/baselabs/replicant/compare/baselabs_replicant-v#{Regex.escape(v)}\.\.\.HEAD$}m,
+           "the [Unreleased] link must compare from the freshly cut baselabs_replicant-v#{v} tag"
   end
 
   test "docs source_ref uses the scoped Hex release tag" do
