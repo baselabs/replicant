@@ -724,6 +724,7 @@ defmodule Replicant.PublishWorkflowTest do
 
     upload = jobs["upload"]
     assert upload["environment"] == "publish"
+
     assert upload["permissions"] == %{
              "contents" => "read",
              "actions" => "read",
@@ -752,6 +753,7 @@ defmodule Replicant.PublishWorkflowTest do
     assert tooling["with"]["ref"] == @workflow_revision
     assert tooling["with"]["fetch-depth"] == 0
     assert tooling["with"]["persist-credentials"] == false
+
     assert tooling["with"]["sparse-checkout"] ==
              "/.github/actions/beam/\n/.github/actions/toolchain/\n/scripts/toolchain.sh\n"
 
@@ -774,6 +776,7 @@ defmodule Replicant.PublishWorkflowTest do
 
     assert publish["uses"] == @hex_action
     assert publish["id"] == "release"
+
     assert publish["with"] ==
              Map.merge(hex_inputs("upload"), %{
                "release-commit" => @release_commit,
@@ -782,6 +785,7 @@ defmodule Replicant.PublishWorkflowTest do
 
     assert verify["uses"] == @hex_action
     assert verify["id"] == "release"
+
     assert verify["with"] ==
              Map.merge(hex_inputs("read-back"), %{
                "release-commit" => @release_commit,
@@ -791,6 +795,7 @@ defmodule Replicant.PublishWorkflowTest do
              })
 
     assert artifact["uses"] == @artifact
+
     assert artifact["with"] == %{
              "name" => "release-assets",
              "path" => @release_assets <> "/",
