@@ -590,14 +590,12 @@ defmodule Replicant.PublishWorkflowTest do
   defp runtime_output_source!(workflow, job, steps, index) do
     reader = Enum.find_index(steps, &(&1["uses"] == @toolchain))
 
-    cond do
-      is_integer(reader) ->
-        assert reader < index
-        assert_reader_step!(steps)
-        "steps.toolchain.outputs"
-
-      true ->
-        qualification_runtime_outputs!(workflow, job)
+    if is_integer(reader) do
+      assert reader < index
+      assert_reader_step!(steps)
+      "steps.toolchain.outputs"
+    else
+      qualification_runtime_outputs!(workflow, job)
     end
   end
 
