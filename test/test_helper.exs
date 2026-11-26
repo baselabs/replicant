@@ -34,76 +34,84 @@ defmodule Replicant.TestHelper do
     end
   end
 
-  # Does the PRIMARY carry BOTH plugin decoders? (pg_available_extensions lists
-  # installable extensions; wal2json is not an extension, but the plugin-bearing
-  # images ship it and every image that carries one carries the other.) This makes
-  # the :pg_old_decoders exclusion a fact about the server instead of a guess from
-  # its version: a stock 15 primary excludes the trio exactly as before, while a
-  # 15 plugin lane (pg_old.dockerfile-built) runs it — "wherever plugins are
-  # installed". A pre-10 primary still excludes the trio unconditionally (its legs
-  # assume a PG10+ primary: publications, pgoutput).
-  def primary_carries_plugins? do
-    url = System.get_env("REPLICANT_TEST_URL")
-
-    if url in [nil, ""] do
-      false
+  def primary_plugins do
+    if System.get_env("REPLICANT_TEST_URL") in [nil, ""] do
+      []
     else
       {:ok, conn} = Postgrex.start_link(PG16.pg_opts())
 
       try do
-        Postgrex.query!(
-          conn,
-          "SELECT count(*) FROM pg_available_extensions WHERE name = 'pglogical'",
-          []
-        ).rows == [[1]]
+        pglogical =
+          Postgrex.query!(
+            conn,
+            "SELECT 1 FROM pg_available_extensions WHERE name = 'pglogical'",
+            []
+          ).rows == [[1]]
+
+        wal2json = wal2json_available?(conn, pglogical)
+
+        for {plugin, true} <- [pglogical: pglogical, wal2json: wal2json], do: plugin
       after
         GenServer.stop(conn)
       end
     end
   end
+
+  defp wal2json_available?(conn, pglogical?) do
+    if System.get_env("EXPECTED_PG_PLUGINS") do
+      # CI runs as the disposable instance's bootstrap user. Check both presence
+      # and absence without allocating slots, including on the pre-10 primary.
+      plugin_available?(Postgrex.query(conn, "LOAD 'wal2json'", []))
+    else
+      # A contributor's replication role need not have LOAD privileges.
+      if pglogical? do
+        slot = "replicant_wal2json_probe_#{System.unique_integer([:positive])}"
+
+        plugin_available?(
+          Postgrex.query(
+            conn,
+            "SELECT pg_create_logical_replication_slot($1, 'wal2json', true)",
+            [slot]
+          )
+        )
+      else
+        false
+      end
+    end
+  end
+
+  defp plugin_available?({:ok, _}), do: true
+
+  defp plugin_available?({:error, %Postgrex.Error{postgres: %{code: code}}})
+       when code in [:undefined_file, :insufficient_privilege, :undefined_function],
+       do: false
+
+  defp plugin_available?({:error, error}), do: raise(error)
 end
 
 version = Replicant.TestHelper.server_version_num()
-plugins? = Replicant.TestHelper.primary_carries_plugins?()
+plugins = Replicant.TestHelper.primary_plugins()
 
-cond do
-  version == 0 ->
-    ExUnit.configure(exclude: [:integration, :pg17, :pg14, :pg10])
+if expected = System.get_env("EXPECTED_PG_PLUGINS") do
+  actual = Enum.map(plugins, &Atom.to_string/1)
 
-  # A PRE-10 primary (9.6) has no pgoutput stream to drive the core integration
-  # modules — `CREATE PUBLICATION` itself is PG10+ — so the publication-dependent
-  # modules carry :pg10 and are excluded here, honestly, never vacuously passed.
-  # The :pg_old_decoders trio (the parity marquee, the halt legs, the crash-resume
-  # marquee) is ALSO excluded on a 9.6 PRIMARY: those legs assume a PG10+ plugin
-  # primary. The 9.6 row's live plugin coverage is therefore the untagged
-  # pgoutput-on-9.6 refusal leg below, while the parity marquee's 9.6 CROSS-VINTAGE
-  # legs run on the 12 ROW's job: CI starts the real 9.6 secondary beside the 12
-  # primary and exports REPLICANT_PG96_URL, and the marquee FLUNKS (never narrows)
-  # if that wiring is missing on a pre-15 plugin row. The streaming/spill/messages
-  # set (:pg14 — proto-v2 streaming, the `messages` option and
-  # logical_decoding_work_mem are PG14+/PG13+; OBSERVED: PG12 fails the spill
-  # suites' SET with 42704) is excluded here too.
-  version < 100_000 ->
-    ExUnit.configure(exclude: [:pg17, :pg_old_decoders, :pg14, :pg10])
-
-  version < 140_000 ->
-    ExUnit.configure(
-      exclude: if(plugins?, do: [:pg17, :pg14], else: [:pg17, :pg14, :pg_old_decoders])
-    )
-
-  # 14–16: a STOCK 15/16 primary carries neither plugin and excludes the trio; a
-  # plugin-bearing primary of any of these majors (the CI 15 plugin lane) runs it
-  # — the exclusion is decided by the plugin probe above, not the version.
-  version < 170_000 ->
-    ExUnit.configure(exclude: if(plugins?, do: [:pg17], else: [:pg17, :pg_old_decoders]))
-
-  # 17/18: the :pg17 failover marquees RUN here (a `>= 150_000` catch-all branch
-  # above would have excluded them on the very rows they target — coverage killed
-  # silently; caught on the 18 substrate, 2026-09-30). The plugin-row trio runs
-  # only when the primary carries the plugins (stock 17/18 images do not).
-  true ->
-    ExUnit.configure(exclude: if(plugins?, do: [], else: [:pg_old_decoders]))
+  if Enum.sort(actual) != Enum.sort(String.split(expected, ",", trim: true)) do
+    raise "matrix row expected PostgreSQL plugins #{inspect(expected)}, found #{inspect(actual)}"
+  end
 end
+
+# Pre-10 has no publications. Its cross-version plugin parity runs on the
+# publication-capable primary with REPLICANT_PG96_URL pointing to the legacy server.
+exclusions = [
+  integration: version == 0,
+  pg10: version < 100_000,
+  pg14: version < 140_000,
+  pg17: version < 170_000,
+  pglogical: :pglogical not in plugins,
+  wal2json: version < 100_000 or :wal2json not in plugins
+]
+
+ExUnit.configure(exclude: for({tag, true} <- exclusions, do: tag))
 
 # NOTE on `--include integration` against a PG16 server: ExUnit's `--include TAG` rescues a test
 # carrying that tag from EVERY exclusion, so `mix test --include integration` re-admits the

@@ -45,6 +45,17 @@ defmodule Replicant.ReleaseContractTest do
     assert adr =~ "conservative"
   end
 
+  test "the PostgreSQL support ADR ships in Hex and ExDoc" do
+    root = Path.expand("../..", __DIR__)
+    adr = "docs/adr/0010-postgresql-server-support.md"
+    manifest = File.read!(Path.join(root, "scripts/release/package_files.manifest"))
+    docs = Mix.Project.config()[:docs]
+
+    assert adr in String.split(manifest, "\n")
+    assert adr in docs[:extras]
+    assert Enum.any?(docs[:groups_for_extras], fn {_group, pages} -> adr in pages end)
+  end
+
   test "package version advances past the preceding release" do
     assert Version.compare(version(), @previous_release) == :gt,
            "mix.exs version #{version()} must be strictly greater than the preceding " <>

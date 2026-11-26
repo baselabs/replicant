@@ -112,6 +112,7 @@ defmodule Replicant.MixProject do
         "docs/adr/0007-actual-replication-session-identity.md",
         "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
         "docs/adr/0009-pglogical-wal2json-decoders.md",
+        "docs/adr/0010-postgresql-server-support.md",
         "notebooks/getting_started.livemd",
         {"examples/README.md", filename: "examples"},
         {"examples/replication_pipeline/README.md", filename: "reference-deployment"},
@@ -133,7 +134,8 @@ defmodule Replicant.MixProject do
           "docs/adr/0006-fail-closed-supervision.md",
           "docs/adr/0007-actual-replication-session-identity.md",
           "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
-          "docs/adr/0009-pglogical-wal2json-decoders.md"
+          "docs/adr/0009-pglogical-wal2json-decoders.md",
+          "docs/adr/0010-postgresql-server-support.md"
         ],
         Guides: [
           "notebooks/getting_started.livemd",

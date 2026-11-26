@@ -1,6 +1,8 @@
 # ADR-0009: Decoders for the pglogical and wal2json output plugins (PostgreSQL 9.6 to 14)
 
-**Status:** Accepted 2026-09-29 (ships in 1.4.0)
+**Status:** Accepted 2026-09-29 (ships in 1.4.0). Partly superseded by
+[ADR-0010](0010-postgresql-server-support.md) for server support, qualification
+coverage, and the planned wal2json retirement.
 **Date:** 2026-09-29
 **Deciders:** replicant maintainer (roadmap row A7)
 

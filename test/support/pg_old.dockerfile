@@ -1,6 +1,5 @@
-# ADR-0009 — the old-major test substrate: pglogical + wal2json compiled into the
-# official postgres:9.6 and postgres:12 images (base pinned by digest; the tags are
-# frozen upstream so the digest IS the reproducibility guarantee). Also builds the
+# ADR-0009 and ADR-0010 — pglogical compiled against digest-pinned official
+# PostgreSQL images. Legacy rows and PG15 also build wal2json. Legacy rows build the
 # wal2json 2.4 snapshot under a second plugin name (`wal2json2_4`) — the live lever
 # for the :decoder_option_unsupported halt (a build that predates
 # numeric-data-types-as-string rejects the option wal2json ≥ 2.6 requires).
@@ -41,7 +40,7 @@ RUN set -eux; \
         build-essential git ca-certificates libkrb5-dev libselinux1-dev \
         libxslt1-dev libpam0g-dev zlib1g-dev libssl-dev libedit-dev; \
       ;; \
-    12|15) \
+    12|15|16|17|18|19) \
       apt-get update; \
       apt-get install -y --no-install-recommends ca-certificates; \
       sed -E 's#https?://apt\.postgresql\.org#https://apt-archive.postgresql.org#; s#-pgdg main.*$#-pgdg-archive main#' \
@@ -70,14 +69,16 @@ RUN set -eux; \
 #   * pre-15 bases: the wal2json_2_6 tag's "Stamp 2.6" commit 75629c2 — the
 #     committed substrate the 9.6/12 CI rows and their receipts are built on;
 #     2.6 sources predate PG15's ReorderBufferTXN change and do not compile there.
-#   * 15+ bases: master @ 75a4b494 ("Remove test_decoding from the regression
+#   * 15 base: master @ 75a4b494 ("Remove test_decoding from the regression
 #     tests", 21 commits past 2.6) — the first committed-lineage pin carrying the
 #     PG15/16 compile shims (txn->xact_time.commit_time under
 #     PG_VERSION_NUM >= 150000).
 # wal2json_2_4 resolves to 36fbee6cbb7e4bc1bf9ee4f55842ab51393e3ac0.
 # The wal2json2_4 lever (the option-rejection halt's live substrate) builds only on
 # the pre-15 majors — wal2json_2_4 predates PG15 and no 15+ lane needs it.
+ARG WITH_WAL2JSON
 RUN set -eux; \
+    case "$WITH_WAL2JSON" in false) exit 0 ;; true) ;; *) exit 1 ;; esac; \
     git clone --quiet https://github.com/eulerto/wal2json.git /tmp/wal2json; \
     cd /tmp/wal2json; \
     case "$PG_MAJOR" in \

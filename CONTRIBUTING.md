@@ -74,7 +74,7 @@ specific `!path`.
 The infrastructure maintainers' CI requirements bind every workflow and release script here;
 maintainers read them before changing either.
 
-Every check above, `mix test` on all six PostgreSQL majors, and the docs and
+Every check above, `mix test` on the declared PostgreSQL matrix, and the docs and
 package build are jobs in
 [`.github/workflows/qualification.yml`](.github/workflows/qualification.yml).
 No workflow runs repository code from a pull request. A fork's change is

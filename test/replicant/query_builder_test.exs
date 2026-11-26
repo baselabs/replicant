@@ -150,12 +150,14 @@ defmodule Replicant.QueryBuilderTest do
       assert sql =~ "slot_name = 'replicant_orders'"
     end
 
-    test "PG17+ (version >= 170000) additionally selects invalidation_reason + synced" do
-      assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders", 170_010)
-      assert sql =~ "wal_status"
-      assert sql =~ "conflicting"
-      assert sql =~ "invalidation_reason"
-      assert sql =~ "synced"
+    test "PG17 and PG19 select the authoritative invalidation and sync columns" do
+      for version <- [170_010, 190_000] do
+        assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders", version)
+        assert sql =~ "wal_status"
+        assert sql =~ "conflicting"
+        assert sql =~ "invalidation_reason"
+        assert sql =~ "synced"
+      end
     end
 
     test "rejects an invalid slot name (no raw interpolation into SQL)" do

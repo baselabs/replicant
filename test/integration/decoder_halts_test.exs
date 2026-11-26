@@ -102,7 +102,7 @@ defmodule Replicant.DecoderHaltsTest do
   end
 
   describe "wal2json schema guard (dropped-column backstop)" do
-    @describetag :pg_old_decoders
+    @describetag :wal2json
 
     test "a dropped VARLENA column on an update-only table halts within the guard interval" do
       # The exact residual the wire rules cannot see: a dropped TOASTable column and an
@@ -254,10 +254,12 @@ defmodule Replicant.DecoderHaltsTest do
     end
   end
 
-  describe "wal2json wire-level dropped-column detection (immediate)" do
-    @describetag :pg_old_decoders
+  for decoder <- [:pglogical, :wal2json] do
+    @tag decoder
+    @tag :pg10
+    test "#{decoder} halts when an UPDATE follows a fixed-width column drop" do
+      decoder = unquote(decoder)
 
-    test "an UPDATE missing a FIXED-WIDTH column halts at the change (no guard wait)" do
       unless PG16.enabled?() do
         flunk("REPLICANT_TEST_URL not set")
       end
@@ -268,22 +270,23 @@ defmodule Replicant.DecoderHaltsTest do
       Postgrex.query!(ctrl, "DROP TABLE IF EXISTS halt_wire CASCADE", [])
       Postgrex.query!(ctrl, "CREATE TABLE halt_wire (id int PRIMARY KEY, n int)", [])
 
+      options = dropped_column_options(ctrl, decoder)
+
       slot = "rep_halt_wire_#{System.unique_integer([:positive])}"
       cleanup_slot(url, slot)
 
-      _halted = attach_event(:wire_halted, [:replicant, :schema_change, :halted])
+      event = attach_event({:wire_halted, slot}, [:replicant, :schema_change, :halted])
+      on_exit(fn -> detach_event(event) end)
 
-      # a LONG guard interval: this leg must halt on the WIRE rule alone (the dropped
-      # int4 is absent from the update, and a fixed-width value is never TOAST-omitted)
       {:ok, _} =
         Replicant.start_link(
-          connection: conn_opts(url),
-          slot_name: slot,
-          sink: ParitySink,
-          go_forward_only: true,
-          decoder: :wal2json,
-          tables: [{"public", "halt_wire"}],
-          schema_check_interval: 60_000
+          [
+            connection: conn_opts(url),
+            slot_name: slot,
+            sink: ParitySink,
+            go_forward_only: true,
+            decoder: decoder
+          ] ++ options
         )
 
       PG16.wait_until(fn ->
@@ -306,15 +309,29 @@ defmodule Replicant.DecoderHaltsTest do
       Postgrex.query!(ctrl, "ALTER TABLE halt_wire DROP COLUMN n", [])
       Postgrex.query!(ctrl, "UPDATE halt_wire SET id = 2 WHERE id = 1", [])
 
-      assert_receive {:wire_halted, %{kind: :destructive}}, 10_000
+      assert_receive {^event, %{kind: :destructive}}, 10_000
       wait_until_gone(slot)
-      detach_event(:wire_halted)
       GenServer.stop(ctrl)
     end
   end
 
+  defp dropped_column_options(ctrl, :pglogical) do
+    Postgrex.query!(
+      ctrl,
+      "SELECT pglogical.replication_set_add_table('default', 'public.halt_wire', false)",
+      []
+    )
+
+    [replication_sets: ["default"]]
+  end
+
+  defp dropped_column_options(_ctrl, :wal2json) do
+    # Prove the wire rule fires without waiting for the catalog guard.
+    [tables: [{"public", "halt_wire"}], schema_check_interval: 60_000]
+  end
+
   describe "wal2json NULL column values (the insert-drop rule's every-live-column assumption)" do
-    @describetag :pg_old_decoders
+    @describetag :wal2json
 
     test "an INSERT carrying NULLs delivers them as nils instead of false-halting :destructive" do
       # The insert drop rule classifies a cached column ABSENT from an insert as
@@ -408,10 +425,9 @@ defmodule Replicant.DecoderHaltsTest do
   # PRE-15 majors (wal2json_2_4 predates PG15 and does not compile there): rows 9/12
   # own this leg and a missing lever there FLUNKS (the image build broke); a 15+
   # plugin lane skips it with a logged reason (structurally absent, never silently);
-  # a stock 15-18 primary excludes the whole trio (the plugin probe) and never
-  # reaches here.
+  # A primary without wal2json excludes this test based on the plugin probe.
   describe ":decoder_option_unsupported (an old wal2json build rejects the option set)" do
-    @describetag :pg_old_decoders
+    @describetag :wal2json
 
     test "a slot on the wal2json2_4 build halts instead of watchdog-looping" do
       unless PG16.enabled?() do
@@ -506,7 +522,7 @@ defmodule Replicant.DecoderHaltsTest do
     GenServer.stop(ctrl)
   end
 
-  # This leg is deliberately NOT :pg_old_decoders-tagged: it needs a real pre-10
+  # This leg is deliberately NOT :wal2json-tagged: it needs a real pre-10
   # PRIMARY (or a PG96 secondary) and must run on the 9-row, where the trio's other
   # primary-server legs are excluded. The target server resolves as the PG96
   # secondary when set, else the primary itself when it is pre-10; otherwise the leg
@@ -532,7 +548,7 @@ defmodule Replicant.DecoderHaltsTest do
   end
 
   describe "wal2json keyless-table pre-flight (divergence resolution: no silent drops)" do
-    @describetag :pg_old_decoders
+    @describetag :wal2json
 
     test "a configured keyless table halts {:decoder, :table_keyless} at start; allow_keyless_tables opts in" do
       unless PG16.enabled?() do
@@ -607,8 +623,7 @@ defmodule Replicant.DecoderHaltsTest do
   end
 
   describe "REPLICA IDENTITY NOTHING (the OBSERVED per-decoder divergences)" do
-    @describetag :pg_old_decoders
-
+    @tag :pg10
     test "pgoutput never carries keyless changes: the SERVER refuses them (55000)" do
       # Publications (and the update-publishing refusal this proves) are PG10+; on
       # the 9.6 row the plugin decoders own the substrate and publications do not
@@ -644,6 +659,7 @@ defmodule Replicant.DecoderHaltsTest do
       Postgrex.query!(ctrl, "DROP PUBLICATION IF EXISTS #{pub}", [])
     end
 
+    @tag :wal2json
     test "wal2json delivers the insert and drops BOTH keyless changes plugin-side" do
       url = System.fetch_env!("REPLICANT_TEST_URL")
       {:ok, ctrl} = Postgrex.start_link(conn_opts(url) ++ [pool_size: 2, backoff_type: :stop])
@@ -745,7 +761,7 @@ defmodule Replicant.DecoderHaltsTest do
   end
 
   describe "wal2json schema-drift re-emit (ADR-0009 §5)" do
-    @tag :pg_old_decoders
+    @tag :wal2json
     test "a new column mid-stream re-emits the relation and classifies additively" do
       unless PG16.enabled?() do
         flunk("REPLICANT_TEST_URL not set")

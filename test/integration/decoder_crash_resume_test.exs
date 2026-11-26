@@ -1,7 +1,7 @@
 defmodule Replicant.DecoderCrashResumeTest do
   @moduledoc """
   ADR-0009's crash-injection marquee (loss = 0, effect-dup = 0 through an
-  idempotent sink), once per plugin decoder on the live old-major server: N committed
+  idempotent sink), once per plugin decoder on each applicable live server: N committed
   transactions are written while the pipeline streams, the pipeline is killed
   mid-stream, restarted, and the union of both runs' deliveries must contain every
   transaction AT LEAST ONCE with duplicates bounded to the crash window (the slot
@@ -11,10 +11,7 @@ defmodule Replicant.DecoderCrashResumeTest do
 
   use ExUnit.Case, async: false
   @moduletag :integration
-  # A primary-server plugin-decoder leg (like the parity/halts trio): excluded when
-  # the primary is PG15+ (no plugins) or pre-10 (the legs assume a PG10+ primary);
-  # verified green on the 12-primary wiring with the 9.6 secondary.
-  @moduletag :pg_old_decoders
+  @moduletag :pg10
   @moduletag timeout: 120_000
 
   alias Replicant.Test.{ParitySink, PG16}
@@ -36,6 +33,7 @@ defmodule Replicant.DecoderCrashResumeTest do
         {:pglogical, [replication_sets: ["default"]]},
         {:wal2json, [tables: [{"public", "crash_t"}]]}
       ] do
+    @tag decoder
     @tag decoder: decoder
     test "crash + resume through #{decoder}: every transaction delivered exactly once", %{
       decoder: unquote(decoder)

@@ -232,8 +232,8 @@ across the range. `decoder:` selects the output plugin
 
 | Decoder | Server | Table set option | Tested in CI on |
 |---|---|---|---|
-| `:pgoutput` (default) | PostgreSQL 10+ (halts `{:config, :decoder_unsupported_on_server}` on 9.6) | `publication:` (a name or a list) | 12, 15, 16, 17, 18 |
-| `:pglogical` (pglogical 2.x, `pglogical_output`) | any server with the plugin installed | `replication_sets:` | 9.6, 12, 15 |
+| `:pgoutput` (default) | PostgreSQL 10+ (halts `{:config, :decoder_unsupported_on_server}` on 9.6) | `publication:` (a name or a list) | 12, 15, 16, 17, 18, 19 |
+| `:pglogical` (pglogical 2.x, `pglogical_output`) | any server with the plugin installed | `replication_sets:` | 9.6, 12, 15, 16, 17, 18, 19 |
 | `:wal2json` (format version 2, wal2json 2.6+) | any server with the plugin installed | `tables: [{"public", "orders"}]` | 9.6, 12, 15 |
 
 | Capability | Requires |
@@ -244,20 +244,35 @@ across the range. `decoder:` selects the output plugin
 | Failover slots (`failover: true`) | PostgreSQL 17+; halts `{:config, :failover_unsupported}` below |
 | Slot-invalidation columns consulted | `wal_status` from 13, `conflicting` from 16, `invalidation_reason` and `synced` from 17; none below 13 |
 
-The [CI matrix](https://github.com/baselabs/replicant/blob/main/.github/workflows/qualification.yml)
-runs the full suite on each maintainer-submitted landing candidate against
-the platform PostgreSQL engine from `.github/postgres.ref` and the compatibility
-lanes declared in `.github/postgres-lanes.json` (9.6, 12, 15, 15 with plugins,
-16 and 17), each a real digest-pinned server with password host authentication
-and `wal_level=logical`. One validated reader generates the matrix; one composite
-action checks the engine's public digest, starts every server, and removes its
-disposable data. The reference example uses the same engine for both databases.
-The 9.6, 12 and
-15-plugin rows build `pglogical` 2.4.8 and `wal2json` into the image and run a
-parity test that delivers one fixture transaction byte-identically across pgoutput,
-pglogical and wal2json. PostgreSQL 10, 11, 13 and 14 are inside the pgoutput range but not in the matrix, and the
-plugin decoders are tested on 9.6, 12 and 15 only. A configuration a decoder cannot express is refused at start
-(`:decoder_capability_unsupported`), never degraded at run time.
+### PostgreSQL version support
+
+Replicant follows the [PGDG support calendar](https://www.postgresql.org/support/versioning/).
+The supported majors are **15, 16, 17, 18 and 19**. Each has a real CI lane.
+Support ends on the PGDG end-of-life date, with an announcement in the changelog
+and this compatibility section. Raising the server floor or refusing a working
+configuration requires a Replicant major release.
+[ADR-0010](docs/adr/0010-postgresql-server-support.md) records the policy.
+
+CI uses digest-pinned upstream images for 15, 16, 17 and 19. The 18 lane runs
+the full suite against the platform engine in `.github/postgres.ref` and runs
+the pglogical suite against a pinned upstream 18 companion. CI builds
+pglogical 2.4.8 against each supported major and compares its delivery to
+pgoutput on the same server. pglogical supports row filters that call
+user-defined functions and intersects predicates from multiple replication
+sets. Native publications restrict filter expressions and combine them with OR.
+
+**Deprecated in 1.x for removal in 2.0:** PostgreSQL below 15 and
+`decoder: :wal2json`, including its `tables:`, `allow_keyless_tables:`, and
+`schema_check_interval:` options. Replicant 1.x retains compatibility coverage
+on 9.6 and 12, with wal2json coverage on 9.6, 12 and 15. PostgreSQL 10, 11, 13
+and 14 can use pgoutput in 1.x and are outside the CI matrix. pglogical keeps
+`replication_sets:`. A decoder that cannot express a configuration refuses it
+at start with `:decoder_capability_unsupported`.
+
+Moving from wal2json to pgoutput requires a new slot and a verified checkpoint
+handoff. A fresh snapshot can rebuild a current-state mirror. Preserve
+append-log history through the handoff or recover it from retained records.
+See the [migration procedure](docs/adr/0010-postgresql-server-support.md#wal2json-migration).
 
 Under wal2json two plugin gaps are closed fail-closed: a configured table with no replica
 identity key refuses to start (`{:decoder, :table_keyless}`; opt in for insert-only tables
@@ -276,7 +291,7 @@ All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 | `sink:` | required | the `Replicant.Sink` module |
 | `go_forward_only:` | `false` | must be `true` to start a state-mirror sink from an empty checkpoint without a snapshot |
 | `snapshot:` | `false` | `true` for point-in-time; `[mode: :incremental, chunk_rows: 1000, max_pending_chunks: 4]` for resumable chunks |
-| `decoder:` | `:pgoutput` | `:pglogical` or `:wal2json` for a server without pgoutput |
+| `decoder:` | `:pgoutput` | `:pglogical` for pglogical replication sets or `:wal2json` for legacy 1.x configurations |
 | `checkpoint_store:` | off | `[connection:, table:, progress_table:, max_retries: 5, retry_backoff_ms: 1000, batch: [...]]`: library-owned checkpoint for non-transactional sinks |
 | `batch_delivery:` | off | `[max_transactions: 100, max_delay_ms: 1000]`: atomic batches through `handle_batch/1` |
 | `streaming:` | off | `[max_concurrent_txns: 64, spill: [dir:, max_spill_bytes:]]`: in-progress streaming and disk spill |
@@ -308,7 +323,7 @@ rejections are in [`usage-rules.md`](usage-rules.md). Two to alert on:
 ## Documentation
 
 - [Getting started (Livebook)](notebooks/getting_started.livemd): a runnable, self-verifying
-  tour, executed in CI against PostgreSQL 15 to 18 on every push.
+  tour, executed in CI against PostgreSQL 15 through 19 on each landing candidate.
 - [Usage rules](usage-rules.md): the public surface, casting contract, telemetry and
   halt references.
 - [Invariants](docs/INVARIANTS.md) and the

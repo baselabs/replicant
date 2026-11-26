@@ -2,8 +2,7 @@ defmodule Replicant.PglogicalSnapshotColumnsTest do
   use ExUnit.Case, async: false
   @moduletag :integration
   @moduletag timeout: 120_000
-  unless Replicant.TestHelper.primary_carries_plugins?(),
-    do: @moduletag(skip: "pglogical is unavailable on the configured server")
+  @moduletag :pglogical
 
   alias Replicant.Snapshotter
   alias Replicant.Test.{PG16, SnapshotRecordingSink}

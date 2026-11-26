@@ -7,10 +7,9 @@ defmodule Replicant.DecoderParityTest do
 
   Geometry (fail-loud, never silently narrowed — a missing expected input flunks
   rather than shrinking the comparison):
-    * the primary (`REPLICANT_TEST_URL`) is a PLUGIN ROW — it must carry BOTH
-      plugins (CI wires the 12 row from `test/support/pg_old.dockerfile`); the
-      pgoutput reference runs on the SAME primary (core variant on 10-14; the
-      truncate + transactional-message variant on 15+, which needs PG14+ messages);
+    * the primary (`REPLICANT_TEST_URL`) carries pglogical and runs its reference
+      through pgoutput on the same server. Rows declaring wal2json also compare
+      its core delivery and, on 15+, the truncate + transactional-message variant;
     * a pre-15 plugin row must ALSO wire `REPLICANT_PG96_URL` to a real 9.6
       carrying both plugins (CI starts the 9.6 beside the 12) — the cross-vintage
       plugin legs are part of the acceptance, not an optional extra;
@@ -24,6 +23,7 @@ defmodule Replicant.DecoderParityTest do
 
   use ExUnit.Case, async: false
   @moduletag :integration
+  @moduletag :pg10
   @moduletag timeout: 180_000
 
   alias Replicant.Test.{DecoderParity, ParitySink, PG16}
@@ -225,8 +225,8 @@ defmodule Replicant.DecoderParityTest do
     end
   end
 
-  @tag :pg_old_decoders
-  test "the fixture delivers byte-identically across pgoutput, pglogical and wal2json", %{
+  @tag :pglogical
+  test "the fixture delivers byte-identically across the applicable decoders", %{
     avail: avail,
     pg96_avail: pg96_avail
   } do
@@ -237,19 +237,14 @@ defmodule Replicant.DecoderParityTest do
     url = System.fetch_env!("REPLICANT_TEST_URL")
     version = major(url)
 
-    # --- FAIL LOUD, never narrow: this marquee runs on plugin rows — the primary
-    # must carry BOTH plugins, or the cross-decoder comparison it exists to make
-    # silently shrinks (the exact vacuous geometry this file refuses). ---
-    assert avail.pglogical,
-           "primary carries no pglogical — wire the plugin row (test/support/pg_old.dockerfile) instead of narrowing the parity marquee"
+    assert avail.pglogical, "primary carries no pglogical"
 
-    assert avail.wal2json,
-           "primary carries no wal2json — wire the plugin row (test/support/pg_old.dockerfile) instead of narrowing the parity marquee"
-
-    # A pre-15 plugin row is a CI plugin lane: the 9.6 cross-vintage legs are
-    # EXPECTED, not optional. (15+ plugin-bearing primaries have no such lane; the
-    # 9.6 legs run there only when the URL is wired.)
     expect_pg96? = version < 150_000
+
+    expect_wal2json? =
+      pg96_enabled?() or expect_pg96? or "wal2json" in String.split(System.get_env("EXPECTED_PG_PLUGINS", ""), ",")
+
+    if expect_wal2json?, do: assert(avail.wal2json, "primary carries no wal2json")
 
     if expect_pg96? and not pg96_enabled?() do
       flunk(
@@ -271,78 +266,33 @@ defmodule Replicant.DecoderParityTest do
              "REPLICANT_PG96_URL server carries no wal2json — the 9.6 legs cannot narrow"
     end
 
-    # --- the plugin legs on the primary (core variant; the fixture's truncate and
-    # transactional-message legs ride the 15+ variant below). pglogical subscribes
-    # BOTH sets: parity_nothing rides default_insert_only, and a leg that never
-    # joins that set cannot be compared on that table. ---
-    pg12_pglogical = leg(url, :pglogical, :core, "12")
-    pg12_wal2json = leg(url, :wal2json, :core, "12")
+    pglogical = leg(url, :pglogical, :core, "pgl")
     pgoutput_core = leg(url, :pgoutput, :core, "pg")
 
-    # NON-VACUITY at exact counts (fresh-review F6): every compared table must
-    # carry its expected change count on every leg — an attachment/wiring failure
-    # that empties a table cannot hide behind [] == []. parity_full under pglogical
-    # carries its INSERT only (default_insert_only set); every other cell is
-    # ins+upd+del (parity_all: 2 inserts + update) and parity_nothing is the single
-    # insert everywhere (keyless U/D never stream on any decoder).
-    for {txns, full_dml_count, label} <- [
-          {pg12_pglogical, 1, "pglogical@12"},
-          {pg12_wal2json, 3, "wal2json@12"},
-          {pgoutput_core, 3, "pgoutput"}
+    assert_core_counts(pglogical, 1, "pglogical")
+    assert_core_counts(pgoutput_core, 3, "pgoutput")
+
+    # The pglogical fixture puts RI FULL in the insert-only set. Compare its
+    # INSERT and all changes from the other tables at the full field projection.
+    for {table, op} <- [
+          {"parity_all", nil},
+          {"parity_idx", nil},
+          {"parity_nothing", nil},
+          {"parity_full", :insert}
         ] do
-      assert_change_counts(
-        txns,
-        %{
-          "parity_all" => 3,
-          "parity_idx" => 3,
-          "parity_full" => full_dml_count,
-          "parity_nothing" => 1
-        },
-        label
-      )
+      assert table_changes(pgoutput_core, table, op) == table_changes(pglogical, table, op),
+             diff_legs(pgoutput_core, pglogical, table)
     end
 
-    # The compared core — the tables ALL compared decoders carry identically, at the
-    # FULL field projection (op/schema/table/record/old_record/unchanged/columns —
-    # table_changes/2): the every-type DEFAULT table (incl. NULL scalars, extreme
-    # floats, unchanged TOAST), the USING-INDEX table's update+delete, and the
-    # keyless table's single insert (insert-only semantics on every decoder; its
-    # U/D divergences are asserted per decoder in DecoderHaltsTest). parity_full
-    # (RI FULL) is pgoutput/wal2json-only under pglogical (OBSERVED plugin
-    # constraint: no usable identity index ⇒ insert-only set), so it is compared
-    # everywhere EXCEPT against pglogical.
-    # WHOLE-DELIVERY equality for the pair whose coverage is complete (F3:
-    # pgoutput vs wal2json both deliver the full fixture — one transaction, same
-    # change order, same metadata; per-table projections alone would hide a
-    # transaction-boundary difference). Pairs involving pglogical compare per
-    # table (its parity_full coverage is insert-only by plugin constraint) plus
-    # the parity_full INSERT below.
-    assert pgoutput_core == pg12_wal2json,
-           "pgoutput and wal2json core deliveries differ:\nleft:  " <>
-             inspect(pgoutput_core, limit: :infinity, pretty: true) <>
-             "\nright: " <> inspect(pg12_wal2json, limit: :infinity, pretty: true)
+    wal2json =
+      if avail.wal2json do
+        deliveries = leg(url, :wal2json, :core, "w2j")
+        assert_core_counts(deliveries, 3, "wal2json")
+        assert pgoutput_core == deliveries
+        deliveries
+      end
 
-    for {a, b, table, op} <- [
-          {pgoutput_core, pg12_pglogical, "parity_all", nil},
-          {pgoutput_core, pg12_pglogical, "parity_idx", nil},
-          {pgoutput_core, pg12_pglogical, "parity_nothing", nil},
-          {pgoutput_core, pg12_wal2json, "parity_all", nil},
-          {pgoutput_core, pg12_wal2json, "parity_idx", nil},
-          {pgoutput_core, pg12_wal2json, "parity_full", nil},
-          {pgoutput_core, pg12_wal2json, "parity_nothing", nil},
-          {pg12_pglogical, pg12_wal2json, "parity_all", nil},
-          {pg12_pglogical, pg12_wal2json, "parity_idx", nil},
-          {pg12_pglogical, pg12_wal2json, "parity_nothing", nil},
-          # parity_full's INSERT is the one parity_full change ALL THREE decoders
-          # deliver — comparable for pglogical too (its upd/del never ride the
-          # insert-only set)
-          {pgoutput_core, pg12_pglogical, "parity_full", :insert}
-        ] do
-      assert table_changes(a, table, op) == table_changes(b, table, op), diff_legs(a, b, table)
-    end
-
-    # --- the 9.6 cross-vintage plugin legs (same core, real 9.6 substrate),
-    # compared against the 12 legs table-for-table (all/idx/full/nothing). ---
+    # Compare the legacy source's core deliveries with the primary table by table.
     if pg96_enabled?() do
       pg96_pglogical = leg(@pg96_url, :pglogical, :core, "96")
       pg96_wal2json = leg(@pg96_url, :wal2json, :core, "96")
@@ -370,29 +320,23 @@ defmodule Replicant.DecoderParityTest do
       )
 
       for {a, b, table, op} <- [
-            {pg96_pglogical, pg12_pglogical, "parity_all", nil},
-            {pg96_pglogical, pg12_pglogical, "parity_idx", nil},
-            {pg96_pglogical, pg12_pglogical, "parity_nothing", nil},
-            {pg96_wal2json, pg12_wal2json, "parity_all", nil},
-            {pg96_wal2json, pg12_wal2json, "parity_idx", nil},
-            {pg96_wal2json, pg12_wal2json, "parity_full", nil},
-            {pg96_wal2json, pg12_wal2json, "parity_nothing", nil},
+            {pg96_pglogical, pglogical, "parity_all", nil},
+            {pg96_pglogical, pglogical, "parity_idx", nil},
+            {pg96_pglogical, pglogical, "parity_nothing", nil},
+            {pg96_wal2json, wal2json, "parity_all", nil},
+            {pg96_wal2json, wal2json, "parity_idx", nil},
+            {pg96_wal2json, wal2json, "parity_full", nil},
+            {pg96_wal2json, wal2json, "parity_nothing", nil},
             {pg96_pglogical, pg96_wal2json, "parity_idx", nil},
             {pg96_pglogical, pgoutput_core, "parity_all", nil},
             {pg96_wal2json, pgoutput_core, "parity_all", nil},
-            {pg96_pglogical, pgoutput_core, "parity_full", :insert},
-            {pg96_wal2json, pg12_wal2json, "parity_full", nil}
+            {pg96_pglogical, pgoutput_core, "parity_full", :insert}
           ] do
         assert table_changes(a, table, op) == table_changes(b, table, op), diff_legs(a, b, table)
       end
     end
 
-    # --- the truncate + transactional-message legs ride only the 15+ variant
-    # (PG14+ messages; the CI plugin lane is 12). Same variant on BOTH legs, and
-    # the comparison is the WHOLE normalized delivery — every change of every
-    # table at the full projection plus the message content — not a per-table
-    # subset. ---
-    if version >= 150_000 do
+    if avail.wal2json and version >= 150_000 do
       pgoutput_full = leg(url, :pgoutput, :truncate_message, "pgfull")
       wal2json_full = leg(url, :wal2json, :truncate_message, "pgfull")
 
@@ -406,6 +350,27 @@ defmodule Replicant.DecoderParityTest do
                inspect(pgoutput_full, limit: :infinity, pretty: true) <>
                "\nright: " <> inspect(wal2json_full, limit: :infinity, pretty: true)
     end
+
+    major = div(version, 10_000)
+
+    if expected = System.get_env("EXPECTED_PG_MAJOR") do
+      assert Integer.to_string(major) == expected
+    end
+
+    IO.puts("PGLOGICAL-PARITY-RECEIPT pg=#{major}")
+  end
+
+  defp assert_core_counts(txns, full_count, label) do
+    assert_change_counts(
+      txns,
+      %{
+        "parity_all" => 3,
+        "parity_idx" => 3,
+        "parity_full" => full_count,
+        "parity_nothing" => 1
+      },
+      label
+    )
   end
 
   # A readable failure message: the per-table projections of both legs.

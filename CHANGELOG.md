@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Adopt the PGDG support calendar with one real CI lane per supported major.
+  Add PostgreSQL 19 and qualify pglogical 2.4.8 across PostgreSQL 15 through 19.
+  See [ADR-0010](docs/adr/0010-postgresql-server-support.md).
+
+### Deprecated
+
+- PostgreSQL below 15 and `decoder: :wal2json` are deprecated in 1.x and will
+  be removed in 2.0, including wal2json's `tables:`, `allow_keyless_tables:`,
+  and `schema_check_interval:` options. pglogical keeps `replication_sets:`.
+  Plan a new pgoutput slot and [checkpoint handoff](docs/adr/0010-postgresql-server-support.md#wal2json-migration)
+  before migration.
+
 ### Fixed
 
 - Publication checks the built Hex package for changelog entries above its version

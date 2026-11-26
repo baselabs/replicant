@@ -323,16 +323,26 @@ the chosen decoder cannot express — `streaming:`/`failover:` off pgoutput, `me
 on pglogical — ADR-0009), `{:config, :failover_unsupported}`, and
 `{:error, :invalid_start_lsn}` from the query builder (1.3.0).
 
-## Decoder selection (ADR-0009)
+## Decoder selection
 
-`decoder:` selects the logical-decoding output plugin: `:pgoutput` (the default,
-PostgreSQL 15-18, byte-identical to 1.3.0; the plugin matrix also runs it on 12 and
-on the 15 plugin lane), `:pglogical` (the `pglogical_output`
-binary protocol, pglogical 2.x) or `:wal2json` (JSON format
-version 2, wal2json ≥ 2.6). The tested plugin lanes are 9.6, 12 and 15 (ADR-0009's
-matrix — on 15 the lane pins a post-2.6 wal2json master commit carrying the PG15
-compile shims). The sink contract, the `commit_lsn`
-watermark, both checkpoint modes and every halt keep their semantics across decoders.
+`decoder:` selects the logical-decoding output plugin. `:pgoutput` is the
+default. `:pglogical` uses the pglogical 2.x binary protocol
+(`pglogical_output`), supports user-defined functions in row filters, and
+intersects the predicates from applicable replication sets. CI covers both
+decoders on PostgreSQL 15 through 19. `:wal2json` uses JSON format 2 with
+wal2json 2.6 or newer and has CI coverage on 9.6, 12 and 15. The sink contract,
+the `commit_lsn` watermark, both checkpoint modes and halt semantics apply
+across decoders.
+
+**Deprecated in 1.x for removal in 2.0:** PostgreSQL below 15,
+`decoder: :wal2json`, and its `tables:`, `allow_keyless_tables:`, and
+`schema_check_interval:` options. `replication_sets:` remains the pglogical
+option. A slot binds its plugin, so use a new pgoutput slot and a verified
+checkpoint handoff. A fresh snapshot restores current state only. Preserve
+append-log history separately during the handoff.
+[ADR-0010](docs/adr/0010-postgresql-server-support.md#wal2json-migration)
+describes the cutover.
+
 The table set is named per decoder — `publication:` for pgoutput,
 `replication_sets:` for pglogical, `tables: [{schema, table}]` for wal2json — and the
 wrong key for the chosen decoder is rejected at start. The plugin differences that

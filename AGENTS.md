@@ -18,7 +18,7 @@ in-progress-transaction streaming, consumer-side disk spill for oversized
 transactions, PG17+ forward-compat with failover slots, **multi-publication per
 pipeline** (`publication: [p1, p2]` — fail-closed on a missing pub), and
 **logical-decoding messages** (`messages: true` — `pg_logical_emit_message` payloads),
-and the **ADR-0009 plugin decoders** (`decoder: :pglogical | :wal2json`, pre-15 majors)
+and the **ADR-0009 plugin decoders** (`decoder: :pglogical | :wal2json`)
 with fail-closed divergence handling: a configured keyless wal2json table halts at start
 (`allow_keyless_tables: true` opts into insert-only semantics), and a dropped column
 halts `:destructive` on every decoder (wal2json: at the change for inserts/fixed-width
@@ -99,7 +99,7 @@ The commands below describe the CI gates. See [Testing](#testing) for the test c
 Update `CHANGELOG.md` under `[Unreleased]`.
 
 **Checks run in CI, through the landing.** The repository has no pre-commit hook. Every check
-(format, credo, compile warnings, the dependency audit, dialyzer, `mix test` on all six
+(format, credo, compile warnings, the dependency audit, dialyzer, `mix test` on supported and legacy
 PostgreSQL majors, docs and package, the reference example) is a job in
 `.github/workflows/qualification.yml`. Maintainers land a commit through a `kci/<commit>`
 branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qualified` job
@@ -206,22 +206,19 @@ they touch a workflow, a Dockerfile, a release script or a secret.
   `REPLICANT_PG96_URL` to a real 9.6 carrying both plugins. The snapshot leg
   (`test/integration/plugin_snapshot_pg96_test.exs`) proves exactly-once arrival across a 9.6
   two-part exported-snapshot handoff wherever a pre-10 server is wired.
-- **PostgreSQL substrate:** `.github/postgres.ref` is the checked platform engine reference.
-  `.github/postgres-lanes.json` declares each other supported major once (9.6, 12, 15, 16, 17),
-  its digest-pinned upstream image, decoder/pgoutput roles, and decoder settings. The engine
-  supplies the current-major lane and both example servers; it is never a compatibility row.
-  `scripts/ci/postgres-lanes.sh` validates the declaration and emits the matrix and expected
-  engine major. `.github/actions/postgres` owns every start and unconditional teardown, checks
-  the public engine digest anonymously before pulling, and uses password host authentication.
-  Decoder images build from declared bases through `test/support/pg_old.dockerfile`, with
-  full source commits and exact server headers. The legacy-source role backs the parity
-  sidecar. The `:pg_old_decoders` exclusion follows a plugin probe, not the version. Rows
-  carry reader-derived `EXPECTED_PG_MAJOR`. Behavior
-  gates on `server_version_num`: the slot-invalidation query selects only columns the major has
-  (PG15 `wal_status`; PG16 `+ conflicting`; PG17/18 `+ invalidation_reason, synced`); failover
-  slots exist on PG17/18 and halt `{:config, :failover_unsupported}` on PG15/16. `:pg14`
-  marquees (streaming, spill, messages) skip pre-14; `:pg10` publication modules skip on 9.6.
-  CI runs the full suite on all six majors.
+- **PostgreSQL substrate:** one qualification lane per PGDG-supported major
+  (15 through 19, [ADR-0010](docs/adr/0010-postgresql-server-support.md)), plus 9.6
+  and 12 compatibility lanes in 1.x. `.github/postgres.ref` pins the platform engine
+  for its lane and the example. `.github/postgres-lanes.json` pins upstream images
+  for the other majors and the engine lane's same-major pglogical companion.
+  `scripts/ci/postgres-lanes.sh` validates the matrix. The shared PostgreSQL action
+  checks the public engine digest anonymously and owns password-authenticated
+  startup and unconditional teardown. Plugin builds use exact server headers and
+  full source commits. wal2json stays on 9.6, 12 and 15. Every lane checks the
+  live major and plugin inventory. Publication-capable pglogical runs require a
+  successful parity receipt. The `:pg17`, `:pg14` and `:pg10` tags gate features
+  on their minimum major. The slot-invalidation query uses `wal_status` from 13,
+  `conflicting` from 16, and `invalidation_reason` and `synced` from 17.
 - **Integration + crash-injection tests** (`test/integration/**`): gate on
   `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
   unset. Qualification provisions isolated containers on loopback with a new database,

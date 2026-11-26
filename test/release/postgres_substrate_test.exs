@@ -4,64 +4,69 @@ defmodule Replicant.PostgresSubstrateTest do
   @root Path.expand("../..", __DIR__)
 
   test "the reader derives engine and compatibility coverage from the declarations" do
-    with_reader(fn lanes, reference, paths ->
-      {output, 0, result} = read_lanes(lanes, reference, paths)
+    with_reader(fn declaration, reference, paths ->
+      {output, 0, result} = read_lanes(declaration, reference, paths)
       assert output == ""
       matrix = Jason.decode!(result["matrix"])["pg"]
       [engine | compatibility] = matrix
+      lanes = declaration["compatibility"]
       assert engine["kind"] == "engine"
       assert engine["major"] == result["engine-major"]
-      refute Enum.any?(lanes, &(&1["major"] == engine["major"]))
+      assert engine["plugins"] == []
+      assert engine["plugin_server"]["image"] == declaration["engine_pglogical_image"]
+      assert engine["plugin_server"]["expected_major"] == engine["expected_major"]
+      assert engine["plugin_server"]["plugins"] == ["pglogical"]
+      assert length(compatibility) == length(lanes)
+      assert Enum.uniq_by(matrix, & &1["major"]) == matrix
 
-      for lane <- lanes, role <- ["pgoutput", "decoders"], role in lane["roles"] do
-        assert Enum.count(compatibility, fn cell ->
-                 cell["major"] == lane["major"] and cell["role"] == role and
-                   cell["image"] == lane["image"]
-               end) == 1
+      for {lane, cell} <- Enum.zip(lanes, compatibility) do
+        assert cell["kind"] == "compatibility"
+        assert Map.take(cell, ["major", "image", "plugins"]) ==
+                 Map.take(lane, ["major", "image", "plugins"])
+
+        refute Map.has_key?(cell, "plugin_server")
+        assert cell["legacy_self"] == Map.get(lane, "legacy-source", false)
+
+        if lane["parity-primary"] do
+          source = Enum.find(lanes, & &1["legacy-source"])
+          assert cell["legacy_server"]["image"] == source["image"]
+          assert cell["legacy_server"]["plugins"] == source["plugins"]
+        else
+          refute Map.has_key?(cell, "legacy_server")
+        end
       end
-
-      source = Enum.find(lanes, &("legacy-source" in &1["roles"]))
-      parity = Enum.filter(compatibility, &Map.has_key?(&1, "sidecar"))
-      assert parity != []
-      assert Enum.all?(parity, &(&1["sidecar"]["image"] == source["image"]))
-
-      count =
-        Enum.sum(
-          Enum.map(lanes, fn lane ->
-            Enum.count(lane["roles"], &(&1 in ["pgoutput", "decoders"]))
-          end)
-        )
-
-      assert length(compatibility) == count
     end)
   end
 
   test "invalid declarations refuse without publishing partial outputs" do
-    with_reader(fn lanes, reference, paths ->
+    with_reader(fn declaration, reference, paths ->
+      lanes = declaration["compatibility"]
       [first | rest] = lanes
       [_, engine_major] = Regex.run(~r/postgres:(\d+)\./, reference)
 
-      mutations = [
+      invalid_lanes = [
         %{},
         [],
         lanes ++ [first],
         [Map.put(first, "unknown", true) | rest],
         [Map.delete(first, "image") | rest],
-        [Map.put(first, "roles", ["unknown"]) | rest],
-        [Map.put(first, "roles", ["decoders", "decoders"]) | rest],
-        [Map.put(first, "roles", ["legacy-source"]) | rest],
+        [Map.put(first, "plugins", ["unknown"]) | rest],
+        [Map.put(first, "plugins", ["pglogical", "pglogical"]) | rest],
+        [Map.put(first, "plugins", ["pglogical"]) | rest],
+        [Map.put(first, "legacy-source", false) | rest],
         [Map.put(first, "major", engine_major) | rest],
-        [Map.put(first, "image", first["image"] <> "bad") | rest],
-        [
-          Map.put(first, "image", String.replace(first["image"], "postgres:", "other:"))
-          | rest
-        ],
+        [Map.update!(first, "image", &(&1 <> "bad")) | rest],
+        [Map.update!(first, "image", &String.replace(&1, "postgres:", "other:")) | rest],
         [Map.put(first, "major", "999") | rest],
-        [Map.put(first, "settings", ["arbitrary=setting"]) | rest],
-        Enum.map(lanes, fn lane ->
-          Map.update!(lane, "roles", &List.delete(&1, "legacy-source"))
-        end)
+        [Map.delete(first, "legacy-source") | rest]
       ]
+
+      mutations =
+        [
+          %{},
+          Map.delete(declaration, "engine_pglogical_image"),
+          Map.put(declaration, "engine_pglogical_image", first["image"])
+        ] ++ Enum.map(invalid_lanes, &Map.put(declaration, "compatibility", &1))
 
       for mutation <- mutations do
         {_output, status, result} = read_lanes(mutation, reference, paths)
@@ -70,7 +75,7 @@ defmodule Replicant.PostgresSubstrateTest do
       end
 
       for bad_ref <- [String.trim(reference), reference <> reference, "invalid\n"] do
-        {_output, status, result} = read_lanes(lanes, bad_ref, paths)
+        {_output, status, result} = read_lanes(declaration, bad_ref, paths)
         assert status != 0
         assert result == %{}
       end
@@ -83,6 +88,14 @@ defmodule Replicant.PostgresSubstrateTest do
     assert test_job["needs"] == "toolchain"
     assert test_job["strategy"]["matrix"] =~ "fromJSON(needs.toolchain.outputs.matrix)"
     assert test_job["env"]["EXPECTED_PG_MAJOR"] == "${{ matrix.pg.expected_major }}"
+
+    assert test_job["env"]["EXPECTED_PG_PLUGINS"] == "${{ join(matrix.pg.plugins, ',') }}"
+    assert test_job["env"]["REPLICANT_PG96_URL"] =~ "matrix.pg.legacy_server"
+
+    companion = Enum.find(test_job["steps"], &(&1["if"] == "matrix.pg.plugin_server != null"))
+    assert companion["env"]["EXPECTED_PG_PLUGINS"] =~ "matrix.pg.plugin_server.plugins"
+    assert companion["run"] =~ "--only pglogical"
+    assert companion["run"] =~ "PGLOGICAL-PARITY-RECEIPT"
 
     for name <- ["test", "reference-example"] do
       steps = qualification["jobs"][name]["steps"]
@@ -160,19 +173,19 @@ defmodule Replicant.PostgresSubstrateTest do
     File.mkdir_p!(dir)
 
     try do
-      lanes = Jason.decode!(File.read!(Path.join(@root, ".github/postgres-lanes.json")))
+      declaration = Jason.decode!(File.read!(Path.join(@root, ".github/postgres-lanes.json")))
       reference = File.read!(Path.join(@root, ".github/postgres.ref"))
-      fun.(lanes, reference, dir)
+      fun.(declaration, reference, dir)
     after
       File.rm_rf!(dir)
     end
   end
 
-  defp read_lanes(lanes, reference, dir) do
+  defp read_lanes(declaration, reference, dir) do
     input = Path.join(dir, "lanes.json")
     ref = Path.join(dir, "postgres.ref")
     output = Path.join(dir, "output")
-    File.write!(input, Jason.encode!(lanes))
+    File.write!(input, Jason.encode!(declaration))
     File.write!(ref, reference)
     File.write!(output, "")
 

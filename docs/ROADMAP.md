@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-11-24 · **Current release:** `1.6.1` (2026-11-24 UTC)
+**Updated:** 2026-11-26 · **Current release:** `1.6.1` (2026-11-24 UTC)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -12,13 +12,15 @@
 
 ## Current package snapshot
 
-Qualification uses the platform PostgreSQL engine in `.github/postgres.ref` for
-its current-major lane and the reference example's source and destination.
-`.github/postgres-lanes.json` declares the other supported majors and their
-pgoutput/decoder/source roles; one reader derives the matrix and one action owns
-password-authenticated startup, stable readiness, and unconditional cleanup.
-The plugin image uses declared bases and full source commits. This CI substrate
-change leaves the library API and decoder guarantees unchanged.
+[ADR-0010](adr/0010-postgresql-server-support.md) follows the PGDG support
+calendar with one real lane for each supported major, currently PostgreSQL 15
+through 19. The 18 lane qualifies against the platform engine and tests
+pglogical against an upstream 18 companion. The reference example also uses
+the platform engine. 1.x keeps 9.6 and 12 compatibility lanes and the existing
+wal2json builds on 9.6, 12 and 15. Replicant 2.0 will remove PostgreSQL below 15,
+wal2json, and its decoder-specific options. The migration requires a new
+pgoutput slot and checkpoint handoff. pglogical stays, including the
+`replication_sets:` option.
 
 Publication selects a qualified `release_commit` on the default branch.
 The keyless build inspects the package and docs, checks the packaged changelog,

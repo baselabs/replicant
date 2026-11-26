@@ -15,6 +15,7 @@ docs/adr/0006-fail-closed-supervision.md
 docs/adr/0007-actual-replication-session-identity.md
 docs/adr/0008-casting-lenient-value-preserving-fallback.md
 docs/adr/0009-pglogical-wal2json-decoders.md
+docs/adr/0010-postgresql-server-support.md
 examples/README.md
 examples/replication_pipeline/README.md
 docs/adr/README.md
