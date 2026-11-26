@@ -3,8 +3,8 @@ defmodule Replicant.ReleasePublicSurfaceTest do
   # SEMANTIC assertions rather than source text greps: a comment or dead string can satisfy
   # `grep 'handle_session_identity'`, but cannot satisfy "the behaviour lists the callback"
   # or "the query builder emits version-tiered SQL". Each assertion reds if its surface is
-  # removed, and none touches a live database. The artifact-derived counterpart runs the same
-  # exercises against the extracted package bytes in scripts/release/consume_candidate.sh.
+  # removed, and none touches a live database. The package gate separately compiles a
+  # consumer of the package whose source bytes qualification compares with this checkout.
   use ExUnit.Case, async: true
 
   describe "R04 — typed slot-origin callback + D2 session identity (public Sink surface)" do

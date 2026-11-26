@@ -21,15 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Plan a new pgoutput slot and [checkpoint handoff](docs/adr/0010-postgresql-server-support.md#wal2json-migration)
   before migration.
 
-### Fixed
+### Changed
 
-- Publication checks the built Hex package for changelog entries above its version
-  and refuses an unstamped archive before checking release state or uploading.
-
-- Publish from an explicitly selected qualified commit, with checksum-verified
-  archives and upload decisions handed to a separate Hex workload identity job.
-  The selected source pins Hex in `.tool-versions`. Keyless read-back verifies the
-  signed registry record before retaining the served archives and published commit.
+- Qualify the Hex package and docs with the shared publication action. Release
+  dispatches use the qualified archives, check the stamped changelog and
+  public/private version collisions before upload, and verify both served
+  archives and their source commit on read-back.
 
 ## [1.6.1] - 2026-11-24
 

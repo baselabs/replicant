@@ -1,7 +1,6 @@
 name: Publish to Hex
 
-# Infra dispatches on the default branch with the qualified release commit.
-# After Hex read-back, infra tags and creates the GitHub release from release-assets.
+# Release only the archives produced by qualification on the selected commit.
 on:
   workflow_dispatch:
     inputs:
@@ -24,377 +23,125 @@ defaults:
     shell: bash
 
 jobs:
-  verify:
-    name: Verify the qualified release source
-    if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      checks: read
-    timeout-minutes: 90 # no green run yet
-    outputs:
-      release_commit: ${{ steps.release.outputs.commit }}
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - name: Refuse refs outside the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          if [ -z "$DEFAULT_BRANCH" ] || [ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
-            echo "::error::Publish runs only from the default branch; this run is on $GITHUB_REF."
-            exit 1
-          fi
-      - name: Validate the release commit
-        id: release
-        env:
-          RELEASE_COMMIT: ${{ inputs.release_commit }}
-          LC_ALL: C
-        run: |
-          if [[ ! "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::release_commit must be a full 40-hex lowercase SHA."
-            exit 1
-          fi
-          printf 'commit=%s\n' "$RELEASE_COMMIT" >> "$GITHUB_OUTPUT"
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.release.outputs.commit }}
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Require default-branch ancestry
-        env:
-          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          head=$(git rev-parse HEAD)
-          if [ "$head" != "$RELEASE_COMMIT" ]; then
-            echo "::error::The checkout is not release commit $RELEASE_COMMIT."
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$RELEASE_COMMIT" "refs/remotes/origin/$DEFAULT_BRANCH"; then
-            echo "::error::$RELEASE_COMMIT is not reachable from $DEFAULT_BRANCH."
-            exit 1
-          fi
-      - name: Require successful qualification of the release commit
-        env:
-          RELEASE_COMMIT: ${{ steps.release.outputs.commit }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          qualified=$(gh api --method GET --paginate \
-            "repos/$GITHUB_REPOSITORY/commits/$RELEASE_COMMIT/check-runs?check_name=qualified&status=completed&filter=all&per_page=100" \
-            --jq '.check_runs[] | select(.name == "qualified" and .conclusion == "success" and .app.slug == "github-actions") | .head_sha')
-          if ! grep -Fxq -- "$RELEASE_COMMIT" <<< "$qualified"; then
-            echo "::error::No successful GitHub Actions qualified check on $RELEASE_COMMIT."
-            exit 1
-          fi
-      - name: Read the source package version
-        id: version
-        run: |
-          python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
-          from pathlib import Path
-          import re
-          declarations = re.findall(r'^[ \t]*@version(?=[ \t(]|$)(.*)$', Path('mix.exs').read_text(), re.M)
-          version = re.fullmatch(
-              r'[ \t]+"([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)"[ \t]*(?:#.*)?',
-              declarations[0],
-          ) if len(declarations) == 1 else None
-          if version is None:
-              raise SystemExit("expected exactly one literal Mix project version")
-          print(f'version={version[1]}')
-          PY
-      - name: Refuse an existing release tag
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          status=0
-          git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null || status=$?
-          case "$status" in
-            2) ;;
-            0) echo "::error::Tag v$VERSION already exists."; exit 1 ;;
-            *) echo "::error::git ls-remote failed with status $status; refusing without a definite answer."; exit 1 ;;
-          esac
-
-      - name: Refuse a first publication
-        run: |
-          status="$(curl --silent --show-error --connect-timeout 10 --max-time 30 \
-            --output /dev/null --write-out '%{http_code}' https://hex.pm/api/packages/replicant)" || {
-            echo "::error::Could not read the Hex package; publication refused"
-            exit 1
-          }
-          case "$status" in
-            200) ;;
-            404)
-              echo "::error::The name replicant is not on Hex; a first publication is the owner's decision"
-              exit 1 ;;
-            *)
-              echo "::error::Hex package lookup failed; publication refused"
-              exit 1 ;;
-          esac
-
-
-  build:
-    name: Build and plan release
-    needs: verify
-    if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90 # no green run yet
-    permissions:
-      contents: read
-    env:
-      VERSION: ${{ needs.verify.outputs.version }}
-      RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-    outputs:
-      elixir: ${{ steps.toolchain.outputs.elixir }}
-      otp: ${{ steps.toolchain.outputs.otp }}
-      hex: ${{ steps.toolchain.outputs.hex }}
-      package_sha256: ${{ steps.handoff.outputs.package_sha256 }}
-      docs_sha256: ${{ steps.handoff.outputs.docs_sha256 }}
-      plan_sha256: ${{ steps.handoff.outputs.plan_sha256 }}
-    steps:
-      # Release tooling belongs to this workflow revision, even for an older source commit.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.verify.outputs.release_commit }}
-          path: source
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: ./.github/actions/toolchain
-        id: toolchain
-        with:
-          path: source/.tool-versions
-
-      - uses: ./.github/actions/beam
-        with:
-          elixir: ${{ steps.toolchain.outputs.elixir }}
-          otp: ${{ steps.toolchain.outputs.otp }}
-
-      - name: Refuse a missing, duplicated or empty release changelog section
-        run: >-
-          elixir -r scripts/release/release_notes.exs
-          -e 'Replicant.ReleaseNotes.section!(File.read!("source/CHANGELOG.md"), hd(System.argv()))' -- "$VERSION"
-
-      - run: mix local.hex "$HEX_VERSION" --force
-        env:
-          HEX_VERSION: ${{ steps.toolchain.outputs.hex }}
-      - run: mix local.rebar --force
-      - run: mix deps.get --check-locked
-        working-directory: source
-
-      - name: Compare two package builds and inspect one docs build
-        env:
-          RELEASE_SOURCE: ${{ github.workspace }}/source
-        run: bash scripts/release/build_candidate.sh "$RUNNER_TEMP/replicant-release"
-
-      - name: Refuse a package whose changelog is not stamped for its version
-        shell: bash
-        run: |
-          python3 -I - "$RUNNER_TEMP/replicant-release/package.tar" "$VERSION" <<'PY'
-          import io, re, sys, tarfile
-          archive, version = sys.argv[1], sys.argv[2]
-          def refuse(message):
-              raise SystemExit(f'{archive}: {message}; publication refused')
-          with tarfile.open(archive, 'r:*') as outer:
-              if 'contents.tar.gz' in outer.getnames():
-                  package = tarfile.open(fileobj=io.BytesIO(outer.extractfile('contents.tar.gz').read()), mode='r:gz')
-                  root = ''
-              else:
-                  package, root = outer, 'package/'
-              found = [member for member in package.getmembers() if member.isfile()
-                       and re.fullmatch(re.escape(root) + r'(?i:changelog(?:\.md|\.markdown|\.txt)?)', member.name)]
-              if len(found) != 1:
-                  refuse('the package must ship exactly one root CHANGELOG')
-              try:
-                  lines = package.extractfile(found[0]).read().decode('utf-8').splitlines()
-              except UnicodeDecodeError:
-                  refuse('the packaged CHANGELOG is not UTF-8')
-          headings, fence = {}, False
-          for index, line in enumerate(lines):
-              if re.match(r' {0,3}(```|~~~)', line):
-                  fence = not fence
-              elif not fence and (match := re.match(r' {0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$', line)):
-                  headings[index] = (len(match.group(1)), match.group(2) or '')
-          token = re.compile(r'(?<![0-9A-Za-z.+-])v?' + re.escape(version) + r'(?![0-9A-Za-z.+-])')
-          stamped = [index for index, (_, title) in headings.items() if token.search(title)]
-          if not stamped:
-              refuse(f'the packaged CHANGELOG has no section for {version}')
-          at, level = stamped[0], headings[stamped[0]][0]
-          def written(start):
-              end = next((index for index, (depth, _) in headings.items() if index > start and depth <= level), len(lines))
-              return any(line.strip() for index, line in enumerate(lines[start + 1:end], start + 1) if index not in headings)
-          if not written(at):
-              refuse(f'the packaged CHANGELOG section for {version} is empty')
-          for start, (depth, title) in headings.items():
-              if start < at and depth == level and written(start):
-                  refuse(f'the packaged CHANGELOG has entries above {version}, under "{title}"')
-          print(f'{archive}: the packaged CHANGELOG is stamped for {version}')
-          PY
-
-      - name: Verify release identity and plan missing uploads
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          elixir -r scripts/release/package_identity.exs \
-            -e '
-              [version, commit, archive, repository, branch] = System.argv()
-              Replicant.PackageIdentity.verify_publish_archive!(version, commit, archive, repository, branch)
-            ' -- "$VERSION" "$RELEASE_COMMIT" "$RUNNER_TEMP/replicant-release/package.tar" source "$DEFAULT_BRANCH" \
-            > "$RUNNER_TEMP/replicant-release/upload-plan"
-
-      - name: Bind both inspected archives and the upload plan
-        id: handoff
-        working-directory: ${{ runner.temp }}/replicant-release
-        run: |
-          sha256sum package.tar docs.tar.gz upload-plan > SHA256SUMS
-          package_sha256=$(sha256sum package.tar | cut -d' ' -f1)
-          docs_sha256=$(sha256sum docs.tar.gz | cut -d' ' -f1)
-          plan_sha256=$(sha256sum upload-plan | cut -d' ' -f1)
-          printf 'package_sha256=%s\ndocs_sha256=%s\nplan_sha256=%s\n' \
-            "$package_sha256" "$docs_sha256" "$plan_sha256" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inspected-archives
-          path: ${{ runner.temp }}/replicant-release/
-          if-no-files-found: error
-          retention-days: 1
-          overwrite: true
-
-      - name: Remove built release archives
-        if: always()
-        run: rm -rf -- "$RUNNER_TEMP/replicant-release"
-
   upload:
-    name: Upload inspected archives
-    needs: [verify, build]
+    name: Upload qualified archives
     if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
     environment: publish
     runs-on: ubuntu-24.04
     timeout-minutes: 90 # no green run yet
     permissions:
       contents: read
+      actions: read
       id-token: write
-    env:
-      VERSION: ${{ needs.verify.outputs.version }}
-      RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
+    outputs:
+      qualification-run: ${{ steps.release.outputs.qualification-run }}
+      qualification-sha256: ${{ steps.release.outputs.qualification-sha256 }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &release_ref
+        name: Require default-branch dispatch and a full release SHA
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          [[ "$GITHUB_REF" == "refs/heads/$DEFAULT_BRANCH" ]]
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+
+      # Run setup only from the dispatched workflow revision. Treat the selected
+      # commit's toolchain file as data, and replace the checkout before the action.
+      - &tooling_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
           persist-credentials: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /.github/actions/beam/
+            /.github/actions/toolchain/
             /scripts/toolchain.sh
-            /scripts/release/publish_hex_artifacts.exs
-            /scripts/release/release_docs.exs
 
-      - uses: ./.github/actions/beam
-        with:
-          elixir: ${{ needs.build.outputs.elixir }}
-          otp: ${{ needs.build.outputs.otp }}
-
-      - run: mix local.hex "$HEX_VERSION" --force
+      - &release_versions
+        name: Read toolchain data from the release commit
         env:
-          HEX_VERSION: ${{ needs.build.outputs.hex }}
-        working-directory: ${{ runner.temp }}
-
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: inspected-archives
-          path: ${{ runner.temp }}/inspected-archives
-
-      - name: Verify the downloaded archives and plan
-        working-directory: ${{ runner.temp }}/inspected-archives
-        env:
-          PACKAGE_SHA256: ${{ needs.build.outputs.package_sha256 }}
-          DOCS_SHA256: ${{ needs.build.outputs.docs_sha256 }}
-          PLAN_SHA256: ${{ needs.build.outputs.plan_sha256 }}
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          test ! -e mix.exs
-          sha256sum package.tar docs.tar.gz upload-plan | cmp - SHA256SUMS
-          printf '%s  %s\n' "$PACKAGE_SHA256" package.tar "$DOCS_SHA256" docs.tar.gz \
-            "$PLAN_SHA256" upload-plan | sha256sum --check --strict -
+          git --no-replace-objects merge-base --is-ancestor "$RELEASE_COMMIT" "refs/remotes/origin/$DEFAULT_BRANCH"
+          git --no-replace-objects show "$RELEASE_COMMIT:.tool-versions" > "$RUNNER_TEMP/replicant-release-versions"
 
-      - name: Exchange, upload and revoke
-        working-directory: ${{ runner.temp }}/inspected-archives
-        env:
-          HEX_API_URL: https://hex.pm/api
-          HEX_WORKLOAD_IDENTITY_AUDIENCE: hexpm
-        run: |
-          umask 077
-          mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" \
-            "$VERSION" "$RELEASE_COMMIT" package.tar docs.tar.gz upload-plan
+      - &toolchain
+        uses: ./.github/actions/toolchain
+        id: toolchain
+        with:
+          path: ${{ runner.temp }}/replicant-release-versions
 
-      - name: Revoke any outstanding Hex token
-        if: always()
+      - &beam
+        uses: ./.github/actions/beam
+        with:
+          elixir: ${{ steps.toolchain.outputs.elixir }}
+          otp: ${{ steps.toolchain.outputs.otp }}
+          install-hex: 'false'
+
+      - &hex
+        name: Install the shared action's pinned Hex
         working-directory: ${{ runner.temp }}
         env:
-          HEX_API_URL: https://hex.pm/api
+          HEX_VERSION: ${{ steps.toolchain.outputs.hex }}
         run: |
-          if [ -f "$RUNNER_TEMP/replicant-hex-token" ]; then
-            mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/publish_hex_artifacts.exs" revoke
-          fi
+          pin="$(curl --fail --silent --show-error --max-time 30 https://raw.githubusercontent.com/baselabs/.github/3bfbb84692a65b4d2c03dc3b7932353026fe6943/.github/actions/hex-publish/hex-version)"
+          [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$pin" == "$HEX_VERSION" ]]
+          mix local.hex "$pin" --force
 
-      - name: Remove inspected archives
-        if: always()
-        run: rm -rf -- "$RUNNER_TEMP/inspected-archives"
-
-  read_back:
-    name: Read back release
-    needs: [verify, build, upload]
-    if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90 # no green run yet
-    env:
-      VERSION: ${{ needs.verify.outputs.version }}
-      RELEASE_COMMIT: ${{ needs.verify.outputs.release_commit }}
-      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-      PACKAGE_SHA256: ${{ needs.build.outputs.package_sha256 }}
-    outputs:
-      published_commit: ${{ steps.read_back.outputs.published_commit }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - &release_checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.workflow_sha }}
-          persist-credentials: false
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ needs.verify.outputs.release_commit }}
-          path: source
+          ref: ${{ inputs.release_commit }}
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: ./.github/actions/beam
+      - uses: baselabs/.github/.github/actions/hex-publish@3bfbb84692a65b4d2c03dc3b7932353026fe6943
+        id: release
         with:
-          elixir: ${{ needs.build.outputs.elixir }}
-          otp: ${{ needs.build.outputs.otp }}
+          operation: upload
+          package: replicant
+          package-directory: .
+          release-commit: ${{ inputs.release_commit }}
+          organization-read-key: ${{ secrets.HEX_ORG_KEY_PUBLISH_API_READ }}
 
-      - run: mix local.hex "$HEX_VERSION" --force
-        env:
-          HEX_VERSION: ${{ needs.build.outputs.hex }}
-        working-directory: ${{ runner.temp }}
+      - name: Remove release toolchain data
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/replicant-release-versions"
 
-      - name: Verify the signed Hex registry release
-        run: |
-          curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 \
-            --max-filesize 16777216 https://repo.hex.pm/packages/replicant |
-            python3 -I scripts/release/check_hex_registry.py "$VERSION" "$PACKAGE_SHA256"
+  read-back:
+    name: Read back release
+    needs: upload
+    if: contains(fromJSON('["corepay","palermo-git"]'), github.actor) && contains(fromJSON('["corepay","palermo-git"]'), github.triggering_actor)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90 # no green run yet
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - *release_ref
+      - *tooling_checkout
+      - *release_versions
+      - *toolchain
+      - *beam
+      - *hex
+      - *release_checkout
 
-      - name: Read back served archives and prove docs provenance
-        id: read_back
-        working-directory: ${{ runner.temp }}
-        run: >-
-          mix run --no-mix-exs "$GITHUB_WORKSPACE/scripts/release/retain_release_assets.exs"
-          "$VERSION" "$RELEASE_COMMIT" "$PACKAGE_SHA256" "$GITHUB_WORKSPACE/source"
-          "$DEFAULT_BRANCH" "$RUNNER_TEMP/release-assets"
+      - uses: baselabs/.github/.github/actions/hex-publish@3bfbb84692a65b4d2c03dc3b7932353026fe6943
+        id: release
+        with:
+          operation: read-back
+          package: replicant
+          package-directory: .
+          release-commit: ${{ inputs.release_commit }}
+          qualification-run: ${{ needs.upload.outputs.qualification-run }}
+          qualification-sha256: ${{ needs.upload.outputs.qualification-sha256 }}
+          release-assets-directory: ${{ runner.temp }}/release-assets
 
       - name: Retain verified release assets for infra
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -402,9 +149,10 @@ jobs:
           name: release-assets
           path: ${{ runner.temp }}/release-assets/
           if-no-files-found: error
+          compression-level: 0
           retention-days: 7
           overwrite: true
 
-      - name: Remove retained release archives
+      - name: Remove release scratch files
         if: always()
-        run: rm -rf -- "$RUNNER_TEMP/release-assets"
+        run: rm -rf -- "$RUNNER_TEMP/release-assets" "$RUNNER_TEMP/replicant-release-versions"

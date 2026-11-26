@@ -7,6 +7,9 @@ inputs:
   otp:
     description: OTP version from the shared toolchain reader.
     required: true
+  install-hex:
+    description: Install the default Hex client. Release jobs install the shared action's pin separately.
+    default: 'true'
 runs:
   using: composite
   steps:
@@ -14,6 +17,7 @@ runs:
       with:
         elixir-version: ${{ inputs.elixir }}
         otp-version: ${{ inputs.otp }}
+        install-hex: ${{ inputs.install-hex }}
         version-type: strict
     - name: Refuse a differing runtime
       shell: bash

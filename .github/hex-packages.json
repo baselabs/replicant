@@ -1,0 +1,100 @@
+{
+  "replicant": {
+    "directory": ".",
+    "app": "replicant",
+    "files": [
+      ".formatter.exs",
+      "CHANGELOG.md",
+      "CONTRIBUTING.md",
+      "LICENSE",
+      "NOTICE",
+      "README.md",
+      "docs/INVARIANTS.md",
+      "docs/ROADMAP.md",
+      "docs/adr/0001-logical-decoding-messages-delivery-guarantees.md",
+      "docs/adr/0002-multi-publication-per-pipeline.md",
+      "docs/adr/0003-value-free-error-boundary.md",
+      "docs/adr/0004-commit-lsn-transaction-watermark.md",
+      "docs/adr/0005-spill-is-ephemeral-scratch.md",
+      "docs/adr/0006-fail-closed-supervision.md",
+      "docs/adr/0007-actual-replication-session-identity.md",
+      "docs/adr/0008-casting-lenient-value-preserving-fallback.md",
+      "docs/adr/0009-pglogical-wal2json-decoders.md",
+      "docs/adr/0010-postgresql-server-support.md",
+      "docs/adr/README.md",
+      "examples/README.md",
+      "examples/replication_pipeline/README.md",
+      "lib/replicant.ex",
+      "lib/replicant/application.ex",
+      "lib/replicant/assembler.ex",
+      "lib/replicant/assembler/batch.ex",
+      "lib/replicant/assembler/streaming.ex",
+      "lib/replicant/assembler_server.ex",
+      "lib/replicant/casting/array_parser.ex",
+      "lib/replicant/casting/types.ex",
+      "lib/replicant/change.ex",
+      "lib/replicant/checkpoint_store.ex",
+      "lib/replicant/config.ex",
+      "lib/replicant/connection.ex",
+      "lib/replicant/decoder/decoder.ex",
+      "lib/replicant/decoder/messages.ex",
+      "lib/replicant/decoder/oid_database.ex",
+      "lib/replicant/decoder/pglogical.ex",
+      "lib/replicant/decoder/pgoutput.ex",
+      "lib/replicant/decoder/plugin.ex",
+      "lib/replicant/decoder/wal2json.ex",
+      "lib/replicant/error.ex",
+      "lib/replicant/identifier.ex",
+      "lib/replicant/pipeline.ex",
+      "lib/replicant/query_builder.ex",
+      "lib/replicant/schema_change.ex",
+      "lib/replicant/session_identity.ex",
+      "lib/replicant/sink.ex",
+      "lib/replicant/snapshot_progress.ex",
+      "lib/replicant/snapshot_window.ex",
+      "lib/replicant/snapshotter.ex",
+      "lib/replicant/snapshotter/incremental.ex",
+      "lib/replicant/spill.ex",
+      "lib/replicant/spill/error.ex",
+      "lib/replicant/spill/reader.ex",
+      "lib/replicant/supervisor.ex",
+      "lib/replicant/telemetry.ex",
+      "lib/replicant/transaction.ex",
+      "mix.exs",
+      "notebooks/getting_started.livemd",
+      "usage-rules.md"
+    ],
+    "requirements": {
+      "db_connection": {
+        "app": "db_connection",
+        "optional": false,
+        "requirement": ">= 2.10.3 and < 3.0.0-0",
+        "repository": "hexpm"
+      },
+      "decimal": {
+        "app": "decimal",
+        "optional": false,
+        "requirement": "~> 3.1",
+        "repository": "hexpm"
+      },
+      "jason": {
+        "app": "jason",
+        "optional": false,
+        "requirement": "~> 1.4",
+        "repository": "hexpm"
+      },
+      "postgrex": {
+        "app": "postgrex",
+        "optional": false,
+        "requirement": "~> 0.23",
+        "repository": "hexpm"
+      },
+      "telemetry": {
+        "app": "telemetry",
+        "optional": false,
+        "requirement": "~> 1.0",
+        "repository": "hexpm"
+      }
+    }
+  }
+}

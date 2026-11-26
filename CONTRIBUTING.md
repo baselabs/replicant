@@ -93,106 +93,58 @@ reader's outputs, selects them strictly, and uses its `--installed` check to ref
 differing Elixir version, full OTP patch version, or Elixir OTP build suffix.
 The example Dockerfile explains its separately pinned container toolchain.
 
-Release scripts read GitHub through `gh api`. The package-check step receives only
-its read-only job token as `GH_TOKEN: ${{ github.token }}`, with job-level
-`contents: read`; qualification reads no repository or environment secret. Release
-absence requires the HTTP 404 status line from `gh api -i` (exit 1); HTTP 200 means
-the release exists. Other statuses, transport errors, missing authentication, or
-failed metadata reads refuse the check without including response values in errors.
-Hex metadata still uses public unauthenticated reads.
-
 ## Publishing (release operator only)
 
-Publishing runs in [`.github/workflows/publish.yml`](.github/workflows/publish.yml),
-on GitHub-hosted Ubuntu 24.04 with the exact `.tool-versions` runtime. Qualification
-and publishing read Hex from the selected source's `.tool-versions` because Hex
-records its version in package metadata.
+The pinned shared Hex action builds the package and renders docs during qualification
+using the selected commit's locked runtime and the action's pinned Hex. It verifies the
+file set, source bytes, and requirements against the committed package declaration
+and compiles a consumer of the unpacked package. The qualified package, docs and
+manifest are retained for seven days. When cutting a release, move its entries from
+`Unreleased` to the dated version section and use the package-scoped tag in the new
+changelog comparison links.
 
-After qualification, give infra the repository, full `release_commit`, version,
-release contents, and successful `qualified` run. Infra obtains the owner's
-approval and dispatches **Publish to Hex** from the default branch with that
-40-character lowercase SHA. Both the original and triggering actors must be
-`corepay` or `palermo-git`. The first
-job verifies default-branch ancestry, a successful GitHub Actions `qualified`
-check on that exact SHA, the version in its `mix.exs`, and the absence of its
-version tag. An anonymous Hex lookup requires the existing `replicant` package
-name. First publication belongs to the owner.
+Give infra the repository, full `release_commit`, version, release contents and
+successful `qualified` run. Infra obtains the owner's approval and dispatches
+[Publish to Hex](.github/workflows/publish.yml) from the default branch with that
+40-character lowercase commit SHA. Both the original and triggering actors must
+be `corepay` or `palermo-git`.
 
-The build job checks out the selected source with complete history and installs
-its exact runtime. It uses the workflow revision for release tooling, so advancing
-the default branch does not change the selected package source. Qualification and
-publication build the package twice from `git archive` and compare the bytes,
-check the package manifest and Hex checksum, and audit and compile its extracted
-source using the committed producer lock. The generated external consumer
-resolves fresh, runs both audits, compiles, and exercises the public API.
-Documentation renders once with warnings as errors from the extracted package and
-producer lock. The builder writes `release.json` with exactly `package`,
-`version`, and `release_commit` as `commit` before inspecting the archive.
+Only `upload` enters the `publish` environment. The shared action checks the
+selected commit's qualification, the packaged changelog stamp, package and tag
+state, and public/private version collisions before exchanging a package-scoped
+token for any required upload. First publication belongs to the owner. If Hex
+holds a release for approval, retry with the same `release_commit`. Upload
+selects the newest successful qualification for that SHA, so keep the original
+run and its archives available through approval.
 
-The shared changelog check requires exactly one root changelog in the inspected
-package, entries under the release version, and empty sections above it. The
-build job then plans the missing uploads. An untagged version already served by
-Hex can resume when its metadata and served package bytes match the inspected
-archive and the version is active. Served docs are kept based on validated
-provenance. Docs uploads require an authoritative archive 404 and metadata that
-does not report docs. Disagreement, malformed responses, and lookup failures
-refuse publication. The archives, their checksums, and the plan travel together
-to the upload job.
-
-Only the upload job enters the `publish` environment. It verifies the downloaded
-checksums and runs the standalone uploader with `mix run --no-mix-exs` in a
-temporary directory without a Mix project. When an upload is planned, the script
-exchanges GitHub workload identity for a short-lived `package:hexpm/replicant`
-token and revokes it on exit. Runner cleanup retries revocation after failure
-or cancellation. Package uploads disable replacement. Hex's docs POST can
-replace an existing archive. The uploader checks served package bytes, release
-metadata, and docs absence in succession before sending it. The workflow
-serializes dispatches. Another Hex writer can still race the final absence
-check and the POST.
-If Hex holds either archive for approval, dispatch again with the same
-`release_commit` after approval. A held package can finish its docs upload once
-the package is publicly visible.
-
-Keyless read-back verifies the signed Hex registry entry for the version and
-outer checksum, checks the served package against that digest, and requires
-readable served docs with `index.html` and valid
-`release.json`. The docs commit must be `release_commit` or its ancestor in the
-fetched default-branch history. A docs build can vary in search data ordering,
-so the workflow preserves the served docs bytes and uses their provenance to
-identify the published commit.
-
-The workflow retains both served archives, `SHA256SUMS` computed over those bytes,
-and `published_commit` in one `release-assets` artifact. It also exposes
-`published_commit` as a read-back output. Infra uses `bin/release-tag` to compare
-the package against Hex, annotate `v<version>` at the served docs commit, and
-create the GitHub release with notes from the packaged changelog.
+`read-back` uses the qualification run and manifest digest from `upload`. The
+shared action verifies the signed registry entry, byte equality for both
+archives, and the docs' `release.json` naming the package, version and selected
+commit. The workflow retains the two archives and their `SHA256SUMS` in a single
+`release-assets` artifact. Infra compares the package against Hex, annotates
+`baselabs_replicant-v<version>` at the published commit, and creates the GitHub
+release with notes from the packaged changelog. Existing releases keep their
+legacy `v<version>` tags.
 
 Consumers verify the permanent [GitHub release](https://github.com/baselabs/replicant/releases)
-for `v<version>`, downloading its archives and `SHA256SUMS`:
+by downloading the archives and checksums:
 
 ```bash
-gh release download vX.Y.Z --repo baselabs/replicant --pattern 'replicant-*' --pattern SHA256SUMS --pattern published_commit
+gh release download baselabs_replicant-vX.Y.Z --repo baselabs/replicant --pattern 'replicant-*' --pattern SHA256SUMS
 sha256sum --check SHA256SUMS
 curl --fail --silent --show-error https://repo.hex.pm/tarballs/replicant-X.Y.Z.tar -o hex.tar
 cmp replicant-X.Y.Z.tar hex.tar
 tar -xOf replicant-X.Y.Z-docs.tar.gz release.json
-cat published_commit
 rm hex.tar
 ```
 
-Check that `release.json` names `replicant`, this version, and the same full commit
-as `published_commit` and the release tag. No rebuilt docs digest is involved.
+Check that `release.json` names `replicant`, the release version and the full
+commit at the GitHub release tag. Record the verified package digest in
+`scripts/release/published_packages.sha256` through the normal landing process
+after the Hex package, HexDocs, annotated tag and GitHub release agree.
 
-Record the verified package digest in `scripts/release/published_packages.sha256`
-through the normal landing process. All four release identities (tag, Hex package,
-HexDocs, GitHub release) and the ledger must agree for subsequent package checks.
-Held versions never add or alter manifest entries speculatively. An interrupted
-or ambiguous upload requires infra to inspect public state before the owner
-retries the same commit. A tagged version or existing GitHub release always refuses.
-
-Agents never release, deploy, publish, tag, create a GitHub release, dispatch the
-publish workflow, or handle publish credentials. Their work ends at the commit on
-`main`.
+Infra owns the dispatch, release, tag and credentials. The repository session
+delivers the qualified release commit on the default branch.
 
 ## Code Style
 

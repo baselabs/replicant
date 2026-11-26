@@ -7,8 +7,7 @@ defmodule Replicant.ReleaseContractTest do
 
   @changelog Path.expand("../../CHANGELOG.md", __DIR__)
   @mixfile Path.expand("../../mix.exs", __DIR__)
-  @workflow Path.expand("../../.github/workflows/qualification.yml", __DIR__)
-  @builder Path.expand("../../scripts/release/build_candidate.sh", __DIR__)
+  @declaration Path.expand("../../.github/hex-packages.json", __DIR__)
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
@@ -46,12 +45,11 @@ defmodule Replicant.ReleaseContractTest do
   end
 
   test "the PostgreSQL support ADR ships in Hex and ExDoc" do
-    root = Path.expand("../..", __DIR__)
     adr = "docs/adr/0010-postgresql-server-support.md"
-    manifest = File.read!(Path.join(root, "scripts/release/package_files.manifest"))
+    manifest = File.read!(@declaration) |> JSON.decode!()
     docs = Mix.Project.config()[:docs]
 
-    assert adr in String.split(manifest, "\n")
+    assert adr in manifest["replicant"]["files"]
     assert adr in docs[:extras]
     assert Enum.any?(docs[:groups_for_extras], fn {_group, pages} -> adr in pages end)
   end
@@ -105,18 +103,16 @@ defmodule Replicant.ReleaseContractTest do
            "the [Unreleased] link must compare from the freshly cut v#{v} tag"
   end
 
-  test "docs source_ref pins the current release tag" do
-    assert Mix.Project.config()[:docs][:source_ref] == "v#{version()}",
-           "docs source_ref must be v#{version()} so HexDocs source links resolve to the release tag"
+  test "docs source_ref uses the scoped Hex release tag" do
+    assert Mix.Project.config()[:docs][:source_ref] == "baselabs_replicant-v#{version()}"
   end
 
   test "shipped release guidance preserves the inspected package bytes" do
     body = File.read!(@mixfile)
 
     refute body =~ "mix hex.publish"
-    assert body =~ "scripts/release/publish_hex_artifacts.exs"
-    assert body =~ ".github/workflows/publish.yml"
-    assert body =~ "after Hex read-back"
+    assert body =~ "after registry read-back"
+    assert Mix.Project.config()[:docs][:formatters] == ["html", "markdown"]
   end
 
   test "workflows never restore or save Actions caches" do
@@ -129,100 +125,10 @@ defmodule Replicant.ReleaseContractTest do
     end
   end
 
-  test "post-release package checks fetch the published identity and ancestry" do
-    workflow = File.read!(@workflow)
-    [_, release_job] = String.split(workflow, "  release-artifact:", parts: 2)
-
-    assert release_job =~ "fetch-depth: 0"
-    assert release_job =~ "scripts/release/published_packages.sha256"
-  end
-
   test "published package digest manifest binds the preceding release bytes" do
     manifest = File.read!(@published_digests)
 
     assert manifest =~
              "#{@published_digest}  replicant-#{@previous_release}.tar"
-  end
-
-  test "candidate accepts only check mode or one output directory" do
-    [_, parser] = Regex.run(~r/(usage\(\).*?)\nlog\(\)/s, File.read!(@builder))
-    script = parser <> ~S(printf '%s\n' "$output_dir")
-
-    for {args, expected} <- [
-          {["--check"], "--check\n"},
-          {["output path"], "output path\n"}
-        ] do
-      assert {expected, 0} == candidate_arguments(script, args)
-    end
-
-    for args <- [[], [""], ["--unknown"], ["--check", "other"], ["one", "two"]] do
-      {output, status} = candidate_arguments(parser, args)
-      assert status == 2
-      assert output =~ "usage: build_candidate.sh --check | <output-directory>"
-    end
-  end
-
-  test "candidate builds and inspects the same two paths the workflow uploads" do
-    source = File.read!(@builder)
-    assert source =~ ~S|commit="$(git rev-parse HEAD)"|
-    assert source =~ ~S|git archive --format=tar --output="$source_archive" "$commit"|
-    assert source =~ ~S|printf 'version=%s\ncommit=%s\n' "$version" "$commit" >> "$GITHUB_OUTPUT"|
-    assert source =~ ~s(package="$output_dir/package.tar")
-    assert source =~ ~s(cmp -s "$package" "$rebuild_tree/package.tar")
-    assert source =~ ~s(verify_package.sh" "$package")
-    assert source =~ ~s(consume_candidate.sh" "$package" "$output_dir/docs.tar.gz")
-    assert source =~ ~s(chmod a-w "$package" "$output_dir/docs.tar.gz")
-    refute source =~ ~r/authorization|witness|receipt/
-  end
-
-  test "qualification and publication inspect one docs render and preserve package equality" do
-    source = File.read!(@builder)
-    assert source =~ ~s|consume_candidate.sh" "$package" "$output_dir/docs.tar.gz"|
-    assert source =~ ~s|cmp -s "$package" "$rebuild_tree/package.tar"|
-    assert length(Regex.scan(~r/consume_candidate\.sh/, source)) == 1
-    refute source =~ ~r/cmp[^\n]*docs|docs build is not byte-reproducible/
-    assert Mix.Project.config()[:docs][:formatters] == ["html", "markdown"]
-    assert File.read!(@workflow) =~ "bash scripts/release/build_candidate.sh --check"
-  end
-
-  test "the selected source commit binds both archive builds and docs provenance" do
-    builder = File.read!(@builder)
-    consumer = File.read!(Path.expand("../../scripts/release/consume_candidate.sh", __DIR__))
-
-    assert builder =~ ~S|${RELEASE_SOURCE:-$tooling_root}|
-    assert builder =~ ~S|"$commit" == "${RELEASE_COMMIT:-$commit}"|
-    assert builder =~ ~S|RELEASE_SOURCE="$repo_root" RELEASE_COMMIT="$commit"|
-    assert consumer =~ ~S|commit="$(git -C "$repo_root" rev-parse HEAD)"|
-    assert consumer =~ ~S|"$commit" == "${RELEASE_COMMIT:-$commit}"|
-    assert consumer =~ ~S|"$src/doc" "$docs_archive" "$version" "$commit"|
-    assert consumer =~ ~S|"$docs_archive" "$src/doc" "$version" "$commit"|
-    refute consumer =~ "GITHUB_SHA"
-  end
-
-  test "the archive builder leaves release registry lookups to the workflows" do
-    source = File.read!(@builder)
-    assert_no_release_lookup!(source)
-
-    for command <- [
-          "elixir -r scripts/release/package_identity.exs",
-          "curl https://hex.pm/api/packages/replicant",
-          "gh api repos/baselabs/replicant/releases",
-          "git ls-remote origin refs/heads/main"
-        ] do
-      assert_raise ExUnit.AssertionError, fn -> assert_no_release_lookup!(source <> command) end
-    end
-  end
-
-  defp assert_no_release_lookup!(source) do
-    refute source =~
-             ~r/PackageIdentity|package_identity\.exs|\bcurl\b|\bgh\s+api\b|\bgit\s+ls-remote\b/
-  end
-
-  defp candidate_arguments(script, args) do
-    System.cmd(
-      "bash",
-      ["--noprofile", "--norc", "-euo", "pipefail", "-c", script, "builder" | args],
-      stderr_to_stdout: true
-    )
   end
 end

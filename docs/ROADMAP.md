@@ -22,17 +22,14 @@ wal2json, and its decoder-specific options. The migration requires a new
 pgoutput slot and checkpoint handoff. pglogical stays, including the
 `replication_sets:` option.
 
-Publication selects a qualified `release_commit` on the default branch.
-The keyless build inspects the package and docs, checks the packaged changelog,
-and plans missing Hex uploads. The uploader verifies the inspected archives and
-uses a short-lived package-scoped workload identity token in the `publish`
-environment. A dispatch with the same `release_commit` can finish a held release
-when the active release's served package matches the inspected bytes.
+The shared Hex action builds and checks the package and docs during
+qualification. Publication selects a qualified `release_commit` on the default
+branch. The upload job uses a package-scoped workload identity token when it
+needs to send the qualified archives. Read-back verifies the signed registry
+entry, both archives and the selected commit in the served docs' `release.json`.
 
-Read-back retains the served archives and their `SHA256SUMS` and checks
-`release.json` against the selected release history. Infra tags the published
-commit from served docs and derives release notes from the changelog in the
-compared package. Consumers verify against the
+Infra uses the verified archives and their `SHA256SUMS` to tag the published
+commit and derive release notes from the package changelog. Consumers verify against the
 [GitHub release](https://github.com/baselabs/replicant/releases), as described in
 the [publishing guide](../CONTRIBUTING.md#publishing-release-operator-only).
 Once infra reports the tag and read-back, the repository records the verified
