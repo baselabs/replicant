@@ -60,7 +60,7 @@ one config option away (see the toolbox at the end).
 
 ```elixir
 Mix.install([
-  {:replicant, "~> 1.5"},
+  {:replicant, "~> 2.0"},
   {:kino, "~> 0.14"}
 ])
 ```

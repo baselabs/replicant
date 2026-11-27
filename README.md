@@ -36,7 +36,7 @@ slot only after your sink has durably stored them.
 ```elixir
 def deps do
   [
-    {:replicant, "~> 1.5"}
+    {:replicant, "~> 2.0"}
   ]
 end
 ```

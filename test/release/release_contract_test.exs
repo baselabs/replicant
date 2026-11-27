@@ -11,13 +11,17 @@ defmodule Replicant.ReleaseContractTest do
   @published_digests Path.expand("../../scripts/release/published_packages.sha256", __DIR__)
   # The preceding release. Bumped as part of cutting each release; a version that fails
   # to advance past it reds here rather than re-minting an already-published version.
-  @previous_release "1.6.1"
+  @previous_release "1.7.0"
   # Immutable registry digest for the preceding release, recorded after read-back.
   # Held versions are compared with freshly built bytes before upload; they do not
   # rewrite this ledger.
-  @published_digest "e315ef3d2e3bb7e99b09cb56594e737876172ba567aedecf187b4e57dfa293f2"
+  @published_digest "c0c958a4a23ad0f178ad7ebea9f1259c75e9f0a872e37289902aa2faad2855b1"
 
   defp version, do: Mix.Project.config()[:version]
+
+  test "removing wal2json and PostgreSQL below 15 requires the major release" do
+    assert version() == "2.0.0"
+  end
 
   test "the changelog records both breaking source removals under Removed" do
     body = File.read!(@changelog)
@@ -108,8 +112,8 @@ defmodule Replicant.ReleaseContractTest do
     v = version()
 
     assert body =~
-             ~r{^\[#{Regex.escape(v)}\]: https://github.com/baselabs/replicant/compare/v#{Regex.escape(@previous_release)}\.\.\.baselabs_replicant-v#{Regex.escape(v)}$}m,
-           "missing/incorrect `[#{v}]:` comparison link to v#{@previous_release}...baselabs_replicant-v#{v}"
+             ~r{^\[#{Regex.escape(v)}\]: https://github.com/baselabs/replicant/compare/baselabs_replicant-v#{Regex.escape(@previous_release)}\.\.\.baselabs_replicant-v#{Regex.escape(v)}$}m,
+           "missing/incorrect `[#{v}]:` comparison link to baselabs_replicant-v#{@previous_release}...baselabs_replicant-v#{v}"
 
     assert body =~
              ~r{^\[Unreleased\]: https://github.com/baselabs/replicant/compare/baselabs_replicant-v#{Regex.escape(v)}\.\.\.HEAD$}m,
