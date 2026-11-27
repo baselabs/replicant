@@ -80,10 +80,8 @@ docker run -d --name replicant_pg18 -e POSTGRES_HOST_AUTH_METHOD=trust \
 ```
 
 Point the input below at it (it defaults to `REPLICANT_TEST_URL`, then to the local
-container above). This notebook tours the default `pgoutput` decoder on PostgreSQL
-15 or newer; a server that carries the `pglogical` or `wal2json` output plugin (the
-tested lanes are 9.6, 12 and 15) is read the same way via `decoder:` — see the
-feature table at the end.
+container above). The notebook uses the default `pgoutput` decoder on PostgreSQL
+15 through 19. The feature table also shows how to select pglogical.
 
 ```elixir
 default_url = System.get_env("REPLICANT_TEST_URL") || "postgres://postgres@localhost:5599/postgres"
@@ -912,7 +910,7 @@ parity_mirror_ids = LbDemo.ids(:lb_sql, "lb_parity_sink")
 ```
 
 Snapshot and stream agree on columns and on rows. The same rule covers generated
-columns (excluded on PostgreSQL 12 to 15 as pgoutput excludes them; PostgreSQL 16+
+columns (excluded on PostgreSQL 15 as pgoutput excludes them; PostgreSQL 16+
 follow the publication's effective list), and an ambiguous projection, such as two
 publications naming one table with different column lists, halts
 `:snapshot_column_list_conflict` before a single row is read.
@@ -1033,17 +1031,10 @@ telemetry, halt-reason, and casting reference:
 | Failover slots (PG17+, HA) | `failover: true` | [README — compatibility](https://hexdocs.pm/replicant/readme.html#compatibility) · [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
 | Append-log consumers | `sink_kind/0` → `:append_log` + `handle_slot_origin/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) · `Replicant.Sink` |
 | Destructive-DDL migration window | `handle_schema_change/2` | [usage rules](https://hexdocs.pm/replicant/usage-rules.html) |
-| Plugin decoders for servers without pgoutput | `decoder: :pglogical` + `replication_sets:` / `decoder: :wal2json` + `tables:` | [README — compatibility](https://hexdocs.pm/replicant/readme.html#compatibility) · [ADR-0009](https://hexdocs.pm/replicant/0009-pglogical-wal2json-decoders.html) |
-| Keyless-table insert-only streams (wal2json) | `allow_keyless_tables: true` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
-| wal2json dropped-column guard interval | `schema_check_interval: 30_000` | [usage rules — the decoder section](https://hexdocs.pm/replicant/usage-rules.html) |
+| pglogical replication sets | `decoder: :pglogical` with `replication_sets:` | [README — compatibility](https://hexdocs.pm/replicant/readme.html#compatibility) |
 
-Under the plugin decoders the two historically-silent divergences are fail-closed now:
-a wal2json table without a replica-identity key **refuses to start** (its updates/deletes
-would be dropped plugin-side with no wire signal — declare `allow_keyless_tables: true`
-only for a genuinely insert-only table), and a dropped column halts `:destructive` on
-every decoder — immediately on pgoutput/pglogical (relation re-emit after DDL), at the
-change under wal2json for inserts and fixed-width columns, and otherwise within one
-`schema_check_interval`.
+When either decoder re-emits relation metadata after a column drop, Replicant
+halts with a destructive schema change.
 
 For multitenancy, classification, and Ash resources, use the
 [`ash_replicant`](https://hex.pm/packages/ash_replicant) sink adapter, which is

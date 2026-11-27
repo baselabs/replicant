@@ -16,13 +16,9 @@ defmodule Replicant.QueryBuilder do
   @spec identify_system() :: String.t()
   def identify_system, do: "IDENTIFY_SYSTEM"
 
-  # PG 10+ exports a snapshot name as "%08X-%08X-%d"; PG 9.6 exports "%08X-%d" (observed
-  # "00004E57-1" from CREATE_REPLICATION_SLOT ... LOGICAL wal2json on 9.6.24), so the
-  # middle hex group is optional. This allowlist forbids quotes and whitespace so the name
-  # is safe inside the SET TRANSACTION SNAPSHOT '<name>' STRING LITERAL — it is NOT an
-  # identifier position, so `Identifier.validate/1` (which rejects uppercase hex and
-  # hyphens) is the WRONG guard here (spec §9).
-  @snapshot_name ~r/\A[0-9A-Fa-f]{1,16}(?:-[0-9A-Fa-f]{1,16})?-\d{1,10}\z/
+  # Exported snapshot names are string literals. The three-part allowlist
+  # excludes quotes and whitespace before interpolation.
+  @snapshot_name ~r/\A[0-9A-Fa-f]{1,16}-[0-9A-Fa-f]{1,16}-\d{1,10}\z/
 
   @doc """
   Replication command that starts streaming WAL from `start_lsn` for the publication set.
@@ -82,7 +78,7 @@ defmodule Replicant.QueryBuilder do
   ordered option list as `key 'value'` pairs inside the command's parentheses. The
   slot name and plugin name are `Identifier.validate`d; every option KEY matches
   `[a-z0-9_.-]+` and every option VALUE matches `[a-zA-Z0-9_.,*()-]*` (the option
-  grammar the three shipped decoders emit — identifier lists, booleans, version
+  grammar the supported decoders emit — identifier lists, booleans, version
   numbers), so a quote or semicolon breakout is refused `{:error, :invalid_identifier}`
   and NEVER interpolated. The `#{@pgoutput}` rendering is byte-identical to
   `start_replication/3` (pinned by test).
@@ -146,36 +142,15 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  `create_durable_slot/2` with the decoder's output plugin (ADR-0009 §2). The default
-  `#{@pgoutput}` emits the published 1.3.0 string byte-for-byte; `pglogical_output` and
-  `wal2json` name their plugin. The plugin name passes `Identifier.validate/1` before
-  interpolation exactly like a slot name (Critical Rule 2).
+  `create_durable_slot/2` with the decoder's output plugin. Both names pass
+  `Identifier.validate/1` before interpolation.
   """
   @spec create_durable_slot(String.t(), boolean(), String.t()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
   def create_durable_slot(slot_name, failover?, plugin) do
-    create_durable_slot(slot_name, failover?, plugin, 150_000)
-  end
-
-  @doc """
-  `create_durable_slot/3` with the server version: `NOEXPORT_SNAPSHOT` (and the
-  parenthesized snapshot grammar) exist from PG 15 — on 9.6 to 14 the durable-slot
-  form is the bare `CREATE_REPLICATION_SLOT … LOGICAL plugin;` (the server exports a
-  snapshot, which is simply discarded). PG15+ — and an unknown version (0, a
-  directly-constructed state) — emits the published strings unchanged.
-  """
-  @spec create_durable_slot(String.t(), boolean(), String.t(), non_neg_integer()) ::
-          {:ok, String.t()} | {:error, :invalid_identifier}
-  def create_durable_slot(slot_name, failover?, plugin, version) do
     with :ok <- Identifier.validate(slot_name),
          :ok <- Identifier.validate(plugin) do
-      tail =
-        cond do
-          version > 0 and version < 150_000 -> ""
-          failover? -> " (FAILOVER, SNAPSHOT 'nothing')"
-          true -> " NOEXPORT_SNAPSHOT"
-        end
-
+      tail = if failover?, do: " (FAILOVER, SNAPSHOT 'nothing')", else: " NOEXPORT_SNAPSHOT"
       {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{plugin}#{tail};"}
     end
   end
@@ -196,28 +171,9 @@ defmodule Replicant.QueryBuilder do
   @spec create_export_slot(String.t(), boolean(), String.t()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
   def create_export_slot(slot_name, failover?, plugin) do
-    create_export_slot(slot_name, failover?, plugin, 150_000)
-  end
-
-  @doc """
-  `create_export_slot/3` with the server version: `EXPORT_SNAPSHOT` (and the
-  parenthesized snapshot grammar) exist from PG 15 — on 9.6 to 14 the form is the
-  bare `CREATE_REPLICATION_SLOT … LOGICAL plugin;` (the server exports the snapshot
-  by default; the result row shape is unchanged). The plugin-decoder + `snapshot:
-  true` combination on 9.6/12 rides exactly this pre-15 form.
-  """
-  @spec create_export_slot(String.t(), boolean(), String.t(), non_neg_integer()) ::
-          {:ok, String.t()} | {:error, :invalid_identifier}
-  def create_export_slot(slot_name, failover?, plugin, version) do
     with :ok <- Identifier.validate(slot_name),
          :ok <- Identifier.validate(plugin) do
-      tail =
-        cond do
-          version < 150_000 -> ""
-          failover? -> " (FAILOVER, SNAPSHOT 'export')"
-          true -> " EXPORT_SNAPSHOT"
-        end
-
+      tail = if failover?, do: " (FAILOVER, SNAPSHOT 'export')", else: " EXPORT_SNAPSHOT"
       {:ok, "CREATE_REPLICATION_SLOT #{slot_name} LOGICAL #{plugin}#{tail};"}
     end
   end
@@ -314,14 +270,10 @@ defmodule Replicant.QueryBuilder do
   end
 
   @doc """
-  The relation-info catalog read for the `:pglogical` and `:wal2json` decoders
-  (ADR-0009 §5): per configured table, its `pg_class` oid, `relreplident`, and every
-  non-dropped column with type oid + typmod — everything the wire does NOT carry
-  (pglogical relations have no types and no replica identity; wal2json has no relation
-  message at all). Runs in the replication connect chain's SIMPLE protocol; both parts
-  of every pair are `Identifier.validate`d before interpolation. A configured table
-  with no rows here is absent on the server — the caller halts fail-closed. Row shape:
-  `[schemaname, tablename, oid, relreplident, attnum, attname, atttypid, atttypmod]`.
+  Replica identity and non-dropped column types for each table discovered in the
+  pglogical replication sets. Each table's schema and name are validated before
+  interpolation into the replication session's simple query. Row shape:
+  `[schemaname, tablename, relreplident, attname, atttypid, atttypmod]`.
   """
   @spec configured_table_info([{String.t(), String.t()}]) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
@@ -354,39 +306,19 @@ defmodule Replicant.QueryBuilder do
   defp table_info_sql(tables) do
     values = Enum.map_join(tables, ", ", fn {s, t} -> "('#{s}','#{t}')" end)
 
-    # `identity_key` marks the columns of the table's replica-identity index —
-    # the PK under `d`, the index flagged `indisreplident` under `i`, nothing
-    # under `f`/`n` — the same `:key` flag pgoutput's Relation carries and the
-    # assembler's old-record key projection keys on. (Resolved via pg_index
-    # directly: pg_get_replica_identity_index only exists from PG 10, and this
-    # read also serves the 9.6 substrate.)
-    "SELECT n.nspname, c.relname, c.oid::int, c.relreplident, a.attnum, a.attname, " <>
-      "a.atttypid::int, a.atttypmod::int, " <>
-      "(ri.indexrelid IS NOT NULL AND a.attnum = ANY(ri.indkey)) AS identity_key " <>
+    "SELECT n.nspname, c.relname, c.relreplident, a.attname, " <>
+      "a.atttypid::int, a.atttypmod::int " <>
       "FROM (VALUES #{values}) AS t(nsp, rel) " <>
       "JOIN pg_namespace n ON n.nspname = t.nsp " <>
       "JOIN pg_class c ON c.relname = t.rel AND c.relnamespace = n.oid " <>
       "JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-      "LEFT JOIN LATERAL (SELECT i.indexrelid, i.indkey FROM pg_index i " <>
-      "WHERE i.indrelid = c.oid AND " <>
-      "(c.relreplident = 'd' AND i.indisprimary OR c.relreplident = 'i' AND i.indisreplident) " <>
-      "LIMIT 1) ri ON true " <>
       "ORDER BY n.nspname, c.relname, a.attnum"
   end
 
   @doc """
-  ADR-0009 §4 — the pre-flight output-plugin option probe, against the pipeline's
-  OWN slot with the decoder's EXACT option list. A build that cannot express an
-  option rejects the call
-  with `invalid_parameter_value` / `feature_not_supported` (OBSERVED: wal2json format
-  bounds use 0A000, an unknown option uses 22023) — the caller halts
-  `:decoder_option_unsupported` instead of feeding the stream-command reconnect loop
-  (postgrex surfaces a rejected START_REPLICATION only as a disconnect, and a rejected
-  or erroring peek on the WALSENDER itself never returns ReadyForQuery). Any OTHER
-  error — pglogical's "produces binary output" (XX000) above all — proves the options
-  PARSED, so the caller proceeds. Option values are validated exactly like
-  `start_replication_for/4`'s; names are `Identifier.validate`d and interpolated (the
-  simple-query protocol cannot bind).
+  Pre-flight pglogical's options on the pipeline's slot using textual output.
+  The caller halts on `invalid_parameter_value` from the plugin startup callback.
+  The slot and options are validated before interpolation.
   """
   @spec decoder_option_probe(String.t(), [{String.t(), String.t()}]) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
@@ -426,11 +358,6 @@ defmodule Replicant.QueryBuilder do
       (`invalidation_reason`/`synced` were added in PG17 and error here).
     * **PG 17+** (`version >= 170000`) — also `invalidation_reason` (Postgres's authoritative
       invalidation field) and `synced` (true on a standby holding a slot synced from the primary).
-    * **PG 9.6 to 12** (`version < 130000`) — NO invalidation column (ADR-0009 §9):
-      `wal_status` and `max_slot_wal_keep_size` arrive in PG13; before that a slot cannot
-      be invalidated by size and the only loss signal is a removed WAL segment, which
-      surfaces as a `START_REPLICATION` failure (the command-error watchdog). The
-      constant `NULL::text` keeps the row-present/absent signal the connect chain keys on.
 
   `wal_status = 'lost'` = WAL removed; `conflicting = true` = standby recovery conflict; any
   non-null `invalidation_reason` = invalidated. All are unrecoverable → fail-closed halt.
@@ -443,8 +370,7 @@ defmodule Replicant.QueryBuilder do
         cond do
           version >= 170_000 -> "wal_status, conflicting, invalidation_reason, synced"
           version >= 160_000 -> "wal_status, conflicting"
-          version >= 130_000 -> "wal_status"
-          true -> "NULL::text"
+          true -> "wal_status"
         end
 
       {:ok,
@@ -593,9 +519,8 @@ defmodule Replicant.QueryBuilder do
   and casts the `<col>::text` value through the SAME `Casting.Types.cast_record/2` path the
   stream uses, so snapshot and stream deliver byte-identical `%Change{}.record` values for
   EVERY column (spec §2 convergence — the F1 fix generalized from PK-only to all columns).
-  PostgreSQL 15+ uses the effective `pg_publication_tables.attnames` list. Earlier
-  servers have no column lists and use non-dropped user columns. PG12–15 excludes
-  generated columns; pre-12 never references `attgenerated`. The caller
+  The projection uses the effective `pg_publication_tables.attnames` list.
+  PostgreSQL 15 excludes generated columns. The caller
   must supply the probed server version. Publication names are bound `$1`. Different
   lists produce separate rows for the same table; the reader MUST reject those
   before reading any table data. Identical lists produce one row. PG15+ row filters
@@ -606,37 +531,26 @@ defmodule Replicant.QueryBuilder do
   """
   @spec table_columns(non_neg_integer()) :: String.t()
   def table_columns(server_version_num)
-      when is_integer(server_version_num) and server_version_num > 0 do
-    {published, filter, grouping} =
-      if server_version_num >= 150_000 do
-        {"SELECT DISTINCT schemaname, tablename, attnames FROM pg_publication_tables WHERE pubname = ANY($1)",
-         " AND a.attname = ANY(p.attnames)", ", p.attnames"}
-      else
-        {"SELECT DISTINCT schemaname, tablename FROM pg_publication_tables WHERE pubname = ANY($1)",
-         "", ""}
-      end
-
-    {cte, filter_join, row_filter, filter_group} = publication_row_filters(server_version_num)
+      when is_integer(server_version_num) and server_version_num >= 150_000 do
+    {cte, filter_join} = publication_row_filters()
 
     cte <>
       "SELECT p.schemaname, p.tablename, format('%I.%I', p.schemaname, p.tablename) AS qualified, " <>
       column_aggregates() <>
-      ", " <>
-      row_filter <>
-      " AS row_filter " <>
-      "FROM (#{published}) p " <>
+      ", f.row_filter " <>
+      "FROM (SELECT DISTINCT schemaname, tablename, attnames FROM pg_publication_tables WHERE pubname = ANY($1)) p " <>
       "JOIN pg_class c ON c.relname = p.tablename " <>
       "JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = p.schemaname " <>
       filter_join <>
       "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-      filter <>
+      " AND a.attname = ANY(p.attnames)" <>
       generated_column_filter(server_version_num) <>
-      " GROUP BY p.schemaname, p.tablename" <> grouping <> filter_group <> ", c.oid"
+      " GROUP BY p.schemaname, p.tablename, p.attnames, f.row_filter, c.oid"
   end
 
   def table_columns(_unprobed), do: raise(Replicant.Error, reason: :snapshot_failed)
 
-  defp generated_column_filter(version) when version >= 120_000 and version < 160_000,
+  defp generated_column_filter(version) when version < 160_000,
     do: " AND a.attgenerated = ''"
 
   defp generated_column_filter(_version), do: ""
@@ -658,23 +572,14 @@ defmodule Replicant.QueryBuilder do
     end)
   end
 
-  defp publication_row_filters(version) do
-    predicate =
-      if version < 150_000 do
-        "CASE WHEN bool_or(pub.pubinsert) THEN NULL ELSE 'false' END"
-      else
-        "CASE WHEN bool_or(rowfilter IS NULL) FILTER (WHERE pub.pubinsert) THEN NULL " <>
-          "ELSE COALESCE(string_agg('(' || rowfilter || ')', ' OR ' ORDER BY rowfilter) " <>
-          "FILTER (WHERE pub.pubinsert), 'false') END"
-      end
-
+  defp publication_row_filters do
     {"WITH row_filters AS (SELECT schemaname, tablename, " <>
-       predicate <>
-       " AS row_filter FROM pg_publication_tables p " <>
+       "CASE WHEN bool_or(rowfilter IS NULL) FILTER (WHERE pub.pubinsert) THEN NULL " <>
+       "ELSE COALESCE(string_agg('(' || rowfilter || ')', ' OR ' ORDER BY rowfilter) " <>
+       "FILTER (WHERE pub.pubinsert), 'false') END AS row_filter FROM pg_publication_tables p " <>
        "JOIN pg_publication pub ON pub.pubname = p.pubname " <>
        "WHERE p.pubname = ANY($1) GROUP BY schemaname, tablename) ",
-     "JOIN row_filters f ON f.schemaname = p.schemaname AND f.tablename = p.tablename ",
-     "f.row_filter", ", f.row_filter"}
+     "JOIN row_filters f ON f.schemaname = p.schemaname AND f.tablename = p.tablename "}
   end
 
   @doc """
@@ -708,84 +613,66 @@ defmodule Replicant.QueryBuilder do
   def table_columns_for(_other), do: {:error, :invalid_identifier}
 
   @doc """
-  The `table_columns/1` row shape for an EXPLICIT table list (the pglogical/wal2json
-  decoders' snapshot path, ADR-0009 §8): same `attnum` order, but the
+  The `table_columns/1` row shape for a pglogical snapshot (ADR-0009 §8): same `attnum` order, but the
   table set comes from the caller (`VALUES` — both parts of every pair are
   `Identifier.validate`d) instead of `pg_publication_tables`. For pglogical, pass
   replication sets as the second argument and bind them as `$1`: `set_att_list`
   restricts the projection per local set. Identical effective projections deduplicate;
   conflicting ones remain separate rows for the reader's refusal. Supply the probed
   server version as the third argument for pglogical's generated-column selection.
-  With no sets
-  (wal2json), all non-dropped columns remain selected and there is no row predicate.
   pglogical's non-NULL `set_row_filter` expressions combine with AND (2.4.8),
   including when another set is unfiltered. `pg_get_expr` renders the server nodes.
   """
-  @spec table_columns_for([{String.t(), String.t()}], [String.t()] | nil, pos_integer() | nil) ::
+  @spec table_columns_for([{String.t(), String.t()}], [String.t()], pos_integer()) ::
           {:ok, String.t()} | {:error, :invalid_identifier}
   def table_columns_for(tables, replication_sets, server_version_num)
-      when is_list(tables) and tables != [] do
+      when is_list(tables) and tables != [] and is_list(replication_sets) and
+             replication_sets != [] do
+    unless is_integer(server_version_num) and server_version_num >= 150_000,
+      do: raise(Replicant.Error, reason: :snapshot_failed)
+
     with :ok <- ensure_valid_pairs(tables) do
-      if not is_nil(replication_sets) and
-           not (is_integer(server_version_num) and server_version_num > 0),
-         do: raise(Replicant.Error, reason: :snapshot_failed)
-
-      generated =
-        if is_nil(replication_sets), do: "", else: generated_column_filter(server_version_num)
-
       values = table_values(tables)
-      {sets_join, filter, grouping} = snapshot_set_columns(replication_sets)
-      {cte, filter_join, row_filter, filter_group} = set_row_filters(replication_sets)
+      {cte, filter_join} = set_row_filters()
 
       {:ok,
        cte <>
          "SELECT DISTINCT n.nspname AS schemaname, c.relname AS tablename, " <>
          "format('%I.%I', n.nspname, c.relname) AS qualified, " <>
          column_aggregates() <>
-         ", " <>
-         row_filter <>
-         " AS row_filter " <>
+         ", f.row_filter " <>
          "FROM (VALUES #{values}) AS p0(nsp, rel) " <>
          "JOIN pg_namespace n ON n.nspname = p0.nsp " <>
          "JOIN pg_class c ON c.relname = p0.rel AND c.relnamespace = n.oid " <>
-         sets_join <>
+         "JOIN pglogical.replication_set_table r ON r.set_reloid = c.oid " <>
+         "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
+         "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id " <>
          filter_join <>
          "LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped " <>
-         filter <>
-         generated <> " GROUP BY n.nspname, c.relname" <> grouping <> filter_group <> ", c.oid"}
+         " AND (r.set_att_list IS NULL OR a.attname = ANY(r.set_att_list))" <>
+         generated_column_filter(server_version_num) <>
+         " GROUP BY n.nspname, c.relname, r.set_id, f.row_filter, c.oid"}
     end
   end
 
   def table_columns_for(_other, _sets, _version), do: {:error, :invalid_identifier}
 
-  defp snapshot_set_columns(nil), do: {"", "", ""}
-
-  defp snapshot_set_columns(sets) when is_list(sets) do
-    {"JOIN pglogical.replication_set_table r ON r.set_reloid = c.oid " <>
-       "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
-       "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id ",
-     " AND (r.set_att_list IS NULL OR a.attname = ANY(r.set_att_list))", ", r.set_id"}
-  end
-
-  defp set_row_filters(nil), do: {"", "", "NULL::text", ""}
-
   # pglogical 2.4.8 replicates a table's inserts when any selected set has
   # replicate_insert, then accumulates the non-NULL set_row_filter nodes of ALL
   # selected sets, insert flag or not (pglogical_repset.c:458-498), and rejects a
   # change if any expression is false/NULL: AND, even beside an unfiltered set.
-  defp set_row_filters(_sets) do
+  defp set_row_filters() do
     {"WITH row_filters AS (SELECT r.set_reloid, " <>
        "CASE WHEN bool_or(s.replicate_insert) THEN string_agg('(' || pg_get_expr(r.set_row_filter::pg_node_tree, r.set_reloid) || ')', " <>
        "' AND ' ORDER BY r.set_id) ELSE 'false' END AS row_filter " <>
        "FROM pglogical.replication_set_table r " <>
        "JOIN pglogical.replication_set s ON s.set_id = r.set_id AND s.set_name = ANY($1) " <>
        "JOIN pglogical.local_node l ON s.set_nodeid = l.node_id GROUP BY r.set_reloid) ",
-     "JOIN row_filters f ON f.set_reloid = c.oid ", "f.row_filter", ", f.row_filter"}
+     "JOIN row_filters f ON f.set_reloid = c.oid "}
   end
 
   @doc """
-  The `pk_columns/0` row shape for an EXPLICIT table list (the pglogical/wal2json
-  decoders' incremental path, ADR-0009 §8). Same columns and PK ordering; the table
+  The `pk_columns/0` row shape for a pglogical snapshot (ADR-0009 §8). Same columns and PK ordering; the table
   set is the caller's validated list.
   """
   @spec pk_columns_for([{String.t(), String.t()}]) ::
@@ -919,18 +806,10 @@ defmodule Replicant.QueryBuilder do
   Read-only watermark position (spec §2/§4): `pg_current_wal_lsn()` on a primary,
   `pg_last_wal_replay_lsn()` on a standby (the chunk reader connects to the same host
   as the replication connection, so its snapshot visibility is bounded by replay).
-  The `/3` form is version-gated (ADR-0009 §9): PG 9.6 names the current-LSN function
-  `pg_current_xlog_location` (the `pg_current_wal_lsn` rename landed in PG 10).
   """
-  @spec watermark_lsn(boolean(), non_neg_integer()) :: String.t()
-  def watermark_lsn(in_recovery, version \\ 100_021)
-
-  def watermark_lsn(true, _version), do: "SELECT pg_last_wal_replay_lsn()::text;"
-
-  def watermark_lsn(false, version) when version < 100_000,
-    do: "SELECT pg_current_xlog_location()::text;"
-
-  def watermark_lsn(false, _version), do: "SELECT pg_current_wal_lsn()::text;"
+  @spec watermark_lsn(boolean()) :: String.t()
+  def watermark_lsn(true), do: "SELECT pg_last_wal_replay_lsn()::text;"
+  def watermark_lsn(false), do: "SELECT pg_current_wal_lsn()::text;"
 
   @doc "DDL creating the lib-owned snapshot-progress table if absent (token is an opaque bytea; spec §6.2)."
   @spec progress_ensure_table(String.t()) :: {:ok, String.t()} | {:error, :invalid_identifier}

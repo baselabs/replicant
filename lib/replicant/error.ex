@@ -29,7 +29,7 @@ defmodule Replicant.Error do
           | :checkpoint_store_schema_mismatch
           | :decoder_protocol_unsupported
           | :decoder_option_unsupported
-          | :decoder_lsn_missing
+          | :server_version_unsupported
           | :decoder_capability_unsupported
 
   @type t :: %__MODULE__{

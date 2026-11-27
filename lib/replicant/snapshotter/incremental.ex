@@ -200,10 +200,9 @@ defmodule Replicant.Snapshotter.Incremental do
 
     try do
       standby? = standby?(db)
-      version = Map.fetch!(args, :server_version_num)
       sp = resume_or_discover(db, args, args.resume)
       chunk_rows = Keyword.fetch!(args.snapshot, :chunk_rows)
-      loop(db, args, sp, chunk_rows, standby?, version)
+      loop(db, args, sp, chunk_rows, standby?)
     after
       GenServer.stop(db)
     end
@@ -412,34 +411,33 @@ defmodule Replicant.Snapshotter.Incremental do
 
   # ---- the chunk loop ----
 
-  defp loop(db, args, sp, chunk_rows, standby?, version, keyed_attempts \\ %{}) do
-    run_ctx = %{standby?: standby?, version: version, keyed_attempts: keyed_attempts}
+  defp loop(db, args, sp, chunk_rows, standby?, keyed_attempts \\ %{}) do
+    run_ctx = %{standby?: standby?, keyed_attempts: keyed_attempts}
 
     case SnapshotProgress.next(sp) do
       :complete ->
         deliver_completion(db, args, sp, chunk_rows, run_ctx)
 
       {:table, %{pk_raw: []} = table, _bound, sp} ->
-        run_keyless_table(db, args, sp, table, standby?, version, 1)
+        run_keyless_table(db, args, sp, table, standby?, 1)
 
       {:table, table, bound, sp} ->
         run_chunk(db, args, sp, table, bound, chunk_rows, %{
           standby?: standby?,
-          version: version,
           keyed_attempts: keyed_attempts
         })
     end
   end
 
   defp run_chunk(db, args, sp, table, bound, chunk_rows, run_ctx) do
-    %{standby?: standby?, version: version, keyed_attempts: keyed_attempts} = run_ctx
+    %{standby?: standby?, keyed_attempts: keyed_attempts} = run_ctx
     fresh_table? = is_nil(bound) and args.resume == nil
 
     # Capture the window GENERATION so the FINAL-chunk barrier below can reject a stale one (a
     # reconnect reset re-seats the window → its buffered chunks were wiped, spec §4/§6.4).
     epoch = open_window_epoch(server(args), table.qualified)
 
-    _lw = watermark(db, standby?, version)
+    _lw = watermark(db, standby?)
 
     {:ok, sql} =
       QueryBuilder.keyset_chunk(
@@ -452,7 +450,7 @@ defmodule Replicant.Snapshotter.Incremental do
 
     params = [chunk_rows | bound || []]
     %Postgrex.Result{columns: cols, rows: rows} = Postgrex.query!(db, sql, params)
-    hw = watermark(db, standby?, version)
+    hw = watermark(db, standby?)
 
     # Cast every column to its stream-identical term (the delivered record) + derive the
     # cast pk_canon (drop-set key, matches the window's cast stream PK); the RAW __rpk_*
@@ -502,7 +500,7 @@ defmodule Replicant.Snapshotter.Incremental do
         do: Map.delete(keyed_attempts, table.qualified),
         else: keyed_attempts
 
-    loop(db, args, sp, chunk_rows, standby?, version, keyed_attempts)
+    loop(db, args, sp, chunk_rows, standby?, keyed_attempts)
   catch
     # Both signals re-read durable progress because discarded chunks were never applied. A reconnect
     # preserves the keyed contention budget; a contention discard consumes one of the same three
@@ -535,7 +533,7 @@ defmodule Replicant.Snapshotter.Incremental do
   # spec §4). Re-discovery here closes the same token-injection vector as the initial
   # resume (the durable token is equally attacker-writable).
   defp reload_and_continue(db, args, chunk_rows, run_ctx) do
-    %{standby?: standby?, version: version, keyed_attempts: keyed_attempts} = run_ctx
+    %{standby?: standby?, keyed_attempts: keyed_attempts} = run_ctx
 
     sp =
       case read_durable_progress(args) do
@@ -550,7 +548,7 @@ defmodule Replicant.Snapshotter.Incremental do
           throw({:halt, :snapshot_failed})
       end
 
-    loop(db, args, sp, chunk_rows, standby?, version, keyed_attempts)
+    loop(db, args, sp, chunk_rows, standby?, keyed_attempts)
   catch
     {:halt, reason} -> {:error, reason}
   end
@@ -614,7 +612,7 @@ defmodule Replicant.Snapshotter.Incremental do
 
     :ok
   catch
-    # the REAL run_ctx (standby?/version) so the reload re-runs the loop correctly —
+    # the REAL run_ctx (standby status) so the reload re-runs the loop correctly —
     # a synthesized map MatchErrors and converts a routine reset into a snapshot halt
     :window_reset -> reload_and_continue(db, args, chunk_rows, run_ctx)
   end
@@ -675,12 +673,12 @@ defmodule Replicant.Snapshotter.Incremental do
   # taint): the reader's NEXT deliver returns {:error, :window_reset} → the reduce throws,
   # the txn rolls back, and this attempt re-reads. After @max_table_attempts the reader
   # halts :snapshot_table_contended (spec §6.4).
-  defp run_keyless_table(_db, args, _sp, table, _standby?, _version, attempt)
+  defp run_keyless_table(_db, args, _sp, table, _standby?, attempt)
        when attempt > @max_table_attempts do
     halt_contended(args, table)
   end
 
-  defp run_keyless_table(db, args, sp, table, standby?, version, attempt) do
+  defp run_keyless_table(db, args, sp, table, standby?, attempt) do
     if attempt > 1 do
       Telemetry.event([:replicant, :snapshot, :chunk_retried], %{}, %{
         table: table.qualified,
@@ -725,7 +723,7 @@ defmodule Replicant.Snapshotter.Incremental do
               args,
               table,
               {cols, rows},
-              watermark_in_txn(c, standby?, version),
+              watermark(c, standby?),
               first?: first?,
               progress: encoded_current
             )
@@ -746,7 +744,7 @@ defmodule Replicant.Snapshotter.Incremental do
         # discards its still-pending batch — silently losing the rows. A discard throws
         # :table_discarded → the catch redoes this table (attempt + 1).
         reset_guard(AssemblerServer.finish_snapshot_table(server(args), table.qualified, epoch))
-        loop(db, args, sp_after, Keyword.fetch!(args.snapshot, :chunk_rows), standby?, version)
+        loop(db, args, sp_after, Keyword.fetch!(args.snapshot, :chunk_rows), standby?)
 
       {:error, fault} ->
         # 1.3.0 — an {:error, _} from Postgrex.transaction is NEVER table contention:
@@ -763,8 +761,8 @@ defmodule Replicant.Snapshotter.Incremental do
     # A CONTENTION discard redoes the whole table AND counts toward the @max_table_attempts halt;
     # a plain reconnect (:window_reset) redoes at the SAME attempt (a reconnect is not contention —
     # spec §6.4). :chunk_retried fires at the top of each attempt > 1.
-    :table_discarded -> run_keyless_table(db, args, sp, table, standby?, version, attempt + 1)
-    :window_reset -> run_keyless_table(db, args, sp, table, standby?, version, attempt)
+    :table_discarded -> run_keyless_table(db, args, sp, table, standby?, attempt + 1)
+    :window_reset -> run_keyless_table(db, args, sp, table, standby?, attempt)
   end
 
   defp halt_contended(args, table) do
@@ -807,10 +805,8 @@ defmodule Replicant.Snapshotter.Incremental do
   # functions (not snapshot-bound), so querying through the txn's own checked-out conn `c`
   # is both correct AND required — `db` is a pool_size-1 pool whose only connection the
   # enclosing transaction holds (querying `db` here would deadlock — plan review F3).
-  defp watermark_in_txn(c, standby?, version), do: watermark(c, standby?, version)
-
-  defp watermark(db, standby?, version) do
-    [[lsn_str]] = Postgrex.query!(db, QueryBuilder.watermark_lsn(standby?, version), []).rows
+  defp watermark(db, standby?) do
+    [[lsn_str]] = Postgrex.query!(db, QueryBuilder.watermark_lsn(standby?), []).rows
     {:ok, lsn} = Replicant.lsn_from_string(lsn_str)
     lsn
   end

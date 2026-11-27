@@ -18,11 +18,8 @@ in-progress-transaction streaming, consumer-side disk spill for oversized
 transactions, PG17+ forward-compat with failover slots, **multi-publication per
 pipeline** (`publication: [p1, p2]` — fail-closed on a missing pub), and
 **logical-decoding messages** (`messages: true` — `pg_logical_emit_message` payloads),
-and the **ADR-0009 plugin decoders** (`decoder: :pglogical | :wal2json`)
-with fail-closed divergence handling: a configured keyless wal2json table halts at start
-(`allow_keyless_tables: true` opts into insert-only semantics), and a dropped column
-halts `:destructive` on every decoder (wal2json: at the change for inserts/fixed-width
-columns, else within `schema_check_interval`, default 30s).
+and the **pglogical decoder** (`decoder: :pglogical`) on PostgreSQL 15 through 19.
+A dropped column halts `:destructive` on both supported decoders.
 A logical-decoding message's `content` and `prefix` are **user bytes**: Critical Rule
 1 binds — never log them, surface them in an error, or emit them in telemetry.
 
@@ -99,7 +96,7 @@ The commands below describe the CI gates. See [Testing](#testing) for the test c
 Update `CHANGELOG.md` under `[Unreleased]`.
 
 **Checks run in CI, through the landing.** The repository has no pre-commit hook. Every check
-(format, credo, compile warnings, the dependency audit, dialyzer, `mix test` on supported and legacy
+(format, credo, compile warnings, the dependency audit, dialyzer, `mix test` on supported
 PostgreSQL majors, docs and package, the reference example) is a job in
 `.github/workflows/qualification.yml`. Maintainers land a commit through a `kci/<commit>`
 branch: `.github/workflows/ci.yml` runs those jobs once on it, and its final `qualified` job
@@ -179,26 +176,21 @@ they touch a workflow, a Dockerfile, a release script or a secret.
   The pgoutput suite decodes REAL captured bytes (walex's MIT capture, credited) for every
   message type, including the unchanged-TOAST sentinel and all replica-identity modes; it never
   self-signs fixtures. `test/integration/pg16_conformance_test.exs` corroborates it live. The
-  plugin decoders' suite (`test/replicant/decoder/plugin_conformance_test.exs`) decodes real
-  9.6/12 captures (`test/fixtures/wal2json_*`, `pglogical_*.bin`) with byte-flip tamper tests.
-  The decoder-parity marquee (`test/integration/decoder_parity_test.exs`) proves byte-identical
-  delivery across pgoutput and both plugins and is FAIL-LOUD: a pre-15 plugin row must wire
-  `REPLICANT_PG96_URL` to a real 9.6 carrying both plugins. The snapshot leg
-  (`test/integration/plugin_snapshot_pg96_test.exs`) proves exactly-once arrival across a 9.6
-  two-part exported-snapshot handoff wherever a pre-10 server is wired.
+  pglogical protocol suite decodes captured frames (`test/fixtures/pglogical_*.bin`)
+  with byte-flip tamper tests. The live parity test compares pgoutput and pglogical
+  delivery on the same server alongside the pglogical halt and crash-resume tests.
 - **PostgreSQL substrate:** one qualification lane per PGDG-supported major
-  (15 through 19, [ADR-0010](docs/adr/0010-postgresql-server-support.md)), plus 9.6
-  and 12 compatibility lanes in 1.x. `.github/postgres.ref` pins the platform engine
+  (15 through 19, [ADR-0010](docs/adr/0010-postgresql-server-support.md)).
+  `.github/postgres.ref` pins the platform engine
   for its lane and the example. `.github/postgres-lanes.json` pins upstream images
   for the other majors and the engine lane's same-major pglogical companion.
   `scripts/ci/postgres-lanes.sh` validates the matrix. The shared PostgreSQL action
   checks the public engine digest anonymously and owns password-authenticated
   startup and unconditional teardown. Plugin builds use exact server headers and
-  full source commits. wal2json stays on 9.6, 12 and 15. Every lane checks the
-  live major and plugin inventory. Publication-capable pglogical runs require a
-  successful parity receipt. The `:pg17`, `:pg14` and `:pg10` tags gate features
-  on their minimum major. The slot-invalidation query uses `wal_status` from 13,
-  `conflicting` from 16, and `invalidation_reason` and `synced` from 17.
+  full source commits. Every lane checks the live major and plugin inventory.
+  Every pglogical run requires a successful parity receipt. The `:pg17` tag
+  gates failover tests. The invalidation query uses `wal_status` on all supported
+  servers, `conflicting` from 16, and `invalidation_reason` and `synced` from 17.
 - **Integration + crash-injection tests** (`test/integration/**`): gate on
   `REPLICANT_TEST_URL` pointing at a live PostgreSQL with `wal_level=logical`; skip when
   unset. Qualification provisions isolated containers on loopback with a new database,

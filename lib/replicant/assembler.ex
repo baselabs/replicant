@@ -439,15 +439,8 @@ defmodule Replicant.Assembler do
       {:skipped, txn.commit_lsn, reset(asm)}
     else
       if txn.changes == [] and txn.messages == [] do
-        # EMPTY v1 transaction — zero changes AND zero messages. PG15+ skips these
-        # server-side; a pre-15 pgoutput walsender still streams BEGIN/COMMIT for
-        # catalog-touched transactions with zero published changes (OBSERVED live on
-        # 12.22: every ALTER/DDL txn). The streamed path suppresses these already
-        # (Streaming.deliver_or_skip_stream, parent CV1 spec §7); the v1 path takes the
-        # same route — no sink call, and the WAL acks forward as proven-carries-nothing
-        # for a state mirror (the {:skipped_empty, lsn} return; an :append_log sink
-        # does NOT ack past its durable frontier — Critical Rule 3's append clause).
-        # A message-bearing txn is NOT empty (v1-distinguishable, spec §7.1).
+        # Apply the streaming path's empty-transaction policy to v1 too. A state
+        # mirror can release filtered WAL. An append log must keep its durable frontier.
         __MODULE__.Streaming.suppress_empty_stream_commit(reset(asm), txn.commit_lsn)
       else
         apply_sink(asm, txn)

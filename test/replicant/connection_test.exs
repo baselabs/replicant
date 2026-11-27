@@ -629,78 +629,6 @@ defmodule Replicant.ConnectionTest do
     end
   end
 
-  describe "keyless_tables/2 (the wal2json pre-flight predicate)" do
-    alias Replicant.Decoder.Messages.Relation
-    alias Replicant.Decoder.Messages.Relation.Column
-
-    # wal2json.c:1869-1897 — an UPDATE/DELETE on a table with NO replica-identity
-    # index and identity ≠ FULL is skipped plugin-side (a server WARNING, no wire
-    # signal). The predicate names exactly those configured tables.
-    test "a table with no key columns and identity ≠ FULL is keyless" do
-      rel = %Relation{
-        id: 1,
-        namespace: "public",
-        name: "events",
-        replica_identity: :nothing,
-        columns: [%Column{name: "payload", type: "text", flags: [], type_modifier: -1}]
-      }
-
-      cache = %{relations: %{{"public", "events"} => rel}}
-
-      assert Connection.keyless_tables(cache, [{"public", "events"}]) == [
-               {"public", "events"}
-             ]
-    end
-
-    test "a PK table on default identity is keyed; FULL is keyed; an identity index is keyed" do
-      keyed_default = %Relation{
-        replica_identity: :default,
-        columns: [%Column{name: "id", type: "int4", flags: [:key], type_modifier: -1}]
-      }
-
-      keyed_full = %Relation{
-        replica_identity: :all_columns,
-        columns: [%Column{name: "id", type: "int4", flags: [], type_modifier: -1}]
-      }
-
-      keyed_index = %Relation{
-        replica_identity: :index,
-        columns: [%Column{name: "k", type: "text", flags: [:key], type_modifier: -1}]
-      }
-
-      cache = %{
-        relations: %{
-          {"public", "a"} => keyed_default,
-          {"public", "b"} => keyed_full,
-          {"public", "c"} => keyed_index
-        }
-      }
-
-      assert Connection.keyless_tables(cache, [
-               {"public", "a"},
-               {"public", "b"},
-               {"public", "c"}
-             ]) == []
-    end
-
-    test "a PK'd table switched to REPLICA IDENTITY NOTHING is keyless (rd_replidindex is cleared server-side)" do
-      rel = %Relation{
-        replica_identity: :nothing,
-        columns: [%Column{name: "id", type: "int4", flags: [], type_modifier: -1}]
-      }
-
-      cache = %{relations: %{{"public", "halted"} => rel}}
-
-      assert Connection.keyless_tables(cache, [{"public", "halted"}]) == [
-               {"public", "halted"}
-             ]
-    end
-
-    test "tables absent from the cache are not reported here (the :table_missing halt owns absence)" do
-      assert Connection.keyless_tables(%{relations: %{}}, [{"public", "ghost"}]) == []
-    end
-  end
-
   describe "classify_slot_status/1 (PG16 wal_status + conflicting)" do
     test "an absent slot classifies :absent (first run → create)" do
       assert Connection.classify_slot_status([]) == :absent
@@ -1121,23 +1049,6 @@ defmodule Replicant.ConnectionTest do
 
       assert {:query, sql, new_state} = Connection.handle_result(result, st)
       assert sql == "CREATE_REPLICATION_SLOT conn_test LOGICAL pgoutput EXPORT_SNAPSHOT;"
-      assert new_state.step == :create_export_slot
-    end
-
-    test "absent slot + snapshot: true on a pre-15 server → the bare export form (ADR-0009)" do
-      result = [%Postgrex.Result{rows: []}]
-
-      st =
-        state(
-          step: :invalidation_check,
-          snapshot: true,
-          checkpoint_lsn: 0,
-          checkpoint_state: :empty,
-          server_version_num: 120_008
-        )
-
-      assert {:query, sql, new_state} = Connection.handle_result(result, st)
-      assert sql == "CREATE_REPLICATION_SLOT conn_test LOGICAL pgoutput;"
       assert new_state.step == :create_export_slot
     end
 
@@ -1917,18 +1828,59 @@ defmodule Replicant.ConnectionTest do
       assert new_state.step == :publication_check
     end
 
+    test "recovery_check halts unsupported text versions before any slot query" do
+      handler = {__MODULE__, :unsupported_server}
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:replicant, :pipeline, :halted],
+        fn _event, _measurements, metadata, _config -> send(test_pid, {:halted, metadata}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      for version <- ["90624", "120022", "149999", "200000"],
+          kind <- [:pgoutput, :pglogical] do
+        st = state(step: :recovery_check)
+        st = %{st | decoder: %{st.decoder | kind: kind, replication_sets: ["default"]}}
+        result = [%Postgrex.Result{rows: [["f", version]]}]
+        slot_name = st.slot_name
+
+        assert {:noreply, _state} = Connection.handle_result(result, st)
+
+        assert_receive {:halted, %{slot_name: ^slot_name} = metadata}
+        assert metadata == %{
+                 slot_name: slot_name,
+                 kind: :config,
+                 reason: :server_version_unsupported
+               }
+      end
+    end
+
+    test "recovery_check halts when the walsender cannot execute the version query" do
+      st = state(step: :recovery_check)
+
+      assert {:noreply, ^st} =
+               Connection.handle_result(
+                 %Postgrex.Error{postgres: %{code: :syntax_error}},
+                 st
+               )
+    end
+
     test "recovery_check coerces text replication results and dispatches the publication check" do
-      result = [%Postgrex.Result{rows: [["f", "160014"]]}]
+      result = [%Postgrex.Result{rows: [["f", "150000"]]}]
 
       assert {:query, sql, new_state} =
                Connection.handle_result(result, state(step: :recovery_check))
 
-      assert new_state.server_version_num == 160_014
+      assert new_state.server_version_num == 150_000
       assert new_state.in_recovery == false
       # The chain now dispatches the A3 existence-gate query from :recovery_check (version-
       # independent — the version-gated 2-col/4-col slot query is now selected in
       # :publication_check, after the existence gate passes). The text-coercion regression
-      # (binary "160014" forcing the wrong path) is still covered by server_version_num above.
+      # (a binary version forcing the wrong path) is still covered by server_version_num above.
       assert sql =~ "pg_publication"
       assert new_state.step == :publication_check
     end
@@ -2340,19 +2292,9 @@ defmodule Replicant.ConnectionTest do
   # resume with pending WAL (OBSERVED live 2026-09-30: crash-resume died with
   # :decoder_option_unsupported before streaming a frame). Red proof: flip the
   # swap out (return options unchanged) and the pglogical row below fails.
-  describe "probe_options/2 (the option pre-flight's per-decoder list)" do
+  describe "probe_options/1 (pglogical option pre-flight)" do
     test "pglogical probes with textual json output; every other option rides unchanged" do
-      state = %Connection{
-        decoder: %{
-          kind: :pglogical,
-          cache: nil,
-          tables: nil,
-          discovered: nil,
-          replication_sets: nil
-        }
-      }
-
-      assert Connection.probe_options(state, [
+      assert Connection.probe_options([
                {"startup_params_format", "1"},
                {"min_proto_version", "1"},
                {"max_proto_version", "1"},
@@ -2365,21 +2307,6 @@ defmodule Replicant.ConnectionTest do
                {"proto_format", "json"},
                {"\"pglogical.replication_set_names\"", "default"}
              ]
-    end
-
-    test "wal2json probes with its EXACT stream options (textual output probes the real set)" do
-      state = %Connection{
-        decoder: %{
-          kind: :wal2json,
-          cache: nil,
-          tables: nil,
-          discovered: nil,
-          replication_sets: nil
-        }
-      }
-
-      options = [{"\"format-version\"", "2"}, {"\"numeric-data-types-as-string\"", "true"}]
-      assert Connection.probe_options(state, options) == options
     end
   end
 end

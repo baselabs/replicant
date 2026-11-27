@@ -2,8 +2,6 @@ defmodule Replicant.SnapshotColumnsTest do
   use ExUnit.Case, async: false
   @moduletag :integration
   @moduletag timeout: 30_000
-  if Replicant.TestHelper.server_version_num() < 150_000,
-    do: @moduletag(skip: "publication column lists require PostgreSQL 15+")
 
   alias Replicant.{QueryBuilder, Snapshotter}
   alias Replicant.Snapshotter.Incremental
@@ -243,7 +241,7 @@ defmodule Replicant.SnapshotColumnsTest do
   for stored <- [false, true] do
     @stored stored
     @tag :snapshot_generated
-    @tag skip: Replicant.TestHelper.server_version_num() < if(stored, do: 180_000, else: 150_000)
+    @tag skip: stored and Replicant.TestHelper.server_version_num() < 180_000
     test "generated stored column snapshot matches stream (publish stored: #{stored})", ctx do
       Postgrex.query!(
         ctx.db,

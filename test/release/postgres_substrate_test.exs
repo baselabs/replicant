@@ -17,7 +17,8 @@ defmodule Replicant.PostgresSubstrateTest do
       assert engine["plugin_server"]["expected_major"] == engine["expected_major"]
       assert engine["plugin_server"]["plugins"] == ["pglogical"]
       assert length(compatibility) == length(lanes)
-      assert Enum.uniq_by(matrix, & &1["major"]) == matrix
+      majors = Enum.map(matrix, &String.to_integer(&1["major"]))
+      assert Enum.sort(majors) == Enum.to_list(15..19)
 
       for {lane, cell} <- Enum.zip(lanes, compatibility) do
         assert cell["kind"] == "compatibility"
@@ -26,15 +27,7 @@ defmodule Replicant.PostgresSubstrateTest do
                  Map.take(lane, ["major", "image", "plugins"])
 
         refute Map.has_key?(cell, "plugin_server")
-        assert cell["legacy_self"] == Map.get(lane, "legacy-source", false)
-
-        if lane["parity-primary"] do
-          source = Enum.find(lanes, & &1["legacy-source"])
-          assert cell["legacy_server"]["image"] == source["image"]
-          assert cell["legacy_server"]["plugins"] == source["plugins"]
-        else
-          refute Map.has_key?(cell, "legacy_server")
-        end
+        assert cell["plugins"] == ["pglogical"]
       end
     end)
   end
@@ -53,13 +46,14 @@ defmodule Replicant.PostgresSubstrateTest do
         [Map.delete(first, "image") | rest],
         [Map.put(first, "plugins", ["unknown"]) | rest],
         [Map.put(first, "plugins", ["pglogical", "pglogical"]) | rest],
-        [Map.put(first, "plugins", ["pglogical"]) | rest],
+        [Map.put(first, "plugins", []) | rest],
         [Map.put(first, "legacy-source", false) | rest],
         [Map.put(first, "major", engine_major) | rest],
         [Map.update!(first, "image", &(&1 <> "bad")) | rest],
         [Map.update!(first, "image", &String.replace(&1, "postgres:", "other:")) | rest],
         [Map.put(first, "major", "999") | rest],
-        [Map.delete(first, "legacy-source") | rest]
+        [Map.put(first, "major", "14") | rest],
+        rest
       ]
 
       mutations =
@@ -91,7 +85,9 @@ defmodule Replicant.PostgresSubstrateTest do
     assert test_job["env"]["EXPECTED_PG_MAJOR"] == "${{ matrix.pg.expected_major }}"
 
     assert test_job["env"]["EXPECTED_PG_PLUGINS"] == "${{ join(matrix.pg.plugins, ',') }}"
-    assert test_job["env"]["REPLICANT_PG96_URL"] =~ "matrix.pg.legacy_server"
+
+    primary = Enum.find(test_job["steps"], &String.contains?(&1["run"] || "", "R05-SUBSTRATE"))
+    assert primary["run"] =~ "PGLOGICAL-PARITY-RECEIPT"
 
     companion = Enum.find(test_job["steps"], &(&1["if"] == "matrix.pg.plugin_server != null"))
     assert companion["env"]["EXPECTED_PG_PLUGINS"] =~ "matrix.pg.plugin_server.plugins"
@@ -132,7 +128,7 @@ defmodule Replicant.PostgresSubstrateTest do
     assert script =~ "--entrypoint baselabs-test-postgres"
     assert script =~ "--tmpfs /var/lib/pg:uid=26,gid=26,mode=0750 --tmpfs /tmp"
     assert script =~ "pg_isready -h 127.0.0.1"
-    assert script =~ "POSTGRES_INITDB_ARGS=\"--auth-host=$auth\""
+    assert script =~ "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256"
     assert script =~ "docker rm -f -v"
     refute script =~ ~r/host replication.*trust/
   end

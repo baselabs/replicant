@@ -55,119 +55,99 @@ defmodule Replicant.Integration.LivebookGettingStartedTest do
   end
 
   test "the getting_started notebook's code cells run green against live PostgreSQL 15+" do
-    # The notebook is the pgoutput tour. Its snapshot-equals-stream section creates a
-    # publication with a column list and a row filter (`FOR TABLE t (cols) WHERE (...)`),
-    # which PostgreSQL added in 15, and its `messages: true` demo cell needs PG14+ (the
-    # pgoutput `messages` option arrived in PG14 — OBSERVED: PG12 rejects it with
-    # "unrecognized pgoutput option: messages"). The plugin-decoder matrix rows (9/12)
-    # carry their own suites; skip the tour there rather than run cells the substrate
-    # cannot express.
-    version = if PG16.enabled?(), do: Replicant.TestHelper.server_version_num(), else: 0
+    source = File.read!(@notebook)
+    cells = extract_elixir_cells(source)
 
-    if PG16.enabled?() and version < 150_000 do
-      IO.puts(
-        "livebook tour skipped: the notebook's column-list + row-filter publication needs " <>
-          "PG15+; the plugin-decoder rows (9/12) carry their own suites"
-      )
+    # The setup cell (the only one carrying Mix.install/1) re-resolves deps; drop it — the test
+    # VM already has replicant + postgrex, and Kino resolves to the headless stub.
+    runnable = Enum.reject(cells, &String.contains?(&1, "Mix.install"))
 
-      :skipped
-    end
+    # Gate integrity: EXACTLY one cell (the setup cell) may be dropped. A stray future
+    # `Mix.install` in another cell would silently skip that cell from the tested path.
+    assert length(cells) - length(runnable) == 1,
+           "expected exactly one Mix.install (setup) cell to be dropped; " <>
+             "dropped #{length(cells) - length(runnable)} — a non-setup cell contains Mix.install"
 
-    if PG16.enabled?() and version >= 150_000 do
-      source = File.read!(@notebook)
-      cells = extract_elixir_cells(source)
+    assert length(runnable) >= @min_runnable_cells,
+           "extracted only #{length(runnable)} runnable elixir cells from #{@notebook} " <>
+             "(floor #{@min_runnable_cells}) — the notebook moved, or the ```elixir fences changed"
 
-      # The setup cell (the only one carrying Mix.install/1) re-resolves deps; drop it — the test
-      # VM already has replicant + postgrex, and Kino resolves to the headless stub.
-      runnable = Enum.reject(cells, &String.contains?(&1, "Mix.install"))
+    # Concatenate + evaluate as one top-to-bottom script (aliases/imports/bindings flow exactly
+    # as Livebook runs the cells in order). The final cell's value is the summary map.
+    script = Enum.join(runnable, "\n\n")
 
-      # Gate integrity: EXACTLY one cell (the setup cell) may be dropped. A stray future
-      # `Mix.install` in another cell would silently skip that cell from the tested path.
-      assert length(cells) - length(runnable) == 1,
-             "expected exactly one Mix.install (setup) cell to be dropped; " <>
-               "dropped #{length(cells) - length(runnable)} — a non-setup cell contains Mix.install"
+    {summary, _binding} = Code.eval_string(script, [], file: @notebook)
 
-      assert length(runnable) >= @min_runnable_cells,
-             "extracted only #{length(runnable)} runnable elixir cells from #{@notebook} " <>
-               "(floor #{@min_runnable_cells}) — the notebook moved, or the ```elixir fences changed"
+    assert is_map(summary),
+           "the notebook's final cell must return a summary map; got: #{inspect(summary)}"
 
-      # Concatenate + evaluate as one top-to-bottom script (aliases/imports/bindings flow exactly
-      # as Livebook runs the cells in order). The final cell's value is the summary map.
-      script = Enum.join(runnable, "\n\n")
+    # --- Observed CDC behavior (the notebook actually did these against live Postgres) ---
 
-      {summary, _binding} = Code.eval_string(script, [], file: @notebook)
+    # Core CRUD: inserted ids 1,2,3; updated 1; deleted 2; TOAST demo added id 10 → mirror {1,3,10}.
+    assert summary.core_final_ids == [1, 3, 10],
+           "core mirror should be [1, 3, 10] after insert/update/delete + TOAST insert; " <>
+             "got #{inspect(summary.core_final_ids)}"
 
-      assert is_map(summary),
-             "the notebook's final cell must return a summary map; got: #{inspect(summary)}"
+    # Effect-once: every applied transaction landed exactly once (append-only ledger, no PK).
+    assert summary.core_dup_count == 0,
+           "a transaction was delivered/applied more than once (dup=#{summary.core_dup_count})"
 
-      # --- Observed CDC behavior (the notebook actually did these against live Postgres) ---
+    # TOAST sentinel: an UPDATE that didn't touch the large `memo` column surfaces it as unchanged.
+    assert summary.toast_unchanged == ["memo"],
+           "expected the unchanged TOASTed column [\"memo\"]; got #{inspect(summary.toast_unchanged)}"
 
-      # Core CRUD: inserted ids 1,2,3; updated 1; deleted 2; TOAST demo added id 10 → mirror {1,3,10}.
-      assert summary.core_final_ids == [1, 3, 10],
-             "core mirror should be [1, 3, 10] after insert/update/delete + TOAST insert; " <>
-               "got #{inspect(summary.core_final_ids)}"
+    # Snapshot/backfill: 5 pre-seeded rows reached the mirror through handle_snapshot/2.
+    assert summary.snapshot_mirror_count == 5,
+           "snapshot backfill should mirror 5 seeded rows; got #{summary.snapshot_mirror_count}"
 
-      # Effect-once: every applied transaction landed exactly once (append-only ledger, no PK).
-      assert summary.core_dup_count == 0,
-             "a transaction was delivered/applied more than once (dup=#{summary.core_dup_count})"
+    # Logical-decoding message: a non-transactional message reached handle_message/2.
+    assert summary.nontxn_message == {"lb_heartbeat", "tick"},
+           "expected the non-txn message {\"lb_heartbeat\", \"tick\"}; got #{inspect(summary.nontxn_message)}"
 
-      # TOAST sentinel: an UPDATE that didn't touch the large `memo` column surfaces it as unchanged.
-      assert summary.toast_unchanged == ["memo"],
-             "expected the unchanged TOASTed column [\"memo\"]; got #{inspect(summary.toast_unchanged)}"
+    # --- Snapshot equals stream (1.5.0): a PG15+ publication with a column list AND a
+    # row filter delivers the same projection and the same rows by both paths. ---
+    # Five seeded rows, two with qty = 0: the snapshot delivers exactly the three that
+    # pass the filter, with exactly the three published columns (no `internal_note`).
+    assert summary.parity_snapshot_ids == [1, 3, 5],
+           "snapshot should deliver only the row-filtered ids [1, 3, 5]; got #{inspect(summary.parity_snapshot_ids)}"
 
-      # Snapshot/backfill: 5 pre-seeded rows reached the mirror through handle_snapshot/2.
-      assert summary.snapshot_mirror_count == 5,
-             "snapshot backfill should mirror 5 seeded rows; got #{summary.snapshot_mirror_count}"
+    assert summary.parity_snapshot_columns == ["id", "item", "qty"],
+           "snapshot records should carry only the published columns; got #{inspect(summary.parity_snapshot_columns)}"
 
-      # Logical-decoding message: a non-transactional message reached handle_message/2.
-      assert summary.nontxn_message == {"lb_heartbeat", "tick"},
-             "expected the non-txn message {\"lb_heartbeat\", \"tick\"}; got #{inspect(summary.nontxn_message)}"
+    # The stream: id 6 (qty 0) was committed before id 7 (qty 2); id 7 arrived, id 6 did not.
+    assert summary.parity_stream_ids == [7],
+           "stream should deliver only the row-filtered id [7]; got #{inspect(summary.parity_stream_ids)}"
 
-      # --- Snapshot equals stream (1.5.0): a PG15+ publication with a column list AND a
-      # row filter delivers the same projection and the same rows by both paths. ---
-      # Five seeded rows, two with qty = 0: the snapshot delivers exactly the three that
-      # pass the filter, with exactly the three published columns (no `internal_note`).
-      assert summary.parity_snapshot_ids == [1, 3, 5],
-             "snapshot should deliver only the row-filtered ids [1, 3, 5]; got #{inspect(summary.parity_snapshot_ids)}"
+    assert summary.parity_stream_columns == ["id", "item", "qty"],
+           "stream records should carry only the published columns; got #{inspect(summary.parity_stream_columns)}"
 
-      assert summary.parity_snapshot_columns == ["id", "item", "qty"],
-             "snapshot records should carry only the published columns; got #{inspect(summary.parity_snapshot_columns)}"
+    assert summary.parity_mirror_ids == [1, 3, 5, 7],
+           "parity mirror should hold the snapshot rows plus the streamed row; got #{inspect(summary.parity_mirror_ids)}"
 
-      # The stream: id 6 (qty 0) was committed before id 7 (qty 2); id 7 arrived, id 6 did not.
-      assert summary.parity_stream_ids == [7],
-             "stream should deliver only the row-filtered id [7]; got #{inspect(summary.parity_stream_ids)}"
+    # --- Casting layer (1.3.0, ADR-0008), observed against the live server ---
+    # Multidimensional arrays nest element-wise (only int[]/float[] recursed before).
+    assert summary.multidim_numeric == [
+             [Decimal.new("1.5"), Decimal.new(2)],
+             [Decimal.new(3), nil]
+           ],
+           "numeric[][] should nest with NULL -> nil; got #{inspect(summary.multidim_numeric)}"
 
-      assert summary.parity_stream_columns == ["id", "item", "qty"],
-             "stream records should carry only the published columns; got #{inspect(summary.parity_stream_columns)}"
+    assert summary.multidim_bool == [[true, false]],
+           "boolean[][] should leave no uncast t/f strings; got #{inspect(summary.multidim_bool)}"
 
-      assert summary.parity_mirror_ids == [1, 3, 5, 7],
-             "parity mirror should hold the snapshot rows plus the streamed row; got #{inspect(summary.parity_mirror_ids)}"
+    assert [[%DateTime{}, %DateTime{}]] = summary.tz_nested
 
-      # --- Casting layer (1.3.0, ADR-0008), observed against the live server ---
-      # Multidimensional arrays nest element-wise (only int[]/float[] recursed before).
-      assert summary.multidim_numeric == [
-               [Decimal.new("1.5"), Decimal.new(2)],
-               [Decimal.new(3), nil]
-             ],
-             "numeric[][] should nest with NULL -> nil; got #{inspect(summary.multidim_numeric)}"
+    # Money is locale-honest: the value 1234.56 renders "$1,234.56" under the
+    # grouped locales and "$1234.56" under C — BOTH parse to the same Decimal, so
+    # the exact equality is deterministic on every CI major (a non-C locale form
+    # like "1.234,56" would deliver the raw string instead — the unit suite pins that).
+    assert Decimal.equal?(summary.money_value, Decimal.new("1234.56")),
+           "money should cast to Decimal 1234.56 under the CI locales; got #{inspect(summary.money_value)}"
 
-      assert summary.multidim_bool == [[true, false]],
-             "boolean[][] should leave no uncast t/f strings; got #{inspect(summary.multidim_bool)}"
-
-      assert [[%DateTime{}, %DateTime{}]] = summary.tz_nested
-
-      # Money is locale-honest: the value 1234.56 renders "$1,234.56" under the
-      # grouped locales and "$1234.56" under C — BOTH parse to the same Decimal, so
-      # the exact equality is deterministic on every CI major (a non-C locale form
-      # like "1.234,56" would deliver the raw string instead — the unit suite pins that).
-      assert Decimal.equal?(summary.money_value, Decimal.new("1234.56")),
-             "money should cast to Decimal 1234.56 under the CI locales; got #{inspect(summary.money_value)}"
-
-      # timetz delivers the raw, lossless string — fraction AND offset intact (the
-      # old truncation delivered "04:05:06").
-      assert summary.timetz_raw == "04:05:06.789-08",
-             "timetz should deliver the verbatim server form; got #{inspect(summary.timetz_raw)}"
-    end
+    # timetz delivers the raw, lossless string — fraction AND offset intact (the
+    # old truncation delivered "04:05:06").
+    assert summary.timetz_raw == "04:05:06.789-08",
+           "timetz should deliver the verbatim server form; got #{inspect(summary.timetz_raw)}"
   end
 
   # ---- helpers ----

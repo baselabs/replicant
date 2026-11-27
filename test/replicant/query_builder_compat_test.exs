@@ -42,7 +42,7 @@ defmodule Replicant.QueryBuilderCompatTest do
 
   test "snapshots use the version-aware forms, never the 1.4.x census" do
     refute QueryBuilder.table_columns(180_000) == QueryBuilder.table_columns()
-    assert {:ok, sql} = QueryBuilder.table_columns_for([{"public", "orders"}], nil, 180_000)
+    assert {:ok, sql} = QueryBuilder.table_columns_for([{"public", "orders"}], ["default"], 180_000)
     assert sql =~ "row_filter"
   end
 end

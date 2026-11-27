@@ -4,24 +4,22 @@ defmodule Replicant.SnapshotParityContractTest do
   alias Replicant.{Error, QueryBuilder, Snapshotter}
   alias Replicant.Snapshotter.Incremental
 
-  test "generated columns are excluded only on PG12-15 in publication discovery" do
-    for version <- [100_000, 110_999, 120_000, 140_000, 150_000, 159_999, 160_000, 180_006] do
+  test "generated columns are excluded only on PG15 in publication discovery" do
+    for version <- [150_000, 159_999, 160_000, 170_000, 180_006, 190_000] do
       sql = QueryBuilder.table_columns(version)
-      assert String.contains?(sql, "AND a.attgenerated = ''") == version in 120_000..159_999
+      assert String.contains?(sql, "AND a.attgenerated = ''") == version in 150_000..159_999
     end
   end
 
-  test "INSERT snapshot predicates use only INSERT publications, including legacy versions" do
-    for version <- [100_000, 140_000, 150_000, 180_006] do
+  test "INSERT snapshot predicates use only INSERT publications, on supported versions" do
+    for version <- [150_000, 180_006] do
       sql = QueryBuilder.table_columns(version)
       assert sql =~ "JOIN pg_publication pub ON pub.pubname = p.pubname"
       assert sql =~ "pub.pubinsert"
 
-      if version >= 150_000 do
-        [cte, _] = String.split(sql, ") SELECT", parts: 2)
-        assert cte =~ "pub.pubinsert"
-        assert cte =~ "bool_or(rowfilter IS NULL)"
-      end
+      [cte, _] = String.split(sql, ") SELECT", parts: 2)
+      assert cte =~ "pub.pubinsert"
+      assert cte =~ "bool_or(rowfilter IS NULL)"
     end
   end
 
@@ -40,9 +38,9 @@ defmodule Replicant.SnapshotParityContractTest do
 
   test "discovery keeps tables whose projection is empty and removes NULL aggregate entries" do
     for sql <- [
-          QueryBuilder.table_columns(140_000),
+          QueryBuilder.table_columns(150_000),
           QueryBuilder.table_columns(180_006),
-          elem(QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha"], 120_000), 1)
+          elem(QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha"], 150_000), 1)
         ] do
       assert sql =~ "LEFT JOIN pg_attribute a"
       assert length(Regex.scan(~r/FILTER \(WHERE a.attnum IS NOT NULL\)/, sql)) == 3
@@ -50,7 +48,7 @@ defmodule Replicant.SnapshotParityContractTest do
   end
 
   test "both pglogical catalog paths scope sets to the local node and gate inserts on any set" do
-    {:ok, sql} = QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha"], 120_000)
+    {:ok, sql} = QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha"], 150_000)
 
     assert length(Regex.scan(~r/JOIN pglogical.local_node l ON s.set_nodeid = l.node_id/, sql)) ==
              2
@@ -90,8 +88,8 @@ defmodule Replicant.SnapshotParityContractTest do
     assert_raise Error, fn -> QueryBuilder.table_columns(0) end
   end
 
-  test "pglogical generated-column selection uses the probed version while wal2json stays unchanged" do
-    for version <- [90_600, 110_000, 120_000, 150_000, 160_000, 180_006] do
+  test "pglogical generated-column selection uses the probed version" do
+    for version <- [150_000, 159_999, 160_000, 170_000, 180_006, 190_000] do
       assert {sql, [["alpha"]]} =
                Snapshotter.columns_query(%{
                  tables: [{"public", "orders"}],
@@ -99,15 +97,7 @@ defmodule Replicant.SnapshotParityContractTest do
                  server_version_num: version
                })
 
-      assert String.contains?(sql, "AND a.attgenerated = ''") == version in 120_000..159_999
-
-      assert {json_sql, []} =
-               Snapshotter.columns_query(%{
-                 tables: [{"public", "orders"}],
-                 server_version_num: version
-               })
-
-      refute json_sql =~ "attgenerated"
+      assert String.contains?(sql, "AND a.attgenerated = ''") == version in 150_000..159_999
     end
   end
 

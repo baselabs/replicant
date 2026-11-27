@@ -41,7 +41,7 @@ def deps do
 end
 ```
 
-Requires Elixir 1.20 and a PostgreSQL server started with `wal_level = logical`.
+Requires Elixir 1.20 and PostgreSQL 15 through 19 with `wal_level = logical`.
 
 ## Quick start
 
@@ -198,15 +198,14 @@ snapshot or from the stream.
   list. Several publications may name the same table with identical lists; differing lists,
   including an unrestricted publication beside a partial list, halt
   `:snapshot_column_list_conflict` before any row is read. pglogical replication sets use
-  their `set_att_list` with the same refusal. wal2json has table filters but no column
-  lists, so it keeps every column of a configured table.
+  their `set_att_list` with the same refusal.
 - **Row filters.** PostgreSQL 15+ filters from publications that publish INSERT are
   combined with OR, because a snapshot is INSERT-equivalent; an unfiltered INSERT publication
   admits every row, and with no INSERT publication the snapshot delivers no rows. pglogical
   2.4.8 set filters combine with AND, matching the plugin. Predicate text comes only from the
   server catalog (`pg_get_expr`) and is parenthesized before composition; no client text is
   interpolated.
-- **Generated columns.** PostgreSQL 12 to 15 exclude generated columns from snapshots, as
+- **Generated columns.** PostgreSQL 15 excludes generated columns from snapshots, as
   pgoutput does from the stream. PostgreSQL 16+ use the publication's effective column list,
   which includes PostgreSQL 18's opt-in `publish_generated_columns = stored`.
 - **Keys are never added.** A publication may omit key columns (PostgreSQL itself refuses
@@ -226,23 +225,21 @@ them.
 
 ## Compatibility
 
-Capabilities are gated on the server's `server_version_num`, so one build runs correctly
-across the range. `decoder:` selects the output plugin
-([ADR-0009](docs/adr/0009-pglogical-wal2json-decoders.md)).
+Replicant connects to PostgreSQL 15 through 19. An unsupported source halts
+with `{:config, :server_version_unsupported}` before slot creation.
 
-| Decoder | Server | Table set option | Tested in CI on |
-|---|---|---|---|
-| `:pgoutput` (default) | PostgreSQL 10+ (halts `{:config, :decoder_unsupported_on_server}` on 9.6) | `publication:` (a name or a list) | 12, 15, 16, 17, 18, 19 |
-| `:pglogical` (pglogical 2.x, `pglogical_output`) | any server with the plugin installed | `replication_sets:` | 9.6, 12, 15, 16, 17, 18, 19 |
-| `:wal2json` (format version 2, wal2json 2.6+) | any server with the plugin installed | `tables: [{"public", "orders"}]` | 9.6, 12, 15 |
+| Decoder | Table set option | Tested in CI on |
+|---|---|---|
+| `:pgoutput` (default) | `publication:` (a name or a list) | 15, 16, 17, 18, 19 |
+| `:pglogical` (pglogical 2.x, `pglogical_output`) | `replication_sets:` | 15, 16, 17, 18, 19 |
 
 | Capability | Requires |
 |---|---|
-| Publication column lists and row filters in the stream and in snapshots | PostgreSQL 15+, `:pgoutput` |
-| In-progress transaction streaming (`streaming:`) and disk spill | PostgreSQL 14+, `:pgoutput` |
-| Logical-decoding messages (`messages: true`) | PostgreSQL 14+ on `:pgoutput`; also `:wal2json`; not `:pglogical` |
+| Publication column lists and row filters in the stream and in snapshots | `:pgoutput` |
+| In-progress transaction streaming (`streaming:`) and disk spill | `:pgoutput` |
+| Logical-decoding messages (`messages: true`) | `:pgoutput` |
 | Failover slots (`failover: true`) | PostgreSQL 17+; halts `{:config, :failover_unsupported}` below |
-| Slot-invalidation columns consulted | `wal_status` from 13, `conflicting` from 16, `invalidation_reason` and `synced` from 17; none below 13 |
+| Slot-invalidation columns consulted | `wal_status` on all supported majors, `conflicting` from 16, `invalidation_reason` and `synced` from 17 |
 
 ### PostgreSQL version support
 
@@ -261,23 +258,18 @@ pgoutput on the same server. pglogical supports row filters that call
 user-defined functions and intersects predicates from multiple replication
 sets. Native publications restrict filter expressions and combine them with OR.
 
-**Deprecated in 1.x for removal in 2.0:** PostgreSQL below 15 and
-`decoder: :wal2json`, including its `tables:`, `allow_keyless_tables:`, and
-`schema_check_interval:` options. Replicant 1.x retains compatibility coverage
-on 9.6 and 12, with wal2json coverage on 9.6, 12 and 15. PostgreSQL 10, 11, 13
-and 14 can use pgoutput in 1.x and are outside the CI matrix. pglogical keeps
-`replication_sets:`. A decoder that cannot express a configuration refuses it
-at start with `:decoder_capability_unsupported`.
+A decoder that cannot express a configuration refuses it at start with
+`:decoder_capability_unsupported`.
+
+### Upgrading from Replicant 1.x
+
+Replicant 2.0 removes PostgreSQL below 15, `decoder: :wal2json`, and the
+`tables:`, `allow_keyless_tables:`, and `schema_check_interval:` options.
 
 Moving from wal2json to pgoutput requires a new slot and a verified checkpoint
 handoff. A fresh snapshot can rebuild a current-state mirror. Preserve
 append-log history through the handoff or recover it from retained records.
 See the [migration procedure](docs/adr/0010-postgresql-server-support.md#wal2json-migration).
-
-Under wal2json two plugin gaps are closed fail-closed: a configured table with no replica
-identity key refuses to start (`{:decoder, :table_keyless}`; opt in for insert-only tables
-with `allow_keyless_tables: true`), and a dropped column, which wal2json cannot announce, is
-detected at the next change or within `schema_check_interval` (default 30 s).
 
 ## Configuration reference
 
@@ -287,11 +279,11 @@ All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 |---|---|---|
 | `connection:` | required | Postgrex connection options for the source |
 | `slot_name:` | required | replication slot, allowlist-validated |
-| `publication:` / `replication_sets:` / `tables:` | required, one per decoder | the table set; a missing publication halts at connect |
+| `publication:` / `replication_sets:` | required, one per decoder | source tables; a missing publication or set halts at connect |
 | `sink:` | required | the `Replicant.Sink` module |
 | `go_forward_only:` | `false` | must be `true` to start a state-mirror sink from an empty checkpoint without a snapshot |
 | `snapshot:` | `false` | `true` for point-in-time; `[mode: :incremental, chunk_rows: 1000, max_pending_chunks: 4]` for resumable chunks |
-| `decoder:` | `:pgoutput` | `:pglogical` for pglogical replication sets or `:wal2json` for legacy 1.x configurations |
+| `decoder:` | `:pgoutput` | `:pglogical` for pglogical replication sets |
 | `checkpoint_store:` | off | `[connection:, table:, progress_table:, max_retries: 5, retry_backoff_ms: 1000, batch: [...]]`: library-owned checkpoint for non-transactional sinks |
 | `batch_delivery:` | off | `[max_transactions: 100, max_delay_ms: 1000]`: atomic batches through `handle_batch/1` |
 | `streaming:` | off | `[max_concurrent_txns: 64, spill: [dir:, max_spill_bytes:]]`: in-progress streaming and disk spill |
@@ -299,8 +291,6 @@ All options go to `Replicant.start_link/1`; `Replicant.Config` validates them.
 | `max_command_retries:` | `5` | connect cycles a pre-stream replication command may fail before the pipeline halts instead of reconnecting forever |
 | `messages:` | `false` | deliver `pg_logical_emit_message` payloads; the sink must implement `handle_message/2` |
 | `failover:` | `false` | create a `FAILOVER` slot on PostgreSQL 17+ |
-| `allow_keyless_tables:` | `false` | wal2json only: accept insert-only tables without a replica identity |
-| `schema_check_interval:` | `30_000` ms | wal2json only: catalog re-read that bounds dropped-column detection |
 
 Optional sink callbacks extend the contract: `handle_session_identity/2` binds a checkpoint
 to the exact source, `handle_slot_origin/2` and `sink_kind/0` serve append-log consumers

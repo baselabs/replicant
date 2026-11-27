@@ -83,7 +83,6 @@ jobs:
       REPLICANT_TEST_URL: postgres://postgres:postgres@127.0.0.1:15432/replicant_test
       EXPECTED_PG_MAJOR: ${{ matrix.pg.expected_major }}
       EXPECTED_PG_PLUGINS: ${{ join(matrix.pg.plugins, ',') }}
-      REPLICANT_PG96_URL: ${{ (matrix.pg.legacy_self && 'postgres://postgres:postgres@127.0.0.1:15432/replicant_test') || (matrix.pg.legacy_server && 'postgres://postgres:postgres@127.0.0.1:15433/replicant_test') || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,7 +106,7 @@ jobs:
           mix test --warnings-as-errors 2>&1 | tee test-output.log
           grep -qE "R05-SUBSTRATE-RECEIPT pg=$EXPECTED_PG_MAJOR version_num=" test-output.log \
             || { echo "::error::integration did not run against PG$EXPECTED_PG_MAJOR (no R05-SUBSTRATE-RECEIPT)"; exit 1; }
-          if [[ "$EXPECTED_PG_MAJOR" -ge 10 && ",$EXPECTED_PG_PLUGINS," == *,pglogical,* ]]; then
+          if [[ "$EXPECTED_PG_PLUGINS" == pglogical ]]; then
             grep -qE "PGLOGICAL-PARITY-RECEIPT pg=$EXPECTED_PG_MAJOR$" test-output.log
           fi
 

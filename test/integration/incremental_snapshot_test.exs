@@ -18,9 +18,6 @@ defmodule Replicant.IncrementalSnapshotTest do
   """
   use ExUnit.Case, async: false
   @moduletag :integration
-  # pgoutput publications are PG10+; a 9.6 primary cannot drive this module (excluded
-  # via the :pg10 tag in test_helper.exs — the 9-row runs the plugin-decoder legs).
-  @moduletag :pg10
 
   alias Replicant.Test.{IncrementalSnapshotSink, PG16}
 
@@ -1400,16 +1397,6 @@ defmodule Replicant.IncrementalSnapshotTest do
   end
 
   defp setup_uuid_table(c, table, pub, rows) do
-    # gen_random_uuid() is core SQL from PG13; a pre-13 server needs pgcrypto for it
-    # (OBSERVED on the 12.22 substrate: 42883 undefined_function). One-time, idempotent,
-    # and only attempted where needed — the CI rows and the substrate connect as a
-    # superuser; a locked-down shared role on <13 would surface the error honestly.
-    [[ver]] = Postgrex.query!(c, "SHOW server_version_num", []).rows
-
-    if String.to_integer(ver) < 130_000 do
-      Postgrex.query!(c, "CREATE EXTENSION IF NOT EXISTS pgcrypto", [])
-    end
-
     reset_pub_table(
       c,
       table,

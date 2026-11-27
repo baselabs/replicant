@@ -19,8 +19,21 @@ defmodule Replicant.ReleaseContractTest do
 
   defp version, do: Mix.Project.config()[:version]
 
-  test "the PostgreSQL 15-19 support policy requires the minor release" do
-    assert version() == "1.7.0"
+  test "the changelog records both breaking source removals under Removed" do
+    body = File.read!(@changelog)
+
+    assert Enum.any?(String.split(body, ~r/^## /m), fn section ->
+             case String.split(section, "### Removed\n", parts: 2) do
+               [_, removed] ->
+                 [group | _] = String.split(removed, ~r/^### /m)
+
+                 group =~ "**Breaking:** Remove support for PostgreSQL below 15" and
+                   group =~ "**Breaking:** Remove `decoder: :wal2json`"
+
+               _other ->
+                 false
+             end
+           end)
   end
 
   test "snapshot release documents the halt, token contents, and conservative plugin policy" do

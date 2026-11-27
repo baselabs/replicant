@@ -9,8 +9,7 @@ defmodule Replicant.Decoder do
   (ADR-0009; `opts[:decoder]`, default `:pgoutput`) and is the value-free-error
   boundary (Critical Rule 1): it catches every raise/throw/exit from ANY plugin's
   parser — the vendored pgoutput byte parser raises on malformed input, the pglogical
-  parser throws on malformed frames, the wal2json JSON decoder errors on malformed
-  JSON — scrubs the raw bytes, and returns a value-free `{:error, %Replicant.Error{}}`.
+  parser throws on malformed frames — scrubs the raw bytes, and returns a value-free `{:error, %Replicant.Error{}}`.
   No row value or raw WAL byte ever escapes the decode boundary.
 
   The pgoutput byte parser (`pgoutput_decode/2`, `@doc false`) is vendored from `walex`
@@ -50,10 +49,9 @@ defmodule Replicant.Decoder do
   Decode one replication payload through the configured decoder plugin, value-free on
   failure.
 
-  `opts[:decoder]` selects the plugin (`:pgoutput` default, `:pglogical`, `:wal2json`);
+  `opts[:decoder]` selects the plugin (`:pgoutput` default, `:pglogical`);
   `opts[:cache]` is the plugin's per-connection state (threaded by the Connection).
-  Returns `{:ok, messages, cache}` (zero or more decoded structs — wal2json emits a
-  synthesized `%Relation{}` ahead of a schema-drifted change) or
+  Returns `{:ok, messages, cache}` (zero or more decoded structs) or
   `{:error, %Error{reason: :decode_failure | :unsupported_message | ...}}` — never
   raises, never surfaces raw bytes.
   """

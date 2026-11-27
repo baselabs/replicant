@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** Remove support for PostgreSQL below 15. Replicant supports PostgreSQL 15 through 19 and halts on other majors before creating a replication slot.
+- **Breaking:** Remove `decoder: :wal2json` and the `tables:`, `allow_keyless_tables:`, and `schema_check_interval:` options. See the [migration procedure](docs/adr/0010-postgresql-server-support.md#wal2json-migration) for switching slots with a verified checkpoint handoff.
+
 ## [1.7.0] - 2026-11-26
 
 ### Added

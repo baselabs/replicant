@@ -261,15 +261,7 @@ defmodule Replicant.AssemblerTest do
       refute_received {:wrote, _}
     end
 
-    test "an EMPTY v1 transaction (zero changes, zero messages) is suppressed, not delivered (pre-PG15 wire behavior)" do
-      # PG15+ skips empty transactions server-side; a pre-15 pgoutput walsender still streams
-      # BEGIN/COMMIT pairs for catalog-touched transactions with zero published changes
-      # (OBSERVED live on 12.22, 2026-09-30: every ALTER/DDL txn delivered as an empty
-      # transaction). The streamed path already suppresses these (parent CV1, spec §7 —
-      # deliver_or_skip_stream); the v1 path must be v1-INDISTINGUISHABLE from it: no sink
-      # call. {:skipped_empty} (not {:skipped}): the ack is sink-kind-gated at the
-      # AssemblerServer (a state mirror acks/releases the empty WAL; an :append_log
-      # sink retains it at the durable frontier, Rule 3) — asserted at that layer.
+    test "a v1 transaction with no changes or messages is suppressed" do
       parent = self()
 
       writer = fn lsn ->

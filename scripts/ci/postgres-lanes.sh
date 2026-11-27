@@ -26,10 +26,8 @@ def validate_image(major, image):
 
 
 def upstream_cell(major, image, plugins):
-    expected = major.split('.')[0]
-    return {'kind': 'compatibility', 'major': major, 'expected_major': expected,
-            'image': image, 'plugins': plugins,
-            'auth': 'md5' if int(expected) < 14 else 'scram-sha-256'}
+    return {'kind': 'compatibility', 'major': major, 'expected_major': major,
+            'image': image, 'plugins': plugins}
 
 
 reference = Path(sys.argv[2]).read_text()
@@ -52,47 +50,26 @@ lanes = declaration['compatibility']
 if not isinstance(lanes, list) or not lanes:
     refuse('expected a nonempty array')
 seen = {engine_major}
-flags = {'legacy-source', 'parity-primary'}
+supported = {str(major) for major in range(15, 20)}
+if engine_major not in supported:
+    refuse('engine major is outside the supported range')
 required = {'major', 'image', 'plugins'}
 for lane in lanes:
-    if not isinstance(lane, dict) or not required <= set(lane) <= required | flags:
+    if not isinstance(lane, dict) or set(lane) != required:
         refuse('unknown or missing lane keys')
     major = lane['major']
-    if not isinstance(major, str) or not re.fullmatch(r'9\.6|[1-9][0-9]+', major):
+    if not isinstance(major, str) or major not in supported:
         refuse('invalid major')
     if major in seen:
         refuse('duplicate major or engine declared as compatibility')
     seen.add(major)
     validate_image(major, lane['image'])
-    plugins = lane['plugins']
-    if (not isinstance(plugins, list)
-        or any(p not in ('pglogical', 'wal2json') for p in plugins)
-        or len(plugins) != len(set(plugins))
-        or ('wal2json' in plugins and 'pglogical' not in plugins)):
-        refuse('invalid plugin list')
-    roles = flags & lane.keys()
-    if any(lane[role] is not True for role in roles):
-        refuse('invalid decoder source role')
-    if roles and set(plugins) != {'pglogical', 'wal2json'}:
-        refuse('decoder source roles require both plugins')
-    if roles == flags or ('legacy-source' in roles) != (major == '9.6'):
-        refuse('legacy source must exercise a pre-publication server')
-legacy = [lane for lane in lanes if lane.get('legacy-source')]
-if len(legacy) != 1:
-    refuse('exactly one legacy source is required')
+    if lane['plugins'] != ['pglogical']:
+        refuse('compatibility lanes must include pglogical')
+if seen != supported:
+    refuse('one lane is required for each supported major')
 
-
-def compatibility_cell(lane):
-    return upstream_cell(lane['major'], lane['image'], lane['plugins'])
-
-
-matrix = [engine]
-for lane in lanes:
-    row = compatibility_cell(lane)
-    row['legacy_self'] = lane.get('legacy-source', False)
-    if lane.get('parity-primary'):
-        row['legacy_server'] = compatibility_cell(legacy[0])
-    matrix.append(row)
+matrix = [engine] + [upstream_cell(lane['major'], lane['image'], lane['plugins']) for lane in lanes]
 print('matrix=' + json.dumps({'pg': matrix}, separators=(',', ':')))
 print('engine-major=' + engine_major)
 PY

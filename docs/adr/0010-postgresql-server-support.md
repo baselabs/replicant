@@ -28,17 +28,16 @@ intersection as its stream.
 · [pglogical filter parser](https://github.com/2ndQuadrant/pglogical/blob/REL2_4_8/pglogical_functions.c#L1266-L1387)
 · [pglogical filter evaluation](https://github.com/2ndQuadrant/pglogical/blob/REL2_4_8/pglogical_output_plugin.c#L619-L672)
 
-Deprecate PostgreSQL below 15 and `decoder: :wal2json` in 1.x. Replicant 2.0
-will remove that server range, along with the wal2json-only options `tables:`,
-`allow_keyless_tables:`, and `schema_check_interval:`. pglogical's
-`replication_sets:` option stays.
+Replicant 1.7 deprecated PostgreSQL below 15 and `decoder: :wal2json`.
+Replicant 2.0 removes them and the decoder's `tables:`, `allow_keyless_tables:`,
+and `schema_check_interval:` options. pglogical uses `replication_sets:`.
 
 ## Qualification
 
-The 1.x matrix retains the 9.6 and 12 compatibility lanes. PostgreSQL 15, 16,
-17 and 19 run on pinned upstream images. The PostgreSQL 18 lane runs against the
-platform engine and uses a same-major upstream companion for pglogical tests.
-The wal2json builds remain on 9.6, 12 and 15.
+PostgreSQL 15, 16, 17 and 19 run on pinned upstream images. PostgreSQL 18 runs
+against the platform engine and uses a same-major upstream companion for
+pglogical tests. Each major exercises pglogical parity, schema halts, and crash
+recovery.
 
 The pinned pglogical 2.4.8 tag selects its PGXS build files via
 `compat$(PGVER)`. It provides compatibility code for all five supported majors,

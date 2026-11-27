@@ -13,11 +13,10 @@ defmodule Replicant.Decoder.Plugin do
       degrading at run time;
     * `init_cache/1` — the per-connection decoder state seeded at every connect
       (pgoutput: none; pglogical: the connect-time catalog read of column types and
-      `relreplident`; wal2json: that read plus the synthesized-relation map);
+      `relreplident`);
     * `decode/3` — one XLogData payload plus the cache to the existing
       `Replicant.Decoder.Messages` structs, returning zero or more messages and the
-      updated cache (wal2json emits a synthesized `%Relation{}` ahead of a change whose
-      column list differs from the cached relation — ADR-0009 §5).
+      updated cache.
 
   `Replicant.Decoder.decode/2` remains the ONLY rescue/catch boundary (ADR-0003): every
   plugin decodes behind it, so a raise/throw/exit from any parser still scrubs to a
@@ -27,7 +26,7 @@ defmodule Replicant.Decoder.Plugin do
   alias Replicant.Error
 
   @typedoc "The decoder-selection atoms accepted by `Replicant.start_link/1`'s `decoder:` option."
-  @type decoder_atom :: :pgoutput | :pglogical | :wal2json
+  @type decoder_atom :: :pgoutput | :pglogical
 
   @typedoc "The per-connection decoder cache threaded through `decode/3` by the Connection."
   @type cache :: term()
@@ -51,9 +50,8 @@ defmodule Replicant.Decoder.Plugin do
   @spec module_for(decoder_atom()) :: module()
   def module_for(:pgoutput), do: Replicant.Decoder.PgOutput
   def module_for(:pglogical), do: Replicant.Decoder.Pglogical
-  def module_for(:wal2json), do: Replicant.Decoder.Wal2json
 
   @doc "The decoder atoms `decoder:` accepts."
   @spec decoder_atoms() :: [decoder_atom()]
-  def decoder_atoms, do: [:pgoutput, :pglogical, :wal2json]
+  def decoder_atoms, do: [:pgoutput, :pglogical]
 end

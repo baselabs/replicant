@@ -145,10 +145,8 @@ _A framework-agnostic Elixir CDC consumer for Postgres logical replication (`pgo
   run ahead of the durable checkpoint before the sink is "too slow"
   (see the halt-reason table below).
 - **Snapshot column lists** — both readers project only published columns in physical
-  order: pgoutput's effective `attnames` on PostgreSQL 15+ (non-dropped columns
-  before 15, excluding generated columns on PG12–15),
-  pglogical's `set_att_list` for the requested local sets, and all configured-table
-  columns for wal2json, which has no publication column lists. Differing lists for
+  order, using pgoutput's effective `attnames` or pglogical's `set_att_list` for
+  the requested local sets. PostgreSQL 15 excludes generated columns. Differing lists for
   one table halt `:snapshot_column_list_conflict` before reading snapshot rows;
   identical lists are accepted. Snapshots select the same columns and rows as the
   stream, including generated-column policy. Both checkpoint modes and all
@@ -307,12 +305,9 @@ durable checkpoint (loss = 0; duplicates bounded by the mode's contract).
 | `[:replicant, :stream, :spill_exhausted]` | a spilled transaction exceeded `max_spill_bytes` | free disk / raise `max_spill_bytes` / shrink the oversized transaction |
 | `:decode_failure` | genuinely-malformed WAL/cast input at the value-free boundary | check upstream WAL/plugin integrity — this is never ordinary data |
 | `:decoder_protocol_unsupported` | the pglogical startup message reported a protocol range outside what the decoder negotiates (protocol 1) | mismatched pglogical build; pin pglogical 2.x, then restart |
-| `:decoder_lsn_missing` | a wal2json commit document arrived without a commit LSN (`include-lsn` carries it on every supported build) | upstream/plugin integrity — never ordinary data |
-| `[:replicant, :connection, :slot_invalidated]` + `reason: :decoder_option_unsupported` | the installed `pglogical_output`/`wal2json` build rejects a requested option (pre-flight-probed at connect, ADR-0009) | upgrade the output plugin to a build carrying the option (`wal2json` ≥ 2.6 for `numeric-data-types-as-string`), then restart |
-| `:decoder_unsupported_on_server` | `decoder: :pgoutput` against a pre-10 server (no `pgoutput`, no publications) | use `decoder: :pglogical` or `decoder: :wal2json` (ADR-0009), or upgrade the server |
-| `:decoder_table_missing` | a table configured for the `:wal2json` decoder (or discovered in a `:pglogical` replication set) does not exist on the server at connect | create the table / fix the configured table list, then restart |
-| `{:decoder, :table_keyless}` | a table configured for the `:wal2json` decoder has no replica-identity index and `REPLICA IDENTITY ≠ FULL` at connect — its updates/deletes would be silently dropped plugin-side | add a PK/identity index, set `REPLICA IDENTITY FULL`, or — for a genuinely insert-only table — set `allow_keyless_tables: true` |
-| `:schema_change` `:destructive` under wal2json | a configured table's column was dropped server-side: detected at the change (insert, or a fixed-width column on update) or within `schema_check_interval` (a TOASTable column on an update-only table) | restore or migrate the sink schema, then restart |
+| `[:replicant, :connection, :slot_invalidated]` with `:decoder_option_unsupported` | the installed `pglogical_output` rejects a requested startup option | install a pglogical build that accepts the option, then restart |
+| `{:config, :server_version_unsupported}` | the source is outside PostgreSQL 15 through 19 | connect to a supported source |
+| `:decoder_table_missing` | a table discovered in a pglogical replication set is absent at connect | restore the table or correct the set, then restart |
 | `:slot_synced_unpromoted` | `failover: true` against a standby whose synced slot is not yet promoted | promote the standby (or point at the primary), then restart |
 
 Start-time rejections (no pipeline starts, nothing halts): `:invalid_identifier`,
@@ -320,8 +315,9 @@ Start-time rejections (no pipeline starts, nothing halts): `:invalid_identifier`
 `:go_forward_required`, `:snapshot_unsupported`, `:batch_unsupported`,
 `:messages_unsupported`, `:decoder_capability_unsupported` (a configured capability
 the chosen decoder cannot express — `streaming:`/`failover:` off pgoutput, `messages:`
-on pglogical — ADR-0009), `{:config, :failover_unsupported}`, and
-`{:error, :invalid_start_lsn}` from the query builder (1.3.0).
+on pglogical), and `{:error, :invalid_start_lsn}` from the query builder.
+An invalid `decoder:` returns a value-free typed `:config_invalid` error naming
+the option.
 
 ## Decoder selection
 
@@ -329,51 +325,18 @@ on pglogical — ADR-0009), `{:config, :failover_unsupported}`, and
 default. `:pglogical` uses the pglogical 2.x binary protocol
 (`pglogical_output`), supports user-defined functions in row filters, and
 intersects the predicates from applicable replication sets. CI covers both
-decoders on PostgreSQL 15 through 19. `:wal2json` uses JSON format 2 with
-wal2json 2.6 or newer and has CI coverage on 9.6, 12 and 15. The sink contract,
-the `commit_lsn` watermark, both checkpoint modes and halt semantics apply
-across decoders.
+decoders on PostgreSQL 15 through 19. Both share the sink contract, commit LSN
+watermark, and checkpoint modes.
 
-**Deprecated in 1.x for removal in 2.0:** PostgreSQL below 15,
-`decoder: :wal2json`, and its `tables:`, `allow_keyless_tables:`, and
-`schema_check_interval:` options. `replication_sets:` remains the pglogical
-option. A slot binds its plugin, so use a new pgoutput slot and a verified
-checkpoint handoff. A fresh snapshot restores current state only. Preserve
-append-log history separately during the handoff.
-[ADR-0010](docs/adr/0010-postgresql-server-support.md#wal2json-migration)
-describes the cutover.
+Use `publication:` with pgoutput and `replication_sets:` with pglogical.
+pgoutput refuses updates and deletes when the publication requires a replica
+identity the table lacks. pglogical requires an identity index for tables in sets
+that replicate updates or deletes. Both decoders re-emit relation metadata after
+DDL, so a dropped column causes a destructive schema-change halt.
 
-The table set is named per decoder — `publication:` for pgoutput,
-`replication_sets:` for pglogical, `tables: [{schema, table}]` for wal2json — and the
-wrong key for the chosen decoder is rejected at start. The plugin differences that
-remain are all fail-closed, none silent (OBSERVED from the plugins' sources):
-
-- **Keyless tables.** An update/delete on a table with no replica-identity index and
-  `REPLICA IDENTITY ≠ FULL` never reaches any stream (pgoutput publications refuse the
-  write outright with 55000; pglogical refuses such tables in update-carrying
-  replication sets; wal2json filters them plugin-side with only a server WARNING). A
-  wal2json pipeline therefore **halts at start** (`{:decoder, :table_keyless}`) for a
-  configured keyless table; a genuinely insert-only table declares
-  `allow_keyless_tables: true` (wal2json-only) to accept that U/D on such tables are
-  invisible to the stream.
-- **Dropped columns.** pgoutput and pglogical re-emit relation metadata after DDL, so
-  the drop classifies `:destructive` immediately. wal2json format 2 has no relation
-  messages, so Replicant splits the ambiguous absence: a cached column missing from an
-  INSERT (inserts carry every live column) or missing from an UPDATE when its type is
-  fixed-width (int/float/bool/date/time/timestamp/interval/uuid — never stored
-  out-of-line) halts `:destructive` at the change; the residual case (a dropped
-  TOASTable column on an update-only table, wire-identical to the unchanged-TOAST
-  sentinel) is bounded by the periodic catalog re-read `schema_check_interval`
-  (default `30_000` ms, wal2json-only) — detection within one interval, through the
-  same `:destructive` classification. A DROP committed in the same DDL batch as an
-  ADD is deferred to that same guard-or-reconnect window (the visible ADD rides the
-  append-only drift branch first, so the DROP stays hidden until the next guard
-  tick).
-- **`type_modifier`** carries pgoutput's raw atttypmod where the plugin's stream
-  expresses it.
-
-Non-transactional messages stay **at-least-once** on every decoder — that is the
-paradigm, not a plugin gap (see invariant 3).
+Replicant 2.0 removes wal2json and support for PostgreSQL below 15. For a 1.x
+upgrade that requires a new slot, verify checkpoint continuity and preserve any
+append-log history. See [ADR-0010](docs/adr/0010-postgresql-server-support.md#wal2json-migration).
 
 ## Non-negotiable rules
 

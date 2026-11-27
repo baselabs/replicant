@@ -48,45 +48,12 @@ defmodule Replicant.TestHelper do
             []
           ).rows == [[1]]
 
-        wal2json = wal2json_available?(conn, pglogical)
-
-        for {plugin, true} <- [pglogical: pglogical, wal2json: wal2json], do: plugin
+        if pglogical, do: [:pglogical], else: []
       after
         GenServer.stop(conn)
       end
     end
   end
-
-  defp wal2json_available?(conn, pglogical?) do
-    if System.get_env("EXPECTED_PG_PLUGINS") do
-      # CI runs as the disposable instance's bootstrap user. Check both presence
-      # and absence without allocating slots, including on the pre-10 primary.
-      plugin_available?(Postgrex.query(conn, "LOAD 'wal2json'", []))
-    else
-      # A contributor's replication role need not have LOAD privileges.
-      if pglogical? do
-        slot = "replicant_wal2json_probe_#{System.unique_integer([:positive])}"
-
-        plugin_available?(
-          Postgrex.query(
-            conn,
-            "SELECT pg_create_logical_replication_slot($1, 'wal2json', true)",
-            [slot]
-          )
-        )
-      else
-        false
-      end
-    end
-  end
-
-  defp plugin_available?({:ok, _}), do: true
-
-  defp plugin_available?({:error, %Postgrex.Error{postgres: %{code: code}}})
-       when code in [:undefined_file, :insufficient_privilege, :undefined_function],
-       do: false
-
-  defp plugin_available?({:error, error}), do: raise(error)
 end
 
 version = Replicant.TestHelper.server_version_num()
@@ -100,15 +67,10 @@ if expected = System.get_env("EXPECTED_PG_PLUGINS") do
   end
 end
 
-# Pre-10 has no publications. Its cross-version plugin parity runs on the
-# publication-capable primary with REPLICANT_PG96_URL pointing to the legacy server.
 exclusions = [
   integration: version == 0,
-  pg10: version < 100_000,
-  pg14: version < 140_000,
   pg17: version < 170_000,
-  pglogical: :pglogical not in plugins,
-  wal2json: version < 100_000 or :wal2json not in plugins
+  pglogical: :pglogical not in plugins
 ]
 
 ExUnit.configure(exclude: for({tag, true} <- exclusions, do: tag))

@@ -42,7 +42,6 @@
       "lib/replicant/decoder/pglogical.ex",
       "lib/replicant/decoder/pgoutput.ex",
       "lib/replicant/decoder/plugin.ex",
-      "lib/replicant/decoder/wal2json.ex",
       "lib/replicant/error.ex",
       "lib/replicant/identifier.ex",
       "lib/replicant/pipeline.ex",

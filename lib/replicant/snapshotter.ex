@@ -13,7 +13,7 @@ defmodule Replicant.Snapshotter do
 
   Both snapshot modes project only published columns, in physical column order:
   pgoutput uses `pg_publication_tables.attnames` on PostgreSQL 15+, pglogical uses
-  `set_att_list`, and wal2json keeps all configured-table columns. Both readers apply
+  `set_att_list`. Both readers apply
   server row filters too: pgoutput ORs INSERT predicates (an unfiltered INSERT
   publication wins);
   pglogical ANDs its non-NULL set filters, matching its 2.4.8 output plugin. Conflicting lists
@@ -178,7 +178,7 @@ defmodule Replicant.Snapshotter do
   @spec columns_query(map()) :: {String.t(), list()}
   def columns_query(args) do
     version = Map.get(args, :server_version_num)
-    unless is_integer(version) and version > 0, do: raise(Error, reason: :snapshot_failed)
+    unless is_integer(version) and version >= 150_000, do: raise(Error, reason: :snapshot_failed)
 
     case Map.get(args, :tables) do
       nil ->
@@ -188,7 +188,7 @@ defmodule Replicant.Snapshotter do
         sets = Map.get(args, :replication_sets)
 
         case QueryBuilder.table_columns_for(tables, sets, version) do
-          {:ok, sql} -> {sql, if(is_nil(sets), do: [], else: [sets])}
+          {:ok, sql} -> {sql, [sets]}
           {:error, reason} -> raise Error, reason: reason
         end
     end

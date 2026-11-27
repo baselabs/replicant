@@ -1,8 +1,8 @@
 # ADR-0009: Decoders for the pglogical and wal2json output plugins (PostgreSQL 9.6 to 14)
 
-**Status:** Accepted 2026-09-29 (ships in 1.4.0). Partly superseded by
-[ADR-0010](0010-postgresql-server-support.md) for server support, qualification
-coverage, and the planned wal2json retirement.
+**Status:** Superseded by [ADR-0010](0010-postgresql-server-support.md) on 2026-11-27.
+Accepted 2026-09-29 and shipped in 1.4.0. Replicant 2.0 removes wal2json and
+PostgreSQL below 15. pglogical remains supported on PostgreSQL 15 through 19.
 **Date:** 2026-09-29
 **Deciders:** replicant maintainer (roadmap row A7)
 
@@ -12,7 +12,7 @@ the shared PostgreSQL action. The platform engine supplies the current-major
 lane and example databases; declared compatibility roles retain the plugin and
 legacy-source coverage. Every host connection uses password authentication;
 plugin builds take their base from the declaration and pin full source commits.
-The decoder design and acceptance guarantees in this ADR remain in force.
+This update describes the 1.x qualification matrix.
 
 ## Context
 

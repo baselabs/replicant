@@ -1,7 +1,7 @@
 defmodule Replicant do
   @moduledoc """
-  Framework-agnostic Elixir CDC consumer for Postgres logical replication
-  (`pgoutput`), delivering committed row changes to a pluggable **sink** with
+  Framework-agnostic Elixir CDC consumer for PostgreSQL 15 through 19 using
+  `pgoutput` (default) or `pglogical`. It delivers committed row changes to a **sink** with
   **zero data loss**: the replication slot advances only after the sink has
   durably persisted the transaction.
 
@@ -110,9 +110,9 @@ defmodule Replicant do
   discovery from the live slot origin after a pre-chunk crash. Both snapshot modes are
   mutually exclusive with `go_forward_only: true`.
 
-  Both modes read only published columns in physical order: pgoutput column lists
-  on PostgreSQL 15+, pglogical replication-set column lists, or all configured-table
-  columns for wal2json. Different lists for one table halt
+  Both modes read only published columns in physical order, using pgoutput
+  publication column lists or pglogical replication-set column lists. Different
+  lists for one table halt
   `:snapshot_column_list_conflict` before snapshot delivery. Unpublished keys are
   never added; incremental backfills use a whole-table window if the complete PK
   is unavailable. Snapshots select the same columns and rows as the stream,
@@ -120,7 +120,7 @@ defmodule Replicant do
   predicates combine with OR among INSERT publications (an unfiltered INSERT
   publication wins); snapshots are INSERT-equivalent. No INSERT publication means
   no snapshot rows. pglogical 2.4.8 non-NULL set predicates combine with AND, even
-  beside an unfiltered set. PG12–15 excludes generated columns; PG16+ uses the
+  beside an unfiltered set. PostgreSQL 15 excludes generated columns; PG16+ uses the
   effective publication list. A table with columns but no publishable projection
   halts `:snapshot_no_publishable_columns` naming the table. Zero-column and
   all-dropped tables retain the empty reset. ADR-0002 documents PG15's additional
@@ -130,7 +130,8 @@ defmodule Replicant do
   `:invalid_identifier` / `:invalid_sink` / `:config_invalid` / `:go_forward_required`,
   plus the start-gate rejections `:conflicting_start_mode`, `:snapshot_unsupported`,
   `:batch_unsupported`, and `:messages_unsupported` (e.g. `messages: true` without a
-  `handle_message/2` callback in the sink).
+  `handle_message/2` callback in the sink). An invalid `decoder:` returns a
+  value-free `%Replicant.Error{reason: :config_invalid, shape: "option=decoder"}`.
   """
   @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(opts) when is_list(opts) do

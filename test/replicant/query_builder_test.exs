@@ -1,7 +1,7 @@
 defmodule Replicant.QueryBuilderTest do
   use ExUnit.Case, async: true
 
-  alias Replicant.Decoder.{Pglogical, Wal2json}
+  alias Replicant.Decoder.Pglogical
   alias Replicant.Decoder.PgOutput
 
   alias Replicant.QueryBuilder
@@ -166,44 +166,6 @@ defmodule Replicant.QueryBuilderTest do
     end
   end
 
-  # ADR-0009 §9 — the below-130000 tier: wal_status (and max_slot_wal_keep_size) arrive
-  # in PG 13; on 9.6 to 12 a slot cannot be invalidated by size and the only loss signal
-  # is a removed WAL segment (a START_REPLICATION failure → the command-error watchdog),
-  # so the query selects NO invalidation column (a constant NULL placeholder keeps the
-  # row-present/absent signal the connect chain keys on).
-  describe "slot_invalidation_status/2 below-130000 tier (ADR-0009)" do
-    test "PG 9.6 to 12 selects no invalidation column" do
-      for version <- [90_602, 100_021, 110_017, 120_008, 129_999] do
-        assert {:ok, sql} = QueryBuilder.slot_invalidation_status("replicant_orders", version)
-        refute sql =~ "wal_status"
-        refute sql =~ "conflicting"
-        refute sql =~ "invalidation_reason"
-        assert sql =~ "SELECT NULL::text FROM pg_replication_slots"
-        assert sql =~ "slot_name = 'replicant_orders'"
-      end
-    end
-  end
-
-  # ADR-0009 §9 — on 9.6 the current-LSN function is pg_current_xlog_location (the
-  # pg_current_wal_lsn rename landed in PG 10). The watermark reader is version-gated.
-  describe "watermark_lsn/3 version gate (ADR-0009)" do
-    test "PG 9.6 selects pg_current_xlog_location" do
-      assert QueryBuilder.watermark_lsn(false, 90_602) ==
-               "SELECT pg_current_xlog_location()::text;"
-    end
-
-    test "PG 10+ selects pg_current_wal_lsn (unchanged)" do
-      for version <- [100_021, 150_019, 180_002] do
-        assert QueryBuilder.watermark_lsn(false, version) == "SELECT pg_current_wal_lsn()::text;"
-      end
-    end
-
-    test "standby selects the replay LSN on every version" do
-      assert QueryBuilder.watermark_lsn(true, 90_602) == "SELECT pg_last_wal_replay_lsn()::text;"
-      assert QueryBuilder.watermark_lsn(true, 150_019) == "SELECT pg_last_wal_replay_lsn()::text;"
-    end
-  end
-
   # ADR-0009 §2 — slot creation carries the decoder's plugin; the default (pgoutput)
   # emits the published 1.3.0 strings byte-for-byte.
   describe "plugin-parameterized slot creation (ADR-0009)" do
@@ -214,17 +176,14 @@ defmodule Replicant.QueryBuilderTest do
       assert a == "CREATE_REPLICATION_SLOT orders_slot LOGICAL pgoutput NOEXPORT_SNAPSHOT;"
     end
 
-    test "create_durable_slot/3 with the plugin decoders names their output plugin" do
+    test "create_durable_slot/3 with pglogical names its output plugin" do
       assert {:ok, a} = QueryBuilder.create_durable_slot("s", false, "pglogical_output")
       assert a == "CREATE_REPLICATION_SLOT s LOGICAL pglogical_output NOEXPORT_SNAPSHOT;"
-
-      assert {:ok, b} = QueryBuilder.create_durable_slot("s", false, "wal2json")
-      assert b == "CREATE_REPLICATION_SLOT s LOGICAL wal2json NOEXPORT_SNAPSHOT;"
     end
 
     test "create_export_slot/3 mirrors the plugin parameter (failover grammar intact)" do
-      assert {:ok, a} = QueryBuilder.create_export_slot("s", false, "wal2json")
-      assert a == "CREATE_REPLICATION_SLOT s LOGICAL wal2json EXPORT_SNAPSHOT;"
+      assert {:ok, a} = QueryBuilder.create_export_slot("s", false, "pglogical_output")
+      assert a == "CREATE_REPLICATION_SLOT s LOGICAL pglogical_output EXPORT_SNAPSHOT;"
 
       assert {:ok, b} = QueryBuilder.create_export_slot("s", true, "pgoutput")
       assert b == "CREATE_REPLICATION_SLOT s LOGICAL pgoutput (FAILOVER, SNAPSHOT 'export');"
@@ -235,16 +194,6 @@ defmodule Replicant.QueryBuilderTest do
                QueryBuilder.create_durable_slot("s", false, "pgoutput; DROP")
 
       assert {:error, :invalid_identifier} = QueryBuilder.create_export_slot("s", false, "")
-    end
-
-    test "below PG15 the durable-slot form is bare (NOEXPORT_SNAPSHOT arrives in 15)" do
-      assert {:ok, sql} =
-               QueryBuilder.create_durable_slot("s", false, "pglogical_output", 120_008)
-
-      assert sql == "CREATE_REPLICATION_SLOT s LOGICAL pglogical_output;"
-
-      assert {:ok, sql96} = QueryBuilder.create_durable_slot("s", false, "wal2json", 90_602)
-      assert sql96 == "CREATE_REPLICATION_SLOT s LOGICAL wal2json;"
     end
   end
 
@@ -289,27 +238,12 @@ defmodule Replicant.QueryBuilderTest do
                  ")"
     end
 
-    test "wal2json renders format 2 and the full option set with add-tables" do
-      options = Wal2json.start_options(tables: [{"public", "orders"}])
-
-      assert {:ok, sql} = QueryBuilder.start_replication_for("s", "wal2json", options, 0)
-
-      assert sql ==
-               "START_REPLICATION SLOT s LOGICAL 0/0 " <>
-                 ~s(("format-version" '2', "include-transaction" 'true', "include-lsn" 'true', ) <>
-                 ~s("include-xids" 'true', "include-timestamp" 'true', "include-types" 'true', ) <>
-                 ~s("include-type-oids" 'true', "include-pk" 'true', ) <>
-                 ~s("numeric-data-types-as-string" 'true', ) <>
-                 ~s("add-tables" 'public.orders') <>
-                 ")"
-    end
-
     test "an option value with a quote breakout is refused, never interpolated" do
       assert {:error, :invalid_identifier} =
                QueryBuilder.start_replication_for(
                  "s",
-                 "wal2json",
-                 [{"add-tables", "x'; DROP"}],
+                 "pglogical_output",
+                 [{~s("pglogical.replication_set_names"), "x'; DROP"}],
                  0
                )
 
@@ -319,8 +253,7 @@ defmodule Replicant.QueryBuilderTest do
   end
 
   # ADR-0009 §2/§5 — per-decoder table-set discovery. pglogical: replication-set
-  # existence + set membership in pglogical's own catalog. wal2json/pglogical: the
-  # relation-info catalog read (relreplident + columns + type oids) in ONE query.
+  # existence, membership, and relation metadata from PostgreSQL catalogs.
   describe "per-decoder discovery queries (ADR-0009)" do
     test "replication_set_exists: pglogical.replication_set IN list on the simple protocol" do
       assert {:ok, sql} = QueryBuilder.replication_set_exists(["alpha", "beta"])
@@ -405,11 +338,8 @@ defmodule Replicant.QueryBuilderTest do
       assert sql == "SET TRANSACTION SNAPSHOT '00000003-0000DD8A-1'"
     end
 
-    test "adopts a PostgreSQL 9.6 exported-snapshot name (two parts: xid-hex, counter)" do
-      # 9.6 exports "%08X-%d" (observed: "00004E57-1" from CREATE_REPLICATION_SLOT ...
-      # LOGICAL wal2json on 9.6.24); 10+ exports "%08X-%08X-%d".
-      {:ok, sql} = QueryBuilder.set_transaction_snapshot("00004E57-1")
-      assert sql == "SET TRANSACTION SNAPSHOT '00004E57-1'"
+    test "refuses obsolete two-part snapshot names" do
+      assert {:error, :invalid_snapshot_name} = QueryBuilder.set_transaction_snapshot("00004E57-1")
     end
 
     test "rejects a name with a quote/whitespace/injection (string-literal guard)" do

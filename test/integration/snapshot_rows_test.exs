@@ -2,8 +2,6 @@ defmodule Replicant.SnapshotRowsTest do
   use ExUnit.Case, async: false
   @moduletag :integration
   @moduletag timeout: 30_000
-  if Replicant.TestHelper.server_version_num() < 150_000,
-    do: @moduletag(skip: "publication row filters require PostgreSQL 15+")
 
   alias Replicant.Test.{PG16, SnapshotRecordingSink}
 

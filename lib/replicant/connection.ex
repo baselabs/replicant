@@ -49,12 +49,9 @@ defmodule Replicant.Connection do
 
   alias Replicant.{AssemblerServer, Decoder, QueryBuilder, Telemetry}
   alias Replicant.Decoder.Messages.{Begin, Commit, StreamAbort, StreamCommit, StreamStart}
-  alias Replicant.Decoder.Messages.Relation
-  alias Replicant.Decoder.Messages.Relation.Column
   alias Replicant.Decoder.OidDatabase
   alias Replicant.Decoder.Pglogical, as: PglogicalDecoder
   alias Replicant.Decoder.Plugin, as: DecoderPlugin
-  alias Replicant.Decoder.Wal2json, as: Wal2jsonDecoder
   alias Replicant.Snapshotter.Incremental
 
   @pg_epoch DateTime.to_unix(~U[2000-01-01 00:00:00Z], :microsecond)
@@ -143,14 +140,12 @@ defmodule Replicant.Connection do
           reader_pid: pid() | nil,
           step: step(),
           messages: boolean(),
-          # The decoder trio rides ONE map field (the 31-flat-field BEAM boundary the
+          # The decoder state rides ONE map field (the 31-flat-field BEAM boundary the
           # struct comment above documents): which plugin decoder, its per-connection
-          # cache, the configured table list (wal2json), and the discovered table set
-          # (pglogical's sets → tables, read at connect).
+          # cache, and the tables discovered from pglogical's replication sets.
           decoder: %{
             kind: Replicant.Decoder.Plugin.decoder_atom(),
             cache: Replicant.Decoder.Plugin.cache(),
-            tables: [{String.t(), String.t()}] | nil,
             discovered: [{String.t(), String.t()}] | nil,
             replication_sets: [String.t()] | nil
           }
@@ -160,7 +155,6 @@ defmodule Replicant.Connection do
   @decoder_defaults %{
     kind: :pgoutput,
     cache: nil,
-    tables: nil,
     discovered: nil,
     replication_sets: nil
   }
@@ -195,7 +189,6 @@ defmodule Replicant.Connection do
     reader_pid: nil,
     step: :disconnected,
     messages: false,
-    schema_guard_timer: nil,
     decoder: @decoder_defaults
   ]
 
@@ -262,11 +255,8 @@ defmodule Replicant.Connection do
        decoder: %{
          kind: Map.get(config, :decoder, :pgoutput),
          cache: DecoderPlugin.module_for(Map.get(config, :decoder, :pgoutput)).init_cache([]),
-         tables: Map.get(config, :tables),
-         discovered: if(Map.get(config, :decoder) == :wal2json, do: Map.get(config, :tables)),
-         replication_sets: Map.get(config, :replication_sets),
-         allow_keyless: Map.get(config, :allow_keyless_tables, false),
-         schema_check_interval: Map.get(config, :schema_check_interval)
+         discovered: nil,
+         replication_sets: Map.get(config, :replication_sets)
        }
      }}
   end
@@ -285,26 +275,18 @@ defmodule Replicant.Connection do
          Replicant.CheckpointStore.retry_decision(faults - 1, max_retries) == :halt do
       halt_command_error(state)
     else
-      handle_connect_proceed(state)
+      {:query, QueryBuilder.identify_system(), %{state | step: :identity_check}}
     end
   end
 
-  # ADR-0009 §4 — the plugin decoders' connect-time probe over ONE short-lived REGULAR
-  # connection: (a) it warms postgrex's shared type table, without which a replication
-  # connection to a PG < 10 walsender fails inside Postgrex's own bootstrap (the
-  # walsender there rejects all SQL — OBSERVED live); and (b) it pre-flights the
-  # decoder's output-plugin option set via pg_logical_slot_peek_changes — a genuine
-  # option rejection (22023, OBSERVED on the wal2json 2.4 build) halts
-  # :decoder_option_unsupported instead of hanging the stream command (a rejected or
-  # erroring peek on the WALSENDER never returns ReadyForQuery, so it cannot be
-  # probed there). pgoutput keeps the untouched default path.
+  # Probe pglogical's options on the existing slot over a short-lived regular
+  # connection. An error on the walsender can leave it waiting for ReadyForQuery.
   defp plugin_connect_probe(%{decoder: %{kind: :pgoutput}} = state), do: {:ok, state}
 
   defp plugin_connect_probe(state) do
     case probe_connect(state) do
       {:ok, db} ->
         try do
-          Postgrex.query!(db, "SELECT 1", [])
           probe_slot_options(db, state)
         rescue
           _ -> {:ok, state}
@@ -321,25 +303,11 @@ defmodule Replicant.Connection do
     end
   end
 
-  # The probe peeks the pipeline's OWN slot: an old build rejects an unknown option at
-  # the plugin's startup callback (22023 — OBSERVED on the wal2json 2.4 build) no
-  # matter the slot's data, and a slot created with a DIFFERENT build (the wal2json2_4
-  # halt lever) carries that build's behavior — so the real slot is the honest target.
-  # ANY result other than the explicit rejection proves nothing against the options;
-  # the stream proceeds.
+  # Only an explicit option rejection on the pipeline's own slot is terminal.
   defp probe_slot_options(db, state) do
-    plugin = DecoderPlugin.module_for(decoder_kind(state))
+    options = PglogicalDecoder.start_options(replication_sets: decoder_sets(state))
 
-    options =
-      plugin.start_options(
-        publications: state.publication || [],
-        streaming: streaming?(state),
-        messages: state.messages,
-        replication_sets: decoder_sets(state) || [],
-        tables: decoder_tables(state) || []
-      )
-
-    case QueryBuilder.decoder_option_probe(state.slot_name, probe_options(state, options)) do
+    case QueryBuilder.decoder_option_probe(state.slot_name, probe_options(options)) do
       {:ok, probe_sql} ->
         if peek_throwaway(db, probe_sql) == :rejected,
           do: {:halt, :decoder_option_unsupported},
@@ -360,21 +328,6 @@ defmodule Replicant.Connection do
         sync_connect: true
       )
     )
-  end
-
-  defp handle_connect_proceed(state) do
-    case plugin_connect_probe(state) do
-      {:ok, state} ->
-        {:query, QueryBuilder.identify_system(), %{state | step: :identity_check}}
-
-      {:halt, :decoder_option_unsupported} ->
-        Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
-          reason: :decoder_option_unsupported
-        })
-
-        Replicant.Supervisor.halt(state.slot_name, {:decoder, :option_unsupported})
-        {:noreply, state}
-    end
   end
 
   defp begin_recovery(state) do
@@ -470,27 +423,13 @@ defmodule Replicant.Connection do
     end
   end
 
-  # ADR-0009 §9 — a walsender on PG < 10 rejects ALL SQL (`SELECT 1` included; arbitrary
-  # queries on replication connections arrived in PG 10 — OBSERVED on the live 9.6
-  # substrate), so the whole catalog phase runs on a short-lived REGULAR connection and
-  # the chain rejoins at the slot decision. The same QueryBuilder SQL executes either way.
+  # Walsenders predating SQL in replication sessions reject the static version
+  # query at parse time. Halt without running any catalog fallback.
   def handle_result(
-        %Postgrex.Error{postgres: %{code: _code}},
+        %Postgrex.Error{postgres: %{code: :syntax_error}},
         %{step: :recovery_check} = state
       ) do
-    case probe_pre10_catalog(state) do
-      {:ok, %{version: version, in_recovery: in_recovery} = probe} ->
-        state = %{state | server_version_num: version, in_recovery: in_recovery}
-
-        Telemetry.event([:replicant, :connection, :connected], %{}, %{
-          kind: recovery_kind(in_recovery)
-        })
-
-        pre10_gate(state, probe)
-
-      {:error, _reason} ->
-        {:disconnect, :query_error}
-    end
+    halt_server_version_unsupported(state)
   end
 
   def handle_result(
@@ -511,30 +450,25 @@ defmodule Replicant.Connection do
     state = %{state | server_version_num: version, in_recovery: in_recovery}
 
     cond do
-      # ADR-0009 §9 — pgoutput and publications exist from PG 10; on an older server the
-      # pgoutput decoder is refused BEFORE slot creation (a permanent fault: the version
-      # never changes across a reconnect — same terminal discipline as failover-unsupported).
-      decoder_kind(state) == :pgoutput and version < 100_000 ->
-        halt_decoder_unsupported_on_server(state)
+      version < 150_000 or version >= 200_000 ->
+        halt_server_version_unsupported(state)
 
       state.failover and version < 170_000 ->
         halt_failover_unsupported(state)
 
       true ->
-        # A3 existence gate (decision #18): START_REPLICATION with a missing publication silently
-        # streams the EXISTING subset (whole-publication data loss), so the existence check MUST
-        # run BEFORE the slot-keyed query. The names are already in the SQL string (simple-query
-        # protocol cannot bind `$1`); a mismatch halts fail-closed in :publication_check.
-        # The table-set existence query is per decoder (ADR-0009 §2): pg_publication for
-        # pgoutput, pglogical.replication_set for pglogical; the wal2json decoder's
-        # configured tables are existence-checked by the relation-info read instead
-        # (it has no server-side named set).
-        case decoder_table_set_check(state) do
-          {:query, sql} ->
+        case plugin_connect_probe(state) do
+          {:ok, state} ->
+            {:ok, sql} = decoder_table_set_check(state)
             {:query, sql, %{state | step: :publication_check}}
 
-          :skip ->
-            request_decoder_table_info(state)
+          {:halt, :decoder_option_unsupported} ->
+            Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
+              reason: :decoder_option_unsupported
+            })
+
+            Replicant.Supervisor.halt(state.slot_name, {:decoder, :option_unsupported})
+            {:noreply, state}
         end
     end
   end
@@ -580,29 +514,21 @@ defmodule Replicant.Connection do
     request_decoder_table_info(set_decoder_tables(state, tables))
   end
 
-  # The relation-info rows (`[schemaname, tablename, oid, relreplident, attnum, attname,
-  # atttypid, atttypmod]`): everything the plugin's wire format cannot express. A
-  # configured/derived table with NO rows is ABSENT on the server — a fail-closed halt
-  # (streaming would silently miss it), value-free.
+  # A discovered table with no catalog rows is absent. Proceeding would silently
+  # miss changes for that table, so halt before selecting a slot.
   def handle_result([%Postgrex.Result{rows: rows}], %{step: :decoder_table_info} = state) do
-    tables = decoder_discovered(state) || decoder_tables(state)
+    tables = decoder_discovered(state)
 
     present =
       rows |> Enum.map(fn [s, t | _rest] -> {s, t} end) |> MapSet.new()
 
     if Enum.all?(tables, &MapSet.member?(present, &1)) do
-      state = set_decoder_cache(state, init_decoder_cache(state, group_relation_info(rows)))
+      state = set_decoder_cache(state, init_decoder_cache(group_relation_info(rows)))
 
-      case enforce_keyless_tables(state) do
-        {:ok, state} ->
-          {:ok, sql} =
-            QueryBuilder.slot_invalidation_status(state.slot_name, state.server_version_num)
+      {:ok, sql} =
+        QueryBuilder.slot_invalidation_status(state.slot_name, state.server_version_num)
 
-          {:query, sql, %{state | step: :invalidation_check}}
-
-        {:halted, state} ->
-          {:noreply, state}
-      end
+      {:query, sql, %{state | step: :invalidation_check}}
     else
       Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
         reason: :decoder_table_missing
@@ -739,34 +665,22 @@ defmodule Replicant.Connection do
 
   def handle_result(_result, _state), do: {:disconnect, :unexpected_result}
 
-  # The per-decoder table-set existence SQL (the :publication_check step that follows).
-  # Every name was Identifier-validated at Config, so the builders never error here
-  # (their `{:error, _}` arms are unreachable defense — same discipline as the prior
-  # inline `{:ok, sql} =` match).
-  defp decoder_table_set_check(%{decoder: %{kind: :pgoutput}, publication: pubs}) do
-    {:ok, sql} = QueryBuilder.publication_exists(pubs)
-    {:query, sql}
-  end
+  # Check configured sets before touching the slot. Both plugins can otherwise
+  # stream the intersection when an expected set is missing.
+  defp decoder_table_set_check(%{decoder: %{kind: :pgoutput}, publication: pubs}),
+    do: QueryBuilder.publication_exists(pubs)
 
-  defp decoder_table_set_check(%{decoder: %{kind: :pglogical}} = state) do
-    sets = decoder_sets(state)
-    {:ok, sql} = QueryBuilder.replication_set_exists(sets)
-    {:query, sql}
-  end
-
-  defp decoder_table_set_check(%{decoder: %{kind: :wal2json}}), do: :skip
+  defp decoder_table_set_check(%{decoder: %{kind: :pglogical}} = state),
+    do: QueryBuilder.replication_set_exists(decoder_sets(state))
 
   defp decoder_table_set_names(%{decoder: %{kind: :pgoutput}, publication: pubs}), do: pubs
   defp decoder_table_set_names(%{decoder: %{kind: :pglogical}} = state), do: decoder_sets(state)
 
-  # Issue the relation-info catalog read (ADR-0009 §5) for the decoder's tables — wal2json's
-  # configured list, or the tables pglogical's sets carry (in `discovered`). An empty
-  # effective list skips the read (nothing to type; the stream idles) — a fresh pglogical
-  # node's sets are empty until replication_set_add_table, the default first-run state.
+  # An empty pglogical set skips the catalog read and starts with an empty cache.
   defp request_decoder_table_info(state) do
-    case decoder_discovered(state) || decoder_tables(state) do
+    case decoder_discovered(state) do
       [] ->
-        state = set_decoder_cache(state, init_decoder_cache(state, %{}))
+        state = set_decoder_cache(state, init_decoder_cache(%{}))
 
         {:ok, sql} =
           QueryBuilder.slot_invalidation_status(state.slot_name, state.server_version_num)
@@ -787,13 +701,8 @@ defmodule Replicant.Connection do
       {:ok, _} ->
         :ok
 
-      # 22023 alone: the plugin's startup callback refused an option (OBSERVED on the
-      # wal2json 2.4 build). 0A000 must NOT read as rejection — the SQL peek cannot
-      # carry a BINARY-output plugin's changes, and when the slot has pending WAL the
-      # server refuses with exactly feature_not_supported ("produces binary output…
-      # expects textual data", OBSERVED on the live 12: it falsely halted every
-      # pglogical resume with pending WAL). The pglogical probe runs proto_format
-      # 'json' (see probe_options/2) so its peek is textual and can never trip it.
+      # 22023 means the startup callback refused an option. Other errors, including
+      # feature_not_supported during WAL decoding, cannot establish that.
       {:error, %Postgrex.Error{postgres: %{code: :invalid_parameter_value}}} ->
         :rejected
 
@@ -810,17 +719,13 @@ defmodule Replicant.Connection do
   # while json output is TEXTUAL, so the SQL peek never hits the binary-output
   # feature_not_supported refusal that a native peek on a slot with pending WAL
   # always raises (OBSERVED live — it falsely halted every pglogical resume).
-  # wal2json probes with its exact stream options: its output is textual and a
-  # genuinely old build rejects the unknown option at startup (22023, OBSERVED).
-  @spec probe_options(map(), [{String.t(), String.t()}]) :: [{String.t(), String.t()}]
-  def probe_options(%{decoder: %{kind: :pglogical}}, options) do
+  @spec probe_options([{String.t(), String.t()}]) :: [{String.t(), String.t()}]
+  def probe_options(options) do
     Enum.map(options, fn
       {"proto_format", "native"} -> {"proto_format", "json"}
       other -> other
     end)
   end
-
-  def probe_options(_state, options), do: options
 
   defp frontier_epoch(%{frontier: f}), do: f.epoch
   defp last_frontier_cast(%{frontier: f}), do: f.last_cast
@@ -831,7 +736,6 @@ defmodule Replicant.Connection do
   # Struct-field accessors (one stable map shape for the type checker).
   defp decoder_kind(%{decoder: d}), do: d.kind
   defp decoder_cache(%{decoder: d}), do: d.cache
-  defp decoder_tables(%{decoder: d}), do: d.tables
   defp decoder_discovered(%{decoder: d}), do: d.discovered
 
   defp decoder_sets(%{decoder: d}), do: d.replication_sets
@@ -844,8 +748,6 @@ defmodule Replicant.Connection do
   defp set_decoder_tables(%{decoder: d} = state, tables),
     do: %{state | decoder: %{d | discovered: tables}}
 
-  # The :invalidation_check decision, shared by the walsender chain and the PG < 10
-  # probe path (ADR-0009 §9).
   defp invalidation_check_flow(rows, state) do
     cond do
       lib_mode?(state) and state.checkpoint_state == :fault_permanent ->
@@ -863,168 +765,6 @@ defmodule Replicant.Connection do
     end
   end
 
-  # The PG < 10 catalog phase, run on a short-lived REGULAR connection (a walsender
-  # there accepts no SQL at all): the SAME QueryBuilder strings the walsender chain
-  # uses, executed synchronously in the connection process — the blocking-read
-  # precedent of read_checkpoint/1; a fault disconnects and auto_reconnect re-runs.
-  defp probe_pre10_catalog(state) do
-    case probe_connect(state) do
-      {:ok, db} ->
-        pre10_probe_body(db, state)
-
-      # The probe connection itself failed: a probe fault → the caller disconnects and
-      # auto_reconnect re-runs the chain (the documented fault path).
-      {:error, _reason} ->
-        {:error, :probe_failed}
-    end
-  end
-
-  defp pre10_probe_body(db, state) do
-    [[in_recovery, version]] = Postgrex.query!(db, QueryBuilder.recovery_and_version(), []).rows
-
-    probe = %{
-      version: repl_int(version),
-      in_recovery: repl_bool(in_recovery),
-      exists_ok: true,
-      table_rows: [],
-      info_rows: [],
-      invalidation_rows: []
-    }
-
-    # pgoutput on a pre-10 server halts in the caller's gate (no pgoutput, no
-    # publications) — do not run the PG10+ catalog query that would throw here.
-    probe =
-      if decoder_kind(state) == :pgoutput and probe.version < 100_000,
-        do: probe,
-        else: pre10_table_set_probe(db, state, probe)
-
-    probe =
-      case probe.table_rows do
-        [] ->
-          probe
-
-        tables ->
-          {:ok, info_sql} = QueryBuilder.configured_table_info(tables)
-          %{probe | info_rows: Postgrex.query!(db, info_sql, []).rows}
-      end
-
-    {:ok, invalidation_sql} =
-      QueryBuilder.slot_invalidation_status(state.slot_name, probe.version)
-
-    invalidation_rows = Postgrex.query!(db, invalidation_sql, []).rows
-
-    {:ok, %{probe | invalidation_rows: invalidation_rows}}
-  catch
-    # A probe fault is value-free (the query strings carry only validated identifiers)
-    _kind, _reason -> {:error, :probe_failed}
-  after
-    GenServer.stop(db)
-  end
-
-  # The per-decoder table-set leg of the pre-10 probe.
-  defp pre10_table_set_probe(db, state, probe) do
-    case decoder_kind(state) do
-      :pgoutput ->
-        found =
-          Postgrex.query!(db, elem(QueryBuilder.publication_exists(state.publication), 1), []).rows
-          |> MapSet.new(fn [name] -> name end)
-
-        %{probe | exists_ok: MapSet.equal?(found, MapSet.new(state.publication))}
-
-      :pglogical ->
-        found =
-          Postgrex.query!(
-            db,
-            elem(QueryBuilder.replication_set_exists(decoder_sets(state)), 1),
-            []
-          ).rows
-          |> MapSet.new(fn [name] -> name end)
-
-        tables =
-          Postgrex.query!(
-            db,
-            elem(QueryBuilder.replication_set_tables(decoder_sets(state)), 1),
-            []
-          ).rows
-          |> Enum.map(fn [s, t, _q] -> {s, t} end)
-
-        %{
-          probe
-          | exists_ok: MapSet.equal?(found, MapSet.new(decoder_sets(state))),
-            table_rows: tables
-        }
-
-      :wal2json ->
-        %{probe | table_rows: decoder_tables(state) || []}
-    end
-  end
-
-  # Fold the probe's discovered tables + relation info into the state the walsender
-  # chain would have built (mirrors the :decoder_table_discovery/:decoder_table_info
-  # handlers, absent-table halt included — and STAYING IDLE after the halt, the
-  # walsender twin's terminal discipline).
-  defp seed_probe_state(state, probe) do
-    tables = probe.table_rows
-    present = probe.info_rows |> Enum.map(fn [s, t | _rest] -> {s, t} end) |> MapSet.new()
-
-    if Enum.all?(tables, &MapSet.member?(present, &1)) do
-      state = set_decoder_tables(state, tables)
-
-      enforce_keyless_tables(
-        set_decoder_cache(state, init_decoder_cache(state, group_relation_info(probe.info_rows)))
-      )
-    else
-      Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
-        reason: :decoder_table_missing
-      })
-
-      Replicant.Supervisor.halt(state.slot_name, {:decoder, :table_missing})
-      {:halted, state}
-    end
-  end
-
-  # The wal2json keyless pre-flight predicate (ADR-0009 divergence resolution):
-  # exactly the tables wal2json.c's UPDATE/DELETE guard would skip — no
-  # replica-identity-index column AND identity ≠ FULL (REPLICA IDENTITY NOTHING, or
-  # default/index identity whose index does not exist). Such a table's U/D never
-  # reaches the wire (a server WARNING only), so a configured one halts at start
-  # unless the operator opted into insert-only semantics (`allow_keyless_tables: true`).
-  @doc false
-  @spec keyless_tables(map(), [{String.t(), String.t()}]) :: [{String.t(), String.t()}]
-  def keyless_tables(cache, tables) do
-    relations = Map.get(cache, :relations, %{})
-
-    Enum.filter(tables, fn key ->
-      case Map.get(relations, key) do
-        %Relation{replica_identity: :all_columns} -> false
-        %Relation{} = rel -> not Enum.any?(rel.columns, &(:key in (&1.flags || [])))
-        nil -> false
-      end
-    end)
-  end
-
-  # The shared enforcement: after a wal2json cache is seeded (either catalog path),
-  # halt fail-closed on a keyless configured table and STAY IDLE (the same discipline
-  # as :decoder_table_missing). pgoutput/pglogical never route here — their
-  # keylessness enforcement is the server's / the runtime decode halt's.
-  defp enforce_keyless_tables(%{decoder: %{kind: :wal2json, allow_keyless: false}} = state) do
-    cache = decoder_cache(state)
-    tables = decoder_discovered(state) || decoder_tables(state) || []
-
-    if keyless_tables(cache, tables) == [] do
-      {:ok, state}
-    else
-      Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
-        reason: :decoder_table_keyless
-      })
-
-      Replicant.Supervisor.halt(state.slot_name, {:decoder, :table_keyless})
-      {:halted, state}
-    end
-  end
-
-  defp enforce_keyless_tables(state), do: {:ok, state}
-
   # Group the flat relation-info rows into the per-table maps the decoders' caches carry.
   # `relreplident` is the pg_class char ("d"/"n"/"f"/"i") — mapped to the SAME atom the
   # pgoutput Relation decoder produces; type names resolve through the SAME OidDatabase
@@ -1033,12 +773,11 @@ defmodule Replicant.Connection do
     Enum.reduce(
       rows,
       %{},
-      fn [s, t, oid, replident, _attnum, attname, atttypid, atttypmod, identity_key], acc ->
+      fn [s, t, replident, attname, atttypid, atttypmod], acc ->
         key = {s, t}
 
         entry =
           Map.get(acc, key, %{
-            oid: repl_int(oid),
             replident: replident_atom(replident),
             columns: []
           })
@@ -1049,8 +788,7 @@ defmodule Replicant.Connection do
               %{
                 name: attname,
                 type_oid: repl_int(atttypid),
-                typmod: repl_int(atttypmod),
-                identity_key: identity_key in [true, "t"]
+                typmod: repl_int(atttypmod)
               }
               | entry.columns
             ]
@@ -1069,14 +807,8 @@ defmodule Replicant.Connection do
   defp replident_atom("i"), do: :index
   defp replident_atom(_other), do: nil
 
-  # Seed the configured decoder's cache from the connect-time relation info (ADR-0009 §5):
-  # pglogical gets column types + replica identities (its wire metadata has neither);
-  # wal2json additionally gets PRE-SEEDED relations (full column sets incl. typmods, the
-  # pg_class oid as the stable relation id, and the replica identity for old-tuple
-  # classification) — so even the first change for a table resolves against exact
-  # metadata, and an unchanged-TOAST column missing from the FIRST change is still
-  # recognized. pgoutput ignores the read entirely.
-  defp init_decoder_cache(%{decoder: %{kind: :pglogical}} = _state, info) do
+  # pglogical wire metadata omits column types and replica identity.
+  defp init_decoder_cache(info) do
     column_types =
       Map.new(info, fn {key, entry} ->
         {key,
@@ -1091,75 +823,6 @@ defmodule Replicant.Connection do
       column_types: column_types,
       replica_identity: replica_identity
     )
-  end
-
-  defp init_decoder_cache(%{decoder: %{kind: :wal2json}} = _state, info) do
-    replica_identity = Map.new(info, fn {key, entry} -> {key, entry.replident} end)
-    relids = Map.new(info, fn {key, entry} -> {key, entry.oid} end)
-
-    relations =
-      Map.new(info, fn {key, entry} ->
-        columns =
-          Enum.map(entry.columns, fn col ->
-            # Under REPLICA IDENTITY FULL every column IS a key column — pgoutput
-            # flags the whole row [:key] there, and the delivered Change.columns
-            # metadata must match (there is no identity index under FULL, so
-            # identity_key alone would flag nothing).
-            flags =
-              cond do
-                entry.replident == :all_columns -> [:key]
-                col.identity_key -> [:key]
-                true -> []
-              end
-
-            %Column{
-              name: col.name,
-              flags: flags,
-              type: OidDatabase.name_for_type_id(col.type_oid),
-              type_modifier: col.typmod
-            }
-          end)
-
-        relation = %Relation{
-          id: entry.oid,
-          namespace: elem(key, 0),
-          name: elem(key, 1),
-          replica_identity: entry.replident,
-          columns: columns
-        }
-
-        {key, relation}
-      end)
-
-    Wal2jsonDecoder.init_cache(
-      relations: relations,
-      replica_identity: replica_identity,
-      relids: relids
-    )
-  end
-
-  defp init_decoder_cache(%{decoder: %{kind: :pgoutput}}, _info), do: nil
-
-  # The PG < 10 probe's fail-closed gates, in the same order the walsender chain
-  # checks them: the pgoutput-before-10 refusal, failover-unsupported, the missing
-  # set/publication (the A3 silent-intersection loss), then the table seeding.
-  defp pre10_gate(state, %{version: version} = probe) do
-    cond do
-      decoder_kind(state) == :pgoutput and version < 100_000 ->
-        halt_decoder_unsupported_on_server(state)
-
-      state.failover and version < 170_000 ->
-        halt_failover_unsupported(state)
-
-      not probe.exists_ok ->
-        halt_publication_missing(state)
-
-      true ->
-        case seed_probe_state(state, probe) do
-          {:ok, state} -> invalidation_check_flow(probe.invalidation_rows, state)
-          {:halted, state} -> {:noreply, state}
-        end
-    end
   end
 
   @impl true
@@ -1284,7 +947,7 @@ defmodule Replicant.Connection do
 
         {:stream, sql, [],
          %{
-           arm_schema_guard(state)
+           state
            | step: :streaming,
              checkpoint_lsn: lsn,
              received_lsn: lsn,
@@ -1341,121 +1004,7 @@ defmodule Replicant.Connection do
     {:noreply, %{state | spill: %{state.spill | bytes: total}}}
   end
 
-  # ---- wal2json periodic schema guard (ADR-0009 divergence resolution) ----
-  # A dropped VARLENA column on an update-only table is wire-indistinguishable from
-  # the unchanged-TOAST sentinel (the decoder's insert/fixed-width rules cover every
-  # other drop immediately), so a wal2json pipeline periodically re-reads the
-  # configured tables' columns on a SHORT-LIVED REGULAR connection (a pre-10
-  # walsender rejects SQL — the same connect-probe pattern) and diffs them against
-  # the decoder cache. A column in the cache but gone from the catalog is re-emitted
-  # as a subset %Relation{} to the AssemblerServer — the shipped column_dropped
-  # classification halts :destructive fail-closed, the same semantics a pgoutput
-  # Relation re-emit gives on the same DDL. A guard-read fault fails OPEN (skip this
-  # tick): the guard is a backstop, the wire rules are the primary detection, and a
-  # transient catalog fault must not halt a healthy stream.
-  def handle_info(:schema_guard_tick, %{step: :streaming, decoder: %{kind: :wal2json}} = state) do
-    tables = decoder_discovered(state) || decoder_tables(state) || []
-
-    if tables != [] do
-      connection = state.connection
-      pid = self()
-      schema_guard_spawn(connection, tables, pid)
-    end
-
-    {:noreply, arm_schema_guard(state)}
-  end
-
-  # Not streaming (halted/idle/snapshotting) or not wal2json: the tick does NOT
-  # re-arm — a halted pipeline stops paying for the guard, and the next connect
-  # chain re-arms it on the streaming entries.
-  def handle_info(:schema_guard_tick, state), do: {:noreply, state}
-
-  def handle_info({:schema_guard_diff, rows}, %{decoder: %{kind: :wal2json}} = state) do
-    case Map.fetch(decoder_cache(state), :relations) do
-      {:ok, relations} ->
-        fresh = group_relation_info(rows)
-        tables = decoder_discovered(state) || decoder_tables(state) || []
-        Enum.each(tables, &cast_if_dropped(state, relations, fresh, &1))
-
-      :error ->
-        :ok
-    end
-
-    {:noreply, state}
-  end
-
-  def handle_info({:schema_guard_diff, _rows}, state), do: {:noreply, state}
   def handle_info(_other, state), do: {:noreply, state}
-
-  # The guard's off-process catalog read: ANY fault (connect or query) means the
-  # connection is unreachable or the catalog unreadable this tick — skip it (fail-open;
-  # the wire rules remain the primary detection and a transient fault must not halt a
-  # healthy stream).
-  defp schema_guard_spawn(connection, tables, pid) do
-    Task.start(fn ->
-      case schema_guard_read(connection, tables) do
-        nil -> :skip
-        rows -> send(pid, {:schema_guard_diff, rows})
-      end
-    end)
-  end
-
-  # One configured table's diff: a cache column gone from the fresh catalog read is a
-  # drop — cast the subset relation to the AssemblerServer, whose shipped
-  # column_dropped classification halts :destructive (same as a pgoutput Relation
-  # re-emit after the same DDL).
-  defp cast_if_dropped(state, relations, fresh, key) do
-    with {:ok, rel} <- Map.fetch(relations, key),
-         {:ok, fresh_entry} <- Map.fetch(fresh, key) do
-      fresh_names = fresh_entry.columns |> Enum.map(& &1.name) |> MapSet.new()
-      dropped = for col <- rel.columns || [], not MapSet.member?(fresh_names, col.name), do: col
-
-      if dropped != [] do
-        dropped_names = Enum.map(dropped, & &1.name)
-        subset = %{rel | columns: Enum.reject(rel.columns, &(&1.name in dropped_names))}
-        GenServer.cast(AssemblerServer.via(state.slot_name), {:message, subset, 0, self()})
-      end
-    end
-  end
-
-  defp arm_schema_guard(%{decoder: %{kind: :wal2json}} = state) do
-    interval = state.decoder[:schema_check_interval] || 30_000
-
-    # CANCEL any timer a previous streaming episode armed: Postgrex keeps mod_state
-    # across reconnects, and every entry to :streaming re-arms here — without the
-    # cancel, a fast reconnect cycle (store paced-retry, walsender termination)
-    # STACKS one live timer per cycle and multiplies the guard's tick rate.
-    if is_reference(state.schema_guard_timer) do
-      Process.cancel_timer(state.schema_guard_timer)
-    end
-
-    %{state | schema_guard_timer: :erlang.send_after(interval, self(), :schema_guard_tick)}
-  end
-
-  defp arm_schema_guard(state), do: state
-
-  # The catalog read for one guard tick. ANY fault (connect or query) skips the tick
-  # (fail-open — the backstop must not halt a healthy stream on a transient fault).
-  defp schema_guard_read(connection, tables) do
-    with {:ok, sql} <- QueryBuilder.configured_table_info(tables),
-         {:ok, conn} <-
-           Postgrex.start_link(
-             Keyword.merge(connection, pool_size: 1, backoff_type: :stop, sync_connect: true)
-           ) do
-      try do
-        case Postgrex.query(conn, sql, []) do
-          {:ok, %Postgrex.Result{rows: rows}} -> rows
-          _else -> nil
-        end
-      after
-        GenServer.stop(conn)
-      end
-    else
-      _else -> nil
-    end
-  rescue
-    _ -> nil
-  end
 
   # ---- public helpers (unit-tested directly) ----
 
@@ -1707,17 +1256,13 @@ defmodule Replicant.Connection do
     {:noreply, state}
   end
 
-  # A PERMANENT config fault — `pgoutput` on a server older than PG 10 (no pgoutput, no
-  # publications; ADR-0009 §9). The version never changes across a reconnect, so halt and
-  # STAY IDLE (do NOT disconnect), mirroring halt_failover_unsupported: a disconnect would
-  # let auto_reconnect re-run the connect chain and re-halt in a spin until the async
-  # teardown lands.
-  defp halt_decoder_unsupported_on_server(state) do
+  # An unsupported server cannot proceed to publication or slot lookup.
+  defp halt_server_version_unsupported(state) do
     Telemetry.event([:replicant, :connection, :slot_invalidated], %{}, %{
-      reason: :decoder_unsupported_on_server
+      reason: :server_version_unsupported
     })
 
-    Replicant.Supervisor.halt(state.slot_name, {:config, :decoder_unsupported_on_server})
+    Replicant.Supervisor.halt(state.slot_name, {:config, :server_version_unsupported})
     {:noreply, state}
   end
 
@@ -1857,10 +1402,6 @@ defmodule Replicant.Connection do
            streaming: state.in_stream
          ) do
       {:ok, messages, cache} ->
-        # A plugin may emit several messages for one payload (wal2json: a re-emitted
-        # Relation ahead of a schema-drifted change) — each is forwarded in order and
-        # each updates the stream/txn tracking, exactly as a single message would.
-        #
         # ORDERING INVARIANT (spec A1 §3.2): track_txn runs HERE, when the Connection
         # forwards each message in WAL order, so a Begin sets in_txn BEFORE any following
         # keepalive is handled — an idle-ack can never fire while an open transaction has
@@ -1869,9 +1410,7 @@ defmodule Replicant.Connection do
         # frame; track_txn the txn.
         state = set_decoder_cache(state, cache)
 
-        # The payload's WAL bytes are accounted ONCE (on the FIRST message), not per
-        # message: a multi-message payload (wal2json's relation + change) must not
-        # double-count in txn.byte_size and the spill accounting.
+        # Account for the payload's WAL bytes once, on its first decoded message.
         state = forward_each_message(messages, payload, state)
 
         {:noreply, state}
@@ -1993,7 +1532,7 @@ defmodule Replicant.Connection do
   defp stream_now(state) do
     {:ok, sql} = start_replication_sql(state, state.checkpoint_lsn)
 
-    {:stream, sql, [], arm_schema_guard(%{state | step: :streaming, in_stream: false})}
+    {:stream, sql, [], %{state | step: :streaming, in_stream: false}}
   end
 
   # The START_REPLICATION command for the configured decoder (ADR-0009 §2): the plugin
@@ -2008,8 +1547,7 @@ defmodule Replicant.Connection do
         publications: state.publication || [],
         streaming: streaming?(state),
         messages: state.messages,
-        replication_sets: decoder_sets(state) || [],
-        tables: decoder_tables(state) || []
+        replication_sets: decoder_sets(state) || []
       )
 
     QueryBuilder.start_replication_for(state.slot_name, plugin.slot_plugin(), options, start_lsn)
@@ -2270,8 +1808,7 @@ defmodule Replicant.Connection do
           QueryBuilder.create_durable_slot(
             state.slot_name,
             state.failover,
-            DecoderPlugin.module_for(decoder_kind(state)).slot_plugin(),
-            state.server_version_num
+            DecoderPlugin.module_for(decoder_kind(state)).slot_plugin()
           )
 
         {:query, sql, %{state | step: :create_incremental_slot}}
@@ -2314,8 +1851,7 @@ defmodule Replicant.Connection do
       QueryBuilder.create_durable_slot(
         state.slot_name,
         state.failover,
-        DecoderPlugin.module_for(decoder_kind(state)).slot_plugin(),
-        state.server_version_num
+        DecoderPlugin.module_for(decoder_kind(state)).slot_plugin()
       )
 
     {:query, sql, %{state | step: :create_slot}}
@@ -2382,8 +1918,7 @@ defmodule Replicant.Connection do
       QueryBuilder.create_export_slot(
         state.slot_name,
         state.failover,
-        DecoderPlugin.module_for(decoder_kind(state)).slot_plugin(),
-        state.server_version_num
+        DecoderPlugin.module_for(decoder_kind(state)).slot_plugin()
       )
 
     {:query, sql, %{state | step: :create_export_slot}}

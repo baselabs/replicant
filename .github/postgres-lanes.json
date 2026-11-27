@@ -2,29 +2,10 @@
   "engine_pglogical_image": "postgres:18@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328",
   "compatibility": [
     {
-      "major": "9.6",
-      "image": "postgres:9.6@sha256:caddd35b05cdd56c614ab1f674e63be778e0abdf54e71a7507ff3e28d4902698",
-      "plugins": [
-        "pglogical",
-        "wal2json"
-      ],
-      "legacy-source": true
-    },
-    {
-      "major": "12",
-      "image": "postgres:12@sha256:2f2a8c2a7d10862e7fba2602e304523554f9df8244c632dafe2628ccb398fb5c",
-      "plugins": [
-        "pglogical",
-        "wal2json"
-      ],
-      "parity-primary": true
-    },
-    {
       "major": "15",
       "image": "postgres:15@sha256:5f72c7b5bd616308ccfd2e74d6be16fb06364e5eecbb815fe9dc6ab9761d2111",
       "plugins": [
-        "pglogical",
-        "wal2json"
+        "pglogical"
       ]
     },
     {

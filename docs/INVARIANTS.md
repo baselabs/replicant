@@ -71,12 +71,8 @@ An UPDATE that does not touch a TOASTed column sends a sentinel, not the value. 
 surfaces it as a first-class `unchanged: [col]` list on `Replicant.Change`; the sentinel never
 appears in `record`. A sink MUST leave those columns untouched on upsert (do not overwrite them
 with NULL or a placeholder). A change of replica identity or a dropped column classifies as
-`:destructive` and halts fail-closed — on every decoder: pgoutput/pglogical re-emit relation
-metadata after DDL, and under wal2json the drop is detected at the change (an insert missing a
-cached column, or a fixed-width column missing from an update) or within one
-`schema_check_interval` (default 30s) for the TOASTable-on-update-only case — a DROP
-committed in the same DDL batch as an ADD defers to that same window (the ADD rides
-the append-only drift branch first).
+`:destructive` and halts fail-closed. pgoutput and pglogical re-emit relation metadata after DDL.
+
 
 ## 5. Stay tenant-blind
 
@@ -101,8 +97,7 @@ that targets the core library; put them one layer up.
 | Spilled oversized transaction | `streaming: [spill: [...]]` | **inherits the active checkpoint-mode guarantee** (effect-once sink-owned; at-least-once lib-mode — spill adds no duplicates), delivered as a single-pass lazy `changes` |
 
 Snapshot records contain only published columns, in physical column order. Both
-readers honor pgoutput column lists on PostgreSQL 15+ and pglogical `set_att_list`;
-wal2json retains all configured-table columns. Different lists for a shared table
+readers honor pgoutput column lists and pglogical `set_att_list`. Different lists for a shared table
 halt `:snapshot_column_list_conflict` before any snapshot row is read or delivered.
 No unpublished key is added to a record or keyset bound. Without the complete PK,
 incremental readers use whole-table windows; sinks must support the resulting
@@ -113,7 +108,7 @@ publication predicates combine with OR only among INSERT publications, because
 snapshots are INSERT-equivalent; an unfiltered INSERT publication wins. No INSERT
 publication means no snapshot rows. pglogical 2.4.8 non-NULL set predicates combine
 with AND, even beside an unfiltered set. Both checkpoint modes and all incremental
-scan paths enforce this. PG12–15 excludes generated columns; PG16+ uses the effective
+scan paths enforce this. PostgreSQL 15 excludes generated columns; PG16+ uses the effective
 publication list. A table with columns but no publishable projection halts
 `:snapshot_no_publishable_columns` with the table name. A genuinely zero-column or
 all-dropped table retains 1.4.2's empty reset. PG15 can additionally refuse an

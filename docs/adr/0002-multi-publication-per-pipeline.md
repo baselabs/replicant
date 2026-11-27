@@ -31,8 +31,7 @@ Two facts were probe-established on live PG16 during design:
   column lists are not. PostgreSQL 15+ column discovery retains DISTINCT effective
   `attnames` per table and projects only those attributes in `attnum` order.
   Identical lists collapse; conflicting lists halt `:snapshot_column_list_conflict`
-  before snapshot delivery in either mode. The pre-15 query remains version-selected
-  because that catalog column does not exist. OBSERVED on PostgreSQL 18.6 via
+  before snapshot delivery in either mode. Observed on PostgreSQL 18.6 via
   `pg_logical_slot_peek_binary_changes`: differing lists, including a partial list
   plus an unrestricted publication, produce `cannot use different column lists for
   table "public.rep_column_probe" in different publications`. The live regression

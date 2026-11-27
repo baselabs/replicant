@@ -3,14 +3,8 @@ defmodule Replicant.SnapshotColumnsUnitTest do
   alias Replicant.{QueryBuilder, Snapshotter}
   alias Replicant.Snapshotter.Incremental
 
-  test "only PostgreSQL 15+ queries attnames; 13 and 14 retain the legacy query" do
-    for version <- [100_000, 120_000, 130_000, 140_000, 149_999] do
-      sql = QueryBuilder.table_columns(version)
-      assert sql =~ "SELECT DISTINCT schemaname, tablename FROM pg_publication_tables"
-      refute sql =~ "attnames"
-    end
-
-    for version <- [150_000, 160_000, 170_000, 180_006] do
+  test "publication discovery uses effective column lists on supported servers" do
+    for version <- [150_000, 160_000, 170_000, 180_006, 190_000] do
       sql = QueryBuilder.table_columns(version)
       assert sql =~ "a.attname = ANY(p.attnames)"
       assert sql =~ "ORDER BY a.attnum"
@@ -20,7 +14,7 @@ defmodule Replicant.SnapshotColumnsUnitTest do
 
   test "pglogical filters real set_att_list catalog rows scoped to requested local sets" do
     assert {:ok, sql} =
-             QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha", "beta"], 120_000)
+             QueryBuilder.table_columns_for([{"public", "orders"}], ["alpha", "beta"], 150_000)
 
     assert sql =~ "pglogical.replication_set_table"
     assert sql =~ "r.set_att_list"
@@ -33,19 +27,13 @@ defmodule Replicant.SnapshotColumnsUnitTest do
     assert sql =~ "GROUP BY n.nspname, c.relname, r.set_id"
   end
 
-  test "wal2json keeps all explicit-table columns and has no replication-set bind" do
-    assert {:ok, sql} = QueryBuilder.table_columns_for([{"public", "orders"}])
-    assert sql =~ "NOT a.attisdropped"
-    refute sql =~ "pglogical"
-    refute sql =~ "$1"
-  end
-
   test "invalid explicit identifiers raise a typed value-free error before any query" do
     error =
       assert_raise Replicant.Error, fn ->
         Snapshotter.table_columns(:unused, %{
           tables: [{"public", "bad; secret"}],
-          server_version_num: 120_000
+          replication_sets: ["default"],
+          server_version_num: 150_000
         })
       end
 
@@ -145,7 +133,7 @@ defmodule Replicant.SnapshotColumnsUnitTest do
   test "incremental args preserve selected pglogical sets and the probed version" do
     state = %Replicant.Connection{
       slot_name: "sets_offline",
-      server_version_num: 120_000,
+      server_version_num: 150_000,
       decoder: %{
         kind: :pglogical,
         discovered: [{"public", "orders"}],
@@ -155,7 +143,7 @@ defmodule Replicant.SnapshotColumnsUnitTest do
 
     args = Replicant.Connection.incremental_args(state, nil)
     assert args.replication_sets == ["alpha", "beta"]
-    assert args.server_version_num == 120_000
+    assert args.server_version_num == 150_000
     assert {sql, [["alpha", "beta"]]} = Snapshotter.columns_query(args)
     assert sql =~ "set_row_filter"
     assert sql =~ "pg_get_expr"
@@ -182,11 +170,6 @@ defmodule Replicant.SnapshotColumnsUnitTest do
   end
 
   test "known server version selects discovery without another server query" do
-    assert {sql, [["pub"]]} =
-             Snapshotter.columns_query(%{publication: ["pub"], server_version_num: 140_000})
-
-    refute sql =~ "rowfilter"
-
     assert {sql, [["pub"]]} =
              Snapshotter.columns_query(%{publication: ["pub"], server_version_num: 180_006})
 

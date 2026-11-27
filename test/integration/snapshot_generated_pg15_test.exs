@@ -1,9 +1,9 @@
-defmodule Replicant.SnapshotGeneratedLegacyTest do
+defmodule Replicant.SnapshotGeneratedPG15Test do
   use ExUnit.Case, async: false
   @moduletag :integration
   @moduletag timeout: 120_000
-  unless Replicant.TestHelper.server_version_num() in 120_000..159_999,
-    do: @moduletag(skip: "legacy generated-column regression requires PG12-15")
+  unless Replicant.TestHelper.server_version_num() in 150_000..159_999,
+    do: @moduletag(skip: "generated-column regression requires PostgreSQL 15")
 
   alias Replicant.Test.{PG16, SnapshotRecordingSink}
 
@@ -49,8 +49,7 @@ defmodule Replicant.SnapshotGeneratedLegacyTest do
 
   for mode <- [true, [mode: :incremental, chunk_rows: 1]] do
     @mode mode
-    test "#{inspect(mode)} PG12-15 snapshot omits generated columns exactly as INSERT stream",
-         ctx do
+    test "#{inspect(mode)} PG15 snapshot omits generated columns exactly as INSERT stream", ctx do
       assert {:ok, _} =
                Replicant.start_link(
                  connection: PG16.pg_opts(),
