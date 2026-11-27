@@ -42,6 +42,10 @@ through later releases:
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
   in ADR-0002.
+- **`replicant` 2.0.0 is cut and awaiting publication** (2026-11-27): removes the
+  wal2json decoder and support for PostgreSQL below 15 (breaking; ADR-0010, CHANGELOG
+  `[2.0.0]`). Its tag will be `baselabs_replicant-v2.0.0`. The digest is recorded here
+  after infra's read-back.
 - **`replicant` 1.7.0 is the current release** (2026-11-26 UTC): Hex package and docs,
   tag `baselabs_replicant-v1.7.0`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/baselabs_replicant-v1.7.0)
   are published at `30a2c92702918504014055a8a34edf99917abc77` (publish run 45891027104),
