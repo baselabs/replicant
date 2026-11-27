@@ -339,7 +339,8 @@ defmodule Replicant.QueryBuilderTest do
     end
 
     test "refuses obsolete two-part snapshot names" do
-      assert {:error, :invalid_snapshot_name} = QueryBuilder.set_transaction_snapshot("00004E57-1")
+      assert {:error, :invalid_snapshot_name} =
+               QueryBuilder.set_transaction_snapshot("00004E57-1")
     end
 
     test "rejects a name with a quote/whitespace/injection (string-literal guard)" do

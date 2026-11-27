@@ -815,6 +815,7 @@ defmodule Replicant.ConfigTest do
                Config.validate(opts)
 
       assert {:error, ^error} = Replicant.start_link(opts)
+
       assert Exception.message(error) ==
                "replicant error reason=config_invalid shape=option=decoder"
     end
@@ -891,7 +892,11 @@ defmodule Replicant.ConfigTest do
         Keyword.delete(pgoutput, :publication) ++
           [decoder: :pglogical, replication_sets: "alpha"]
 
-      removed = [tables: [{"public", "orders"}], allow_keyless_tables: false, schema_check_interval: nil]
+      removed = [
+        tables: [{"public", "orders"}],
+        allow_keyless_tables: false,
+        schema_check_interval: nil
+      ]
 
       for opts <- [pgoutput, pglogical], option <- removed do
         assert {:error, :config_invalid} = Config.validate([option | opts])

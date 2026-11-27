@@ -1851,6 +1851,7 @@ defmodule Replicant.ConnectionTest do
         assert {:noreply, _state} = Connection.handle_result(result, st)
 
         assert_receive {:halted, %{slot_name: ^slot_name} = metadata}
+
         assert metadata == %{
                  slot_name: slot_name,
                  kind: :config,
