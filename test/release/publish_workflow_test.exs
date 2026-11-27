@@ -14,7 +14,7 @@ defmodule Replicant.PublishWorkflowTest do
   @checkout "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
   @beam "erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124"
   @artifact "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
-  @hex_pin "3bfbb84692a65b4d2c03dc3b7932353026fe6943"
+  @hex_pin "654fcd0ef63daf8e3f79dfeb4ca900adffd0d4e2"
   @hex_action "baselabs/.github/.github/actions/hex-publish@#{@hex_pin}"
   @hex_version_url "https://raw.githubusercontent.com/baselabs/.github/#{@hex_pin}/.github/actions/hex-publish/hex-version"
   @example_image ~r/\Ahexpm\/elixir:(\d+\.\d+\.\d+)-erlang-(\d+\.\d+\.\d+)-\S+@sha256:[0-9a-f]{64}\z/

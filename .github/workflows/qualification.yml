@@ -147,10 +147,10 @@ jobs:
         env:
           HEX_VERSION: ${{ needs.toolchain.outputs.hex }}
         run: |
-          pin="$(curl --fail --silent --show-error --max-time 30 https://raw.githubusercontent.com/baselabs/.github/3bfbb84692a65b4d2c03dc3b7932353026fe6943/.github/actions/hex-publish/hex-version)"
+          pin="$(curl --fail --silent --show-error --max-time 30 https://raw.githubusercontent.com/baselabs/.github/654fcd0ef63daf8e3f79dfeb4ca900adffd0d4e2/.github/actions/hex-publish/hex-version)"
           [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$pin" == "$HEX_VERSION" ]]
           mix local.hex "$pin" --force
-      - uses: baselabs/.github/.github/actions/hex-publish@3bfbb84692a65b4d2c03dc3b7932353026fe6943
+      - uses: baselabs/.github/.github/actions/hex-publish@654fcd0ef63daf8e3f79dfeb4ca900adffd0d4e2
         with:
           operation: qualify
           package: replicant
