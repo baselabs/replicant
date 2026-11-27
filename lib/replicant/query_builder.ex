@@ -661,7 +661,7 @@ defmodule Replicant.QueryBuilder do
   # replicate_insert, then accumulates the non-NULL set_row_filter nodes of ALL
   # selected sets, insert flag or not (pglogical_repset.c:458-498), and rejects a
   # change if any expression is false/NULL: AND, even beside an unfiltered set.
-  defp set_row_filters() do
+  defp set_row_filters do
     {"WITH row_filters AS (SELECT r.set_reloid, " <>
        "CASE WHEN bool_or(s.replicate_insert) THEN string_agg('(' || pg_get_expr(r.set_row_filter::pg_node_tree, r.set_reloid) || ')', " <>
        "' AND ' ORDER BY r.set_id) ELSE 'false' END AS row_filter " <>
