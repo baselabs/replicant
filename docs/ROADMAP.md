@@ -1,6 +1,6 @@
 # Replicant — Feature Tracker
 
-**Updated:** 2026-11-26 · **Current release:** `1.7.0` (2026-11-26 UTC)
+**Updated:** 2026-11-28 · **Current release:** `2.0.0` (2026-11-28 UTC)
 
 > **⚠ Commit-SHA note.** Git history was rewritten after most of this file was
 > written, so the historical commit SHAs cited in the slice rows below (e.g.
@@ -42,11 +42,13 @@ through later releases:
   pglogical set filters, generated-column policy, empty-projection refusal, and
   unpublished-key handling. PG15's dropped-column comparison limit is documented
   in ADR-0002.
-- **`replicant` 2.0.0 is cut and awaiting publication** (2026-11-27): removes the
-  wal2json decoder and support for PostgreSQL below 15 (breaking; ADR-0010, CHANGELOG
-  `[2.0.0]`). Its tag will be `baselabs_replicant-v2.0.0`. The digest is recorded here
-  after infra's read-back.
-- **`replicant` 1.7.0 is the current release** (2026-11-26 UTC): Hex package and docs,
+- **`replicant` 2.0.0 is the current release** (2026-11-28 UTC): Hex package and docs,
+  tag `baselabs_replicant-v2.0.0`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/baselabs_replicant-v2.0.0)
+  are published at `196a9a30019e2624dd27240009d2cdb895c031cf` (publish run 46145500349).
+  The verified package digest is recorded in `scripts/release/published_packages.sha256`.
+  It removes the wal2json decoder and support for PostgreSQL below 15 (breaking;
+  ADR-0010, CHANGELOG `[2.0.0]`).
+- **`replicant` 1.7.0** (2026-11-26 UTC): Hex package and docs,
   tag `baselabs_replicant-v1.7.0`, and the [GitHub release](https://github.com/baselabs/replicant/releases/tag/baselabs_replicant-v1.7.0)
   are published at `30a2c92702918504014055a8a34edf99917abc77` (publish run 45891027104),
   the first release through the shared Hex publication action. The verified package
