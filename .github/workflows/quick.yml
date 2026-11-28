@@ -68,14 +68,32 @@ jobs:
         id: lanes
         run: scripts/ci/postgres-lanes.sh
 
-      - name: Select the engine lane without its pglogical companion
+      # The pglogical companion starts only when the selection holds pglogical tests,
+      # which the engine (no plugins) excludes; qualification runs them the same way.
+      - name: Select the engine lane
         if: steps.select.outputs.tests != 'none'
         id: engine
         env:
           POSTGRES_MATRIX: ${{ steps.lanes.outputs.matrix }}
+          TESTS: ${{ steps.select.outputs.tests }}
         run: |
-          lane=$(jq -ce '.pg[] | select(.kind == "engine") | del(.plugin_server)' <<< "$POSTGRES_MATRIX")
-          echo "lane=$lane" >> "$GITHUB_OUTPUT"
+          pglogical=false
+          if [ "$TESTS" = all ]; then
+            pglogical=true
+          else
+            read -ra files <<< "$TESTS"
+            if grep -qlE '@(module)?tag :pglogical' "${files[@]}"; then pglogical=true; fi
+          fi
+          if [ "$pglogical" = true ]; then
+            lane=$(jq -ce '.pg[] | select(.kind == "engine")' <<< "$POSTGRES_MATRIX")
+          else
+            lane=$(jq -ce '.pg[] | select(.kind == "engine") | del(.plugin_server)' <<< "$POSTGRES_MATRIX")
+          fi
+          {
+            echo "lane=$lane"
+            echo "plugins=$(jq -r '.plugins | join(",")' <<< "$lane")"
+            echo "companion-plugins=$(jq -r '.plugin_server.plugins // [] | join(",")' <<< "$lane")"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Start the pinned PostgreSQL engine
         if: steps.engine.outputs.lane != ''
@@ -83,21 +101,36 @@ jobs:
         with:
           lane: ${{ steps.engine.outputs.lane }}
 
+      # A pass that runs no test (every selected test excluded on this substrate) is a
+      # failure, not a green run.
       - name: Test the selected files
         if: steps.engine.outputs.lane != ''
         env:
           TESTS: ${{ steps.select.outputs.tests }}
           # Throwaway container fixtures, matching qualification.
           REPLICANT_TEST_URL: postgres://postgres:postgres@127.0.0.1:15432/replicant_test
+          COMPANION_URL: postgres://postgres:postgres@127.0.0.1:15434/replicant_test
           EXPECTED_PG_MAJOR: ${{ steps.lanes.outputs.engine-major }}
-          EXPECTED_PG_PLUGINS: ''
+          ENGINE_PLUGINS: ${{ steps.engine.outputs.plugins }}
+          COMPANION_PLUGINS: ${{ steps.engine.outputs.companion-plugins }}
         run: |
-          if [ "$TESTS" = all ]; then
-            mix test --warnings-as-errors
-          else
-            read -ra files <<< "$TESTS"
-            mix test --warnings-as-errors "${files[@]}"
+          files=()
+          [ "$TESTS" = all ] || read -ra files <<< "$TESTS"
+          ran() {
+            python3 -c 'import re,sys
+          t=sys.stdin.read()
+          m=re.search(r"(\d+) tests?, \d+ failures?(?:, (\d+) excluded)?(?:, (\d+) skipped)?", t)
+          print(0 if not m else int(m.group(1))-int(m.group(2) or 0)-int(m.group(3) or 0))' < "$1"
+          }
+          EXPECTED_PG_PLUGINS="$ENGINE_PLUGINS" mix test --warnings-as-errors "${files[@]}" 2>&1 | tee engine.log
+          total=$(ran engine.log)
+          if [ -n "$COMPANION_PLUGINS" ]; then
+            REPLICANT_TEST_URL="$COMPANION_URL" EXPECTED_PG_PLUGINS="$COMPANION_PLUGINS" \
+              mix test --warnings-as-errors --only pglogical "${files[@]}" 2>&1 | tee companion.log
+            total=$((total + $(ran companion.log)))
           fi
+          echo "tests run: $total"
+          [ "$total" -gt 0 ] || { echo "::error::the selected tests all were excluded; nothing ran"; exit 1; }
 
       - name: Remove PostgreSQL and its disposable data
         if: always() && steps.engine.outputs.lane != ''

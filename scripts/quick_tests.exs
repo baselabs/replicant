@@ -3,7 +3,9 @@
 # depends on one directly. A deleted or renamed library file counts with the modules it
 # defined at the merge base, so tests that still name them are selected. A change to the
 # build itself (mix.exs, mix.lock, .tool-versions, config, the test helper or test support)
-# selects the whole suite, because every test depends on it.
+# or to the PostgreSQL substrate and quick workflow that run the tests (the engine pin and
+# lanes, their scripts and actions, quick.yml, this selector) selects the whole suite,
+# because every test depends on it.
 #
 #   elixir scripts/quick_tests.exs BASE_REF
 #
@@ -11,7 +13,10 @@
 # Run it from the repository root after `mix deps.get`; it calls `git` and `mix xref`.
 
 defmodule QuickTests do
-  @whole_suite ~r{\A(mix\.exs|mix\.lock|\.tool-versions|config/.*|test/test_helper\.exs|test/support/.*)\z}
+  @whole_suite ~r{\A(mix\.exs|mix\.lock|\.tool-versions|config/.*|test/test_helper\.exs|test/support/.*
+                 |\.github/postgres\.ref|\.github/postgres-lanes\.json|scripts/ci/postgres(-lanes)?\.sh
+                 |\.github/actions/(postgres|beam|toolchain)/.*|\.github/workflows/quick\.yml
+                 |scripts/quick_tests\.exs)\z}x
 
   def main([base]) do
     merge_base = git!(["merge-base", base, "HEAD"]) |> String.trim()
