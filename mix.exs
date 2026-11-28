@@ -172,7 +172,6 @@ defmodule Replicant.MixProject do
           Replicant.Decoder.Plugin,
           Replicant.Decoder.PgOutput,
           Replicant.Decoder.Pglogical,
-          Replicant.Decoder.Wal2json,
           Replicant.Decoder.Messages,
           Replicant.Decoder.OidDatabase
         ],
