@@ -19,7 +19,7 @@ defaults:
 jobs:
   quick:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90 # no green run yet
+    timeout-minutes: 6 # Green run 46149326469: quick 2m42s
     env:
       MIX_ENV: test
     steps:
