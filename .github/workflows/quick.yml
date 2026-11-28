@@ -119,8 +119,12 @@ jobs:
           ran() {
             python3 -c 'import re,sys
           t=sys.stdin.read()
-          m=re.search(r"(\d+) tests?, \d+ failures?(?:, (\d+) excluded)?(?:, (\d+) skipped)?", t)
-          print(0 if not m else int(m.group(1))-int(m.group(2) or 0)-int(m.group(3) or 0))' < "$1"
+          r=re.search(r"^Result: (.*)$", t, re.M)
+          if r:
+              print(sum(int(n) for n, k in re.findall(r"(\d+) (passed|failed|invalid)", r.group(1))))
+          else:
+              m=re.search(r"(\d+) tests?, \d+ failures?(?:, (\d+) excluded)?(?:, (\d+) skipped)?", t)
+              print(0 if not m else int(m.group(1))-int(m.group(2) or 0)-int(m.group(3) or 0))' < "$1"
           }
           EXPECTED_PG_PLUGINS="$ENGINE_PLUGINS" mix test --warnings-as-errors "${files[@]}" 2>&1 | tee engine.log
           total=$(ran engine.log)
