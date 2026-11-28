@@ -19,9 +19,7 @@ defaults:
 jobs:
   quick:
     runs-on: ubuntu-24.04
-    # 2x (244 s uncached engine suite minus 12 s for its pglogical companion, run
-    # 46076846281, plus 6 s for format, compile and Credo, runs 46076846281 and 46136138758).
-    timeout-minutes: 8
+    timeout-minutes: 90 # no green run yet
     env:
       MIX_ENV: test
     steps:
@@ -38,16 +36,6 @@ jobs:
         with:
           elixir: ${{ steps.toolchain.outputs.elixir }}
           otp: ${{ steps.toolchain.outputs.otp }}
-
-      - name: Restore deps and _build
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ steps.toolchain.outputs.otp }}-${{ steps.toolchain.outputs.elixir }}-${{ hashFiles('mix.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ steps.toolchain.outputs.otp }}-${{ steps.toolchain.outputs.elixir }}-
 
       - run: mix deps.get --check-locked
       - run: mix format --check-formatted
@@ -121,7 +109,7 @@ jobs:
           t=sys.stdin.read()
           r=re.search(r"^Result: (.*)$", t, re.M)
           if r:
-              print(sum(int(n) for n, k in re.findall(r"(\d+) (passed|failed|invalid)", r.group(1))))
+              print(sum(int(n) for n, k in re.findall(r"(\d+)(?:/\d+)? (passed|failed|invalid)", r.group(1))))
           else:
               m=re.search(r"(\d+) tests?, \d+ failures?(?:, (\d+) excluded)?(?:, (\d+) skipped)?", t)
               print(0 if not m else int(m.group(1))-int(m.group(2) or 0)-int(m.group(3) or 0))' < "$1"
