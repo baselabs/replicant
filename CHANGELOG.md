@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Run quick checks on work branches, including selected tests against the pinned PostgreSQL engine.
+
 ## [2.0.0] - 2026-11-27
 
 ### Removed

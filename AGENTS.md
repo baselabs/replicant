@@ -71,8 +71,8 @@ separate.
 
 All checks run only in GitHub CI on GitHub-hosted runners. This public repository never
 builds on the build box. Nothing that compiles or tests runs on the owner's Mac.
-Covering tests for changed files and their direct dependents run in
-`.github/workflows/qualification.yml`, through the same `kci/` route as all other checks.
+The quick workflow runs covering tests on work branches. The full qualification suite runs
+through the `kci/` route in `.github/workflows/qualification.yml`.
 Land changes with the landing tool, which submits a `kci/<commit>` candidate and moves `main`
 only after its `qualified` check succeeds. Do not push directly to `main`.
 It settles after promotion itself: it deletes local and origin branches that contain the landed
@@ -95,7 +95,7 @@ The commands below describe the CI gates. See [Testing](#testing) for the test c
 
 Update `CHANGELOG.md` under `[Unreleased]`.
 
-**Checks run in CI, through the landing.** The repository has no pre-commit hook. Every check
+**Qualification runs in CI, through the landing.** The repository has no pre-commit hook. Every check
 (format, credo, compile warnings, the dependency audit, dialyzer, `mix test` on supported
 PostgreSQL majors, docs and package, the reference example) is a job in
 `.github/workflows/qualification.yml`. Maintainers land a commit through a `kci/<commit>`
@@ -124,6 +124,15 @@ container toolchain is pinned separately.
 Make the change, commit with named paths, and use the route in [Build and test](#build-and-test).
 `main` moves only on that commit's `qualified` check.
 If CI goes red, fix forward in the next commit.
+
+Push the work branch to run `.github/workflows/quick.yml` and read its result once it finishes.
+A newer push cancels the older run. Quick checks locked dependencies, formatting, compilation
+with warnings as errors, and Credo, then runs the tests `scripts/quick_tests.exs` selects against
+the pinned PostgreSQL engine. It selects changed tests and tests that cover changed, deleted or
+renamed library modules and the direct dependents of changed library files. Changes to `mix.exs`,
+`mix.lock`, `.tool-versions`, `config/`, the test helper or test support select the whole suite on
+that engine. Ask for landing after the latest quick run is green. The `qualified` check on the
+`kci/` candidate decides landing.
 
 - A test that fails on every run is a defect: fix it, or quarantine it with a reason, in the
   change that finds it.

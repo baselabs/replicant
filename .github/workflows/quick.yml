@@ -1,0 +1,106 @@
+name: Quick
+
+# Give work branches feedback before landing. The qualified check on kci/** decides landing.
+on:
+  push:
+    branches-ignore: [main, 'kci/**']
+
+concurrency:
+  group: quick-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quick:
+    runs-on: ubuntu-24.04
+    # 2x (244 s uncached engine suite minus 12 s for its pglogical companion, run
+    # 46076846281, plus 6 s for format, compile and Credo, runs 46076846281 and 46136138758).
+    timeout-minutes: 8
+    env:
+      MIX_ENV: test
+    steps:
+      # The selector needs the merge base with the default branch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: ./.github/actions/toolchain
+        id: toolchain
+
+      - uses: ./.github/actions/beam
+        with:
+          elixir: ${{ steps.toolchain.outputs.elixir }}
+          otp: ${{ steps.toolchain.outputs.otp }}
+
+      - name: Restore deps and _build
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ steps.toolchain.outputs.otp }}-${{ steps.toolchain.outputs.elixir }}-${{ hashFiles('mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-${{ steps.toolchain.outputs.otp }}-${{ steps.toolchain.outputs.elixir }}-
+
+      - run: mix deps.get --check-locked
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: mix credo --strict
+
+      - name: Select the tests that cover this branch
+        id: select
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          selected=$(elixir scripts/quick_tests.exs "origin/$DEFAULT_BRANCH")
+          echo "selected: $selected"
+          echo "tests=$selected" >> "$GITHUB_OUTPUT"
+
+      - name: Read the declared PostgreSQL lanes
+        if: steps.select.outputs.tests != 'none'
+        id: lanes
+        run: scripts/ci/postgres-lanes.sh
+
+      - name: Select the engine lane without its pglogical companion
+        if: steps.select.outputs.tests != 'none'
+        id: engine
+        env:
+          POSTGRES_MATRIX: ${{ steps.lanes.outputs.matrix }}
+        run: |
+          lane=$(jq -ce '.pg[] | select(.kind == "engine") | del(.plugin_server)' <<< "$POSTGRES_MATRIX")
+          echo "lane=$lane" >> "$GITHUB_OUTPUT"
+
+      - name: Start the pinned PostgreSQL engine
+        if: steps.engine.outputs.lane != ''
+        uses: ./.github/actions/postgres
+        with:
+          lane: ${{ steps.engine.outputs.lane }}
+
+      - name: Test the selected files
+        if: steps.engine.outputs.lane != ''
+        env:
+          TESTS: ${{ steps.select.outputs.tests }}
+          # Throwaway container fixtures, matching qualification.
+          REPLICANT_TEST_URL: postgres://postgres:postgres@127.0.0.1:15432/replicant_test
+          EXPECTED_PG_MAJOR: ${{ steps.lanes.outputs.engine-major }}
+          EXPECTED_PG_PLUGINS: ''
+        run: |
+          if [ "$TESTS" = all ]; then
+            mix test --warnings-as-errors
+          else
+            read -ra files <<< "$TESTS"
+            mix test --warnings-as-errors "${files[@]}"
+          fi
+
+      - name: Remove PostgreSQL and its disposable data
+        if: always() && steps.engine.outputs.lane != ''
+        uses: ./.github/actions/postgres
+        with:
+          mode: stop
